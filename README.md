@@ -2,6 +2,13 @@
 
 Play the real single-player campaign with friends riding along.
 
+## Get it
+
+Download `MafiaDE-Coop.zip` from the Releases page of this repository and extract it anywhere, on any PC.
+It contains the server and the client; nothing needs installing. Requirements: Windows 10/11 x64, Mafia:
+Definitive Edition on Steam (current version), Steam running and logged in, the Microsoft Visual C++
+2015-2022 x64 redistributable.
+
 ## Host (you)
 
 1. Double-click **`1 - HOST - Play Campaign.cmd`**. It starts the co-op server if needed, then the game.
@@ -9,18 +16,17 @@ Play the real single-player campaign with friends riding along.
    (top-right corner shows it connecting; you keep full control).
 3. Play. Friends appear next to you and see what you see.
 
-Forward **UDP 27015** on your router to this PC. That is the only port.
+Forward **UDP 27015** on your router to this PC. That is the only port. Give friends your public IP.
 
 ## Friends
 
-Send them `dist\MafiaMP-Coop-Client.zip` (rebuild it with **`4 - Make Friend Package.cmd`** after any update,
-it embeds your current public IP). They extract it anywhere and double-click `JOIN GAME.cmd`. They need the game
-on Steam, Steam running, and the Microsoft Visual C++ 2015-2022 x64 redistributable.
+Same zip. Double-click **`3 - JOIN - Join a Game.cmd`**, type the host's IP (remembered for next time) and a
+name. The game starts and connects by itself.
 
 ## Testing alone
 
 Start `1 - HOST - Play Campaign.cmd`, load a chapter, then `5 - TEST - Second Client.cmd`: a second game starts
-from the friend package and joins your own server as "Tester" (enter `127.0.0.1` and `27015` in its menu if it
+from the package and joins your own server as "Tester" (enter `127.0.0.1` and `27015` in its menu if it
 does not connect by itself). You should see the second Tommy next to you, and in the second window `/mirror`
 should list your NPCs and cars. Play both windowed; it needs a lot of RAM.
 
@@ -58,7 +64,7 @@ Everything is in this repository as plain files:
 - `dev\` scripts, this README, `server\server.json`.
 
 Not in the repo: build output (`Frameworkuilds`), vendor downloads the build fetches itself (vcpkg, CEF, libnode,
-Steam and Discord SDKs), MafiaMP's `files\` (loading videos, taken from an upstream clone or the friend package),
+Steam and Discord SDKs), MafiaMP's `files\` (loading videos, taken from an upstream clone or the release package),
 `dist\`, and logs. Build from a clone with `devuild_all.cmd` (Visual Studio 2022 build tools; the first configure
 downloads the vendors).
 
