@@ -1,0 +1,845 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2020, CitizenFX
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+#ifndef IS_FXSERVER
+#define ASSERT(x) __noop
+
+// This header calls VirtualProtect, VirtualAlloc, GetModuleHandle and friends and never declared
+// them: <windows.h> only ever arrived through jitasm.h, which is now x86-only. Include it plainly,
+// exactly as jitasm did - NOT utils/safe_win32.h, which opens with WinSock2.h. Most consumers
+// reach this header after MinHook.h has already pulled a plain <windows.h>, and winsock.h is in
+// scope by then; WinSock2.h on top of that is a redefinition error.
+#include <windows.h>
+
+// jitasm is x86-only here: every type built on it - FunctionAssembly, inject_hook,
+// inject_hook_frontend, CallStub, inject_call - lives inside the `#ifndef _M_AMD64` block below,
+// whose `#else` branch hands x64 AllocateFunctionStub instead. Including the assembler on x64 cost
+// every translation unit ~98k preprocessed lines for declarations it cannot reach, and this is the
+// most included Framework header in the mods. Anything on x64 that genuinely wants jitasm includes
+// it directly, which re-enables the blocks below.
+#if !defined(GTA_FIVE) && !defined(JITASM_H) && !defined(_M_AMD64)
+#include "jitasm.h"
+#endif
+
+#include <function2/function2.hpp>
+#include <memory>
+
+namespace hook {
+    // for link /DYNAMICBASE executables
+    extern ptrdiff_t baseAddressDifference;
+
+    // The x64 preferred-base window that adjust_base/get_adjusted treat as "an address
+    // inside the main module". The end used to be hardcoded at base + 96 MB, which silently
+    // stopped adjusting anything past it — a 444 MB image (Hogwarts Legacy) has four fifths
+    // of its RVA space beyond that line, so a resolved address up there would be handed back
+    // unrelocated under ASLR. set_base() now reads the real SizeOfImage and widens the window
+    // to match; the 96 MB default survives only as the fallback for a process that never
+    // called set_base().
+    //
+    // x86 is deliberately left alone: these constants are out of range for a 32-bit address
+    // space, so the checks below have always been dead there and m2o's committed table
+    // depends on that behaviour.
+    inline constexpr uintptr_t kPreferredImageBase = 0x140000000;
+    extern uintptr_t preferredImageEnd;
+
+    // Reads SizeOfImage off the module mapped at `base` and widens the window to match.
+    // Out-of-line so this header keeps working wherever <windows.h> is not in scope.
+    void set_preferred_image_end(uintptr_t base);
+
+    // sets the base address difference based on an obtained pointer
+    inline void set_base(uintptr_t address) {
+#ifdef _M_IX86
+        uintptr_t addressDiff = (address - 0x400000);
+#elif defined(_M_AMD64)
+        uintptr_t addressDiff = (address - kPreferredImageBase);
+        set_preferred_image_end(address);
+#endif
+
+        // pointer-style cast to ensure unsigned overflow ends up copied directly into a signed value
+        baseAddressDifference = *(ptrdiff_t *)&addressDiff;
+    }
+
+    // sets the base to the process main base
+    inline void set_base() {
+        set_base((uintptr_t)GetModuleHandle(NULL));
+    }
+
+    inline bool is_preferred_base_address(uintptr_t address) {
+        return address >= kPreferredImageBase && address <= preferredImageEnd;
+    }
+
+    // adjusts the address passed to the base as set above
+    template <typename T>
+    inline void adjust_base(T &address) {
+        if (is_preferred_base_address((uintptr_t)address)) {
+            *(uintptr_t *)&address += baseAddressDifference;
+        }
+    }
+
+    // returns the adjusted address to the stated base
+    template <typename T>
+    inline uintptr_t get_adjusted(T address) {
+        if (is_preferred_base_address((uintptr_t)address)) {
+            return (uintptr_t)address + baseAddressDifference;
+        }
+
+        return (uintptr_t)address;
+    }
+
+    // returns the adjusted address to the stated base
+    template <typename T>
+    inline uintptr_t get_unadjusted(T address) {
+#ifdef _M_AMD64
+        if ((uintptr_t)address >= hook::get_adjusted(kPreferredImageBase) && (uintptr_t)address <= hook::get_adjusted(preferredImageEnd)) {
+            return (uintptr_t)address - baseAddressDifference;
+        }
+#endif
+
+        return (uintptr_t)address;
+    }
+
+    // gets the current executable TLS offset
+    template <typename T = char *>
+    T get_tls() {
+        // ah, the irony in using TLS to get TLS
+        static auto tlsIndex = ([]() {
+            const auto base       = (char *)GetModuleHandle(NULL);
+            const auto moduleBase = (PIMAGE_DOS_HEADER)base;
+            const auto ntBase     = (PIMAGE_NT_HEADERS)(base + moduleBase->e_lfanew);
+            const auto tlsBase    = (PIMAGE_TLS_DIRECTORY)(base + ntBase->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
+
+            return reinterpret_cast<uint32_t *>(tlsBase->AddressOfIndex);
+        })();
+
+#if defined(_M_IX86)
+        LPVOID *tlsBase = (LPVOID *)__readfsdword(0x2C);
+#elif defined(_M_AMD64)
+        auto tlsBase          = (LPVOID *)__readgsqword(0x58);
+#endif
+
+        return (T)tlsBase[*tlsIndex];
+    }
+
+    struct pass {
+        template <typename... T>
+        pass(T...) {}
+    };
+
+#ifdef JITASM_H
+#pragma region assembly generator
+    class FunctionAssembly {
+      private:
+        void *m_code;
+
+      public:
+        inline FunctionAssembly(jitasm::Frontend &frontend) {
+            frontend.Assemble();
+
+            void *code;
+            code = VirtualAlloc(0, frontend.GetCodeSize(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+
+            memcpy(code, frontend.GetCode(), frontend.GetCodeSize());
+
+            m_code = code;
+        }
+
+        inline ~FunctionAssembly() {
+            VirtualFree(m_code, 0, MEM_RELEASE);
+        }
+
+        inline void *GetCode() const {
+            return m_code;
+        }
+    };
+#pragma endregion
+#endif
+
+    template <typename ValueType, typename AddressType>
+    inline void put(AddressType address, ValueType value) {
+        adjust_base(address);
+
+        DWORD oldProtect;
+        VirtualProtect((void *)address, sizeof(value), PAGE_EXECUTE_READWRITE, &oldProtect);
+
+        memcpy((void *)address, &value, sizeof(value));
+
+        VirtualProtect((void *)address, sizeof(value), oldProtect, &oldProtect);
+    }
+
+    template <typename ValueType, typename AddressType>
+    inline void putVP(AddressType address, ValueType value) {
+        adjust_base(address);
+
+        DWORD oldProtect;
+        VirtualProtect((void *)address, sizeof(value), PAGE_EXECUTE_READWRITE, &oldProtect);
+
+        memcpy((void *)address, &value, sizeof(value));
+
+        VirtualProtect((void *)address, sizeof(value), oldProtect, &oldProtect);
+    }
+
+    template <typename TRet = void, typename... TArgs, typename AddressType>
+    constexpr inline TRet call(AddressType address, TArgs... args) {
+        return reinterpret_cast<TRet (*)(TArgs...)>(address)(args...);
+    }
+
+    template <typename TRet = void, typename... TArgs>
+    constexpr inline TRet this_call(uintptr_t address, TArgs... args) {
+        return reinterpret_cast<TRet(__thiscall *)(TArgs...)>(address)(args...);
+    }
+
+    template <typename TRet = void, typename... TArgs>
+    constexpr inline TRet stdcall_call(uintptr_t address, TArgs... args) {
+        return reinterpret_cast<TRet(__stdcall *)(TArgs...)>(address)(args...);
+    }
+
+    template <typename AddressType>
+    inline void nop(AddressType address, size_t length) {
+        adjust_base(address);
+
+        DWORD oldProtect;
+        VirtualProtect((void *)address, length, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+        memset((void *)address, 0x90, length);
+
+        VirtualProtect((void *)address, length, oldProtect, &oldProtect);
+    }
+
+    template <typename AddressType>
+    inline void return_function(AddressType address, uint16_t stackSize = 0) {
+        if (stackSize == 0) {
+            put<uint8_t>(address, 0xC3);
+        }
+        else {
+            put<uint8_t>(address, 0xC2);
+            put<uint16_t>((uintptr_t)address + 1, stackSize);
+        }
+    }
+
+    // Stub a function to `mov eax, value ; ret[n stackSize]` (needs 6-8 patchable bytes).
+    template <typename AddressType>
+    inline void return_value_function(AddressType address, uint32_t value, uint16_t stackSize = 0) {
+        put<uint8_t>(address, 0xB8);
+        put<uint32_t>((uintptr_t)address + 1, value);
+        return_function((uintptr_t)address + 5, stackSize);
+    }
+
+    template <typename TRet, typename TFnRet, typename... TArgs>
+    inline TRet bind(TFnRet (*func)(TArgs...)) {
+        return (TRet) reinterpret_cast<void *&>(func);
+    }
+
+    template <typename TRet, class TClass, typename TFnRet, typename... TArgs>
+    inline TRet bind(TFnRet (TClass::*func)(TArgs...)) {
+        return (TRet)(void *&)func;
+    }
+
+    template <typename T>
+    inline T *getRVA(uintptr_t rva) {
+#ifdef _M_IX86
+        return (T *)(baseAddressDifference + 0x400000 + rva);
+#elif defined(_M_AMD64)
+        return (T *)(baseAddressDifference + 0x140000000 + rva);
+#endif
+    }
+
+    namespace {
+        template <typename TOrdinal>
+        inline bool iat_matches_ordinal(uintptr_t *nameTableEntry, TOrdinal ordinal) {}
+
+        template <>
+        inline bool iat_matches_ordinal(uintptr_t *nameTableEntry, int ordinal) {
+            if (IMAGE_SNAP_BY_ORDINAL(*nameTableEntry)) {
+                return IMAGE_ORDINAL(*nameTableEntry) == ordinal;
+            }
+
+            return false;
+        }
+
+        template <>
+        inline bool iat_matches_ordinal(uintptr_t *nameTableEntry, const char *ordinal) {
+            if (!IMAGE_SNAP_BY_ORDINAL(*nameTableEntry)) {
+                const auto import = getRVA<IMAGE_IMPORT_BY_NAME>(*nameTableEntry);
+
+                return !_stricmp(import->Name, ordinal);
+            }
+
+            return false;
+        }
+    } // namespace
+
+    template <typename T, typename TOrdinal>
+    T iat(const char *moduleName, T function, TOrdinal ordinal) {
+#ifdef _M_IX86
+        IMAGE_DOS_HEADER *imageHeader = (IMAGE_DOS_HEADER *)(baseAddressDifference + 0x400000);
+#elif defined(_M_AMD64)
+        auto imageHeader = (IMAGE_DOS_HEADER *)(baseAddressDifference + 0x140000000);
+#endif
+        const IMAGE_NT_HEADERS *ntHeader = getRVA<IMAGE_NT_HEADERS>(imageHeader->e_lfanew);
+
+        const IMAGE_IMPORT_DESCRIPTOR *descriptor = getRVA<IMAGE_IMPORT_DESCRIPTOR>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+        while (descriptor->Name) {
+            const char *name = getRVA<char>(descriptor->Name);
+
+            if (_stricmp(name, moduleName)) {
+                descriptor++;
+
+                continue;
+            }
+
+            if (descriptor->OriginalFirstThunk == 0) {
+                return nullptr;
+            }
+
+            auto nameTableEntry    = getRVA<uintptr_t>(descriptor->OriginalFirstThunk);
+            auto addressTableEntry = getRVA<uintptr_t>(descriptor->FirstThunk);
+
+            while (*nameTableEntry) {
+                if (iat_matches_ordinal(nameTableEntry, ordinal)) {
+                    T origEntry = (T)*addressTableEntry;
+
+                    DWORD oldProtect;
+                    VirtualProtect(addressTableEntry, sizeof(T), PAGE_READWRITE, &oldProtect);
+
+                    *addressTableEntry = (uintptr_t)function;
+
+                    VirtualProtect(addressTableEntry, sizeof(T), oldProtect, &oldProtect);
+
+                    return origEntry;
+                }
+
+                nameTableEntry++;
+                addressTableEntry++;
+            }
+
+            return nullptr;
+        }
+
+        return nullptr;
+    }
+
+#ifndef _M_AMD64
+    // a context for the hook function to party on
+    struct HookContext {
+        uint32_t m_jumpRet;
+        uint32_t m_edi, m_esi, m_ebp, m_esp, m_ebx, m_edx, m_ecx, m_eax; // matches pushad format
+    };
+
+    class inject_hook {
+        friend struct inject_hook_frontend;
+
+      private:
+        HookContext *m_curContext;
+        std::shared_ptr<FunctionAssembly> m_assembly;
+        uintptr_t m_address;
+
+      public:
+        // return value type container
+        using ReturnType = int;
+
+      private:
+        // set context and run
+        ReturnType do_run(HookContext *context) {
+            m_curContext = context;
+
+            return run();
+        }
+
+      protected:
+        // return type values for use in return;
+
+        // return without jumping anywhere
+        inline ReturnType DoNowt() {
+            return ReturnType(0);
+        }
+
+        // jump to this place after the hook
+        inline ReturnType JumpTo(uint32_t address) {
+            m_curContext->m_eax = address;
+
+            return ReturnType(1);
+        }
+
+        // accessors for context registers
+        inline uint32_t Eax() {
+            return m_curContext->m_eax;
+        }
+        inline void Eax(uint32_t a) {
+            m_curContext->m_eax = a;
+        }
+
+        inline uint32_t Ebx() {
+            return m_curContext->m_ebx;
+        }
+        inline void Ebx(uint32_t a) {
+            m_curContext->m_ebx = a;
+        }
+
+        inline uint32_t Ecx() {
+            return m_curContext->m_ecx;
+        }
+        inline void Ecx(uint32_t a) {
+            m_curContext->m_ecx = a;
+        }
+
+        inline uint32_t Edx() {
+            return m_curContext->m_edx;
+        }
+        inline void Edx(uint32_t a) {
+            m_curContext->m_edx = a;
+        }
+
+        inline uint32_t Esi() {
+            return m_curContext->m_esi;
+        }
+        inline void Esi(uint32_t a) {
+            m_curContext->m_esi = a;
+        }
+
+        inline uint32_t Edi() {
+            return m_curContext->m_edi;
+        }
+        inline void Edi(uint32_t a) {
+            m_curContext->m_edi = a;
+        }
+
+        inline uint32_t Esp() {
+            return m_curContext->m_esp;
+        }
+        inline void Esp(uint32_t a) {
+            m_curContext->m_esp = a;
+        }
+
+        inline uint32_t Ebp() {
+            return m_curContext->m_ebp;
+        }
+        inline void Ebp(uint32_t a) {
+            m_curContext->m_ebp = a;
+        }
+
+      public:
+        virtual ReturnType run() = 0;
+
+        inject_hook(uint32_t address) {
+            m_address = address;
+        }
+
+        void inject();
+        void injectCall();
+    };
+
+#ifdef JITASM_H
+    struct inject_hook_frontend: jitasm::Frontend {
+      private:
+        inject_hook *m_hook;
+
+        static inject_hook::ReturnType CallHookFunction(inject_hook *hook, HookContext *context) {
+            return hook->do_run(context);
+        }
+
+      public:
+        inject_hook_frontend(inject_hook *hook) {
+            m_hook = hook;
+        }
+
+        void InternalMain() {
+            // set up the context stack frame
+            pushad();    // registers
+            sub(esp, 4); // jump target area
+            mov(dword_ptr[esp], 0);
+
+            // load the context address into eax
+            lea(eax, dword_ptr[esp]);
+
+            // push eax (second argument to our call)
+            push(eax);
+
+            // push the (softcoded, heh) hook function
+            push((uint32_t)m_hook);
+
+            // call the call stub
+            mov(eax, (uint32_t)CallHookFunction);
+            call(eax);
+
+            // remove garbage from the stack
+            add(esp, 8);
+
+            // do we want to jump somewhere?
+            test(eax, eax);
+            jnz("actuallyJump");
+
+            // guess not, remove jump target area and popad
+            add(esp, 4);
+            popad();
+
+            // get esp back from the context bit
+            mov(esp, dword_ptr[esp - 20]);
+
+            ret();
+
+            L("actuallyJump");
+
+            add(esp, 4);
+            popad();
+
+            mov(esp, dword_ptr[esp - 20]);
+
+            AppendInstr(jitasm::I_CALL, 0xFF, 0, jitasm::Imm8(4), R(eax));
+        }
+    };
+
+#define DEFINE_INJECT_HOOK(hookName, hookAddress)                                                                                                                                                                                                                                      \
+    class _zz_inject_hook_##hookName: public hook::inject_hook {                                                                                                                                                                                                                       \
+      public:                                                                                                                                                                                                                                                                          \
+        _zz_inject_hook_##hookName(uint32_t address): hook::inject_hook(address) {};                                                                                                                                                                                                   \
+        ReturnType run();                                                                                                                                                                                                                                                              \
+    };                                                                                                                                                                                                                                                                                 \
+    static _zz_inject_hook_##hookName hookName(hookAddress);                                                                                                                                                                                                                           \
+    _zz_inject_hook_##hookName::ReturnType _zz_inject_hook_##hookName::run()
+#endif
+
+#if 0
+    struct AsmHookStub : jitasm::Frontend
+            {
+            private:
+                hook_function* m_safeFunction;
+
+                static bool CallHookFunction(hook_function* function, HookContext& context)
+                {
+                    return (*function)(context);
+                }
+
+            public:
+                AsmHookStub(hook_function* function)
+                {
+                    m_safeFunction = function;
+                }
+
+                void InternalMain()
+                {
+                    // set up the context stack frame
+                    pushad(); // registers
+                    sub(esp, 4); // jump target area
+                    mov(dword_ptr[esp], 0);
+
+                    // load the jump target into eax
+                    lea(eax, dword_ptr[esp]);
+
+                    // push eax (second argument to our call)
+                    push(eax);
+
+                    // push the (softcoded, heh) hook function
+                    push((uint32_t)m_safeFunction);
+
+                    // call the call stub
+                    mov(eax, (uint32_t)CallHookFunction);
+                    call(eax);
+
+                    // remove garbage from the stack
+                    add(esp, 8);
+
+                    // check if we want to execute the original trampoline
+                    test(al, al);
+                    jnz("noTrampolineReturn");
+
+
+
+                    L("noTrampolineReturn");
+
+
+                }
+            };
+#endif
+
+    template <typename T, typename AT>
+    inline void jump(AT address, T func) {
+        put<uint8_t>(address, 0xE9);
+        put<int>((uintptr_t)address + 1, (intptr_t)func - (intptr_t)get_adjusted(address) - 5);
+    }
+
+    template <typename T, typename AT>
+    inline void call(AT address, T func) {
+        put<uint8_t>(address, 0xE8);
+        put<int>((uintptr_t)address + 1, (intptr_t)func - (intptr_t)get_adjusted(address) - 5);
+    }
+
+    template <typename T>
+    inline T get_call(T address) {
+        intptr_t target = *(uintptr_t *)(get_adjusted(address) + 1);
+        target += (get_adjusted(address) + 5);
+
+        return (T)target;
+    }
+
+    template <typename TTarget, typename T>
+    inline void set_call(TTarget *target, T address) {
+        *(T *)target = get_call(address);
+    }
+
+    inline uintptr_t get_member_internal(void *function) {
+        return (uintptr_t)function;
+    }
+
+    template <typename T>
+    inline uintptr_t get_member_old(T function) {
+        return ((uintptr_t(*)(T))get_member_internal)(function);
+    }
+
+    template <typename TClass, typename TMember>
+    inline uintptr_t get_member(TMember TClass::*function) {
+        union member_cast {
+            TMember TClass::*function;
+            struct {
+                void *ptr;
+                void *offset;
+            };
+        };
+
+        member_cast cast;
+
+        if (sizeof(cast.function) != sizeof(cast.ptr)) {
+            return get_member_old(function);
+        }
+
+        cast.function = function;
+
+        return (uintptr_t)cast.ptr;
+    }
+
+    namespace vp {
+        template <typename T, typename AT>
+        inline void jump(AT address, T func) {
+            putVP<uint8_t>(address, 0xE9);
+            putVP<int>((uintptr_t)address + 1, (intptr_t)func - (intptr_t)get_adjusted(address) - 5);
+        }
+
+        template <typename T, typename AT>
+        inline void call(AT address, T func) {
+            putVP<uint8_t>(address, 0xE8);
+            putVP<int>((uintptr_t)address + 1, (intptr_t)func - (intptr_t)get_adjusted(address) - 5);
+        }
+    } // namespace vp
+
+#ifdef JITASM_H
+#pragma region inject call : call stub
+    template <typename R, typename... Args>
+    struct CallStub: jitasm::function<void, CallStub<R, Args...>> {
+      private:
+        void *m_target;
+
+      public:
+        CallStub(void *target): m_target(target) {}
+
+        void main() {
+            uint32_t stackOffset = 0;
+            uint32_t argOffset   = sizeof(uintptr_t) * 2; // as frame pointers are also kept here
+            uint32_t argCleanup  = 0;
+
+            pass {(
+                [&] {
+                    int size = (std::min)(sizeof(Args), sizeof(uintptr_t));
+
+                    argOffset += size;
+                }(),
+                1)...};
+
+            // as this is the end, and the last argument isn't past the end
+            argOffset -= 4;
+
+            pass {(
+                [&] {
+                    this->mov(this->eax, this->dword_ptr[this->esp + stackOffset + argOffset]);
+                    this->push(this->eax);
+
+                    int size = (std::max)(sizeof(Args), sizeof(uintptr_t));
+
+                    stackOffset += size;
+                    argCleanup += size;
+                    argOffset -= size;
+                }(),
+                1)...};
+
+            this->mov(this->eax, (uintptr_t)m_target);
+            this->call(this->eax);
+
+            this->add(this->esp, argCleanup);
+        }
+    };
+#pragma endregion
+#endif
+
+#pragma region inject call
+    template <typename R, typename... Args>
+    class inject_call {
+      private:
+        R (*m_origAddress)(Args...);
+
+        uintptr_t m_address;
+
+        std::shared_ptr<FunctionAssembly> m_assembly;
+
+      public:
+        inject_call(uintptr_t address) {
+            if (*(uint8_t *)address != 0xE8) {
+                __debugbreak();
+                // "inject_call attempted on something that was not a call. Are you sure you have a compatible version
+                // of the game executable? You might need to try poking the guru."
+            }
+
+            m_address = address;
+        }
+
+        void inject(R (*target)(Args...)) {
+            CallStub<R, Args...> stub(target);
+
+            m_assembly = std::make_shared<FunctionAssembly>(stub);
+
+            // store original
+            int origAddress = *(int *)(m_address + 1);
+            origAddress += 5;
+            origAddress += m_address;
+
+            m_origAddress = (R(*)(Args...))origAddress;
+
+            // and patch
+            put<int>(m_address + 1, (uintptr_t)m_assembly->GetCode() - (uintptr_t)get_adjusted(m_address) - 5);
+        }
+
+        R call() {
+            return ((R(*)())m_origAddress)();
+        }
+
+        R call(Args... args) {
+            return m_origAddress(args...);
+        }
+    };
+#pragma endregion
+#else
+    void *AllocateFunctionStub(void *ptr, int type = 0);
+
+    void *AllocateStubMemory(size_t size);
+
+    template <typename T>
+    struct get_func_ptr {
+        static void *get(T func) {
+            return (void *)func;
+        }
+    };
+
+    template <int Register, typename T, typename AT>
+        requires (Register < 8 && Register >= 0)
+    inline void jump_reg(AT address, T func) {
+        LPVOID funcStub = AllocateFunctionStub(get_func_ptr<T>::get(func), Register);
+
+        put<uint8_t>(address, 0xE9);
+        put<int>((uintptr_t)address + 1, (intptr_t)funcStub - (intptr_t)get_adjusted(address) - 5);
+    }
+
+    template <typename T, typename AT>
+    inline void jump(AT address, T func) {
+        jump_reg<0>(address, func);
+    }
+
+    template <typename T, typename AT>
+    inline void jump_rcx(AT address, T func) {
+        jump_reg<1>(address, func);
+    }
+
+    template <int Register, typename T, typename AT>
+        requires (Register < 8 && Register >= 0)
+    inline void call_reg(AT address, T func) {
+        LPVOID funcStub = AllocateFunctionStub(get_func_ptr<T>::get(func), Register);
+
+        put<uint8_t>(address, 0xE8);
+        put<int>((uintptr_t)address + 1, (intptr_t)funcStub - (intptr_t)get_adjusted(address) - 5);
+    }
+
+    template <typename T, typename AT>
+    inline void call(AT address, T func) {
+        call_reg<0>(address, func);
+    }
+
+    template <typename T, typename AT>
+    inline void call_rcx(AT address, T func) {
+        call_reg<1>(address, func);
+    }
+
+    template <typename T>
+    inline T get_call(T address) {
+        intptr_t target = *(int32_t *)(get_adjusted(address) + 1);
+        target += (get_adjusted(address) + 5);
+
+        return (T)target;
+    }
+
+    template <typename TTarget, typename T>
+    inline void set_call(TTarget *target, T address) {
+        *(T *)target = get_call(address);
+    }
+
+    inline uintptr_t get_member_internal(void *function) {
+        return *(uintptr_t *)function;
+    }
+
+    template <typename T>
+    inline uintptr_t get_member_old(T function) {
+        return ((uintptr_t(*)(T))get_member_internal)(function);
+    }
+
+    template <typename TClass, typename TMember>
+    inline uintptr_t get_member(TMember TClass::*function) {
+        union member_cast {
+            TMember TClass::*function;
+            void *ptr;
+        };
+
+        member_cast cast;
+
+        if (sizeof(cast.function) != sizeof(cast.ptr)) {
+            return get_member_old(function);
+        }
+
+        cast.function = function;
+
+        return (uintptr_t)cast.ptr;
+    }
+
+    template <typename TClass, typename TMember>
+    struct get_func_ptr<TMember TClass::*> {
+        static void *get(TMember TClass::*function) {
+            return (void *)get_member(function);
+        }
+    };
+#endif
+
+    template <typename T, typename TAddr>
+    inline T get_address(TAddr address) {
+        intptr_t target = *(int32_t *)(get_adjusted(address));
+        target += (get_adjusted(address) + 4);
+
+        return (T)target;
+    }
+
+    template <typename T, typename TAddr>
+    inline T get_address(TAddr address, size_t offsetTo4ByteAddr, size_t numBytesInLine) {
+        intptr_t target = *(int32_t *)(get_adjusted((char *)address + offsetTo4ByteAddr));
+        target += (get_adjusted(address) + numBytesInLine);
+
+        return (T)target;
+    }
+} // namespace hook
+
+#include "hooking_invoke.h"
+#include "hooking_patterns.h"
+#endif

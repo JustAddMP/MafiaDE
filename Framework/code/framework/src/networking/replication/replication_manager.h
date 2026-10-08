@@ -1,0 +1,363 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include "delegation.h"
+#include "entity_registry.h"
+#include "interest_grid.h"
+#include "network_entity.h"
+
+#include <mafianet/NetworkIDManager.h>
+#include <mafianet/RPC4Plugin.h>
+#include <mafianet/ReplicaManager3.h>
+#include <mafianet/peerinterface.h>
+
+#include <function2/function2.hpp>
+#include <glm/glm.hpp>
+
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace Framework::Networking {
+    class NetworkPeer;
+} // namespace Framework::Networking
+
+namespace Framework::Networking::Replication {
+    // Downcast a base NetworkEntity* to a concrete subclass. Uses RTTI where it
+    // is available; when a target is built with /GR- (RTTI disabled) it falls
+    // back to comparing the registered type id, which requires the concrete
+    // type to declare a kTypeName. Both paths are identical for the exact
+    // registered leaf type -- the id check just cannot see a base class.
+    template <typename T>
+    inline T *CheckedEntityCast(NetworkEntity *entity) {
+#if defined(_CPPRTTI)
+        return dynamic_cast<T *>(entity);
+#else
+        return (entity != nullptr && entity->GetTypeId() == EntityRegistry::Get().TypeId(T::kTypeName)) ? static_cast<T *>(entity) : nullptr;
+#endif
+    }
+
+    // Server-side transform send interval by distance from the viewer: every tick inside nearDistance,
+    // midIntervalMs out to midDistance, farIntervalMs beyond. Only the transform channel is throttled;
+    // a zero interval means every tick.
+    struct SerializeRateBands {
+        float nearDistance     = 0.0f;
+        float midDistance      = 0.0f;
+        uint32_t midIntervalMs = 0;
+        uint32_t farIntervalMs = 0;
+        // Interval inside nearDistance. Zero, the default, sends every tick: a type whose receivers
+        // re-simulate between samples (input replay, interpolation) can take a lower near rate.
+        uint32_t nearIntervalMs = 0;
+
+        // Distances are clamped to 0 <= nearDistance <= midDistance, so an inverted or negative band
+        // cannot hand a far viewer the near interval.
+        SerializeRateBands Normalized() const {
+            SerializeRateBands out = *this;
+            out.nearDistance       = nearDistance > 0.0f ? nearDistance : 0.0f;
+            out.midDistance        = midDistance > out.nearDistance ? midDistance : out.nearDistance;
+            return out;
+        }
+    };
+
+    // The replicated world: a ReplicaManager3 that owns the set of NetworkEntity objects. It
+    // creates/destroys entities, resolves them by NetworkID, tracks each connection's "viewer"
+    // entity, and drives an InterestGrid that ReplicationConnection::QueryReplicaList reads for
+    // interest management.
+    // Identifies one state-change subscription. Zero is never handed out.
+    using StateChangeHandle                                      = uint32_t;
+    inline constexpr StateChangeHandle kInvalidStateChangeHandle = 0;
+
+    class ReplicationManager final: public MafiaNet::ReplicaManager3 {
+      public:
+        ReplicationManager();
+        ~ReplicationManager();
+
+        void Init(NetworkPeer *owner, bool isServer);
+
+        // Sends unreliable transforms as per-connection batches (see TransformBatch). Every receiver
+        // reads batches; each game opts its senders in, before connecting. Framework 29 wire protocol.
+        void SetTransformBatchingEnabled(bool enabled) {
+            _batchTransforms = enabled;
+        }
+        bool TransformBatchingEnabled() const {
+            return _batchTransforms;
+        }
+
+        // RakPeer updates every plugin on each Receive(), so draining N packets would run N world
+        // passes. Between these two calls only the first Update() runs one; outside them every call
+        // does, as in ReplicaManager3.
+        void BeginNetworkUpdate() {
+            _networkUpdateActive      = true;
+            _updatedThisNetworkUpdate = false;
+        }
+        void EndNetworkUpdate() {
+            _networkUpdateActive = false;
+        }
+        void Update() override;
+        // Decodes transform batches and hands everything else to ReplicaManager3.
+        MafiaNet::PluginReceiveResult OnReceive(MafiaNet::Packet *packet) override;
+
+        // Server: push the entity's forced state to its owner — the server's authoritative override
+        // of an owned entity (see NetworkEntity::ForceState / OnStateForced). Bumps the entity's
+        // state epoch so owner updates sent before the override arrives are dropped instead of
+        // reverting it. No-op on clients and for unowned entities (which already replicate to
+        // everyone).
+        void ForceState(NetworkEntity *entity);
+
+        // Server: change an entity's owner and notify the new owner directly (see
+        // NetworkEntity::SetOwner). Needed because serialize to an owner is withheld, so the grant
+        // can't ride normal replication.
+        void SetOwner(NetworkEntity *entity, MafiaNet::PeerGuid guid);
+
+        // --- State bags ---
+        // Server: send this tick's accumulated bag changes. Driven from NetworkPeer::Update, next to
+        // RebuildInterest. Each change goes only to the connections that have the entity constructed,
+        // so bags inherit interest, virtual worlds and budgets rather than restating them — and no
+        // state reaches a client that cannot see the entity.
+        void FlushStateBags();
+
+        // Called by a bag when it first dirties in a tick, so the flush walks what changed.
+        void MarkStateBagDirty(NetworkEntity *entity);
+
+        // Subscribe to bag changes on this peer: the server on write, a client on apply, including
+        // the keys a construction seed delivered. Returns a handle for RemoveStateChangeHandler, or
+        // kInvalidStateChangeHandle when the callback is empty.
+        //
+        // The filter is applied before the callback runs, which is the point of it: a busy server
+        // changes bags many times a tick, and a listener watching one key of one entity should not be
+        // paying to build arguments for every other change in the world. An empty filter still sees
+        // everything, for a mod that wants the firehose.
+        StateChangeHandle AddStateChangeHandler(const StateChangeFilter &filter, fu2::function<void(const StateChange &) const> callback);
+        void RemoveStateChangeHandler(StateChangeHandle handle);
+        void NotifyStateChanged(const StateChange &change);
+
+        bool IsServer() const {
+            return _isServer;
+        }
+        MafiaNet::PeerGuid GetMyGUID() const {
+            return _myGUID;
+        }
+
+        // --- Entity lifecycle ---
+        // Server: construct and start replicating an entity of the given type, nullptr if unknown.
+        // Non-owning: the manager owns it; destroy via DestroyEntity.
+        NetworkEntity *CreateEntity(uint32_t typeId);
+        // Broadcast destruction and delete the entity.
+        void DestroyEntity(NetworkEntity *entity);
+        NetworkEntity *GetEntityByNetworkID(MafiaNet::NetworkID networkId) const;
+        void ForEachEntity(const fu2::function<void(NetworkEntity *) const> &fn) const;
+
+        // Typed wrappers over the base-pointer entity API (cast once inside). CreateEntity<T> resolves
+        // the type id from T::kTypeName.
+        template <typename T>
+        T *CreateEntity() {
+            return CheckedEntityCast<T>(CreateEntity(EntityRegistry::Get().TypeId(T::kTypeName)));
+        }
+        template <typename T>
+        T *GetEntity(MafiaNet::NetworkID networkId) const {
+            return CheckedEntityCast<T>(GetEntityByNetworkID(networkId));
+        }
+        template <typename T>
+        T *GetViewerAs(MafiaNet::PeerGuid guid) const {
+            return CheckedEntityCast<T>(GetViewer(guid));
+        }
+        template <typename T>
+        void ForEach(const fu2::function<void(T *) const> &fn) const {
+            ForEachEntity([&fn](NetworkEntity *entity) {
+                if (T *typed = CheckedEntityCast<T>(entity)) {
+                    fn(typed);
+                }
+            });
+        }
+
+        // --- Viewers (a connection's controlled entity, e.g. a player's avatar) ---
+        void SetViewer(MafiaNet::PeerGuid guid, NetworkEntity *entity);
+        NetworkEntity *GetViewer(MafiaNet::PeerGuid guid) const;
+        void ClearViewer(MafiaNet::PeerGuid guid);
+        // Every connection that has one, for code that needs "where is each player" rather than one
+        // named player: interest is computed per viewer, and so is delegation.
+        void ForEachViewer(const fu2::function<void(MafiaNet::PeerGuid, NetworkEntity *) const> &fn) const;
+        // Every player's avatar with the guid of the player it stands for, on either peer. What
+        // proximity voice keys a speaker's position on.
+        void ForEachAvatar(const fu2::function<void(MafiaNet::PeerGuid, NetworkEntity *) const> &fn) const;
+
+        // Server: every peer that has `entity` constructed -- the audience interest, virtual worlds
+        // and budgets have already chosen, and so the one an event about the entity belongs to. The
+        // same question FlushStateBags asks, answered from the connections rather than re-derived
+        // from positions and ranges. O(connections); visits nothing on a client.
+        void ForEachStreamingPeer(NetworkEntity *entity, const fu2::function<void(MafiaNet::PeerGuid) const> &fn) const;
+
+        // --- Delegated simulation ---
+        // Election of which client simulates which server-owned entity. Server-side; on a client the
+        // manager exists but does nothing. See delegation.h.
+        DelegationManager &Delegation() {
+            return _delegation;
+        }
+        const DelegationManager &Delegation() const {
+            return _delegation;
+        }
+
+        // --- Interest management ---
+        // Configure the spatial index extent (see InterestGrid::Configure). Call before the first
+        // RebuildInterest().
+        void ConfigureGrid(float cellSize, float worldMin, float worldMax);
+        // Select the interest ground plane: false (default) = XZ (Y-up), true = XY (Z-up). See
+        // InterestGrid::SetGroundPlaneXY.
+        void SetInterestGroundPlaneXY(bool groundXY) {
+            _interest.SetGroundPlaneXY(groundXY);
+            // Delegation measures the same distances for the same reason, so a game that has told
+            // the framework which way is up has told it once.
+            _delegation.SetGroundPlaneXY(groundXY);
+        }
+        // Streaming-boundary hysteresis. See InterestGrid::SetStreamOutMargin.
+        void SetInterestStreamOutMargin(float margin) {
+            _interest.SetStreamOutMargin(margin);
+        }
+        // Seconds of viewer velocity used as a second focus point. See
+        // InterestGrid::SetLookaheadSeconds.
+        void SetInterestLookaheadSeconds(float seconds) {
+            _interest.SetLookaheadSeconds(seconds);
+        }
+        // Per-type cap on in-range entities per viewer (0 = uncapped). See InterestGrid::SetBudget.
+        void SetInterestBudget(uint32_t typeId, uint32_t maxCount) {
+            _interest.SetBudget(typeId, maxCount);
+        }
+        // By registered type name, so games configure budgets without resolving ids themselves.
+        void SetInterestBudget(const std::string &typeName, uint32_t maxCount) {
+            _interest.SetBudget(EntityRegistry::Get().TypeId(typeName), maxCount);
+        }
+        // Holds a type to each entity's own streaming range instead of letting the viewer's widen
+        // it. See InterestGrid::SetUsesEntityRange.
+        void SetInterestUsesEntityRange(uint32_t typeId, bool usesEntityRange) {
+            _interest.SetUsesEntityRange(typeId, usesEntityRange);
+        }
+        void SetInterestUsesEntityRange(const std::string &typeName, bool usesEntityRange) {
+            _interest.SetUsesEntityRange(EntityRegistry::Get().TypeId(typeName), usesEntityRange);
+        }
+        // Minimum milliseconds between spatial-index rebuilds (0 = every tick, the default). Viewer
+        // queries are staggered across the same interval. Entity creation and destruction still force
+        // an immediate rebuild and refresh every viewer; an ownership change refreshes its two owners.
+        void SetInterestRebuildInterval(uint32_t intervalMs) {
+            _interestRebuildInterval = intervalMs;
+        }
+        // Rebuild the spatial index from current entity positions. Server only; call once per tick
+        // before ReplicaManager3 serializes (driven from NetworkPeer::Update). Honours the interval.
+        void RebuildInterest();
+        void CollectInterest(NetworkEntity *viewer, MafiaNet::PeerGuid viewerGUID, const std::unordered_set<NetworkEntity *> &previous, std::unordered_set<NetworkEntity *> &out);
+        // Change counter for the interest index (see InterestGrid::Generation).
+        uint32_t InterestGeneration() const {
+            return _interest.Generation();
+        }
+
+        // Bumped by a change every viewer must see before its next phase: a destroyed entity (a cached
+        // set must never hand it out) or a rebuild caused by creation or destruction.
+        uint32_t InterestUrgentGeneration() const {
+            return _interestUrgentGeneration;
+        }
+        uint32_t InterestRefreshInterval() const {
+            return _interestRebuildInterval;
+        }
+
+        // Server: transform rate bands, default and per-type override.
+        void SetSerializeRateBands(const SerializeRateBands &bands) {
+            _rateBands = bands.Normalized();
+        }
+        void SetSerializeRateBands(uint32_t typeId, const SerializeRateBands &bands) {
+            _rateBandsByType[typeId] = bands.Normalized();
+        }
+        void SetSerializeRateBands(const std::string &typeName, const SerializeRateBands &bands) {
+            _rateBandsByType[EntityRegistry::Get().TypeId(typeName)] = bands.Normalized();
+        }
+        const SerializeRateBands &GetSerializeRateBands(uint32_t typeId) const {
+            if (_rateBandsByType.empty()) {
+                return _rateBands;
+            }
+            const auto it = _rateBandsByType.find(typeId);
+            return it != _rateBandsByType.end() ? it->second : _rateBands;
+        }
+        bool HasSerializeRateBands() const {
+            return _rateBands.midIntervalMs != 0 || _rateBands.farIntervalMs != 0 || !_rateBandsByType.empty();
+        }
+        // Milliseconds between transform sends at squared distance distSq; 0 = every tick.
+        static uint32_t TransformSendIntervalMs(const SerializeRateBands &bands, float distSq);
+
+        // Server: invoked from OnClosedConnection just before the dropped peer's avatar is destroyed,
+        // while it is still resolvable. The integration layer wires its player-disconnect notification
+        // here.
+        void SetOnClientDisconnect(fu2::function<void(MafiaNet::PeerGuid) const> callback) {
+            _onClientDisconnect = std::move(callback);
+        }
+
+        // Fired with the NetworkID at the end of CreateEntity / start of DestroyEntity.
+        void SetOnEntityCreated(fu2::function<void(uint64_t) const> callback) {
+            _onEntityCreated = std::move(callback);
+        }
+        void SetOnEntityDestroyed(fu2::function<void(uint64_t) const> callback) {
+            _onEntityDestroyed = std::move(callback);
+        }
+
+        // --- ReplicaManager3 hooks ---
+        // Connection-drop teardown. The base only removes replicas a dropped peer itself created;
+        // player avatars are server-created, so on the server we additionally notify the game and
+        // destroy the dropped peer's viewer (DestroyEntity broadcasts the destruction to remaining
+        // clients), which is the missing half that otherwise leaks avatars across reconnects.
+        void OnClosedConnection(const MafiaNet::SystemAddress &systemAddress, MafiaNet::RakNetGUID rakNetGUID, MafiaNet::PI2_LostConnectionReason lostConnectionReason) override;
+
+        MafiaNet::Connection_RM3 *AllocConnection(const MafiaNet::SystemAddress &systemAddress, MafiaNet::RakNetGUID rakNetGUID) const override;
+        void DeallocConnection(MafiaNet::Connection_RM3 *connection) const override;
+
+      private:
+        // Makes the connection of this peer, if any, refresh its interest on its next query.
+        void InvalidateInterestOf(MafiaNet::PeerGuid guid);
+
+        bool _isServer                 = false;
+        bool _batchTransforms          = false;
+        bool _networkUpdateActive      = false;
+        bool _updatedThisNetworkUpdate = false;
+        MafiaNet::PeerGuid _myGUID     = MafiaNet::UNASSIGNED_PEER_GUID;
+        // Server-side monotonic NetworkID allocator. Starts at 1 (0 reads as "none" in game code) and
+        // stays well within JavaScript's safe-integer range so scripting can hold ids as plain numbers.
+        // Bumped only from CreateEntity on the sim thread, so it needs no synchronization.
+        uint64_t _nextNetworkId    = 0;
+        NetworkPeer *_owner        = nullptr;
+        bool _clientRPCsRegistered = false;
+        InterestGrid _interest;
+        DelegationManager _delegation;
+        SerializeRateBands _rateBands;
+        std::unordered_map<uint32_t, SerializeRateBands> _rateBandsByType;
+        uint32_t _interestUrgentGeneration = 0;
+        uint32_t _interestRebuildInterval  = 0;
+        int64_t _lastInterestRebuild       = 0;
+        // Entity set changed since the last rebuild; forces one regardless of the interval.
+        bool _interestDirty = true;
+        std::unordered_map<MafiaNet::PeerGuid, NetworkEntity *> _viewers;
+        // By NetworkID, not pointer: an entity can be destroyed between dirtying and the flush.
+        std::unordered_set<uint64_t> _dirtyStateBags;
+
+        struct StateChangeSubscription {
+            StateChangeFilter filter;
+            fu2::function<void(const StateChange &) const> callback;
+        };
+        // Handles rather than iterators or pointers, so a handler that unsubscribes during dispatch
+        // (itself or another) cannot invalidate what the dispatch is walking.
+        std::unordered_map<StateChangeHandle, StateChangeSubscription> _stateChangeHandlers;
+        // Keyed buckets, so a change consults only the subscriptions that named its key plus the ones
+        // that named no key at all.
+        std::unordered_map<std::string, std::vector<StateChangeHandle>> _stateChangeByKey;
+        std::vector<StateChangeHandle> _stateChangeAnyKey;
+        StateChangeHandle _nextStateChangeHandle = kInvalidStateChangeHandle;
+        fu2::function<void(MafiaNet::PeerGuid) const> _onClientDisconnect;
+        fu2::function<void(uint64_t) const> _onEntityCreated;
+        fu2::function<void(uint64_t) const> _onEntityDestroyed;
+    };
+} // namespace Framework::Networking::Replication

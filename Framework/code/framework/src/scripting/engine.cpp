@@ -1,0 +1,64 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2024, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "engine.h"
+#include "engine_helpers.h"
+
+#include <logging/logger.h>
+
+namespace Framework::Scripting {
+
+    bool Engine::Execute(std::string_view code, std::string_view filename) {
+        if (!_initialized) {
+            _lastError = "Engine not initialized";
+            return false;
+        }
+
+        v8::Isolate *isolate = GetIsolate();
+        v8::Locker locker(isolate);
+        v8::Isolate::Scope isolateScope(isolate);
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = GetContext();
+        v8::Context::Scope contextScope(context);
+
+        v8::TryCatch tryCatch(isolate);
+
+        v8::Local<v8::String> source = v8::String::NewFromUtf8(isolate, code.data(), v8::NewStringType::kNormal, static_cast<int>(code.size())).ToLocalChecked();
+        v8::ScriptOrigin origin(v8::String::NewFromUtf8(isolate, filename.data(), v8::NewStringType::kNormal, static_cast<int>(filename.size())).ToLocalChecked());
+
+        v8::Local<v8::Script> script;
+        if (!v8::Script::Compile(context, source, &origin).ToLocal(&script)) {
+            if (tryCatch.HasCaught()) {
+                _lastError = FormatV8Exception(isolate, tryCatch, "Script compilation error");
+            } else {
+                _lastError = "Failed to compile script";
+            }
+            return false;
+        }
+
+        v8::Local<v8::Value> result;
+        if (!script->Run(context).ToLocal(&result)) {
+            if (tryCatch.HasCaught()) {
+                _lastError = FormatV8Exception(isolate, tryCatch, "Runtime error");
+            } else {
+                _lastError = "Unknown execution error";
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+    bool Engine::InitFrameworkSDK() {
+        if (_sdkRegisterCallback) {
+            _sdkRegisterCallback(this);
+        }
+        return true;
+    }
+
+} // namespace Framework::Scripting

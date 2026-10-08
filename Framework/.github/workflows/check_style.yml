@@ -1,0 +1,28 @@
+name: Check code style
+
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+  workflow_dispatch:
+
+jobs:
+  check_style:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        # The style check only inspects this repo's own tracked files
+        # (check_style.sh excludes vendors and submodules), so there is
+        # no need to fetch the private services-adapter submodule, which
+        # the default GITHUB_TOKEN cannot access.
+        submodules: false
+    
+    - name: Check if the code adheres to the standard style
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      run: |
+        chmod +x scripts/check_style_ci.sh
+        ./scripts/check_style_ci.sh $DISCORD_WEBHOOK

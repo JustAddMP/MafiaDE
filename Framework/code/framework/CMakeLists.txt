@@ -1,0 +1,488 @@
+include(UpdateGitHash)
+update_git_version(FW "${CMAKE_CURRENT_SOURCE_DIR}/src/utils/version.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/version.cpp")
+
+# List the source files
+set(FRAMEWORK_SRC
+    src/logging/logger.cpp
+
+    ${CMAKE_CURRENT_BINARY_DIR}/version.cpp
+    src/utils/delay_scope.cpp
+    src/utils/config.cpp
+    src/utils/config_schema.cpp
+    src/utils/persistent_config.cpp
+    src/utils/interpolator.cpp
+    src/utils/time.cpp
+    src/utils/command_listener.cpp
+    src/utils/command_processor.cpp
+    src/utils/hashing.cpp
+    src/utils/crypto.cpp
+    src/utils/vfs.cpp
+    src/utils/package/package.cpp
+    src/utils/streamed_assets/pak_archive.cpp
+    src/utils/streamed_assets/policy.cpp
+    src/utils/path.cpp
+    src/utils/safe_string.cpp
+    src/utils/url_protocol.cpp
+    src/utils/states/machine.cpp
+
+    src/external/sentry/wrapper.cpp
+    src/external/sentry/crash_trail.cpp
+
+    src/networking/network_peer.cpp
+    src/networking/errors.cpp
+
+    src/networking/replication/network_entity.cpp
+    src/networking/replication/state_bag.cpp
+    src/networking/replication/entity_registry.cpp
+    src/networking/replication/interest_grid.cpp
+    src/networking/replication/delegation.cpp
+    src/networking/replication/replication_manager.cpp
+    src/networking/replication/replication_connection.cpp
+    src/networking/replication/transform_batch.cpp
+
+    # JavaScript scripting engine base and builtins (used by both client and server)
+    # Note: node_engine.cpp and v8_engine.cpp are in OBJECT libraries due to special compile flags
+    src/scripting/engine.cpp
+    src/scripting/value_transfer.cpp
+    src/scripting/function_references.cpp
+    src/scripting/builtins/builtins.cpp
+    src/scripting/builtins/vector2.cpp
+    src/scripting/builtins/vector3.cpp
+    src/scripting/builtins/vector4.cpp
+    src/scripting/builtins/quaternion.cpp
+    src/scripting/builtins/color.cpp
+    src/scripting/builtins/entity.cpp
+    src/scripting/builtins/state_bag.cpp
+    src/scripting/builtins/player.cpp
+    src/scripting/builtins/text_label.cpp
+    src/scripting/builtins/chat.cpp
+    src/scripting/builtins/events.cpp
+    src/scripting/builtins/messages.cpp
+    src/scripting/builtins/console.cpp
+    src/scripting/builtins/imports.cpp
+    src/scripting/builtins/exports.cpp
+    src/scripting/builtins/execution_environment.cpp
+    src/scripting/resource/package_manifest.cpp
+    src/scripting/resource/resource.cpp
+    src/scripting/resource/resource_manager.cpp
+    src/scripting/resource/resource_packager.cpp
+
+    src/jobs/job_system.cpp
+    src/jobs/io_tasks.cpp
+)
+
+set(FRAMEWORK_SERVER_SRC
+    src/http/webserver.cpp
+
+    src/networking/network_server.cpp
+
+    src/integrations/server/instance.cpp
+    src/integrations/server/connection_gate.cpp
+    src/integrations/server/asset_paks/asset_pak_builder.cpp
+    src/integrations/server/networking/engine.cpp
+
+    # JavaScript scripting (server module)
+    src/integrations/server/scripting/module.cpp
+    src/integrations/server/scripting/builtins/voice.cpp
+    src/integrations/server/scripting/builtins/pending_connection.cpp
+
+    src/voice/server/voice_router.cpp
+    src/voice/server/voice_server.cpp
+)
+
+set(FRAMEWORK_CLIENT_SRC
+    src/graphics/renderer.cpp
+    src/graphics/renderio.cpp
+    src/graphics/types.cpp
+
+    src/networking/network_client.cpp
+
+    src/external/steam/wrapper.cpp
+    src/external/discord/wrapper.cpp
+    src/external/imgui/wrapper.cpp
+
+    src/external/imgui/widgets/ui_base.cpp
+
+    src/external/imgui/widgets/console.cpp
+
+    src/integrations/client/instance.cpp
+    src/integrations/client/masterlist_browser.cpp
+    src/integrations/client/resource_packages.cpp
+    src/integrations/client/networking/engine.cpp
+    src/integrations/client/ui/chat_box.cpp
+
+    # JavaScript scripting (V8 engine for client)
+    src/integrations/client/scripting/module.cpp
+    src/integrations/client/scripting/builtins/web.cpp
+    src/integrations/client/scripting/builtins/keybinds.cpp
+    src/integrations/client/scripting/builtins/chat.cpp
+    src/integrations/client/scripting/builtins/discord.cpp
+    src/integrations/client/scripting/builtins/voice.cpp
+    src/integrations/client/scripting/builtins/nametags.cpp
+
+    src/utils/key_names.cpp
+
+    src/voice/client/mixer.cpp
+    src/voice/client/audio_device.cpp
+    src/voice/client/noise_suppressor.cpp
+    src/voice/client/voice_client.cpp
+)
+
+# GUI (CEF-based)
+list(APPEND FRAMEWORK_CLIENT_SRC
+    src/gui/manager.cpp
+    src/gui/clipboard.cpp
+    src/gui/view.cpp
+    src/gui/sdk.cpp
+    src/gui/backend/view_d3d9.cpp
+    src/gui/backend/view_d3d11.cpp
+    src/gui/backend/view_d3d12.cpp
+    src/gui/cef/app.cpp
+    src/gui/cef/renderer_app.cpp
+    src/gui/cef/client.cpp
+    src/gui/cef/render_handler.cpp
+    src/gui/cef/life_span_handler.cpp
+    src/gui/cef/load_handler.cpp
+    src/gui/cef/display_handler.cpp
+    src/gui/resources/scheme.cpp
+    src/gui/resources/mime.cpp
+    src/gui/resources/resource_path.cpp
+    src/gui/resources/resource_stream.cpp
+    src/gui/resources/directory_provider.cpp
+    src/gui/resources/memory_provider.cpp
+    src/gui/resources/resource_handler.cpp
+    src/gui/resources/resource_registry.cpp
+)
+
+# Append the platform-dependent files to the related lists
+if(WIN32)
+    list(APPEND FRAMEWORK_CLIENT_SRC
+        src/graphics/backend/d3d9.cpp
+        src/graphics/backend/d3d11.cpp
+        src/graphics/backend/d3d12.cpp
+        src/graphics/backend/d3d12_ui_compositor.cpp
+        src/graphics/backend/d3d12_image.cpp
+        src/utils/hooking/hook_function.cpp
+        src/utils/hooking/hooking_patterns.cpp
+        src/utils/hooking/pattern_table.cpp
+        src/utils/hooking/hooking.cpp
+        src/utils/game_module.cpp
+        src/utils/memory.cpp
+        src/utils/minidump.cpp
+    )
+
+endif()
+
+# Additional libraries
+find_package(OpenSSL REQUIRED)
+
+# Build depending on the platform
+add_library(Framework STATIC ${FRAMEWORK_SRC})
+
+# Add services adapter to the project
+add_subdirectory(src/services)
+
+if(WIN32)
+    # Build the loader and it's data
+    add_library(FrameworkLoader
+        STATIC
+        src/utils/hashing.cpp
+        src/launcher/gpu_preference.cpp
+        src/launcher/project.cpp
+        src/launcher/rgl_bypass.cpp
+        src/utils/minidump.cpp
+        src/launcher/loaders/exe_ldr.cpp
+        src/launcher/loaders/process_identity.cpp
+        src/launcher/loaders/image_snapshot.cpp
+        src/launcher/loaders/image_snapshot_capture.cpp
+        src/external/steam/wrapper.cpp
+        src/external/epic/manifest.cpp
+        src/external/rockstar/library.cpp
+        src/utils/hooking/hook_function.cpp
+        src/utils/hooking/hooking_patterns.cpp
+        src/utils/hooking/pattern_table.cpp
+        src/utils/hooking/hooking.cpp
+        src/utils/memory.cpp)
+    target_link_options(FrameworkLoader PUBLIC /IGNORE:4254 /SAFESEH:NO /DYNAMICBASE:NO /LARGEADDRESSAWARE /FORCE:MULTIPLE /STACK:12000000,4096 /INCREMENTAL:NO /SUBSYSTEM:windows /LAST:.zdata /ENTRY:mainCRTStartup /MANIFEST:EMBED)
+
+    if(FW_DLL_INJECTION)
+        target_compile_definitions(FrameworkLoader PUBLIC FW_DLL_INJECTION)
+    endif()
+
+    # A launcher embeds the manifest fw_set_binary_identity() generated for it, else this generic one.
+    # The architecture stays amd64 on every build, as the manifest this replaces always declared.
+    set(FW_MANIFEST_NAME "MafiaHub.Framework.Launcher")
+    set(FW_MANIFEST_VERSION "1.0.0.0")
+    set(FW_MANIFEST_ARCH "amd64")
+    set(FW_MANIFEST_DESCRIPTION "MafiaHub Framework Launcher")
+    configure_file(src/launcher/launcher.manifest.in "${CMAKE_CURRENT_BINARY_DIR}/launcher.manifest" @ONLY)
+    target_link_options(FrameworkLoader PUBLIC "/MANIFESTINPUT:$<IF:$<BOOL:$<TARGET_PROPERTY:FW_LAUNCHER_MANIFEST>>,$<TARGET_PROPERTY:FW_LAUNCHER_MANIFEST>,${CMAKE_CURRENT_BINARY_DIR}/launcher.manifest>")
+
+    # The game reservation is compiled into each launcher, sized by its FW_LAUNCHER_GAME_RESERVE
+    target_sources(FrameworkLoader INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher/game_reserve.cpp)
+
+    if(CMAKE_CL_64)
+        target_link_options(FrameworkLoader PUBLIC /BASE:0x140000000)
+    else()
+        target_link_options(FrameworkLoader PUBLIC /BASE:0x400000)
+    endif()
+
+    add_library(FrameworkLoaderData
+        SHARED
+        src/launcher/data/tls.cpp
+        src/launcher/data/seh_win32.cpp)
+
+    # Build the client
+    add_library(FrameworkClient STATIC ${FRAMEWORK_CLIENT_SRC})
+endif()
+
+if(LIBNODE_AVAILABLE)
+    add_library(FrameworkServer STATIC ${FRAMEWORK_SERVER_SRC})
+endif()
+
+# Custom defines
+target_compile_definitions(Framework PUBLIC MG_ENABLE_LOG=0)
+
+# Per-build key for RPC identifiers (see networking/rpc/rpc_identifier.h). A cache variable alone
+# never reaches the preprocessor, so release CI passing -DFW_RPC_IDENTIFIER_SALT=<uint64> would
+# silently keep the default; turn it into a define here. PUBLIC because every peer -- framework,
+# server, client and downstream projects -- must derive the same identifiers.
+set(FW_RPC_IDENTIFIER_SALT "" CACHE STRING "64-bit salt keying every RPC identifier; must match on client and server")
+if(NOT FW_RPC_IDENTIFIER_SALT STREQUAL "")
+    # Accept the value with or without an integer suffix; the header needs it unsigned 64-bit.
+    string(REGEX REPLACE "[uUlL]+$" "" FW_RPC_IDENTIFIER_SALT_VALUE "${FW_RPC_IDENTIFIER_SALT}")
+    target_compile_definitions(Framework PUBLIC FW_RPC_IDENTIFIER_SALT=${FW_RPC_IDENTIFIER_SALT_VALUE}ULL)
+endif()
+
+# External libraries & other stuff
+macro(link_shared_deps target_name)
+    # Framework source directories (PUBLIC for dependent projects)
+    target_include_directories(${target_name} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/services>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    )
+
+    # Headers for the still-vendored trees. Everything from vcpkg arrives on its imported target.
+    target_include_directories(${target_name} PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendors/physfs/src
+        ${CMAKE_SOURCE_DIR}/vendors/semver
+        ${CMAKE_SOURCE_DIR}/vendors/ftl/include
+    )
+
+    # Required libraries for apple systems
+    if(APPLE)
+        target_link_libraries(${target_name} "-framework CoreFoundation" "-framework Foundation" "-framework GSS" "-framework Security" "-framework CoreText" "-framework CoreGraphics" bsm)
+    endif()
+
+    # Windows-specific standard defines (target-scoped instead of global add_definitions)
+    if(WIN32)
+        target_compile_definitions(${target_name} PRIVATE _USE_MATH_DEFINES NOMINMAX)
+    endif()
+
+    # Global libraries (v8/v8pp excluded - linked explicitly to scripting targets only)
+    target_link_libraries(${target_name} MafiaNet::MafiaNetStatic glm::glm spdlog::spdlog fmt::fmt cppfs::cppfs nlohmann_json::nlohmann_json sentry::sentry httplib OpenSSL::SSL OpenSSL::Crypto CURL::libcurl cxxopts::cxxopts function2::function2 semver Hash ftl Tracy::TracyClient physfs-static miniz::miniz)
+
+    # Required libraries for windows
+    if(WIN32)
+        target_link_libraries(${target_name} unofficial::stackwalker::StackWalker)
+    endif()
+endmacro()
+
+# Node.js inspector support for script debugging (auto-enabled for Debug builds)
+option(FW_NODE_INSPECTOR "Enable Node.js inspector for script debugging" OFF)
+
+# FrameworkNodeEngine - Object library for node_engine.cpp (requires full libnode)
+if(LIBNODE_AVAILABLE)
+    # This is separate because it needs NODE_WANT_INTERNALS and libuv headers which
+    # cause Windows SDK errno conflicts (EINVAL/ERANGE undefined) when applied to PCH.
+    add_library(FrameworkNodeEngine OBJECT src/scripting/node_engine.cpp src/scripting/node_runtime.cpp)
+
+    # Apply the same shared dependencies as Framework
+    target_include_directories(FrameworkNodeEngine PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/services>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    )
+    # Link to libnode for headers (includes V8 and Node.js headers)
+    # Also link spdlog for logging used by node_engine.cpp
+    target_link_libraries(FrameworkNodeEngine PUBLIC libnode v8pp spdlog::spdlog fmt::fmt glm::glm nlohmann_json::nlohmann_json function2::function2)
+
+    # Node.js internal APIs require NODE_WANT_INTERNALS
+    target_compile_definitions(FrameworkNodeEngine PRIVATE NODE_WANT_INTERNALS=1)
+
+    # Match Framework compile definitions and features
+    target_compile_definitions(FrameworkNodeEngine PRIVATE MG_ENABLE_LOG=0)
+    if(WIN32)
+        target_compile_definitions(FrameworkNodeEngine PRIVATE _USE_MATH_DEFINES NOMINMAX)
+    endif()
+    target_compile_features(FrameworkNodeEngine PRIVATE cxx_std_20)
+
+    # Node.js inspector: enabled via explicit option OR Debug builds
+    target_compile_definitions(FrameworkNodeEngine PRIVATE
+        $<$<OR:$<BOOL:${FW_NODE_INSPECTOR}>,$<CONFIG:Debug>>:FW_NODE_INSPECTOR>)
+endif()
+
+# FrameworkV8Engine - Object library for v8_engine.cpp
+# Standalone V8 engine for client-side scripting (no Node.js dependency).
+# Uses V8 symbols from the v8 target (which links libnode for the V8 runtime).
+add_library(FrameworkV8Engine OBJECT src/scripting/v8_engine.cpp)
+
+target_include_directories(FrameworkV8Engine PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/services>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+)
+target_link_libraries(FrameworkV8Engine PUBLIC v8 v8pp spdlog::spdlog fmt::fmt glm::glm nlohmann_json::nlohmann_json function2::function2)
+target_compile_definitions(FrameworkV8Engine PRIVATE MG_ENABLE_LOG=0)
+if(WIN32)
+    target_compile_definitions(FrameworkV8Engine PRIVATE _USE_MATH_DEFINES NOMINMAX)
+endif()
+target_compile_features(FrameworkV8Engine PRIVATE cxx_std_20)
+
+# Link the solutions based on the platform
+link_shared_deps(Framework)
+target_link_libraries(Framework v8 v8pp)
+if(LIBNODE_AVAILABLE)
+    target_link_libraries(Framework libnode)
+endif()
+
+# The prebuilt MafiaHubServices (IMPORTED archive, created in src/services) references Framework
+# symbols (Utils::Time) but can't declare that dependency there since Framework isn't defined yet.
+# One-directional ordering only (Framework never links MafiaHubServices back): declare it here so
+# order-dependent GNU ld places Framework after it.
+if(TARGET MafiaHubServices)
+    # Prebuilt = IMPORTED (only the INTERFACE keyword is allowed). Source build
+    # from the submodule = normal target whose own CMakeLists already links with
+    # the plain signature, so match it — mixing plain/keyword on one target errors.
+    get_target_property(_mhs_imported MafiaHubServices IMPORTED)
+    if(_mhs_imported)
+        target_link_libraries(MafiaHubServices INTERFACE Framework)
+    else()
+        target_link_libraries(MafiaHubServices Framework)
+    endif()
+    unset(_mhs_imported)
+endif()
+
+# Include scripting engine objects in Framework
+if(LIBNODE_AVAILABLE)
+    target_sources(Framework PRIVATE $<TARGET_OBJECTS:FrameworkNodeEngine>)
+endif()
+target_sources(Framework PRIVATE $<TARGET_OBJECTS:FrameworkV8Engine>)
+
+if(WIN32)
+    link_shared_deps(FrameworkClient)
+    target_link_libraries(FrameworkClient v8 v8pp)
+    if(LIBNODE_AVAILABLE)
+        target_link_libraries(FrameworkClient libnode)
+    endif()
+endif()
+
+if(LIBNODE_AVAILABLE)
+    link_shared_deps(FrameworkServer)
+    target_link_libraries(FrameworkServer v8 v8pp MafiaHubServices libsig libnode)
+    target_compile_definitions(FrameworkServer PRIVATE
+        $<$<OR:$<BOOL:${FW_NODE_INSPECTOR}>,$<CONFIG:Debug>>:FW_NODE_INSPECTOR>)
+
+    # FrameworkServer-specific includes
+    target_include_directories(FrameworkServer PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendors/libsig
+    )
+endif()
+
+# Platform-dependent post processing
+if(WIN32)
+    target_link_libraries(Framework ws2_32 dbghelp crypt32 winmm iphlpapi psapi userenv shlwapi)
+
+    target_link_libraries(FrameworkClient MafiaHubServices DiscordSDK imgui::imgui ImGuizmo)
+
+    # imgui's D3D12 backend is x64-only upstream (the vcpkg port marks dx12-binding !x86), and no
+    # 32-bit title reaches a D3D12 renderer. The Framework's own D3D12 backend stays on both.
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_compile_definitions(FrameworkClient PRIVATE FW_IMGUI_DX12)
+    endif()
+
+    set(CLIENT_SHARED_LIBS minhook::minhook SteamSDK udis86)
+    target_link_libraries(FrameworkClient ${CLIENT_SHARED_LIBS})
+
+    # Voice capture/playback. PUBLIC on the miniaudio side, so the feature-trimming defines
+    # and the include directory reach anything that pulls in the voice client.
+    target_link_libraries(FrameworkClient miniaudio)
+
+    # FrameworkClient-specific includes (Windows graphics, hooking, external services)
+    target_include_directories(FrameworkClient PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendors/imguizmo
+        ${CMAKE_SOURCE_DIR}/vendors/steamworks/include
+        ${CMAKE_SOURCE_DIR}/vendors/udis86
+        ${CMAKE_SOURCE_DIR}/vendors/discord/src
+    )
+
+    link_shared_deps(FrameworkLoader)
+    target_link_libraries(FrameworkLoader ${CLIENT_SHARED_LIBS} MafiaHubServices FrameworkLoaderData ntdll sfd)
+    target_link_libraries(FrameworkLoaderData udis86 minhook::minhook)
+    target_compile_definitions(FrameworkLoaderData PRIVATE _USE_MATH_DEFINES NOMINMAX)
+    target_link_options(FrameworkLoaderData PUBLIC /EXPORT:CoreRT_SetupSEHHandler /EXPORT:GetThreadLocalStorage /EXPORT:CoreSetExceptionOverride)
+
+    # FrameworkLoader-specific includes
+    target_include_directories(FrameworkLoader PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendors/ntdll
+        ${CMAKE_SOURCE_DIR}/vendors/sfd
+        ${CMAKE_SOURCE_DIR}/vendors/steamworks/include
+        ${CMAKE_SOURCE_DIR}/vendors/udis86
+    )
+
+    # FrameworkLoaderData includes
+    target_include_directories(FrameworkLoaderData PRIVATE
+        ${CMAKE_SOURCE_DIR}/vendors/udis86
+    )
+
+    if(NOT CMAKE_CL_64)
+        if(TARGET FrameworkServer)
+            target_link_options(FrameworkServer PUBLIC "-SAFESEH:NO")
+        endif()
+    else()
+        target_link_options(FrameworkClient PUBLIC "-SAFESEH:NO")
+    endif()
+
+    # CEF GUI integration (CEF target provides include dirs via INTERFACE)
+    target_link_libraries(FrameworkClient CEF Microsoft::DirectXTK)
+
+    # CEF subprocess executable
+    # The renderer process must register the very same custom schemes as the
+    # browser process, so it compiles the same registration unit.
+    add_executable(cef_subprocess
+        src/gui/cef/subprocess_main.cpp
+        src/gui/cef/renderer_app.cpp
+        src/gui/resources/scheme.cpp
+    )
+    target_link_libraries(cef_subprocess CEF)
+    target_include_directories(cef_subprocess PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_definitions(cef_subprocess PRIVATE _USE_MATH_DEFINES NOMINMAX)
+    set_target_properties(cef_subprocess PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        # Windowed subsystem (no black console window per CEF child) while keeping the int main() entry.
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
+    )
+    # Shared by every project, so it carries the Framework's identity rather than a mod's
+    fw_set_binary_identity(cef_subprocess PRODUCT "MafiaHub Framework" VERSION ${FW_VERSION} COMPANY "MafiaHub" DESCRIPTION "MafiaHub Framework Web Helper")
+    if(TARGET CEFCopyDlls)
+        add_dependencies(FrameworkClient CEFCopyDlls)
+        add_dependencies(cef_subprocess CEFCopyDlls)
+    endif()
+    # clients need the subprocess exe at runtime; build it with every FrameworkClient consumer
+    add_dependencies(FrameworkClient cef_subprocess)
+
+    # Ensure runtime DLLs are copied to bin directory for all client/server targets
+    if(TARGET libnode_copy_dll)
+        add_dependencies(FrameworkClient libnode_copy_dll)
+        if(TARGET FrameworkServer)
+            add_dependencies(FrameworkServer libnode_copy_dll)
+        endif()
+    endif()
+    if(TARGET OpenSSLCopyStub)
+        add_dependencies(FrameworkClient OpenSSLCopyStub)
+        if(TARGET FrameworkServer)
+            add_dependencies(FrameworkServer OpenSSLCopyStub)
+        endif()
+    endif()
+endif()

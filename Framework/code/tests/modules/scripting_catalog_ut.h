@@ -1,0 +1,312 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2026, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include "scripting/event_metadata.h"
+#include "scripting/scripting_catalog.h"
+#include "scripting/timer_metadata.h"
+
+#include <v8pp/metadata.hpp>
+
+#include <algorithm>
+#include <string>
+
+// Merging the framework's catalog into a project's. The rule has two halves that pull in opposite
+// directions: a class both sides define must stay the project's, because the two declare the same
+// members differently; a data type both sides define must blend, because EventMap is one map that
+// both sides put their own events into. Getting either half wrong is silent -- the export still
+// writes, it just documents the wrong surface.
+MODULE(scripting_catalog, {
+    using Framework::Scripting::MergeScriptingCatalog;
+
+    const auto hasProperty = [](const v8pp::metadata::registry &registry, const std::string &symbolName, const std::string &propertyName) {
+        for (const auto &symbol : registry.symbols()) {
+            if (symbol.name != symbolName) {
+                continue;
+            }
+            return std::any_of(symbol.properties.begin(), symbol.properties.end(), [&propertyName](const v8pp::metadata::property &property) {
+                return property.name == propertyName;
+            });
+        }
+        return false;
+    };
+
+    const auto propertyType = [](const v8pp::metadata::registry &registry, const std::string &symbolName, const std::string &propertyName) {
+        for (const auto &symbol : registry.symbols()) {
+            if (symbol.name != symbolName) {
+                continue;
+            }
+            for (const auto &property : symbol.properties) {
+                if (property.name == propertyName) {
+                    return property.value_type.name;
+                }
+            }
+        }
+        return std::string();
+    };
+
+    const auto countSymbols = [](const v8pp::metadata::registry &registry, const std::string &name) {
+        return std::count_if(registry.symbols().begin(), registry.symbols().end(), [&name](const v8pp::metadata::symbol &symbol) {
+            return symbol.name == name;
+        });
+    };
+
+    IT("carries a data type the project does not define at all", {
+        v8pp::metadata::registry source;
+        source.data_type("FrameworkOnly").add_property("a", "string", "");
+
+        v8pp::metadata::registry destination;
+        MergeScriptingCatalog(destination, source);
+        EQUALS(hasProperty(destination, "FrameworkOnly", "a"), true);
+    });
+
+    IT("blends the framework's events into a map the project already created", {
+        v8pp::metadata::registry source;
+        source.data_type("EventMap").add_property("resourceStart", "[resourceName: string]", "");
+
+        v8pp::metadata::registry destination;
+        destination.data_type("EventMap").add_property("playerConnect", "[player: Player]", "");
+
+        MergeScriptingCatalog(destination, source);
+
+        // The whole point: a mod documents what it raises, and inherits what the framework raises.
+        EQUALS(hasProperty(destination, "EventMap", "playerConnect"), true);
+        EQUALS(hasProperty(destination, "EventMap", "resourceStart"), true);
+        // Blended into the one map rather than appended as a second symbol of the same name.
+        EQUALS(countSymbols(destination, "EventMap") == 1, true);
+    });
+
+    IT("leaves an event the project already declares alone", {
+        v8pp::metadata::registry source;
+        source.data_type("EventMap").add_property("resourceStart", "[resourceName: string]", "");
+
+        v8pp::metadata::registry destination;
+        destination.data_type("EventMap").add_property("resourceStart", "[projectShape: number]", "");
+
+        MergeScriptingCatalog(destination, source);
+        // A project that has deliberately narrowed an event keeps its own tuple.
+        STREQUALS(propertyType(destination, "EventMap", "resourceStart").c_str(), "[projectShape: number]");
+    });
+
+    IT("does not blend a class both sides define", {
+        v8pp::metadata::registry source;
+        source.constructor("Player").add_property("frameworkOnly", "string", "");
+
+        v8pp::metadata::registry destination;
+        destination.constructor("Player").add_property("projectOnly", "string", "");
+
+        MergeScriptingCatalog(destination, source);
+        // Both sides declare Player with different members; blending them is not expressible in
+        // TypeScript, so the project's specialised one is taken whole.
+        EQUALS(hasProperty(destination, "Player", "projectOnly"), true);
+        EQUALS(hasProperty(destination, "Player", "frameworkOnly"), false);
+    });
+
+    IT("does not blend across different kinds of symbol", {
+        v8pp::metadata::registry source;
+        source.data_type("Player").add_property("frameworkOnly", "string", "");
+
+        v8pp::metadata::registry destination;
+        destination.constructor("Player").add_property("projectOnly", "string", "");
+
+        // Adding a data type over a constructor of the same name throws inside the registry, so the
+        // merge has to check both kinds rather than only the source's.
+        MergeScriptingCatalog(destination, source);
+        EQUALS(hasProperty(destination, "Player", "frameworkOnly"), false);
+    });
+
+    IT("drops a skipped symbol even when the project has no symbol of that name", {
+        v8pp::metadata::registry source;
+        source.constructor("Entity").add_property("id", "number", "");
+
+        v8pp::metadata::registry destination;
+        MergeScriptingCatalog(destination, source, {"Entity"});
+        EQUALS(countSymbols(destination, "Entity") == 0, true);
+    });
+
+    IT("is idempotent: merging twice carries nothing across a second time", {
+        // A client re-initialises its scripting on every connect and the catalogs are process-global,
+        // so the merge runs again over its own output. Left unguarded it collided with what it wrote
+        // last time and minted a Base... twin of every framework class, plus BasePlayer_ for the one
+        // already carried across under that name.
+        const auto build = [](v8pp::metadata::registry &source, v8pp::metadata::registry &destination) {
+            source.constructor("Entity", "framework entity").add_property("id", "number", "");
+            source.constructor("Player", "framework player").add_property("id", "number", "");
+            source.data_type("EventMap").add_property("resourceStart", "[resourceName: string]", "");
+            destination.constructor("Player", "project player").add_property("nickname", "string", "");
+        };
+
+        v8pp::metadata::registry source;
+        v8pp::metadata::registry once;
+        build(source, once);
+        MergeScriptingCatalog(once, source);
+
+        v8pp::metadata::registry twice;
+        build(source, twice);
+        MergeScriptingCatalog(twice, source);
+        MergeScriptingCatalog(twice, source);
+
+        EQUALS(twice.symbols().size() == once.symbols().size(), true);
+        EQUALS(countSymbols(twice, "BasePlayer") == 1, true);
+        EQUALS(countSymbols(twice, "BasePlayer_") == 0, true);
+        EQUALS(countSymbols(twice, "BaseEntity") == 0, true);
+        EQUALS(countSymbols(twice, "Entity") == 1, true);
+        // The project still owns its own class, and the framework's is still reachable as the base.
+        EQUALS(hasProperty(twice, "Player", "nickname"), true);
+        EQUALS(hasProperty(twice, "BasePlayer", "id"), true);
+    });
+
+    IT("still sidesteps a class the project itself calls Base...", {
+        // The suffix is the fallback, not the bug: a project that defines its own BasePlayer must
+        // keep it, and the framework's Player still has to reach the output under some name.
+        v8pp::metadata::registry source;
+        source.constructor("Player", "framework player").add_property("id", "number", "");
+
+        v8pp::metadata::registry destination;
+        destination.constructor("Player", "project player").add_property("nickname", "string", "");
+        destination.constructor("BasePlayer", "project base player").add_property("projectOnly", "string", "");
+
+        MergeScriptingCatalog(destination, source);
+        EQUALS(hasProperty(destination, "BasePlayer", "projectOnly"), true);
+        EQUALS(hasProperty(destination, "BasePlayer_", "id"), true);
+    });
+
+    IT("declares the events the framework raises", {
+        v8pp::metadata::registry framework;
+        Framework::Scripting::RegisterEventMetadata(framework);
+
+        v8pp::metadata::registry project;
+        project.data_type("EventMap");
+        MergeScriptingCatalog(project, framework);
+
+        // A mod inherits these rather than restating them; that is what makes the framework's own
+        // documentation self-sufficient.
+        EQUALS(hasProperty(project, "EventMap", "resourceStart"), true);
+        EQUALS(hasProperty(project, "EventMap", "resourceStop"), true);
+        EQUALS(hasProperty(project, "EventMap", "entityStateChange"), true);
+    });
+
+    const auto functionOf = [](const v8pp::metadata::registry &registry, const std::string &symbolName, const std::string &functionName) -> const v8pp::metadata::function * {
+        for (const auto &symbol : registry.symbols()) {
+            if (symbol.name != symbolName) {
+                continue;
+            }
+            for (const auto &function : symbol.functions) {
+                if (function.name == functionName) {
+                    return &function;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    const auto kindOf = [](const v8pp::metadata::registry &registry, const std::string &name) {
+        for (const auto &symbol : registry.symbols()) {
+            if (symbol.name == name) {
+                return symbol.kind;
+            }
+        }
+        throw std::invalid_argument("no such symbol");
+    };
+
+    IT("blends a global object the project extends in place", {
+        // M2O attaches setDefaultRelay onto the framework's Chat object, so sendToPlayer is still live
+        // on it. Taking the project's symbol whole dropped the framework's functions from the docs.
+        v8pp::metadata::registry source;
+        source.global_object("Chat", "framework chat").record(v8pp::metadata::function_of<v8::FunctionCallback>("sendToPlayer", {}));
+        source.global_object("Chat").record(v8pp::metadata::function_of<v8::FunctionCallback>("setDefaultRelay", v8pp::metadata::docs("void", {}, "framework version")));
+
+        v8pp::metadata::registry destination;
+        destination.global_object("Chat", "project chat").record(v8pp::metadata::function_of<v8::FunctionCallback>("setDefaultRelay", v8pp::metadata::docs("void", {}, "project version")));
+
+        MergeScriptingCatalog(destination, source);
+        EQUALS(functionOf(destination, "Chat", "sendToPlayer") != nullptr, true);
+        // The project's own member of the same name wins.
+        STREQUALS(functionOf(destination, "Chat", "setDefaultRelay")->description.c_str(), "project version");
+
+        MergeScriptingCatalog(destination, source);
+        EQUALS(countSymbols(destination, "Chat") == 1, true);
+        EQUALS(std::count_if(destination.symbols().front().functions.begin(), destination.symbols().front().functions.end(), [](const v8pp::metadata::function &function) {
+            return function.name == "sendToPlayer";
+        }) == 1, true);
+    });
+
+    const auto globalFunction = [](const v8pp::metadata::registry &registry, const std::string &name) -> const v8pp::metadata::function * {
+        for (const auto &function : registry.functions()) {
+            if (function.name == name) {
+                return &function;
+            }
+        }
+        return nullptr;
+    };
+
+    IT("declares the timers each side installs, with the handle that side returns", {
+        v8pp::metadata::registry client;
+        Framework::Scripting::RegisterTimerMetadata(client, true);
+        v8pp::metadata::registry server;
+        Framework::Scripting::RegisterTimerMetadata(server, false);
+
+        for (const char *name : {"setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask"}) {
+            EQUALS(globalFunction(client, name) != nullptr, true);
+            EQUALS(globalFunction(server, name) != nullptr, true);
+        }
+        STREQUALS(globalFunction(client, "setTimeout")->call_signature.return_type.name.c_str(), "number");
+        STREQUALS(globalFunction(server, "setTimeout")->call_signature.return_type.name.c_str(), "Timeout");
+        // Extra arguments reach the handler, so they are a rest parameter rather than one array.
+        EQUALS(globalFunction(client, "setTimeout")->call_signature.parameters.back().variadic, true);
+        // Node's handle is an object a script can call ref/unref on; the client's is a bare id.
+        EQUALS(functionOf(server, "Timeout", "unref") != nullptr, true);
+        EQUALS(countSymbols(client, "Timeout") == 0, true);
+    });
+
+    IT("carries the framework's global functions into a project's catalog once", {
+        v8pp::metadata::registry framework;
+        Framework::Scripting::RegisterTimerMetadata(framework, true);
+
+        v8pp::metadata::registry project;
+        project.function_(v8pp::metadata::function_of<v8::FunctionCallback>("setTimeout", v8pp::metadata::docs("void", {}, "project version")));
+        MergeScriptingCatalog(project, framework);
+        MergeScriptingCatalog(project, framework);
+
+        EQUALS(project.functions().size() == framework.functions().size(), true);
+        // The project's own declaration of a name wins, as it does for every other member.
+        STREQUALS(globalFunction(project, "setTimeout")->description.c_str(), "project version");
+        EQUALS(globalFunction(project, "clearInterval") != nullptr, true);
+
+        const auto exported = Framework::Scripting::ExportableScriptingCatalog(project, [](const std::string &) {
+            return true;
+        });
+        EQUALS(exported.functions().size() == project.functions().size(), true);
+    });
+
+    IT("exports a class that is not on the global as an interface", {
+        v8pp::metadata::registry catalog;
+        auto &player = catalog.constructor("Player", "published");
+        player.constructor = v8pp::metadata::function_of<v8::FunctionCallback>("constructor", {});
+        auto &bag = catalog.constructor("StateBag", "reached as entity.state");
+        bag.constructor = v8pp::metadata::function_of<v8::FunctionCallback>("constructor", {});
+        bag.record(v8pp::metadata::function_of<v8::FunctionCallback>("get", {}, false));
+        bag.record(v8pp::metadata::function_of<v8::FunctionCallback>("create", {}, true));
+        catalog.constructor("BasePlayer").bases.push_back("Entity");
+
+        const auto exported = Framework::Scripting::ExportableScriptingCatalog(catalog, [](const std::string &name) {
+            return name == "Player";
+        });
+
+        EQUALS(kindOf(exported, "Player") == v8pp::metadata::symbol_kind::constructor, true);
+        EQUALS(kindOf(exported, "StateBag") == v8pp::metadata::symbol_kind::data_type, true);
+        EQUALS(kindOf(exported, "BasePlayer") == v8pp::metadata::symbol_kind::data_type, true);
+        EQUALS(functionOf(exported, "StateBag", "get") != nullptr, true);
+        // A static would hang off a constructor no script can reach.
+        EQUALS(functionOf(exported, "StateBag", "create") == nullptr, true);
+        EQUALS(exported.symbols().back().bases.size() == 1, true);
+        // The live catalog keeps its kinds, so the next registration of StateBag does not collide.
+        EQUALS(kindOf(catalog, "StateBag") == v8pp::metadata::symbol_kind::constructor, true);
+    });
+})

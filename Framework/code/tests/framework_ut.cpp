@@ -1,0 +1,130 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2022, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#define UNIT_MAX_MODULES 64
+#include "logging/logger.h"
+#include "unit.h"
+
+/* TEST CATEGORIES */
+#include "modules/bitops_ut.h"
+#include "modules/connection_admission_ut.h"
+#include "modules/connection_gate_ut.h"
+#include "modules/delegation_ut.h"
+#include "modules/gui_resources_ut.h"
+#include "modules/input_state_ut.h"
+#include "modules/interest_grid_ut.h"
+#include "modules/interpolator_ut.h"
+#include "modules/nametag_ut.h"
+#include "modules/network_packets_ut.h"
+#include "modules/network_work_ut.h"
+#include "modules/persistent_config_ut.h"
+#include "modules/playout_buffer_ut.h"
+#include "modules/replication_authority_ut.h"
+#include "modules/replication_rate_ut.h"
+#include "modules/resource_package_ut.h"
+#include "modules/result_ut.h"
+#include "modules/rpc_identifier_ut.h"
+#include "modules/scripting_catalog_ut.h"
+#include "modules/server_config_ut.h"
+#include "modules/snapshot_buffer_ut.h"
+#include "modules/spsc_ring_ut.h"
+#include "modules/state_bag_scripting_ut.h"
+#include "modules/state_bag_ut.h"
+#include "modules/state_machine_ut.h"
+#include "modules/streamed_assets_ut.h"
+#include "modules/string_utils_ut.h"
+#include "modules/transform_batch_ut.h"
+#include "modules/url_protocol_ut.h"
+#include "modules/voice_activity_ut.h"
+#include "modules/voice_mixer_ut.h"
+#include "modules/voice_positions_ut.h"
+#include "modules/voice_ptt_gate_ut.h"
+#include "modules/voice_router_ut.h"
+
+#ifdef _WIN32
+// The hooking layer, and so the pattern table, is Windows-only.
+#include "modules/pattern_hints_ut.h"
+#include "modules/pattern_table_ut.h"
+#include "modules/physical_keys_ut.h"
+#include "modules/polling_input_ut.h"
+#include "modules/window_input_ut.h"
+#endif
+
+// Scripting tests
+#include "modules/engine_ut.h"
+#include "modules/node_runtime_ut.h"
+#include "modules/value_transfer_ut.h"
+#include "modules/function_references_ut.h"
+#include "modules/js_features_ut.h"
+#include "modules/resource_manager_ut.h"
+#include "modules/resource_isolation_ut.h"
+#include "modules/resource_ut.h"
+#include "modules/timer_context_ut.h"
+
+int main() {
+    UNIT_CREATE("FrameworkTests");
+
+    Framework::Logging::GetInstance()->PauseLogging(true);
+
+    UNIT_MODULE(bitops);
+    UNIT_MODULE(string_utils);
+    UNIT_MODULE(interpolator);
+    UNIT_MODULE(result);
+    UNIT_MODULE(network_packets);
+    UNIT_MODULE(network_work);
+    UNIT_MODULE(replication_authority);
+    UNIT_MODULE(replication_rate);
+    UNIT_MODULE(transform_batch);
+    UNIT_MODULE(interest_grid);
+    UNIT_MODULE(input_state);
+    UNIT_MODULE(delegation);
+    UNIT_MODULE(state_bag);
+    UNIT_MODULE(state_bag_scripting);
+    UNIT_MODULE(scripting_catalog);
+    UNIT_MODULE(rpc_identifier);
+    UNIT_MODULE(state_machine);
+    UNIT_MODULE(persistent_config);
+    UNIT_MODULE(server_config);
+    UNIT_MODULE(url_protocol);
+    UNIT_MODULE(snapshot_buffer);
+    UNIT_MODULE(voice_router);
+    UNIT_MODULE(voice_positions);
+    UNIT_MODULE(spsc_ring);
+    UNIT_MODULE(playout_buffer);
+    UNIT_MODULE(voice_mixer);
+    UNIT_MODULE(voice_ptt_gate);
+    UNIT_MODULE(voice_activity);
+    UNIT_MODULE(gui_resources);
+    UNIT_MODULE(resource_package);
+    UNIT_MODULE(streamed_assets);
+#ifdef _WIN32
+    UNIT_MODULE(pattern_hints);
+    UNIT_MODULE(pattern_table);
+    UNIT_MODULE(physical_keys);
+    UNIT_MODULE(window_input);
+    UNIT_MODULE(polling_input);
+#endif
+
+    // Scripting tests
+    UNIT_MODULE(engine);
+    UNIT_MODULE(node_runtime);
+    UNIT_MODULE(value_transfer);
+    UNIT_MODULE(function_references);
+    UNIT_MODULE(resource);
+    UNIT_MODULE(resource_manager);
+    UNIT_MODULE(resource_lifecycle);
+    UNIT_MODULE(resource_manager_callbacks);
+    UNIT_MODULE(resource_isolation);
+    UNIT_MODULE(js_features);
+    UNIT_MODULE(timer_context);
+    UNIT_MODULE(connection_gate);
+    UNIT_MODULE(connection_admission);
+    UNIT_MODULE(nametag);
+
+    return UNIT_RUN();
+}

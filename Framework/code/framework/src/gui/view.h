@@ -1,0 +1,260 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2024, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include <utils/safe_win32.h>
+
+#include <d3d11.h>
+#include <function2/function2.hpp>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include <glm/glm.hpp>
+
+#include <utils/error.h>
+#include <utils/result.h>
+
+#include "graphics/renderer.h"
+#include "sdk.h"
+#include "view_events.h"
+
+#include "include/cef_browser.h"
+
+#include "cef/client.h"
+#include "cef/display_handler.h"
+#include "cef/life_span_handler.h"
+#include "cef/load_handler.h"
+#include "cef/render_handler.h"
+
+namespace Framework::GUI {
+    class Manager;
+
+    class View {
+      private:
+        OnViewEventCallback _onViewEventCallback;
+
+        // CEF raises Created inside Init, before any caller can subscribe.
+        bool _created = false;
+
+      protected:
+        CefRefPtr<CefBrowser> _browser;
+        CefRefPtr<CEF::Client> _cefClient;
+        CefRefPtr<CEF::RenderHandler> _renderHandler;
+        CefRefPtr<CEF::LifeSpanHandler> _lifeSpanHandler;
+        CefRefPtr<CEF::LoadHandler> _loadHandler;
+        CefRefPtr<CEF::DisplayHandler> _displayHandler;
+
+        Graphics::Renderer *_graphicsRenderer = nullptr;
+        Manager *_manager                     = nullptr;
+
+        std::unique_ptr<SDK> _sdk;
+
+        // CPU renderer fallback
+        std::vector<uint8_t> _pixelData;
+
+        bool _gpuAccelerated  = false;
+        bool _hasFocus        = false;
+        int _x;
+        int _y;
+        int _z;
+        int _width;
+        int _height;
+        bool _shouldDisplay   = false;
+        bool _garbageCollected = false;
+
+        bool _offscreen = false;
+
+        bool _alwaysComposite = false;
+        bool _audioMuted      = false;
+
+        // 0x0 views fill the viewport and track it across resizes
+        bool _autoResize = false;
+
+        std::recursive_mutex _renderMutex;
+        glm::vec2 _cursorPos {};
+        bool _isMouseDown = false;
+        int _id;
+
+        void EmitViewEvent(const ViewEventData &data);
+
+      public:
+        View(int id, Graphics::Renderer *graphicsRenderer, Manager *manager);
+        virtual ~View();
+
+        [[nodiscard]] virtual Utils::Result<void, Framework::Error> Init(const std::string &url, int width, int height, int offsetX, int offsetY, bool gpuAccelerated = false);
+
+        virtual void Update();
+        virtual void Render() = 0;
+
+        void RequestBeginFrame();
+
+        // Submit the view's quad; called inside an ImGui frame on the game thread.
+        virtual void SubmitImGuiDraw() {}
+
+        void ProcessMouseEvent(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+        void ProcessKeyboardEvent(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+        int GetId() const {
+            return _id;
+        }
+
+        void Focus(bool enable) {
+            _hasFocus = enable;
+            if (_browser) {
+                _browser->GetHost()->SetFocus(enable);
+            }
+        }
+
+        bool HasFocus() const {
+            return _hasFocus;
+        }
+
+        void Display(bool enable) {
+            _shouldDisplay = enable;
+        }
+
+        bool ShouldDisplay() const {
+            return _shouldDisplay;
+        }
+
+        // Is this view actually going on screen? Every stage - begin frame, upload, blit - asks
+        // it, so one that is not costs nothing instead of painting for a blit that never happens.
+        bool IsOnScreen() const;
+
+        // Latched: CEF's own "is muted" getter does not work. Driven by the manager.
+        void SetAudioMuted(bool muted);
+
+        bool IsAudioMuted() const {
+            return _audioMuted;
+        }
+
+        // Keeps painting without compositing, so a render target can sample the page; a merely hidden
+        // view never paints. D3D9 only - D3D11/D3D12 interleave upload with drawing and ignore it.
+        void SetOffscreen(bool enable) {
+            _offscreen = enable;
+        }
+
+        bool IsOffscreen() const {
+            return _offscreen;
+        }
+
+        // Exempt from Manager::SetCompositingSuppressed - for a view that stands in for something
+        // the game would otherwise be drawing itself, where hiding it shows nothing at all.
+        void SetAlwaysComposite(bool enable) {
+            _alwaysComposite = enable;
+        }
+
+        bool AlwaysComposites() const {
+            return _alwaysComposite;
+        }
+
+        // IDirect3DTexture9* on D3D9, ID3D11Texture2D* on D3D11. Null until the first paint.
+        [[nodiscard]] virtual void *GetNativeTexture() const {
+            return nullptr;
+        }
+
+        void SetPosition(int x, int y) {
+            _x = x;
+            _y = y;
+        }
+
+        // Resize the view and its CEF surface; backend recreates its texture on next Render.
+        void Resize(int width, int height);
+
+        // Restrict main-frame navigation and page->script events to the URL's origin.
+        void LockToOrigin(const std::string &url);
+
+        // Navigate the main frame; re-locks the origin when the view is origin-locked.
+        void LoadURL(const std::string &url);
+
+        void SetAutoResize(bool enable) {
+            _autoResize = enable;
+        }
+
+        bool IsAutoResize() const {
+            return _autoResize;
+        }
+
+        glm::vec2 GetPosition() const {
+            return {_x, _y};
+        }
+
+        void SetZIndex(int z);
+
+        int GetZIndex() const {
+            return _z;
+        }
+
+        void SetGarbageCollected(bool garbageCollected) {
+            _garbageCollected = garbageCollected;
+        }
+
+        bool IsGarbageCollected() const {
+            return _garbageCollected;
+        }
+
+        inline void AddEventListener(const std::string &eventName, const EventCallback &proc) {
+            if (!_sdk) {
+                return;
+            }
+            _sdk->AddEventListener(eventName, proc);
+        }
+
+        inline void RemoveEventListener(const std::string &eventName) {
+            if (!_sdk) {
+                return;
+            }
+            _sdk->RemoveEventListener(eventName);
+        }
+
+        inline void EvaluateScript(const std::string &script) {
+            if (!_browser || !_browser->GetMainFrame()) {
+                return;
+            }
+            _browser->GetMainFrame()->ExecuteJavaScript(script, "", 0);
+        }
+
+        // Escape hatch: the raw CEF browser. Prefer EvaluateScript / AddEventListener / the SDK above;
+        // reach for this only for CEF features the View doesn't surface.
+        CefRefPtr<CefBrowser> GetBrowser() const {
+            return _browser;
+        }
+
+        inline GUI::SDK *GetSDK() const {
+            return _sdk.get();
+        }
+
+        CEF::RenderHandler *GetRenderHandler() const {
+            return _renderHandler.get();
+        }
+
+        cef_cursor_type_t GetCursorType() const {
+            if (_displayHandler) {
+                return _displayHandler->GetCursorType();
+            }
+            return CT_POINTER;
+        }
+
+        // Single slot. Runs on the CEF-pumping thread, inside a CEF handler.
+        inline void SetOnViewEventCallback(OnViewEventCallback proc) {
+            _onViewEventCallback = std::move(proc);
+        }
+
+        bool IsCreated() const {
+            return _created;
+        }
+
+        inline void SetOnBeforeBrowseCallback(CEF::OnBeforeBrowseCallback cb) {
+            _lifeSpanHandler->SetOnBeforeBrowseCallback(std::move(cb));
+        }
+    };
+} // namespace Framework::GUI

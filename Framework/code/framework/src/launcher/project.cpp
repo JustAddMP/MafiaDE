@@ -1,0 +1,1320 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "project.h"
+
+#include "external/epic/manifest.h"
+#include "external/rockstar/library.h"
+#include "gpu_preference.h"
+#include "loaders/exe_ldr.h"
+#include "loaders/process_identity.h"
+#include "logging/logger.h"
+#include "rgl_bypass.h"
+#include "sfd.h"
+#include "utils/hashing.h"
+#include "utils/string_utils.h"
+#include "utils/url_protocol.h"
+
+#include <Psapi.h>
+#include <ShellScalingApi.h>
+#include <Windows.h>
+#include <algorithm>
+#include <cppfs/FileHandle.h>
+#include <cppfs/fs.h>
+#include <cstdlib>
+#include <filesystem>
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <ostream>
+#include <stdexcept>
+#include <utils/hooking/hooking.h>
+#include <utils/minidump.h>
+
+#include <utils/hooking/jitasm.h>
+
+// Only survives DLL injection: PE loading maps the game over this image and takes the
+// export directory with it, which is what ForceHighPerformanceGPU() works around.
+extern "C" {
+__declspec(dllexport) unsigned long NvOptimusEnablement        = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+}
+
+// linker config for sections
+#pragma comment(linker, "/merge:.data=.cld")
+#pragma comment(linker, "/merge:.rdata=.clr")
+#pragma comment(linker, "/merge:.cl=.zdata")
+#pragma comment(linker, "/merge:.text=.zdata")
+#pragma comment(linker, "/section:.zdata,re")
+
+// The space the game image is mapped into. Its bulk, .fwgame$b, is compiled into each launcher
+// by game_reserve.cpp so a project can size it to its game; these two markers bound it. The
+// linker joins .fwgame$* into one section ordered by the suffix, which is the only ordering it
+// documents, so where .fwgame itself lands is checked on every launch in RunWithPELoading().
+#pragma bss_seg(".fwgame$a")
+char fwgame_begin[1];
+#pragma bss_seg(".fwgame$c")
+char fwgame_end[1];
+
+// The launcher's own uninitialized globals below have always sat after the reservation
+#pragma bss_seg(".fwgame$d")
+
+// mark the end section we merge with .text
+#pragma data_seg(".fwend")
+uint8_t zdata[200] = {1};
+
+static const wchar_t *gImagePath;
+static const wchar_t *gDllName;
+HMODULE tlsDll {};
+static Framework::Launcher::ProjectConfiguration *gConfig = nullptr;
+
+static wchar_t gProjectDllPath[32768];
+
+// Default entry point for the client DLL
+using ClientEntryPoint = void (*)(const wchar_t *projectPath);
+using ThreadLocalCallback = void(NTAPI *)(void *, DWORD, void *);
+
+void __cdecl RegisterThreadLocalExeAtexitCallback_Stub(ThreadLocalCallback) {
+    // ucrtbase owns one EXE TLS-destructor callback per process. The launcher's CRT
+    // already registered it, so registering the mapped game's callback aborts.
+}
+
+static LONG NTAPI HandleVariant(PEXCEPTION_POINTERS exceptionInfo) {
+    const auto result = Framework::Utils::MiniDump::ExceptionFilter(exceptionInfo);
+    if (result == EXCEPTION_CONTINUE_EXECUTION)
+        return result;
+    else if (result != EXCEPTION_EXECUTE_HANDLER)
+        return (exceptionInfo->ExceptionRecord->ExceptionCode == STATUS_INVALID_HANDLE) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    return result;
+}
+
+void WINAPI GetStartupInfoW_Stub(LPSTARTUPINFOW lpStartupInfo) {
+    Framework::Launcher::Project::InitialiseClientDLL();
+
+    return GetStartupInfoW(lpStartupInfo);
+}
+
+void WINAPI GetStartupInfoA_Stub(LPSTARTUPINFOA lpStartupInfo) {
+    Framework::Launcher::Project::InitialiseClientDLL();
+
+    return GetStartupInfoA(lpStartupInfo);
+}
+
+LPWSTR BuildGameCommandLineW() {
+    if (!gImagePath || !gConfig) {
+        return GetCommandLineW();
+    }
+
+    static wchar_t buffer[32768] = {};
+    const auto &args             = gConfig->additionalLaunchArguments;
+    const wchar_t *separator     = !args.empty() && args.front() != L' ' ? L" " : L"";
+    _snwprintf_s(buffer, _countof(buffer), _TRUNCATE, L"\"%ls\"%ls%ls", gImagePath, separator, args.c_str());
+    return buffer;
+}
+
+LPSTR BuildGameCommandLineA() {
+    static char buffer[32768] = {};
+    const auto commandLine    = Framework::Utils::StringUtils::WideToNormal(BuildGameCommandLineW());
+    strcpy_s(buffer, commandLine.c_str());
+    return buffer;
+}
+
+bool SynchronizeUCRTCommandLine() {
+    const auto ucrt = GetModuleHandleW(L"ucrtbase.dll");
+    if (!ucrt) {
+        return false;
+    }
+
+    using NarrowCommandLineAccessor = char **(__cdecl *)();
+    using WideCommandLineAccessor   = wchar_t **(__cdecl *)();
+    const auto narrowAccessor = reinterpret_cast<NarrowCommandLineAccessor>(GetProcAddress(ucrt, "__p__acmdln"));
+    const auto wideAccessor   = reinterpret_cast<WideCommandLineAccessor>(GetProcAddress(ucrt, "__p__wcmdln"));
+    if (!narrowAccessor || !wideAccessor) {
+        return false;
+    }
+
+    *narrowAccessor() = BuildGameCommandLineA();
+    *wideAccessor()   = BuildGameCommandLineW();
+    return true;
+}
+
+bool SetProcessEnvironmentVariable(const wchar_t *name, const std::wstring &value) {
+    const bool processUpdated = SetEnvironmentVariableW(name, value.c_str()) != FALSE;
+    const bool ucrtUpdated    = _wputenv_s(name, value.c_str()) == 0;
+    return processUpdated && ucrtUpdated;
+}
+
+LPWSTR WINAPI GetCommandLineW_Stub() {
+    if (!gConfig->loadClientManually) {
+        Framework::Launcher::Project::InitialiseClientDLL();
+    }
+    return BuildGameCommandLineW();
+}
+
+LPSTR WINAPI GetCommandLineA_Stub() {
+    if (!gConfig->loadClientManually) {
+        Framework::Launcher::Project::InitialiseClientDLL();
+    }
+    return BuildGameCommandLineA();
+}
+
+namespace {
+    // The real API truncates into the caller's buffer and says so in its return value;
+    // the CRT's _s copies abort the process instead, which is not a contract the game
+    // can be handed. Mirror Win32: fill what fits, terminate, report the truncation.
+    template <typename CharT>
+    DWORD CopyMappedImagePath(CharT *destination, DWORD size, const CharT *path, size_t length) {
+        if (!destination || size == 0) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return 0;
+        }
+
+        if (length >= size) {
+            std::copy_n(path, size - 1, destination);
+            destination[size - 1] = CharT {};
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return size;
+        }
+
+        std::copy_n(path, length, destination);
+        destination[length] = CharT {};
+        return static_cast<DWORD>(length);
+    }
+
+    // Set only once Launch() has resolved the game, but these hooks are reachable before
+    // that; without the guard the conversions below read through a null pointer.
+    bool ShouldReportMappedImage(HMODULE module) {
+        return gImagePath && (!module || module == GetModuleHandle(nullptr));
+    }
+} // namespace
+
+DWORD WINAPI GetModuleFileNameA_Hook(HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
+    if (ShouldReportMappedImage(hModule)) {
+        const auto gamePath = Framework::Utils::StringUtils::WideToNormal(gImagePath);
+        return CopyMappedImagePath(lpFilename, nSize, gamePath.c_str(), gamePath.size());
+    }
+
+    return GetModuleFileNameA(hModule, lpFilename, nSize);
+}
+
+DWORD WINAPI GetModuleFileNameExA_Hook(HANDLE hProcess, HMODULE hModule, LPSTR lpFilename, DWORD nSize) {
+    if (ShouldReportMappedImage(hModule)) {
+        const auto gamePath = Framework::Utils::StringUtils::WideToNormal(gImagePath);
+        return CopyMappedImagePath(lpFilename, nSize, gamePath.c_str(), gamePath.size());
+    }
+
+    return GetModuleFileNameExA(hProcess, hModule, lpFilename, nSize);
+}
+
+DWORD WINAPI GetModuleFileNameW_Hook(HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
+    if (ShouldReportMappedImage(hModule)) {
+        return CopyMappedImagePath(lpFilename, nSize, gImagePath, wcslen(gImagePath));
+    }
+
+    return GetModuleFileNameW(hModule, lpFilename, nSize);
+}
+
+DWORD WINAPI GetModuleFileNameExW_Hook(HANDLE hProcess, HMODULE hModule, LPWSTR lpFilename, DWORD nSize) {
+    if (ShouldReportMappedImage(hModule)) {
+        return CopyMappedImagePath(lpFilename, nSize, gImagePath, wcslen(gImagePath));
+    }
+
+    return GetModuleFileNameExW(hProcess, hModule, lpFilename, nSize);
+}
+
+HMODULE WINAPI GetModuleHandleW_Hook(LPWSTR lpModuleName) {
+    if (lpModuleName == nullptr) {
+        return GetModuleHandle(nullptr);
+    }
+
+    return GetModuleHandleW(lpModuleName);
+}
+
+HMODULE WINAPI GetModuleHandleA_Hook(LPSTR lpModuleName) {
+    if (lpModuleName == nullptr) {
+        return GetModuleHandle(nullptr);
+    }
+
+    return GetModuleHandleA(lpModuleName);
+}
+
+BOOL WINAPI GetModuleHandleExW_Hook(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE *phModule) {
+    if (lpModuleName == nullptr) {
+        *phModule = GetModuleHandle(nullptr);
+        return TRUE;
+    }
+
+    return GetModuleHandleExW(dwFlags, lpModuleName, phModule);
+}
+
+BOOL WINAPI GetModuleHandleExA_Hook(DWORD dwFlags, LPSTR lpModuleName, HMODULE *phModule) {
+    if (lpModuleName == nullptr) {
+        *phModule = GetModuleHandle(nullptr);
+        return TRUE;
+    }
+
+    return GetModuleHandleExA(dwFlags, lpModuleName, phModule);
+}
+
+namespace Framework::Launcher {
+    Project::Project(ProjectConfiguration &cfg): _config(cfg), _configuredPlatform(cfg.platform) {
+        gConfig = &_config;
+        // Fetch the current working directory
+        GetCurrentDirectoryW(32768, gProjectDllPath);
+
+        Logging::GetInstance()->SetLogName(_config.name);
+
+        auto projectPath = Utils::StringUtils::WideToNormal(gProjectDllPath);
+        std::replace(projectPath.begin(), projectPath.end(), '/', '\\');
+        Logging::GetInstance()->SetLogFolder(projectPath + "/logs");
+
+        _steamWrapper = std::make_unique<External::Steam::Wrapper>();
+        _minidump     = std::make_unique<Utils::MiniDump>();
+        _fileConfig   = std::make_unique<Utils::Config>();
+
+        _minidump->SetSymbolPath(Utils::StringUtils::WideToNormal(gProjectDllPath));
+    }
+
+    bool Project::Launch() {
+        ForceHighPerformanceGPU();
+
+        if (!_config.urlProtocolScheme.empty()) {
+            HandleUrlProtocolLaunch();
+        }
+
+        if (_config.allocateDeveloperConsole) {
+            AllocateDeveloperConsole();
+        }
+
+        if (!_config.disablePersistentConfig) {
+            if (!LoadJSONConfig()) {
+                MessageBox(nullptr, "Failed to load JSON launcher config", _config.name.c_str(), MB_ICONERROR);
+                return false;
+            }
+        }
+
+        // Run platform-dependent platform checks and init steps
+        if (!RunPlatformChecks()) {
+            return false;
+        }
+
+        // Load the destination DLL
+        if (!_config.loadClientManually && !LoadLibraryW(_config.destinationDllName.c_str())) {
+            DWORD dwError = GetLastError();
+            MessageBox(nullptr, fmt::format("Failed to load core runtime with error code {}", dwError).c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        if (!_config.disablePersistentConfig) {
+            SaveJSONConfig();
+        }
+
+        // Add the required DLL directories to the current process
+        const auto addDllDirectory          = (decltype(&AddDllDirectory))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "AddDllDirectory");
+        const auto setDefaultDllDirectories = (decltype(&SetDefaultDllDirectories))GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetDefaultDllDirectories");
+        if (addDllDirectory && setDefaultDllDirectories) {
+            setDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+
+            // mod-supplied absolute search dirs: for runtimes outside the game tree
+            // whose deps are only reachable via PATH, which we just dropped
+            for (const auto &dir : _config.additionalDllDirectories) {
+                addDllDirectory(dir.c_str());
+            }
+
+            // first search in game root dir
+            addDllDirectory(_gamePath.c_str());
+
+            // add any custom search paths from the mod
+            for (auto &path : _config.additionalSearchPaths) {
+                addDllDirectory((_gamePath + L"\\" + path).c_str());
+            }
+
+            // add our own paths now
+            addDllDirectory(gProjectDllPath);
+            addDllDirectory((std::wstring(gProjectDllPath) + L"\\bin").c_str());
+
+            if (_config.useAlternativeWorkDir) {
+                _gamePath = GetGameWorkDir(_gamePath);
+                addDllDirectory(_gamePath.c_str());
+            }
+
+            SetCurrentDirectoryW(_gamePath.c_str());
+        }
+
+        // Load TLS dummy so the game can use thread-local storage
+        if (!(tlsDll = LoadLibraryW(L"FrameworkLoaderData.dll"))) {
+            MessageBox(nullptr, "Failed to load a vital framework component", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Load the steam runtime only if required
+        if (_config.platform == ProjectPlatform::STEAM) {
+            HMODULE steamDll {};
+
+#ifdef _M_IX86
+            steamDll = LoadLibraryW(L"fw_steam_api.dll");
+#else
+            steamDll = LoadLibraryW(L"fw_steam_api64.dll");
+#endif
+
+            if (!steamDll) {
+                MessageBox(nullptr, "Failed to inject the steam runtime DLL in the running process", _config.name.c_str(), MB_ICONERROR);
+                return false;
+            }
+        }
+
+        // Use real scaling
+        const auto shcore = LoadLibraryW(L"shcore.dll");
+        if (shcore) {
+            const auto SetProcessDpiAwareness = (decltype(&::SetProcessDpiAwareness))GetProcAddress(shcore, "SetProcessDpiAwareness");
+
+            if (SetProcessDpiAwareness) {
+                SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+            }
+        }
+
+        // handle path variable
+        {
+            static wchar_t pathBuf[32768];
+            GetEnvironmentVariableW(L"PATH", pathBuf, sizeof(pathBuf));
+
+            // append bin & game directories
+            const std::wstring newPath = _gamePath + L";" + std::wstring(gProjectDllPath) + L";" + std::wstring(pathBuf);
+            SetProcessEnvironmentVariable(L"PATH", newPath);
+        }
+
+        // Update the game path to include the executable name;
+        _gamePath += std::wstring(L"/") + _config.executableName;
+
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(_gamePath, ec)) {
+            MessageBoxA(nullptr, ("The game executable could not be found:\n" + Utils::StringUtils::WideToNormal(_gamePath)).c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Verify game integrity if enabled. GetGameVersion() reads the whole executable into
+        // memory and CRC32s it — for Hogwarts Legacy that is 430 MB of I/O plus the hash, about
+        // a second and a half of boot, and the mapper below then reads the same file again. The
+        // checksum has no other consumer, so when verification is off there is nothing to compute.
+        if (_config.verifyGameIntegrity) {
+            if (!EnsureGameExecutableIsCompatible(GetGameVersion())) {
+                MessageBox(nullptr, "Unsupported game version", _config.name.c_str(), MB_ICONERROR);
+                return false;
+            }
+        }
+
+        Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Loading game {}", Utils::StringUtils::WideToNormal(_gamePath));
+
+        // Run with type depending
+        if (_config.launchType == ProjectLaunchType::PE_LOADING) {
+            return RunWithPELoading();
+        }
+#ifdef FW_DLL_INJECTION
+        else if (_config.launchType == ProjectLaunchType::DLL_INJECTION) {
+            return RunWithDLLInjection();
+        }
+#endif
+        else {
+            return false;
+        }
+    }
+
+    bool Project::RunPlatformChecks() {
+        if (_config.platform == ProjectPlatform::CLASSIC) {
+            return RunInnerClassicChecks();
+        }
+
+        const bool canFallBack = _config.allowManualGamePathFallback;
+
+        // a remembered manual pick wins over the store
+        if (canFallBack && _manualGamePath && GameExecutableExistsIn(_config.classicGamePath)) {
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Using the manually selected game path from the launcher config");
+            _config.platform = ProjectPlatform::CLASSIC;
+            return RunInnerClassicChecks();
+        }
+
+        const auto status = [&]() -> PlatformCheckStatus {
+            switch (_config.platform) {
+            case ProjectPlatform::STEAM: return RunInnerSteamChecks(!canFallBack);
+            case ProjectPlatform::EPIC: return RunInnerEpicChecks(!canFallBack);
+            case ProjectPlatform::ROCKSTAR: return RunInnerRockstarChecks(!canFallBack);
+            default: return PlatformCheckStatus::UNAVAILABLE;
+            }
+        }();
+        if (status == PlatformCheckStatus::OK) {
+            _manualGamePath = false;
+            return true;
+        }
+
+        if (status == PlatformCheckStatus::ABORT || !canFallBack) {
+            return false;
+        }
+
+        Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Store lookup did not resolve the game, falling back to the manual game path");
+        _config.platform         = ProjectPlatform::CLASSIC;
+        _config.promptForGameExe = true;
+        _config.preferSteam      = false;
+        return RunInnerClassicChecks();
+    }
+
+    PlatformCheckStatus Project::ReportStoreUnavailable(const char *store, const std::string &reason, bool reportErrors) const {
+        Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->warn("{} lookup failed: {}", store, reason);
+        if (reportErrors) {
+            MessageBox(nullptr, reason.c_str(), _config.name.c_str(), MB_ICONERROR);
+        }
+        return PlatformCheckStatus::UNAVAILABLE;
+    }
+
+    PlatformCheckStatus Project::RunInnerSteamChecks(bool reportErrors) {
+        // are we a steam child ?
+        const auto child_part    = L"-steamchild:";
+        const wchar_t *cmd_match = wcsstr(GetCommandLineW(), child_part);
+
+        if (cmd_match) {
+            const int master_pid = _wtoi(&cmd_match[wcslen(child_part)]);
+
+            // open a handle to the parent process with SYNCHRONIZE rights
+            const auto handle = OpenProcess(SYNCHRONIZE, FALSE, master_pid);
+
+            // if we opened the process...
+            if (handle != INVALID_HANDLE_VALUE) {
+                // ... wait for it to exit and close the handle afterwards
+                WaitForSingleObject(handle, INFINITE);
+
+                CloseHandle(handle);
+            }
+
+            return PlatformCheckStatus::ABORT;
+        }
+
+        const auto unavailable = [&](const std::string &reason) {
+            return ReportStoreUnavailable("Steam", reason, reportErrors);
+        };
+
+        // Make sure we have our required files
+        const std::vector<std::string> requiredFiles = {"fw_steam_api64.dll", "fw_steam_api.dll"};
+        if (!EnsureAtLeastOneFileExists(requiredFiles)) {
+            return unavailable("The Steam runtime bridge is missing from the launcher directory");
+        }
+
+        PrepareSteamAppIdentity();
+
+        // Initialize the steam wrapper
+        const auto initResult = _steamWrapper->Init();
+        if (!initResult) {
+            return unavailable(fmt::format("Failed to init the bridge with steam, are you sure the Steam Client is running? {}", initResult.GetError().message));
+        }
+
+        // Make sure steam has the game inside the library
+        if (!_steamWrapper->IsAppInstalled(_config.steamAppId)) {
+            _steamWrapper->Shutdown();
+            return unavailable("The destination game is not installed in your Steam library");
+        }
+
+        // Ask the game path from steam
+        const auto installDir = _steamWrapper->GetAppInstallDir(_config.steamAppId);
+        if (installDir.empty()) {
+            _steamWrapper->Shutdown();
+            return unavailable("Steam returned an empty install directory for the destination game");
+        }
+
+        auto installPath = Utils::StringUtils::NormalToWide(installDir);
+        std::replace(installPath.begin(), installPath.end(), '\\', '/');
+
+        if (!GameExecutableExistsIn(installPath)) {
+            _steamWrapper->Shutdown();
+            return unavailable(fmt::format("Steam points at {}, but the game executable is not there", Utils::StringUtils::WideToNormal(installPath)));
+        }
+
+        _gamePath = installPath;
+
+        // Set classic game path to the one found by Steam just for sake of having that information stored in the config
+        // file.
+        _config.classicGamePath = _gamePath;
+
+        // Hand the account id to the in-process client (ClientIdentity); the wrapper is gone by then.
+        const auto steamId = _steamWrapper->GetSteamID().ConvertToUint64();
+        if (steamId != 0) {
+            SetProcessEnvironmentVariable(L"MafiaHubSteamId", std::to_wstring(steamId));
+        }
+
+        // Now we have everything we want, just say goodbye
+        _steamWrapper->Shutdown();
+        return PlatformCheckStatus::OK;
+    }
+
+    PlatformCheckStatus Project::RunInnerEpicChecks(bool reportErrors) {
+        const auto unavailable = [&](const std::string &reason) {
+            return ReportStoreUnavailable("Epic", reason, reportErrors);
+        };
+
+        // Locate the game via the Epic launcher's plaintext manifests - no SDK or running client
+        // needed, just Epic having installed it once. Matched by AppName, else by exe file name.
+        const auto exeName = Utils::StringUtils::WideToNormal(_config.executableName);
+        const auto appName = Utils::StringUtils::WideToNormal(_config.epicAppName);
+
+        const auto app = External::Epic::FindInstalledApp(exeName, appName);
+        if (!app.IsValid()) {
+            return unavailable("The destination game is not installed through the Epic Games Launcher");
+        }
+
+        auto installPath = Utils::StringUtils::NormalToWide(app.installLocation);
+        std::ranges::replace(installPath, L'\\', L'/');
+
+        if (!GameExecutableExistsIn(installPath)) {
+            return unavailable(fmt::format("Epic points at {}, but the game executable is not there", Utils::StringUtils::WideToNormal(installPath)));
+        }
+
+        _gamePath = installPath;
+
+        // Mirror the Steam path: the launch code appends executableName to this root, and we
+        // stash it in classicGamePath purely so it lands in the persisted JSON config.
+        _config.classicGamePath = _gamePath;
+
+        // Unlike Steam there's no runtime DLL to inject or app-id file to drop; any Epic launch
+        // args go through ProjectConfiguration::additionalLaunchArguments.
+        return PlatformCheckStatus::OK;
+    }
+
+    PlatformCheckStatus Project::RunInnerRockstarChecks(bool reportErrors) {
+        const auto unavailable = [&](const std::string &reason) {
+            return ReportStoreUnavailable("Rockstar Games Launcher", reason, reportErrors);
+        };
+
+        // Read from the registry, so the launcher itself does not need to be running
+        const auto exeName  = Utils::StringUtils::WideToNormal(_config.executableName);
+        const auto titleKey = Utils::StringUtils::WideToNormal(_config.rockstarTitleKey);
+
+        const auto title = External::Rockstar::FindInstalledTitle(exeName, titleKey);
+        if (!title.IsValid()) {
+            return unavailable("The destination game is not installed through the Rockstar Games Launcher");
+        }
+
+        auto installPath = Utils::StringUtils::NormalToWide(title.installFolder);
+        std::ranges::replace(installPath, L'\\', L'/');
+
+        if (!GameExecutableExistsIn(installPath)) {
+            return unavailable(fmt::format("The Rockstar Games Launcher points at {}, but the game executable is not there", title.installFolder));
+        }
+
+        Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Rockstar Games Launcher title '{}' (build {}) resolved to {}", title.titleKey, title.version, title.installFolder);
+
+        _gamePath = installPath;
+
+        // As with Steam and Epic, stashed here purely so it lands in the persisted JSON config
+        _config.classicGamePath = _gamePath;
+        return PlatformCheckStatus::OK;
+    }
+
+    bool Project::EnsureImageSnapshot(Loaders::ImageSnapshot &snapshot, const std::vector<uint8_t> &sourceImage) {
+        const auto logger = Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER);
+        if (snapshot.IsAvailable()) {
+            return true;
+        }
+
+        if (!_config.captureImageSnapshot) {
+            logger->error("No cached image snapshot for this build of the game, and this launcher sets no captureImageSnapshot to take one");
+            return false;
+        }
+
+        logger->info("No cached image snapshot for this build of the game, running it once so its decrypted code can be captured");
+        return _config.captureImageSnapshot(snapshot, _gamePath, std::filesystem::path(_config.executableName).filename().wstring(), sourceImage);
+    }
+
+    std::vector<std::wstring> Project::GetAlternativeWorkDirCandidates() const {
+        std::vector<std::wstring> candidates;
+        if (!_config.useAlternativeWorkDir) {
+            return candidates;
+        }
+
+        if (!_config.alternativeWorkDir.empty()) {
+            candidates.push_back(_config.alternativeWorkDir);
+        }
+        for (const auto &fallback : _config.alternativeWorkDirFallbacks) {
+            if (!fallback.empty()) {
+                candidates.push_back(fallback);
+            }
+        }
+        return candidates;
+    }
+
+    std::wstring Project::GetGameWorkDir(const std::wstring &gameRoot) const {
+        const auto candidates = GetAlternativeWorkDirCandidates();
+        if (candidates.empty()) {
+            return gameRoot;
+        }
+
+        // the first layout that holds the executable, else the primary one so errors name it
+        for (const auto &candidate : candidates) {
+            const auto workDir = std::filesystem::path(gameRoot) / candidate;
+
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(workDir / _config.executableName, ec)) {
+                return workDir.wstring();
+            }
+        }
+        return (std::filesystem::path(gameRoot) / candidates.front()).wstring();
+    }
+
+    bool Project::GameExecutableExistsIn(const std::wstring &gameRoot) const {
+        if (gameRoot.empty()) {
+            return false;
+        }
+
+        std::error_code ec;
+        return std::filesystem::is_regular_file(std::filesystem::path(GetGameWorkDir(gameRoot)) / _config.executableName, ec);
+    }
+
+    bool Project::ResolveGamePathFromPrompt() {
+        const auto startPath = Utils::StringUtils::WideToNormal(gProjectDllPath);
+
+        sfd_Options sfd = {};
+        sfd.path        = startPath.c_str();
+        sfd.extension   = _config.promptExtension.c_str();
+        sfd.filter_name = _config.promptFilterName.c_str();
+        sfd.filter      = _config.promptFilter.c_str();
+        sfd.title       = _config.promptTitle.c_str();
+
+        const char *picked = sfd_open_dialog(&sfd);
+
+        // the dialog leaves the working directory wherever the player browsed to
+        SetCurrentDirectoryW(gProjectDllPath);
+
+        if (!picked) {
+            return false;
+        }
+
+        const std::filesystem::path exePath(Utils::StringUtils::NormalToWide(picked));
+
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(exePath, ec)) {
+            MessageBoxA(nullptr, ("Cannot find a game executable by given path:\n" + std::string(picked) + "\n\n Please check your path and try again!").c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        const auto expectedName = Utils::StringUtils::WideToNormal(_config.executableName);
+        if (_wcsicmp(exePath.filename().c_str(), _config.executableName.c_str()) != 0) {
+            MessageBoxA(nullptr, ("Please select " + expectedName + ", not " + Utils::StringUtils::WideToNormal(exePath.filename().wstring()) + ".").c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // stores hand back the game root, so strip the work dir off the picked executable's folder
+        auto gameRoot = exePath.parent_path();
+        for (const auto &candidate : GetAlternativeWorkDirCandidates()) {
+            std::vector<std::wstring> parts;
+            for (const auto &part : std::filesystem::path(candidate)) {
+                if (!part.empty()) {
+                    parts.push_back(part.wstring());
+                }
+            }
+
+            auto stripped = gameRoot;
+            bool matched  = !parts.empty();
+            for (auto it = parts.rbegin(); matched && it != parts.rend(); ++it) {
+                if (_wcsicmp(stripped.filename().c_str(), it->c_str()) != 0) {
+                    matched = false;
+                    break;
+                }
+
+                stripped = stripped.parent_path();
+            }
+
+            if (matched) {
+                gameRoot = stripped;
+                break;
+            }
+        }
+
+        auto gamePath = gameRoot.wstring();
+        std::replace(gamePath.begin(), gamePath.end(), L'\\', L'/');
+
+        if (_config.promptSelectionFunctor) {
+            gamePath = _config.promptSelectionFunctor(gamePath);
+        }
+
+        if (!GameExecutableExistsIn(gamePath)) {
+            MessageBoxA(nullptr, ("Cannot find " + expectedName + " inside the selected game directory:\n" + Utils::StringUtils::WideToNormal(gamePath)).c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        _config.classicGamePath = gamePath;
+        _manualGamePath         = true;
+        return true;
+    }
+
+    void Project::PrepareSteamAppIdentity() const {
+        cppfs::FileHandle appIdFile = cppfs::fs::open("steam_appid.txt");
+        appIdFile.writeFile(std::to_string(_config.steamAppId) + "\n");
+        SetProcessEnvironmentVariable(L"SteamAppId", std::to_wstring(_config.steamAppId));
+    }
+
+    bool Project::RunInnerClassicChecks() {
+        if (_configuredPlatform == ProjectPlatform::STEAM) {
+            PrepareSteamAppIdentity();
+        }
+
+        if (GameExecutableExistsIn(_config.classicGamePath)) {
+            _gamePath = _config.classicGamePath;
+            return true;
+        }
+
+        if (!_config.promptForGameExe) {
+            MessageBoxA(nullptr, "Please specify game path", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        if (!ResolveGamePathFromPrompt()) {
+            return false;
+        }
+
+        if (_config.preferSteam) {
+#ifdef _M_IX86
+            const auto steamDllName = L"steam_api.dll";
+#else
+            const auto steamDllName = L"steam_api64.dll";
+#endif
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(std::filesystem::path(GetGameWorkDir(_config.classicGamePath)) / steamDllName, ec)) {
+                Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Steam dll found in the game directory, switching to steam platform");
+                _config.platform = ProjectPlatform::STEAM;
+                if (RunInnerSteamChecks(false) == PlatformCheckStatus::OK) {
+                    return true;
+                }
+
+                _config.platform = ProjectPlatform::CLASSIC;
+            }
+        }
+
+        _gamePath = _config.classicGamePath;
+        return true;
+    }
+
+    void Project::HandleUrlProtocolLaunch() {
+        if (const auto url = Utils::UrlProtocol::ExtractLaunchUrl(_config.urlProtocolScheme, GetCommandLineW())) {
+            SetProcessEnvironmentVariable(L"MafiaHubLaunchURL", *url);
+        }
+    }
+
+#ifdef FW_DLL_INJECTION
+    DLLInjectionResult InjectLibraryIntoProcess(HANDLE hProcess, const wchar_t *szLibraryPath) {
+        DLLInjectionResult result = DLLInjectionResult::INJECT_LIBRARY_RESULT_OK;
+
+        // Get the length of the library path
+        const size_t sLibraryPathLen = (wcslen(szLibraryPath) + 1) * sizeof(WCHAR);
+
+        // Allocate the a block of memory in our target process for the library path
+        void *pRemoteLibraryPath = VirtualAllocEx(hProcess, NULL, sLibraryPathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+        // Write our library path to the allocated block of memory
+        SIZE_T sBytesWritten     = 0;
+        const BOOL bWriteSuccess = WriteProcessMemory(hProcess, pRemoteLibraryPath, szLibraryPath, sLibraryPathLen, &sBytesWritten);
+
+        if (!bWriteSuccess || sBytesWritten != sLibraryPathLen) {
+            result = DLLInjectionResult::INJECT_LIBRARY_RESULT_WRITE_FAILED;
+        }
+        else {
+            // Get the handle of Kernel32.dll
+            const HMODULE hKernel32 = GetModuleHandle("kernel32.dll");
+            if (hKernel32 == NULL) {
+                result = DLLInjectionResult::INJECT_LIBRARY_GET_MODULE_HANDLE_FAILED;
+            }
+            else {
+                // Get the address of the LoadLibraryA function from Kernel32.dll
+                const FARPROC pfnLoadLibraryW = GetProcAddress(hKernel32, "LoadLibraryW");
+                if (pfnLoadLibraryW == NULL) {
+                    result = DLLInjectionResult::INJECT_LIBRARY_GET_PROC_ADDRESS_FAILED;
+                }
+                else {
+                    // Create a thread inside the target process to load our library
+                    const HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)pfnLoadLibraryW, pRemoteLibraryPath, 0, NULL);
+
+                    if (hThread) {
+                        // Wait for the created thread to end
+                        WaitForSingleObject(hThread, INFINITE);
+
+                        DWORD dwExitCode = 0;
+                        if (GetExitCodeThread(hThread, &dwExitCode)) {
+                            // Should never happen as we wait for the thread to be finished.
+                            assert(dwExitCode != STILL_ACTIVE);
+                        }
+                        else {
+                            result = DLLInjectionResult::INJECT_LIBRARY_GET_RETURN_CODE_FAILED;
+                        }
+
+                        // In case LoadLibrary returns handle equal to zero there was some problem.
+                        if (dwExitCode == 0) {
+                            result = DLLInjectionResult::INJECT_LIBRARY_LOAD_LIBRARY_FAILED;
+                        }
+
+                        // Close our thread handle
+                        CloseHandle(hThread);
+                    }
+                    else {
+                        // Thread creation failed
+                        result = DLLInjectionResult::INJECT_LIBRARY_THREAD_CREATION_FAILED;
+                    }
+                }
+            }
+        }
+
+        // Free the allocated block of memory inside the target process
+        VirtualFreeEx(hProcess, pRemoteLibraryPath, 0, MEM_RELEASE);
+        return result;
+    }
+
+    DLLInjectionResult InjectLibraryIntoProcess(DWORD dwProcessId, const wchar_t *szLibraryPath) {
+        // Open our target process
+        const HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, dwProcessId);
+
+        if (!hProcess) {
+            // Failed to open the process
+            return DLLInjectionResult::INJECT_LIBRARY_OPEN_PROCESS_FAIL;
+        }
+
+        // Inject the library into the process
+        const DLLInjectionResult result = InjectLibraryIntoProcess(hProcess, szLibraryPath);
+
+        // Close the process handle
+        CloseHandle(hProcess);
+        return result;
+    }
+
+    bool Project::RunWithDLLInjection() {
+        // Method cannot be called directly
+        if (_gamePath.empty()) {
+            MessageBoxA(nullptr, "Failed to extract game path from project", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Fix the path
+        std::replace(_gamePath.begin(), _gamePath.end(), '/', '\\');
+
+        // Append the optional additional arguments
+        if (_config.additionalLaunchArguments.length() > 0) {
+            _gamePath = _gamePath + L" " + _config.additionalLaunchArguments;
+        }
+
+        // Compute the global variable
+        gImagePath = _gamePath.c_str();
+        gDllName   = _config.destinationDllName.c_str();
+
+        // Prepare startup info
+        STARTUPINFOW siStartupInfo;
+        PROCESS_INFORMATION piProcessInfo;
+        memset(&siStartupInfo, 0, sizeof(siStartupInfo));
+        memset(&piProcessInfo, 0, sizeof(piProcessInfo));
+        siStartupInfo.cb = sizeof(siStartupInfo);
+
+        // Create the game process and suspend it
+        if (!CreateProcessW(NULL, (LPWSTR)_gamePath.c_str(), NULL, NULL, TRUE, CREATE_SUSPENDED, NULL, gProjectDllPath, &siStartupInfo, &piProcessInfo)) {
+            MessageBoxA(nullptr, "Failed to start game binary, cannot launch", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Inject the client dll inside
+        const std::wstring completeDllPath           = gProjectDllPath + std::wstring(L"\\") + gDllName;
+        const DLLInjectionResult moduleInjectResult = InjectLibraryIntoProcess(piProcessInfo.hProcess, completeDllPath.c_str());
+
+        // Was it successfull?
+        if (moduleInjectResult != DLLInjectionResult::INJECT_LIBRARY_RESULT_OK) {
+            MessageBoxA(nullptr, "Failed to inject module into game process", _config.name.c_str(), MB_ICONERROR);
+
+            TerminateProcess(piProcessInfo.hProcess, 0);
+            return false;
+        }
+
+        // Resume the game main thread
+        ResumeThread(piProcessInfo.hThread);
+
+        return true;
+    }
+#endif
+
+    bool Project::RunWithPELoading() {
+        // Method cannot be called directly
+        if (_gamePath.empty()) {
+            MessageBoxA(nullptr, "Failed to extract game path from project", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        std::replace(_gamePath.begin(), _gamePath.end(), '/', '\\');
+        gImagePath = _gamePath.c_str();
+        gDllName   = _config.destinationDllName.c_str();
+
+        const HANDLE hFile = CreateFileW(_gamePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            MessageBoxA(nullptr, "Failed to find executable image", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // determine file length
+        DWORD dwFileLength = GetFileSize(hFile, nullptr);
+        if (dwFileLength == INVALID_FILE_SIZE) {
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "Could not inquire executable image size", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        const HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (hMapping == INVALID_HANDLE_VALUE) {
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "Could not map executable image", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        const auto *data = (uint8_t *)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        if (!data) {
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "Could not map view of executable image", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Loaded game ({:.02f} MB or {})", (float(dwFileLength) / 1024.0f / 1024.0f), dwFileLength);
+
+        auto base = GetModuleHandle(nullptr);
+
+        // The game lands at our image base with its sections from RVA 0x1000 on, so the
+        // reservation must start right after our headers and reach past the game's last page
+        const auto imageBase     = reinterpret_cast<uintptr_t>(base);
+        const auto gameImageSize = reinterpret_cast<const IMAGE_NT_HEADERS *>(data + reinterpret_cast<const IMAGE_DOS_HEADER *>(data)->e_lfanew)->OptionalHeader.SizeOfImage;
+        if (reinterpret_cast<uintptr_t>(fwgame_begin) != imageBase + 0x1000 || reinterpret_cast<uintptr_t>(fwgame_end) < imageBase + gameImageSize) {
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->error("Game image of {:#x} bytes does not fit the reservation at {:#x}-{:#x} (image base {:#x})", gameImageSize, reinterpret_cast<uintptr_t>(fwgame_begin), reinterpret_cast<uintptr_t>(fwgame_end), imageBase);
+            UnmapViewOfFile(data);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "The game executable does not fit the space this launcher reserves for it. The game may have been updated; please update the mod.", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Get file size
+        DWORD fileSize = GetFileSize(hFile, NULL);
+        if (fileSize == INVALID_FILE_SIZE) {
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "Failed to get file size of the game executable", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // A wrapped title cannot be mapped from the file alone; its code comes from the cache
+        Loaders::ImageSnapshot snapshot(std::filesystem::path(gProjectDllPath) / "cache" / fmt::format("{}_image_snapshot.bin", _config.name), Utils::Hashing::CalculateCRC32(reinterpret_cast<const char *>(data), fileSize));
+
+        if (_config.useRockstarImageSnapshot && !EnsureImageSnapshot(snapshot, std::vector<uint8_t>(data, data + fileSize))) {
+            UnmapViewOfFile(data);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+            MessageBoxA(nullptr, "The game's decrypted code could not be prepared.\n\nMake sure the Rockstar Games Launcher is installed and signed in, then try again.", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // Create the loader instance
+        Loaders::ExecutableLoader loader(data, fileSize);
+        loader.SetLoadLimit(_config.loadLimit);
+        loader.SetUseDirectTlsSlot0(_config.useDirectTlsSlot0);
+        loader.SetLibraryLoader([this](const char *library) -> HMODULE {
+            if (_libraryLoader) {
+                const auto mod = _libraryLoader(library);
+                if (mod) {
+                    return mod;
+                }
+            }
+            auto mod = LoadLibraryA(library);
+            if (mod == nullptr) {
+                mod = (HMODULE)INVALID_HANDLE_VALUE;
+            }
+            return mod;
+        });
+        loader.SetFunctionResolver([this](HMODULE hmod, const char *exportFn) -> LPVOID {
+            if (_functionResolver) {
+                const auto ret = _functionResolver(hmod, exportFn);
+                if (ret) {
+                    return ret;
+                }
+            }
+
+            const auto exportName = std::string(exportFn);
+
+            if (_config.suppressThreadLocalExeAtexitCallback &&
+                exportName == "_register_thread_local_exe_atexit_callback") {
+                Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info(
+                    "Suppressing duplicate mapped-EXE TLS atexit registration");
+                return reinterpret_cast<LPVOID>(RegisterThreadLocalExeAtexitCallback_Stub);
+            }
+            if (!_config.loadClientManually && exportName == "GetStartupInfoW") {
+                return reinterpret_cast<LPVOID>(GetStartupInfoW_Stub);
+            }
+            if (!_config.loadClientManually && exportName == "GetStartupInfoA") {
+                return reinterpret_cast<LPVOID>(GetStartupInfoA_Stub);
+            }
+            if (exportName == "GetCommandLineW") {
+                return reinterpret_cast<LPVOID>(GetCommandLineW_Stub);
+            }
+            if (exportName == "GetCommandLineA") {
+                return reinterpret_cast<LPVOID>(GetCommandLineA_Stub);
+            }
+            if (exportName == "GetModuleFileNameA") {
+                return reinterpret_cast<LPVOID>(GetModuleFileNameA_Hook);
+            }
+            if (exportName == "GetModuleFileNameExA") {
+                return reinterpret_cast<LPVOID>(GetModuleFileNameExA_Hook);
+            }
+            if (exportName == "GetModuleFileNameW") {
+                return reinterpret_cast<LPVOID>(GetModuleFileNameW_Hook);
+            }
+            if (exportName == "GetModuleFileNameExW") {
+                return reinterpret_cast<LPVOID>(GetModuleFileNameExW_Hook);
+            }
+            if (exportName == "GetModuleHandleA") {
+                return reinterpret_cast<LPVOID>(GetModuleHandleA_Hook);
+            }
+            if (exportName == "GetModuleHandleExA") {
+                return reinterpret_cast<LPVOID>(GetModuleHandleExA_Hook);
+            }
+            if (exportName == "GetModuleHandleW") {
+                return reinterpret_cast<LPVOID>(GetModuleHandleW_Hook);
+            }
+            if (exportName == "GetModuleHandleExW") {
+                return reinterpret_cast<LPVOID>(GetModuleHandleExW_Hook);
+            }
+            return static_cast<LPVOID>(GetProcAddress(hmod, exportFn));
+        });
+
+        loader.SetSectionsMappedCallback([&](HMODULE module) {
+            if (_config.useRockstarImageSnapshot) {
+                snapshot.Apply(module);
+            }
+        });
+
+        loader.SetTLSInitializer([&](void **base, uint32_t *index) {
+            const auto tlsExport = (void (*)(void **, uint32_t *))GetProcAddress(tlsDll, "GetThreadLocalStorage");
+            tlsExport(base, index);
+        });
+
+        // Map and prepare the image. The loader throws on fatal mapping errors (unresolvable
+        // imports, protection failures); catch them here, before the game runs, so they report as
+        // a startup failure rather than a crash inside the running game.
+        void (*entry_point)() = nullptr;
+        try {
+            loader.LoadIntoModule(base);
+            loader.Protect();
+
+            // The code was written in place and only now made executable
+            FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+
+            // Once loaded, we can close handles
+            UnmapViewOfFile(data);
+            CloseHandle(hMapping);
+            CloseHandle(hFile);
+
+            // Acquire the entry point reference
+            entry_point = static_cast<void (*)()>(loader.GetEntryPoint());
+
+            // With the code in place the stub has nothing left to do but spin, so enter past it
+            if (_config.useRockstarImageSnapshot) {
+                const auto stub = RGL::ResolveEntryStub(reinterpret_cast<uintptr_t>(base), reinterpret_cast<uintptr_t>(entry_point));
+                switch (stub.status) {
+                case RGL::EntryStubStatus::RESOLVED:
+                    Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Skipping the Rockstar Games Launcher entry stub at {:#x}, entering the game at {:#x}", reinterpret_cast<uintptr_t>(entry_point), stub.entryPoint);
+                    entry_point = reinterpret_cast<void (*)()>(stub.entryPoint);
+                    break;
+                case RGL::EntryStubStatus::NOT_PRESENT: Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("The game executable carries no Rockstar Games Launcher entry stub, entering it at {:#x}", reinterpret_cast<uintptr_t>(entry_point)); break;
+                case RGL::EntryStubStatus::UNSUPPORTED: throw std::runtime_error("The Rockstar Games Launcher entry stub could not be decoded, this game build is not supported yet");
+                }
+            }
+
+            hook::set_base(reinterpret_cast<uintptr_t>(base));
+
+            // Must run before the game does: modules it loads later resolve their own
+            // install directory through the process identity.
+            Loaders::ApplyMappedImageIdentity(_gamePath);
+
+            if (SynchronizeUCRTCommandLine()) {
+                Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info(
+                    "Mapped game command line: {}", BuildGameCommandLineA());
+            }
+
+            // The OS loader normally dispatches executable TLS callbacks before the entry
+            // point. This image was mapped manually, so complete that loader step here.
+            loader.RunTLSCallbacks();
+
+            if (_preLaunchFunctor) {
+                _preLaunchFunctor();
+            }
+        }
+        catch (const std::exception &ex) {
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->error("Failed to load and start the game: {}", ex.what());
+
+            MessageBoxA(nullptr, fmt::format("The game could not be started:\n\n{}\n\nSee Launcher.log for the full stack trace.", ex.what()).c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        // The game runs here; a C++ exception surfacing means it crashed while running.
+        try {
+            InvokeEntryPoint(entry_point);
+            return true;
+        }
+        catch (const std::exception &ex) {
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->error("Unhandled C++ exception escaped the game session: {}", ex.what());
+
+            MessageBoxA(nullptr, fmt::format("The game stopped due to an unhandled error:\n\n{}\n\nSee Launcher.log for the full stack trace.", ex.what()).c_str(), _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+    }
+
+    void Project::InvokeEntryPoint(void (*entryPoint)()) {
+        // SEH call to prevent STATUS_INVALID_HANDLE
+        __try {
+            // and call the entry point
+            entryPoint();
+        }
+        __except (HandleVariant(GetExceptionInformation())) {
+        }
+    }
+
+    void Project::AllocateDeveloperConsole() const {
+        AllocConsole();
+        AttachConsole(GetCurrentProcessId());
+        SetConsoleTitleW(_config.developerConsoleTitle.c_str());
+
+        // Disable QuickEdit: a stray click puts the console in select mode, which blocks
+        // every write to it — freezing whatever game thread logs next until a key clears it.
+        const HANDLE conIn = GetStdHandle(STD_INPUT_HANDLE);
+        DWORD conMode      = 0;
+        if (conIn != INVALID_HANDLE_VALUE && GetConsoleMode(conIn, &conMode)) {
+            SetConsoleMode(conIn, (conMode & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS);
+        }
+
+        (void)freopen("CON", "w", stdout);
+        (void)freopen("CONIN$", "r", stdin);
+        (void)freopen("CONIN$", "r", stderr);
+    }
+
+    bool Project::EnsureFilesExist(const std::vector<std::string> &files) {
+        for (const auto &file : files) {
+            cppfs::FileHandle fh = cppfs::fs::open(file);
+            if (!fh.exists() || !fh.isFile()) {
+                MessageBox(nullptr, std::string("The file " + file + "is not present in the current directory").c_str(), "Framework", MB_ICONERROR);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool Project::EnsureAtLeastOneFileExists(const std::vector<std::string> &files) {
+        for (const auto &file : files) {
+            cppfs::FileHandle fh = cppfs::fs::open(file);
+            if (fh.exists() && fh.isFile()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool Project::LoadJSONConfig() {
+        if (!_config.overrideConfigFileName) {
+            _config.configFileName = fmt::format("{}_launcher.json", _config.name);
+        }
+        const auto configHandle = cppfs::fs::open(_config.configFileName);
+
+        if (!configHandle.exists()) {
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("JSON config file is not present, generating new instance...");
+            _fileConfig->Parse("{}");
+            return true;
+        }
+
+        const auto configData = configHandle.readFile();
+
+        try {
+            // Parse our config data first
+            _fileConfig->Parse(configData);
+
+            if (!_fileConfig->IsParsed()) {
+                Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->critical("JSON config load has failed: {}", _fileConfig->GetLastError());
+                return false;
+            }
+
+            // Retrieve fields and overwrite ProjectConfiguration defaults
+            Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Loading launcher settings from JSON config file...");
+            _config.classicGamePath    = _fileConfig->GetDefault<std::wstring>("game_path", _config.classicGamePath);
+            _manualGamePath            = _fileConfig->GetDefault<bool>("game_path_manual", _manualGamePath);
+            _config.steamAppId         = _fileConfig->GetDefault<AppId_t>("steam_app_id", _config.steamAppId);
+            _config.executableName     = _fileConfig->GetDefault<std::wstring>("game_executable_name", _config.executableName);
+            _config.destinationDllName = _fileConfig->GetDefault<std::wstring>("mod_dll_name", _config.destinationDllName);
+
+            std::replace(_config.classicGamePath.begin(), _config.classicGamePath.end(), '\\', '/');
+        }
+        catch (const std::exception &ex) {
+            return false;
+        }
+        return true;
+    }
+
+    void Project::SaveJSONConfig() const {
+        auto configHandle = cppfs::fs::open(_config.configFileName);
+
+        // Retrieve fields from ProjectConfiguration and store data into a persistent config file
+        _fileConfig->Set<std::wstring>("game_path", _config.classicGamePath);
+        _fileConfig->Set<bool>("game_path_manual", _manualGamePath);
+        _fileConfig->Set<AppId_t>("steam_app_id", _config.steamAppId);
+        _fileConfig->Set<std::wstring>("game_executable_name", _config.executableName);
+        _fileConfig->Set<std::wstring>("mod_dll_name", _config.destinationDllName);
+
+        configHandle.writeFile(_fileConfig->ToString());
+    }
+
+    uint32_t Project::GetGameVersion() const {
+        if (_gamePath.empty()) {
+            MessageBoxA(nullptr, "Failed to extract game path from project", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        auto gameExeHandle = std::ifstream(Utils::StringUtils::WideToNormal(_gamePath), std::ios::binary | std::ios::ate);
+        if (!gameExeHandle.good()) {
+            MessageBoxA(nullptr, "Failed to find the game executable", _config.name.c_str(), MB_ICONERROR);
+            return false;
+        }
+
+        const auto gameExeSize = gameExeHandle.tellg();
+        gameExeHandle.seekg(0, std::ios::beg);
+        std::vector<char> data(gameExeSize);
+        gameExeHandle.read(data.data(), gameExeSize);
+        const auto checksum = Utils::Hashing::CalculateCRC32(data.data(), gameExeSize);
+        return checksum;
+    }
+
+    bool Project::EnsureGameExecutableIsCompatible(uint32_t checksum) {
+        for (auto &version : _config.supportedGameVersions) {
+            if (checksum == version) {
+                Framework::Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->info("Game integrity verified. Mod allowed to launch (Checksum {}, found {})", checksum, version);
+                return true;
+            }
+        }
+
+        Framework::Logging::GetLogger(FRAMEWORK_INNER_LAUNCHER)->error("Game integrity failed to verify. Mod not allowed to launch (Checksum {})", checksum);
+        return false;
+    }
+
+    void Project::InitialiseClientDLL() {
+        static bool init = false;
+
+        if (!init) {
+            const auto mod = LoadLibraryW(gDllName);
+
+            if (mod) {
+                const auto initFunc = reinterpret_cast<ClientEntryPoint>(GetProcAddress(mod, "InitClient"));
+                if (initFunc) {
+                    initFunc(gProjectDllPath);
+                }
+                else {
+                    MessageBoxA(nullptr, "Failed to find InitClient function in client DLL", "Error", MB_ICONERROR);
+                    ExitProcess(1);
+                }
+            }
+            init = true;
+        }
+    }
+} // namespace Framework::Launcher

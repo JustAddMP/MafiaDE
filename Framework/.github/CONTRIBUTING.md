@@ -1,0 +1,38 @@
+# Contributing to the project
+
+There are many ways on how to get involved in the project:
+
+## Report bugs
+
+If you stumble upon an issue, try to provide reproducible steps a description or a possible fix if you know how to solve it. Use the Issues page to report it or open a PR with a fix.
+
+## Suggest new features
+
+If you have something on your mind, that is compatible with project's philosophy, let us know! We always appreciate any suggestions that can improve this project!
+
+## Code
+
+If you feel up for it, feel free to code and pull request any changes you've made, that can be useful for the project. This is the best way to help us out and it is highly appreciated!
+
+## Version changes
+
+We loosely follow semver to enforce build requirements between networked peers.
+
+We separate and bump versions based on these criteria:
+* PATCH when changes were made to either side that do not affect sync between peers nor the scripting layer itself (could also be cosmetic/meta changes)
+* MINOR when a change is made in the scripting layer
+* MAJOR when a change is made to the netcode, shared ecs modules or sync flow between peers (requires both client and the server side to be updated)
+
+Our PR workflow automates version bumping for you based on files that have been modified. This way we ensure each PR properly communicates potential dependency changes.
+
+## Code submission policy
+
+Please follow the following rules when contributing to the project:
+- Follow our [coding style](CODING_STYLE.md) and ensure your code is clean and well-commented
+- Do not create external dependencies when introducing new features without prior discussion with the code owners
+- Split your changes to separate, atomic commits
+- Rebase your commits on the `develop` branch
+- Wrap commit messages at 72 characters
+- Format your commit message appropriately, the format should be: `Module: Brief commit description`, the `Module` can describe a file, structure or a process, depends on context
+- Use proper English, with care for grammar and punctuation
+- Commits should contain long description in case they are more complex, but they are not mandatory

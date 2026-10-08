@@ -1,0 +1,1522 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "instance.h"
+
+#include "integrations/shared/scripting/state_bag_events.h"
+
+#include <scripting/resource/resource_packager.h>
+#include <utils/crypto.h>
+#include <utils/package/package.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+
+#include <filesystem>
+#include <optional>
+#include <set>
+#include <fstream>
+#include <sstream>
+
+#include "core_modules.h"
+
+#include "integrations/shared/rpc/emit_script_event.h"
+#include "networking/replication/network_entity.h"
+#include "networking/replication/replication_manager.h"
+#include "networking/rpc/chat_message.h"
+#include "networking/rpc/client_identity.h"
+#include "networking/rpc/client_join.h"
+#include "networking/rpc/resource_refresh.h"
+#include "networking/rpc/server_resources.h"
+#include "networking/rpc/voice_settings.h"
+
+#include "networking/connection.h"
+
+#include "scripting/builtins/events.h"
+#include "scripting/builtins/player.h"
+#include "scripting/node_engine.h"
+#include "scripting/resource/resource_manager.h"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+#include <v8pp/convert.hpp>
+
+#include "utils/command_processor.h"
+#include "utils/config_schema.h"
+#include "utils/path.h"
+#include "utils/profiler.h"
+#include "utils/version.h"
+#include "utils/time.h"
+
+#include "cxxopts.hpp"
+#include <cppfs/FileHandle.h>
+#include <cppfs/fs.h>
+#include <csignal>
+
+#ifdef _WIN32
+#include <timeapi.h>
+#endif
+
+namespace Framework::Integrations::Server {
+    namespace {
+        constexpr double kTickHitchWarnMs         = 100.0;
+
+        // How much longer MafiaNet keeps a waiting connection request than the gate takes to time it
+        // out, so the player always gets the gate's reason rather than a silent drop.
+        constexpr uint32_t kAdmissionTimeoutMarginMs = 15000;
+
+        // What a player reads when the server refuses without a script having said anything.
+        constexpr const char *kServerFullReason   = "The server is full.";
+        constexpr const char *kUnidentifiedReason = "Your client could not be identified. Update it and try again.";
+        constexpr double kTickHitchWarnIntervalMs = 1000.0;
+
+        // The default 15.6 ms Windows sleep quantum would hold the tick to ~32 Hz. Restored on every
+        // exit from Run(), unwinding included.
+        struct TimerResolutionScope {
+#ifdef _WIN32
+            TimerResolutionScope() {
+                timeBeginPeriod(1);
+            }
+            ~TimerResolutionScope() {
+                timeEndPeriod(1);
+            }
+#else
+            TimerResolutionScope()  = default;
+            ~TimerResolutionScope() = default;
+#endif
+            TimerResolutionScope(const TimerResolutionScope &)            = delete;
+            TimerResolutionScope &operator=(const TimerResolutionScope &) = delete;
+        };
+    } // namespace
+
+    Instance::Instance(): _shuttingDown(false) {
+        _networkingEngine = std::make_unique<Networking::Engine>();
+        _webServer        = std::make_unique<HTTP::Webserver>();
+        _fileConfig       = std::make_unique<Utils::Config>();
+        _scriptingModule  = std::make_unique<Scripting::ServerScriptingModule>();
+        _masterlist       = std::make_unique<Services::MasterlistConnector>();
+        _commandListener  = std::make_unique<Utils::CommandListener>();
+        _commandProcessor = std::make_unique<Utils::CommandProcessor>();
+        _crashReporter    = &External::Sentry::GetCrashReporter();
+    }
+
+    Instance::~Instance() {
+        sig_detach(this);
+    }
+
+    Utils::Result<void, Error> Instance::Init(InstanceOptions &opts) {
+        _opts = opts;
+
+        if (opts.gameName.empty() || opts.gameVersion.empty()) {
+            return Error("Game name and version are required");
+        }
+
+        // Crash reporting comes up first so its handler is installed before anything else can fault.
+        // An entry-point InitCrashReporter already installed it; this is then a no-op and only the
+        // decoration below applies.
+        if (_crashReporter && !opts.sentryDSN.empty()) {
+            External::Sentry::InitOptions sentryOpts;
+            sentryOpts.dsn         = opts.sentryDSN;
+            sentryOpts.handlerPath = opts.sentryModulePath.empty() ? "." : opts.sentryModulePath;
+            sentryOpts.release     = opts.sentryRelease.empty() ? opts.gameName + "@" + opts.gameVersion : opts.sentryRelease;
+            sentryOpts.environment = opts.sentryEnvironment;
+            sentryOpts.attachments = opts.sentryAttachments;
+            if (auto sentryResult = External::Sentry::InitCrashReporter(sentryOpts); !sentryResult) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Crash reporting disabled: {}", sentryResult.GetError().message);
+            }
+            else {
+                _crashReporter->SetGameInformation({opts.gameName, opts.gameVersion + " / mod " + opts.modVersion});
+                _crashReporter->SetTag("net.role", "server");
+                _crashReporter->SetTag("build.game_version", opts.gameVersion);
+                _crashReporter->SetTag("build.mod_version", opts.modVersion);
+
+                auto *reporter = _crashReporter;
+                Logging::GetInstance()->SetLogForwarder([reporter](int level, const std::string &name, const std::string &message) {
+                    External::Sentry::Level mapped = External::Sentry::Level::Info;
+                    if (level >= spdlog::level::critical) {
+                        mapped = External::Sentry::Level::Fatal;
+                    }
+                    else if (level >= spdlog::level::err) {
+                        mapped = External::Sentry::Level::Error;
+                    }
+                    else if (level >= spdlog::level::warn) {
+                        mapped = External::Sentry::Level::Warning;
+                    }
+                    reporter->AddBreadcrumb(name, message, mapped);
+                });
+
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Crash reporting initialized");
+            }
+        }
+
+        CoreModules::SetTickInterval(opts.worldConfig.tickInterval);
+
+        // First level is argument parser, because we might want to overwrite stuffs
+        cxxopts::Options options(_opts.modSlug, _opts.modHelpText);
+        AddCommandLineOptions(options, _opts);
+
+        // Try to parse and return if anything wrong happened
+        const auto result = options.parse(_opts.argc, _opts.argv);
+
+        // If help was specified, just print the help and exit
+        if (result.count("help")) {
+            std::cout << options.help() << std::endl;
+            exit(0);
+        }
+
+        // Allow mod to specify custom JSON config file name
+        if (result.count("config")) {
+            _opts.modConfigFile = result["config"].as<std::string>();
+        }
+
+        // Load JSON config if present
+        if (!LoadConfigFromJSON()) {
+            return Error("Failed to parse JSON config file '" + _opts.modConfigFile + "'");
+        }
+
+        ApplyCommandLine(result, _opts);
+
+        if (_opts.bindHost.empty()) {
+            return Error("bindHost is required");
+        }
+        if (_opts.bindPort <= 0 || _opts.bindPort > 65535) {
+            return Error("bindPort must be in the range 1-65535 (got " + std::to_string(_opts.bindPort) + ")");
+        }
+        if (_opts.webServerEnabled && (_opts.webBindPort <= 0 || _opts.webBindPort > 65535)) {
+            return Error("webBindPort must be in the range 1-65535 (got " + std::to_string(_opts.webBindPort) + ")");
+        }
+        if (_opts.webServerEnabled && _opts.webBindHost.empty()) {
+            return Error("webBindHost is required");
+        }
+        if (_opts.maxPlayers <= 0) {
+            return Error("maxPlayers must be greater than 0 (got " + std::to_string(_opts.maxPlayers) + ")");
+        }
+        // MafiaNet keeps 255 bytes and silently drops the rest, so a longer one would be a different
+        // password from the one the operator wrote, and nobody could type the one it enforces.
+        if (_opts.bindPassword.size() > 255) {
+            return Error("password must be at most 255 bytes (got " + std::to_string(_opts.bindPassword.size()) + ")");
+        }
+        if (_opts.maxPlayersHardCap > 0 && _opts.maxPlayers > _opts.maxPlayersHardCap) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("maxplayers {} exceeds this build's hard cap; running with {}", _opts.maxPlayers, _opts.maxPlayersHardCap);
+            _opts.maxPlayers = _opts.maxPlayersHardCap;
+        }
+
+        // Initialize the logging instance with the mod slug name
+        Logging::GetInstance()->SetLogName(_opts.modSlug);
+
+        // Initialize the web server
+        if (_opts.webServerEnabled && _webServer->Init(_opts.webBindHost, _opts.webBindPort, _opts.httpServeDir) != HTTP::WebserverError::WEBSERVER_NONE) {
+            return Error("Failed to initialize the webserver on " + _opts.webBindHost + ":" + std::to_string(_opts.webBindPort));
+        }
+
+        // Initialize our networking engine
+        // MafiaNet drops a request nobody answers; the gate always answers first, with a reason.
+        Framework::Networking::AdmissionSettings admission;
+        admission.pendingConnections           = _opts.pendingConnections;
+        admission.pendingConnectionsPerAddress = _opts.pendingConnectionsPerAddress;
+        admission.sessionTimeoutMs             = static_cast<uint32_t>(std::max(_opts.admissionTimeoutMs, 1)) + kAdmissionTimeoutMarginMs;
+        if (auto netResult = _networkingEngine->Init(_opts.bindHost, _opts.bindPort, _opts.maxPlayers, _opts.bindPassword, admission); !netResult) {
+            return netResult;
+        }
+
+        CoreModules::SetNetworkPeer(_networkingEngine->GetNetworkServer());
+
+        // Before any peer can connect, so the very first handshake already carries it.
+        PublishSessionConfig();
+
+        // The networked world is the replication manager owned by the peer. Serialize entity updates
+        // at the configured tick rate (tickInterval is in seconds).
+        auto *replication = _networkingEngine->GetNetworkServer()->GetReplicationManager();
+        CoreModules::SetReplication(replication);
+        if (replication) {
+            replication->SetAutoSerializeInterval(static_cast<MafiaNet::Time>(Utils::Time::SecondsToMs(_opts.worldConfig.tickInterval)));
+            replication->ConfigureGrid(_opts.worldConfig.streamCellSize, _opts.worldConfig.streamWorldMin, _opts.worldConfig.streamWorldMax);
+            // Replication owns connection teardown: when a peer drops, it notifies the game (avatar
+            // still resolvable) just before destroying and broadcasting the destruction of the avatar.
+            replication->SetOnClientDisconnect([this](MafiaNet::PeerGuid guid) {
+                if (_readyPlayerGuids.contains(static_cast<uint64_t>(guid))) {
+                    OnPlayerDisconnect(guid);
+                }
+            });
+        }
+
+        // Voice relay: attaches RakVoice to the live peer, so it must come up after the networking
+        // engine. Failure is not fatal — the server simply runs without voice.
+        if (_voiceServer.Init(_networkingEngine->GetNetworkServer())) {
+            CoreModules::SetVoiceServer(&_voiceServer);
+        }
+        else {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Voice relay unavailable; voice chat disabled");
+        }
+
+        if (!_opts.bindPublicServer || !_masterlist->Init(_opts.services.masterlistUrl, _opts.bindSecretKey)) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Server will not be announced to masterlist");
+        }
+
+        // Init the signals handlers if enabled
+        if (_opts.enableSignals) {
+            sig_attach(SIGINT, sig_slot(this, &Instance::OnSignal), sig_ctx_sys());
+            sig_attach(SIGTERM, sig_slot(this, &Instance::OnSignal), sig_ctx_sys());
+        }
+
+        // Register the default endpoints
+        InitEndpoints();
+
+        // Initialize default messages
+        InitNetworkingMessages();
+
+        // Initialize command listener
+        InitCommandListener();
+
+        // Initialize mod subsystems
+        PostInit();
+    
+        const auto sdkCallback = [this](Framework::Scripting::Engine *engine) {
+            this->RegisterScriptingBuiltins(engine);
+        };
+
+        // Initialize the scripting engine
+        _scriptingModule->SetResourcesPath(_opts.resourcesPath);
+        _scriptingModule->SetDevMode(_opts.developmentMode);
+        _scriptingModule->SetModVersion(_opts.modVersion);
+        if (_scriptingModule->Init(sdkCallback) != Framework::Scripting::ScriptingError::SCRIPTING_NONE) {
+            return Error("Failed to initialize the scripting engine");
+        }
+
+        CoreModules::SetScriptingModule(_scriptingModule.get());
+
+        _connectionGate.Init(_scriptingModule.get(), _networkingEngine->GetNetworkServer(), std::chrono::milliseconds(std::max(_opts.admissionTimeoutMs, 1)));
+        CoreModules::SetConnectionGate(&_connectionGate);
+
+        // A resource owns the entities it spawns; they are destroyed when it stops.
+        if (replication) {
+            auto *resourceManager = _scriptingModule->GetResourceManager();
+            replication->SetOnEntityCreated([resourceManager](uint64_t networkId) {
+                resourceManager->OnEntityCreated(networkId);
+            });
+            replication->SetOnEntityDestroyed([resourceManager](uint64_t networkId) {
+                resourceManager->OnEntityDestroyed(networkId);
+            });
+        }
+
+        _stateBagEvents = Integrations::Shared::Scripting::InstallStateBagEvents([this](v8::Isolate *isolate, uint64_t networkId) {
+            return WrapScriptEntity(isolate, networkId);
+        });
+
+        PostScriptInit();
+
+        // Discover resources
+        _scriptingModule->GetResourceManager()->DiscoverResources();
+
+        // Initialize asset streamer (needs discovered resources to know client files)
+        InitAssetStreamer();
+
+        // Mirror runtime resource start/stop to clients. Gated on boot (the
+        // StartAll below predates any connection) and shutdown.
+        _scriptingModule->GetResourceManager()->AddOnResourceStarted([this](const std::string &name) {
+            if (_resourcesBooted && !_shuttingDown) {
+                BroadcastResourceRefresh(name);
+            }
+        });
+        _scriptingModule->GetResourceManager()->AddOnResourceStopped([this](const std::string &name) {
+            if (_resourcesBooted && !_shuttingDown) {
+                BroadcastResourceStop(name);
+            }
+        });
+
+        // Start all resources (ES modules load asynchronously via normal Update cycle)
+        auto startResult = _scriptingModule->GetResourceManager()->StartAll();
+        if (!startResult) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed to start resources: {}", startResult.GetError());
+        }
+        _resourcesBooted = true;
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->flush();
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Host:\t{}", _opts.bindHost);
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Port:\t{}", _opts.bindPort);
+        if (_opts.webServerEnabled) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Http Host:\t{}", _opts.webBindHost);
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Http Port:\t{}", _opts.webBindPort);
+        }
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Max Players:\t{}", _opts.maxPlayers);
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Password:\t{}", _opts.bindPassword.empty() ? "none" : "required");
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("{} Server successfully started", _opts.modName);
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->flush();
+
+        _initialized  = true;
+        _shuttingDown = false;
+        return {};
+    }
+
+    void Instance::InitEndpoints() {
+        _webServer->RegisterRequest("/", [this](const httplib::Request &req, httplib::Response &res) {
+            nlohmann::json root;
+            root["mod_name"]          = _opts.modName;
+            root["mod_slug"]          = _opts.modSlug;
+            root["mod_version"]       = _opts.modVersion;
+            root["framework_version"] = Utils::Version::rel;
+            root["host"]              = _opts.bindHost;
+            root["port"]              = _opts.bindPort;
+            root["password_required"] = !_opts.bindPassword.empty();
+            root["max_players"]       = _opts.maxPlayers;
+            root["mod_config"]        = Framework::Utils::ExtractReplicatedConfig(_opts.modConfigSchema, _modConfig);
+            res.body                  = root.dump(4);
+            res.status                = 200;
+        });
+
+        Logging::GetLogger(FRAMEWORK_INNER_HTTP)->debug("All core endpoints have been registered!");
+    }
+
+
+    void AddCommandLineOptions(cxxopts::Options &options, const InstanceOptions &opts) {
+        options.allow_unrecognised_options();
+        options.add_options("MafiaHub Integrations server",
+            {{"p,port", "Networking port to bind", cxxopts::value<int32_t>()->default_value(std::to_string(opts.bindPort))}, {"h,host", "Networking host to bind", cxxopts::value<std::string>()->default_value(opts.bindHost)},
+                {"c,config", "JSON config file to read", cxxopts::value<std::string>()->default_value(opts.modConfigFile)}, {"P,apiport", "HTTP API port to bind", cxxopts::value<int32_t>()->default_value(std::to_string(opts.webBindPort))},
+                {"H,apihost", "HTTP API host to bind", cxxopts::value<std::string>()->default_value(opts.webBindHost)},
+                {"t,server-token", "Masterlist push token; the server is announced only when this is set", cxxopts::value<std::string>()}, {"password", "Password players must give to join; empty lets anyone in", cxxopts::value<std::string>()}, {"help", "Prints this help message", cxxopts::value<bool>()->default_value("false")}});
+    }
+
+    void ApplyConfigDocument(const nlohmann::json &document, InstanceOptions &opts) {
+        const auto read = [&document](const char *key, auto &field) {
+            if (document.contains(key)) {
+                field = document.at(key).get<std::decay_t<decltype(field)>>();
+            }
+        };
+
+        read("host", opts.bindHost);
+        read("port", opts.bindPort);
+        read("apihost", opts.webBindHost);
+        read("apiport", opts.webBindPort);
+        read("map", opts.bindMapName);
+        read("maxplayers", opts.maxPlayers);
+        read("server-token", opts.bindSecretKey);
+        read("password", opts.bindPassword);
+    }
+
+    void ApplyCommandLine(const cxxopts::ParseResult &result, InstanceOptions &opts) {
+        // count() is the number of command-line occurrences: a value that came from default_value
+        // leaves it at 0, so a flag the operator did not pass never overrides the config document.
+        const auto read = [&result](const char *key, auto &field) {
+            if (result.count(key)) {
+                field = result[key].as<std::decay_t<decltype(field)>>();
+            }
+        };
+
+        read("host", opts.bindHost);
+        read("port", opts.bindPort);
+        read("apihost", opts.webBindHost);
+        read("apiport", opts.webBindPort);
+        read("server-token", opts.bindSecretKey);
+        read("password", opts.bindPassword);
+    }
+
+    bool Instance::LoadConfigFromJSON() {
+        auto configHandle = cppfs::fs::open(_opts.modConfigFile);
+
+        if (!configHandle.exists()) {
+            // Write one instead of starting on invisible defaults. A generated file documents every
+            // key the mod understands, which is the difference between a server operator being able
+            // to see what is configurable and having to read the mod's source.
+            const nlohmann::json defaults = BuildDefaultConfigFile();
+            try {
+                configHandle.writeFile(defaults.dump(4));
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Wrote a default '{}'", _opts.modConfigFile);
+            }
+            catch (const std::exception &ex) {
+                // Not fatal: the resolved defaults below are the same either way, the operator just
+                // does not get a file to edit.
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Could not write a default '{}': {}", _opts.modConfigFile, ex.what());
+            }
+
+            _modConfig = defaults.contains("mod") ? defaults["mod"] : nlohmann::json::object();
+            std::string schemaError;
+            if (!Framework::Utils::ValidateConfigAgainstSchema(_opts.modConfigSchema, _modConfig, schemaError)) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->critical("Default config is invalid: {}", schemaError);
+                return false;
+            }
+            return true;
+        }
+
+        const auto configData = configHandle.readFile();
+
+        try {
+            // Parse our config data first
+            _fileConfig->Parse(configData);
+
+            if (!_fileConfig->IsParsed()) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->critical("JSON config load has failed: {}", _fileConfig->GetLastError());
+                return false;
+            }
+
+            auto *document = _fileConfig->GetDocument();
+            if (document) {
+                ApplyConfigDocument(*document, _opts);
+            }
+
+            // Mod-declared keys live under "mod" so they cannot collide with framework keys added
+            // later, and so the replicated subset is a filter over one object rather than a
+            // subtraction over the whole document.
+            _modConfig = (document && document->contains("mod")) ? (*document)["mod"] : nlohmann::json::object();
+
+            std::string schemaError;
+            if (!Framework::Utils::ValidateConfigAgainstSchema(_opts.modConfigSchema, _modConfig, schemaError)) {
+                // Fail here rather than at the first connect: an operator sees the reason at boot.
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->critical("{}: {}", _opts.modConfigFile, schemaError);
+                return false;
+            }
+
+            // Unknown keys are kept, not rejected. Downgrading a mod must not brick a config file.
+            for (auto it = _modConfig.begin(); it != _modConfig.end(); ++it) {
+                bool declared = false;
+                for (const auto &field : _opts.modConfigSchema) {
+                    if (field.key == it.key()) {
+                        declared = true;
+                        break;
+                    }
+                }
+                if (!declared) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("{}: 'mod.{}' is not a key this build understands; keeping it", _opts.modConfigFile, it.key());
+                }
+            }
+        }
+        catch (const std::exception &ex) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->critical("JSON config could not be applied: {}", ex.what());
+            return false;
+        }
+        return true;
+    }
+
+    nlohmann::json Instance::BuildDefaultConfigFile() const {
+        nlohmann::json frameworkKeys;
+        frameworkKeys["host"]         = _opts.bindHost;
+        frameworkKeys["port"]         = _opts.bindPort;
+        frameworkKeys["apihost"]      = _opts.webBindHost;
+        frameworkKeys["apiport"]      = _opts.webBindPort;
+        frameworkKeys["map"]          = _opts.bindMapName;
+        frameworkKeys["maxplayers"]   = _opts.maxPlayers;
+        frameworkKeys["server-token"] = _opts.bindSecretKey;
+        frameworkKeys["password"]     = _opts.bindPassword;
+        return Framework::Utils::BuildDefaultConfigDocument(_opts.modConfigSchema, frameworkKeys);
+    }
+
+    void Instance::PublishSessionConfig() {
+        const auto replicated = Framework::Utils::ExtractReplicatedConfig(_opts.modConfigSchema, _modConfig);
+        _replicatedModConfig  = replicated.dump();
+
+        auto *net = _networkingEngine ? _networkingEngine->GetNetworkServer() : nullptr;
+        if (!net) {
+            return;
+        }
+
+        // Carried by MafiaNet's session handshake, which completes before either side reports a
+        // connection. A client therefore has this in hand the moment it sees
+        // ID_CONNECTION_REQUEST_ACCEPTED, which is before the asset phase and before any client
+        // script runs -- the whole point of putting it there rather than in an ordinary message.
+        // A mod wanting a shape of its own replaces this from PostInit, which runs after Init.
+        net->SetSessionConfig(_replicatedModConfig);
+
+        if (!replicated.empty()) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Publishing {} replicated config key(s) to clients", replicated.size());
+        }
+    }
+
+    void Instance::InitNetworkingMessages() {
+        const auto net = _networkingEngine->GetNetworkServer();
+        // Build gate: a mismatched token fails the challenge inside NetworkServer; the peer never
+        // reaches the asset phase.
+        if (_opts.verifyBuildToken) {
+            net->SetBuildToken(Framework::Networking::NetworkPeer::BuildToken(_opts.gameName, _opts.gameVersion, Utils::Version::rel, _opts.modVersion));
+        }
+        else {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Build token verification DISABLED; accepting any client version");
+            net->SetBuildToken(Framework::Networking::NetworkPeer::kBuildVerificationDisabledToken);
+        }
+
+        // A client asks to join. The request waits in MafiaNet's pending pool -- no player slot, not
+        // counted as online, sent nothing -- until the admission gate answers it.
+        net->SetOnSessionRequestCallback([this](MafiaNet::RakNetGUID guid, const std::optional<Framework::Networking::RPC::ClientIdentity> &identity) {
+            OnSessionRequest(guid, identity);
+        });
+
+        // A waiting request went away: the client gave up, or MafiaNet timed it out.
+        net->SetOnSessionAbandonedCallback([this](MafiaNet::RakNetGUID guid) {
+            _connectionGate.Drop(guid.g);
+        });
+
+        // Admitted and build verified -> send the resource list (carries the ReadyEvent id and tick rate).
+        net->SetOnClientAuthenticatedCallback([this, net](MafiaNet::RakNetGUID guid) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Build verified for player guid {}, sending resource list", guid.g);
+
+            Framework::Networking::RPC::ServerResources resources;
+            resources.readyEventId = Framework::Networking::NetworkServer::ReadyEventId(guid);
+            resources.tickRate     = _opts.worldConfig.tickInterval;
+            resources.packageKey   = _packageKeyHex;
+            resources.resources = DescribeClientResources();
+            net->SendRPC(resources, guid);
+
+            // Travels with the resource list: a client that learns the ranges only when
+            // someone speaks would misjudge the first words it hears.
+            _voiceServer.SendSettingsTo(guid);
+        });
+
+        net->SetOnPlayerDisconnectCallback([this, net](MafiaNet::Packet *packet, Framework::Networking::DisconnectionReason reason, const std::string &) {
+            const auto guid = packet->guid;
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Disconnecting peer {}, reason: {}", guid.g, static_cast<uint32_t>(reason));
+            _armedSpawnBarrierGuids.erase(guid.g);
+            _readyPlayerGuids.erase(guid.g);
+            // Drop voice state unconditionally: a peer that never reached the ready barrier can
+            // still have been registered in the router by a position push.
+            _voiceServer.OnPlayerDisconnect(guid.g);
+
+            // Player notification and avatar teardown run in ReplicationManager::OnClosedConnection,
+            // which RakNet fires before this packet is delivered; here we just finalise the connection.
+            net->GetPeer()->CloseConnection(guid, true);
+        });
+
+        net->SetOnConnectionReadyCallback([this, net](int eventId, MafiaNet::RakNetGUID guid) {
+            if (eventId != Framework::Networking::NetworkServer::ReadyEventId(guid) || _armedSpawnBarrierGuids.erase(guid.g) == 0 || !_readyPlayerGuids.insert(guid.g).second) {
+                return;
+            }
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Client spawn ready for player guid {}", guid.g);
+            OnPlayerReady(MafiaNet::ToPeerGuid(guid));
+            net->GetReadyEvent()->SetEvent(eventId, true);
+        });
+
+        // Client is done downloading and its resources run: build the avatar. Gated on the build check
+        // so an unverified peer cannot conjure one; admission needs no check, because a refused or
+        // still-waiting peer has no connection to send this over.
+        net->RegisterRPC<Framework::Networking::RPC::ClientJoin>([this, net](const Framework::Networking::RPC::ClientJoin &, MafiaNet::Packet *packet) {
+            const auto guid = packet->guid;
+            if (!net->IsAuthenticated(guid)) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Ignoring join from unauthenticated peer {}", guid.g);
+                return;
+            }
+
+            auto *replication = net->GetReplicationManager();
+            const auto peerGuid = MafiaNet::ToPeerGuid(guid);
+            if (replication && (replication->GetConnectionByGUID(guid) || replication->GetViewer(peerGuid))) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Ignoring duplicate join from {}", guid.g);
+                return;
+            }
+
+            // Only a request carrying an identity is ever accepted, so a connection has one.
+            const Framework::Networking::RPC::ClientIdentity &identity = *net->GetPeerIdentity(guid);
+
+            // The game builds the avatar and registers it as this connection's viewer; hand it the
+            // metadata so it spawns with the real nickname/slot.
+            PlayerConnectionData data;
+            data.guid        = peerGuid;
+            data.playerIndex = guid.systemIndex;
+            data.nickname    = identity.name;
+            data.hardwareID  = identity.hardwareId;
+            data.steamId     = identity.steamId;
+            data.discordId   = identity.discordId;
+            OnPlayerConnect(data);
+
+            // Gate opens: this connection now starts receiving the replicated world.
+            net->PushReplicationConnection(guid);
+
+            const int eventId = Framework::Networking::NetworkServer::ReadyEventId(guid);
+            net->GetReadyEvent()->SetEvent(eventId, false);
+            net->GetReadyEvent()->AddToWaitList(eventId, guid);
+            _armedSpawnBarrierGuids.insert(guid.g);
+        });
+
+        // Incoming chat from clients. Sender resolution + command parsing happen here; the mod
+        // observes via the OnChatMessage / OnChatCommand overrides.
+        net->RegisterRPC<Framework::Networking::RPC::ChatMessage>([this](const Framework::Networking::RPC::ChatMessage &payload, MafiaNet::Packet *packet) {
+            if (payload.text.empty()) {
+                return;
+            }
+            // Resolve the sender from its connection's viewer entity.
+            auto *engine = GetNetworkingEngine();
+            auto *server = engine ? engine->GetNetworkServer() : nullptr;
+            auto *repl   = server ? server->GetReplicationManager() : nullptr;
+            auto *sender = repl ? repl->GetViewer(MafiaNet::ToPeerGuid(packet->guid)) : nullptr;
+            if (!sender) {
+                return;
+            }
+            HandleIncomingChat(sender->GetNetworkID(), payload.text);
+        });
+
+        // Client -> server scripting events (the client's Game.emitServer). Resolve the sender from
+        // its viewer entity, then hand off to OnClientEvent, which routes into the dedicated
+        // client-event table (Events.onClient) — never the global bus a client could otherwise
+        // collide with.
+        net->RegisterRPC<Framework::Integrations::Shared::RPC::EmitScriptEvent>([this](const Framework::Integrations::Shared::RPC::EmitScriptEvent &payload, MafiaNet::Packet *packet) {
+            const std::string name = payload.GetEventName();
+            if (name.empty()) {
+                return;
+            }
+            auto *engine = GetNetworkingEngine();
+            auto *server = engine ? engine->GetNetworkServer() : nullptr;
+            auto *repl   = server ? server->GetReplicationManager() : nullptr;
+            auto *sender = repl ? repl->GetViewer(MafiaNet::ToPeerGuid(packet->guid)) : nullptr;
+            if (!sender) {
+                return;
+            }
+            OnClientEvent(sender->GetNetworkID(), name, payload.GetPayload());
+        });
+
+        // A client announcing whether its player left voice chat on. The GUID is the packet's,
+        // never a field, so a peer can only ever speak for itself.
+        net->RegisterRPC<Framework::Networking::RPC::VoicePreference>([this, net](const Framework::Networking::RPC::VoicePreference &payload, MafiaNet::Packet *packet) {
+            if (!net->IsAuthenticated(packet->guid)) {
+                return;
+            }
+            _voiceServer.OnPlayerPreference(static_cast<uint64_t>(MafiaNet::ToPeerGuid(packet->guid)), payload.enabled);
+        });
+
+        // A player switching how far their voice carries. Same rule: the packet's GUID only.
+        net->RegisterRPC<Framework::Networking::RPC::VoiceTierRequest>([this, net](const Framework::Networking::RPC::VoiceTierRequest &payload, MafiaNet::Packet *packet) {
+            if (!net->IsAuthenticated(packet->guid)) {
+                return;
+            }
+            _voiceServer.OnTierRequest(static_cast<uint64_t>(MafiaNet::ToPeerGuid(packet->guid)), payload.tier);
+        });
+
+        // Voice frames are not RPCs: RakVoice writes a raw message id, so they surface on the
+        // unknown-packet path (the relay host deliberately declines to consume them itself).
+        net->SetUnknownPacketHandler([this, net](MafiaNet::Packet *packet) {
+            // GetPacketDataOffset() is the offset the peer resolved for this very packet, so an
+            // ID_TIMESTAMP prefix is already skipped.
+            const int offset = net->GetPacketDataOffset();
+            if (offset < 0 || static_cast<uint32_t>(offset) >= packet->length) {
+                return;
+            }
+            if (packet->data[offset] == ID_RAKVOICE_RELAY_DATA) {
+                _voiceServer.OnVoiceFrame(packet);
+            }
+        });
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Networking messages registered");
+    }
+
+    void Instance::OnSessionRequest(MafiaNet::RakNetGUID guid, const std::optional<Framework::Networking::RPC::ClientIdentity> &request) {
+        auto *net = _networkingEngine->GetNetworkServer();
+        if (!request) {
+            // Not a framework client of this protocol: there is nobody to ask playerConnecting about.
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Refusing a connection request from {} that carried no identity", guid.g);
+            net->RejectSession(guid, kUnidentifiedReason);
+            return;
+        }
+
+        // Sanitize before retention: nickname length-capped, ids digit strings or dropped, a ticket too
+        // long to be one dropped rather than cut.
+        auto identity = *request;
+        if (identity.name.size() > 64) {
+            identity.name.resize(64);
+        }
+        const auto digits = [](std::string &value, size_t max) {
+            if (value.size() > max || value.find_first_not_of("0123456789") != std::string::npos) {
+                value.clear();
+            }
+        };
+        digits(identity.steamId, 32);
+        digits(identity.discordId, 32);
+        digits(identity.hardwareId, 128);
+        if (identity.ticket.size() > Framework::Networking::RPC::ClientIdentity::kMaxTicketLength) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Dropping a {} byte ticket from {}", identity.ticket.size(), guid.g);
+            identity.ticket.clear();
+        }
+        net->SetPeerIdentity(guid, identity);
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Player {} guid {} hwid {} is connecting", identity.name, guid.g, identity.hardwareId);
+        if (!_connectionGate.Begin(guid, identity, net->GetAddress(guid))) {
+            AdmitSession(guid);
+        }
+    }
+
+    void Instance::AdmitSession(MafiaNet::RakNetGUID guid) {
+        auto *net = _networkingEngine->GetNetworkServer();
+        // The pool let the request in whatever the player count, so a queue can hold people while the
+        // server is full. Letting one in still needs a free slot.
+        if (net->GetPlayerCount() >= static_cast<uint32_t>(_opts.maxPlayers)) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Refusing guid {}: the server is full", guid.g);
+            net->RejectSession(guid, kServerFullReason);
+            return;
+        }
+        net->AcceptSession(guid);
+    }
+
+    void Instance::ApplyAdmissionDecisions() {
+        _admissionDecisions.clear();
+        _connectionGate.Collect(_admissionDecisions);
+        auto *net = _networkingEngine->GetNetworkServer();
+        for (const AdmissionDecision &decision : _admissionDecisions) {
+            if (decision.admitted) {
+                AdmitSession(decision.guid);
+            }
+            else {
+                net->RejectSession(decision.guid, decision.reason);
+            }
+        }
+    }
+
+    void Instance::HandleIncomingChat(uint64_t senderNetworkId, const std::string &text) {
+        if (text.empty()) {
+            return;
+        }
+        if (text[0] != '/') {
+            OnChatMessage(senderNetworkId, text);
+            return;
+        }
+        // Same tokenizer as console commands, so a line parses identically on both surfaces.
+        std::vector<std::string> tokens = Utils::CommandProcessor::Tokenize(std::string_view(text).substr(1));
+        if (tokens.empty()) {
+            return;
+        }
+        const std::string command = std::move(tokens.front());
+        tokens.erase(tokens.begin());
+        OnChatCommand(senderNetworkId, text, command, tokens);
+    }
+
+    void Instance::OnClientEvent(uint64_t senderNetworkId, const std::string &eventName, const std::string &payloadJson) {
+        if (!_scriptingModule) {
+            return;
+        }
+        auto *engine          = _scriptingModule->GetEngine();
+        auto *resourceManager = _scriptingModule->GetResourceManager();
+        if (!engine || !resourceManager || !engine->IsInitialized()) {
+            return;
+        }
+
+        v8::Isolate *isolate = engine->GetIsolate();
+        v8::Locker locker(isolate);
+        v8::Isolate::Scope isolateScope(isolate);
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = engine->GetContext();
+        v8::Context::Scope contextScope(context);
+
+        std::vector<v8::Local<v8::Value>> args;
+        args.push_back(WrapScriptPlayer(isolate, senderNetworkId));
+
+        // The payload is untrusted. Parse it under a TryCatch: v8 rejects (and schedules an exception
+        // for) inputs like too-deeply-nested JSON, so on any failure drop the whole event — continuing
+        // into EmitClient with an exception pending on the isolate would abort the process.
+        if (!payloadJson.empty()) {
+            v8::TryCatch tryCatch(isolate);
+            v8::Local<v8::String> jsonStr;
+            v8::Local<v8::Value> parsed;
+            if (!v8::String::NewFromUtf8(isolate, payloadJson.c_str()).ToLocal(&jsonStr) ||
+                !v8::JSON::Parse(context, jsonStr).ToLocal(&parsed)) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Dropping client event '{}' from {}: malformed JSON payload", eventName, senderNetworkId);
+                return;
+            }
+            args.push_back(parsed);
+        }
+
+        resourceManager->GetEvents().EmitClient(isolate, context, eventName, args);
+    }
+
+    v8::Local<v8::Value> Instance::WrapScriptPlayer(v8::Isolate *isolate, uint64_t networkId) {
+        Framework::Scripting::Builtins::Player::GetClass(isolate);
+        return v8pp::class_<Framework::Scripting::Builtins::Player>::create_object(isolate, networkId);
+    }
+
+    v8::Local<v8::Value> Instance::WrapScriptEntity(v8::Isolate *isolate, uint64_t networkId) {
+        return Integrations::Shared::Scripting::WrapEntityDefault(isolate, networkId);
+    }
+
+    std::string Instance::GetPackageStagingDir() const {
+        const auto scripting = GetScriptingModule();
+        const std::string assetsPath = Framework::Utils::GetAbsolutePathA(scripting ? scripting->GetResourcesPath() : _opts.resourcesPath);
+        return (std::filesystem::path(assetsPath).parent_path() / ".packages").string();
+    }
+
+    void Instance::InitAssetStreamer() {
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Setting up asset streamer...");
+        const auto net      = GetNetworkingEngine()->GetNetworkServer();
+        const auto streamer = net->GetAssetStreamer();
+
+        const auto scripting = GetScriptingModule();
+        if (!scripting) {
+            return;
+        }
+
+        // Containers are built once and shared by every client, so the key cannot be
+        // per-connection.
+        const std::string stagingDir = GetPackageStagingDir();
+        std::error_code ec;
+        std::filesystem::create_directories(stagingDir, ec);
+        if (ec) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Could not create the package staging directory '{}': {}", stagingDir, ec.message());
+            return;
+        }
+
+        // Persisted: the key feeds the container bytes, so a fresh one each restart would change
+        // every hash and re-download every resource. It guards the client cache, not these files.
+        if (!_packageKeyReady) {
+            const auto keyPath = (std::filesystem::path(stagingDir) / "package.key").string();
+
+            std::string storedHex;
+            if (std::ifstream keyFile(keyPath, std::ios::binary); keyFile.is_open()) {
+                std::getline(keyFile, storedHex);
+            }
+            while (!storedHex.empty() && (storedHex.back() == 0x0D || storedHex.back() == 0x0A)) {
+                storedHex.pop_back();
+            }
+
+            if (storedHex.size() == Framework::Utils::Crypto::kKeySize * 2 && Framework::Utils::Crypto::FromHex(storedHex, _packageKey.data(), _packageKey.size())) {
+                _packageKeyHex = storedHex;
+            }
+            else {
+                bool ok     = false;
+                _packageKey = Framework::Utils::Crypto::GenerateKey(&ok);
+                if (!ok) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Could not generate a resource package key; client resources will not be served");
+                    return;
+                }
+                _packageKeyHex = Framework::Utils::Crypto::ToHex(_packageKey.data(), _packageKey.size());
+
+                std::ofstream keyOut(keyPath, std::ios::binary | std::ios::trunc);
+                if (keyOut.is_open()) {
+                    keyOut << _packageKeyHex;
+                }
+                if (!keyOut.good()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Could not persist the resource package key to '{}'; clients will re-download resources after a restart", keyPath);
+                }
+            }
+            _packageKeyReady = true;
+        }
+
+        // Uploads are named relative to this, so clients receive a flat "<resource>.fwpak".
+        streamer->SetApplicationDirectory(stagingDir.c_str());
+        _packageHashes.clear();
+
+        const auto resourceManager = scripting->GetResourceManager();
+        if (!resourceManager) {
+            return;
+        }
+
+        // Clients never receive these, so a client manifest must not depend on them.
+        std::set<std::string> serverOnlyResources;
+        for (const auto &resourceName : resourceManager->GetAllResourceNames()) {
+            const auto resource = resourceManager->GetResource(resourceName);
+            if (resource && !resource->GetManifest().GetMafiaHubConfig().HasClientContent()) {
+                serverOnlyResources.insert(resourceName);
+            }
+        }
+
+        size_t packagedFiles = 0;
+        for (const auto &resourceName : resourceManager->GetAllResourceNames()) {
+            const auto resource = resourceManager->GetResource(resourceName);
+            if (!resource) {
+                continue;
+            }
+            if (!resource->GetManifest().GetMafiaHubConfig().HasClientContent()) {
+                continue;
+            }
+
+            Framework::Scripting::PackagedResource packaged;
+            std::string error;
+            if (!Framework::Scripting::ResourcePackager::Package(resourceName, resource->GetPath(), resource->GetManifest(), &_packageKey, packaged, error, serverOnlyResources)) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Could not package client resource '{}': {}", resourceName, error);
+                continue;
+            }
+
+            const std::string packageName = resourceName + Framework::Utils::Package::kExtension;
+            const auto packagePath        = std::filesystem::path(stagingDir) / packageName;
+
+            // An unchanged resource keeps its mtime, so the delta transfer has nothing to send.
+            bool needsWrite = true;
+            if (std::filesystem::exists(packagePath, ec) && !ec) {
+                const auto existing = Framework::Utils::Crypto::Sha256FileHex(packagePath.string());
+                needsWrite          = !Framework::Utils::Crypto::ConstantTimeEquals(existing, packaged.sha256);
+            }
+
+            if (needsWrite) {
+                std::ofstream out(packagePath, std::ios::binary | std::ios::trunc);
+                if (!out.is_open()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Could not write package '{}'", packagePath.string());
+                    continue;
+                }
+                out.write(packaged.blob.data(), static_cast<std::streamsize>(packaged.blob.size()));
+                if (!out.good()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed while writing package '{}'", packagePath.string());
+                    continue;
+                }
+            }
+
+            streamer->AddFile(packagePath.string().c_str(), packageName.c_str());
+            _packageHashes[resourceName] = packaged.sha256;
+            packagedFiles += packaged.fileCount;
+
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Packaged client resource '{}': {} files, {} bytes, sha256 {}{}", resourceName, packaged.fileCount, packaged.blob.size(), packaged.sha256.substr(0, 16), needsWrite ? "" : " (unchanged)");
+        }
+
+        // Asset paks: plain ZIPs the client's engine mounts, staged beside the packages and sent by
+        // the same delta transfer. A resource stopped at runtime ships none until it starts again.
+        _assetPaks.clear();
+        if (_opts.assetPakPolicy) {
+            if (!_assetPakBuilder.IsActive()) {
+                _assetPakBuilder.Init(_opts.assetPakPolicy, stagingDir);
+            }
+            for (const auto &resourceName : resourceManager->GetAllResourceNames()) {
+                const auto resource = resourceManager->GetResource(resourceName);
+                if (!resource || (_resourcesBooted && !resource->IsRunning())) {
+                    _assetPakBuilder.Forget(resourceName);
+                    continue;
+                }
+                std::vector<Framework::Networking::RPC::AssetPakInfo> paks = _assetPakBuilder.Build(resourceName, resource->GetPath());
+                for (const auto &pak : paks) {
+                    const std::string pakName = Framework::Utils::StreamedAssets::PakFileName(resourceName, pak.lane, pak.sha256);
+                    streamer->AddFile(_assetPakBuilder.PathOf(resourceName, pak).string().c_str(), pakName.c_str());
+                }
+                if (!paks.empty()) {
+                    _assetPaks[resourceName] = std::move(paks);
+                }
+            }
+        }
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Asset streamer ready with {} encrypted resource packages ({} files) and {} resource(s) shipping asset paks", _packageHashes.size(), packagedFiles, _assetPaks.size());
+    }
+
+    Framework::Networking::RPC::ResourceInfo Instance::DescribeResource(const std::string &name, const std::string &version) const {
+        Framework::Networking::RPC::ResourceInfo info;
+        info.name    = name;
+        info.version = version;
+        // Announced without a hash when packaging failed; the client refuses those unless the
+        // resource ships assets only.
+        if (const auto hash = _packageHashes.find(name); hash != _packageHashes.end()) {
+            info.packageHash = hash->second;
+        }
+        if (const auto paks = _assetPaks.find(name); paks != _assetPaks.end()) {
+            info.assetPaks = paks->second;
+        }
+        return info;
+    }
+
+    std::vector<Framework::Networking::RPC::ResourceInfo> Instance::DescribeClientResources() const {
+        std::vector<Framework::Networking::RPC::ResourceInfo> resources;
+        if (!_scriptingModule) {
+            return resources;
+        }
+        for (const auto &resource : _scriptingModule->GetClientResourceList()) {
+            resources.push_back(DescribeResource(resource.name, resource.version));
+        }
+        // A running resource with no client scripts still has its assets to send.
+        const auto *manager = _scriptingModule->GetResourceManager();
+        for (const auto &[name, paks] : _assetPaks) {
+            const auto described = std::find_if(resources.begin(), resources.end(), [&name](const Framework::Networking::RPC::ResourceInfo &info) {
+                return info.name == name;
+            });
+            const auto *resource = manager != nullptr ? manager->GetResource(name) : nullptr;
+            if (described == resources.end() && resource != nullptr && resource->IsRunning()) {
+                resources.push_back(DescribeResource(name, resource->GetVersion()));
+            }
+        }
+        return resources;
+    }
+
+    void Instance::BroadcastResourceRefresh(const std::string &name) {
+        if (!_scriptingModule || !_networkingEngine) {
+            return;
+        }
+        auto *rm = _scriptingModule->GetResourceManager();
+        if (!rm) {
+            return;
+        }
+        const auto *resource = rm->GetResource(name);
+        if (!resource) {
+            return;
+        }
+        const auto net = _networkingEngine->GetNetworkServer();
+        if (!net) {
+            return;
+        }
+
+        // Rebuild the streamer's upload list so changed files get fresh hashes;
+        // the delta transfer compares stored hashes. See docs/resource_hot_reload.md.
+        if (auto *streamer = net->GetAssetStreamer()) {
+            streamer->ClearUploads();
+        }
+        InitAssetStreamer();
+
+        // Only resources with a client entry point or asset paks need a client-side refresh.
+        const bool scripts = resource->GetManifest().GetMafiaHubConfig().HasClientContent();
+        const bool assets  = _assetPaks.contains(resource->GetName());
+        if (!scripts && !assets) {
+            return;
+        }
+        if (scripts && !_packageHashes.contains(resource->GetName())) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Not broadcasting refresh of '{}': packaging failed", name);
+            return;
+        }
+
+        Framework::Networking::RPC::ResourceRefresh refresh;
+        refresh.resources.push_back(DescribeResource(resource->GetName(), resource->GetVersion()));
+        net->BroadcastRPC(refresh);
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Broadcasting hot-reload of resource '{}' to clients", name);
+    }
+
+    void Instance::BroadcastResourceStop(const std::string &name) {
+        if (!_scriptingModule || !_networkingEngine) {
+            return;
+        }
+        auto *rm = _scriptingModule->GetResourceManager();
+        if (!rm) {
+            return;
+        }
+        const auto *resource = rm->GetResource(name);
+        if (!resource) {
+            return;
+        }
+        // Only client resources, and those shipping assets, need a client-side stop.
+        const bool assets = _assetPaks.erase(resource->GetName()) > 0;
+        _assetPakBuilder.Forget(resource->GetName());
+        if (!resource->GetManifest().GetMafiaHubConfig().HasClientContent() && !assets) {
+            return;
+        }
+
+        const auto net = _networkingEngine->GetNetworkServer();
+        if (!net) {
+            return;
+        }
+
+        // No streamer rebuild: stopping ships no files.
+        Framework::Networking::RPC::ResourceStop stop;
+        stop.resources.push_back({resource->GetName(), resource->GetVersion()});
+        net->BroadcastRPC(stop);
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Broadcasting stop of resource '{}' to clients", name);
+    }
+
+    void Instance::InitCommandListener() {
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Setting up command listener and processor...");
+        
+        _commandListener->SetCommandCallback([this](const std::string &command) {
+            this->HandleCommand(command);
+        });
+        
+        _commandProcessor->RegisterCommand(
+            "help", {},
+            [this](cxxopts::ParseResult &) {
+                std::stringstream ss;
+                for (const auto &name : _commandProcessor->GetCommandNames()) {
+                    ss << fmt::format("{} {:>8}\n", name, _commandProcessor->GetCommandInfo(name)->options->help());
+                }
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Available commands:\n{}", ss.str());
+            },
+            "Show this help message");
+            
+        _commandProcessor->RegisterCommand(
+            "quit", {},
+            [this](cxxopts::ParseResult &) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Stopping server...");
+                Shutdown();
+            },
+            "Stop the server");
+
+        // No argument: stop the server (back-compat). With one: stop a resource.
+        _commandProcessor->RegisterCommand(
+            "stop", {},
+            [this](cxxopts::ParseResult &result) {
+                const auto &args = result.unmatched();
+                if (args.empty()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Stopping server...");
+                    Shutdown();
+                    return;
+                }
+                auto *rm = _scriptingModule ? _scriptingModule->GetResourceManager() : nullptr;
+                if (!rm) {
+                    return;
+                }
+                auto res = rm->StopResource(args[0]);
+                if (res) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Stopped resource '{}'", args[0]);
+                } else {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed to stop '{}': {}", args[0], res.GetError());
+                }
+            },
+            "Stop a resource (stop <resource>), or the server if no resource is given");
+
+        _commandProcessor->RegisterCommand(
+            "status", {},
+            [this](cxxopts::ParseResult &) {
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Server status:");
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("  Name: {}", _opts.modName);
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("  Host: {}:{}", _opts.bindHost, _opts.bindPort);
+                
+                if (_networkingEngine) {
+                    const auto net = _networkingEngine->GetNetworkServer();
+                    const auto peer = net->GetPeer();
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("  Players: {}/{}", peer->NumberOfConnections(), _opts.maxPlayers);
+                }
+            },
+            "Show server status");
+
+        // Resource lifecycle commands. Helper folds the shared boilerplate
+        // (resolve manager, require a name, log the result).
+        auto resourceCommand = [this](std::string_view verb, auto op) {
+            return [this, verb, op](cxxopts::ParseResult &result) {
+                auto *rm = _scriptingModule ? _scriptingModule->GetResourceManager() : nullptr;
+                if (!rm) {
+                    return;
+                }
+                const auto &args = result.unmatched();
+                if (args.empty()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Usage: {} <resource>", verb);
+                    return;
+                }
+                auto res = op(rm, args[0]);
+                if (res) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("{}: '{}'", verb, args[0]);
+                } else {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed to {} '{}': {}", verb, args[0], res.GetError());
+                }
+            };
+        };
+
+        _commandProcessor->RegisterCommand(
+            "start", {},
+            resourceCommand("start", [](Framework::Scripting::ResourceManager *rm, const std::string &n) {
+                return rm->StartResource(n);
+            }),
+            "Start a resource: start <resource>");
+
+        _commandProcessor->RegisterCommand(
+            "restart", {},
+            resourceCommand("restart", [](Framework::Scripting::ResourceManager *rm, const std::string &n) {
+                if (!rm->IsResourceRunning(n)) {
+                    return Framework::Scripting::ResourceOperationResult(std::string("resource is not running (use start)"));
+                }
+                return rm->RestartResource(n);
+            }),
+            "Reload a running resource's code: restart <resource>");
+
+        // Start-or-reload — the canonical verb FiveM/MTASA operators expect.
+        _commandProcessor->RegisterCommand(
+            "ensure", {},
+            resourceCommand("ensure", [](Framework::Scripting::ResourceManager *rm, const std::string &n) {
+                return rm->IsResourceRunning(n) ? rm->RefreshResource(n) : rm->StartResource(n);
+            }),
+            "Start or reload a resource: ensure <resource>");
+
+        // Re-scan for new/changed resources (manifests), without restarting.
+        _commandProcessor->RegisterCommand(
+            "refresh", {},
+            [this](cxxopts::ParseResult &) {
+                auto *rm = _scriptingModule ? _scriptingModule->GetResourceManager() : nullptr;
+                if (!rm) {
+                    return;
+                }
+                auto added = rm->Rescan();
+                Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Refreshed resources ({} new)", added.size());
+            },
+            "Re-scan the resources directory for new/changed resources");
+
+        _commandProcessor->RegisterCommand(
+            "refreshall", {},
+            [this](cxxopts::ParseResult &) {
+                auto *rm = _scriptingModule ? _scriptingModule->GetResourceManager() : nullptr;
+                if (!rm) {
+                    return;
+                }
+                auto res = rm->RefreshAll();
+                if (res) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Refreshed all resources ({} affected)", res.GetValue().size());
+                } else {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed to refresh all resources: {}", res.GetError());
+                }
+            },
+            "Re-scan and reload all running resources from disk");
+
+        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->debug("Command listener and processor initialized");
+    }
+
+    void Instance::HandleCommand(std::string_view command) {
+        try {
+            auto result = _commandProcessor->ProcessCommand(command);
+            if (result.GetError() != Utils::CommandProcessorError::COMMAND_NONE) {
+                switch (result.GetError()) {
+                    case Utils::CommandProcessorError::COMMAND_PRINT_HELP:
+                        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("{}", result.GetValue());
+                        break;
+                    case Utils::CommandProcessorError::COMMAND_UNKNOWN: {
+                        // Not a built-in command; hand it to the mod override and the scripting layer.
+                        std::vector<std::string> tokens = Utils::CommandProcessor::Tokenize(command);
+                        if (!tokens.empty()) {
+                            const std::string name = std::move(tokens.front());
+                            tokens.erase(tokens.begin());
+                            OnConsoleCommand(std::string(command), name, tokens);
+                            EmitConsoleCommand(name, tokens);
+                        }
+                        break;
+                    }
+                    case Utils::CommandProcessorError::COMMAND_EMPTY_INPUT:
+                        break;
+                    case Utils::CommandProcessorError::COMMAND_INTERNAL_ERROR:
+                        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Error processing command ({}): {}", command, result.GetValue());
+                        break;
+                    default:
+                        Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Error processing command ({}): {}", command, static_cast<int>(result.GetError()));
+                        break;
+                }
+            }
+        }
+        catch (const std::exception &ex) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Error processing command: {}", ex.what());
+        }
+    }
+
+    void Instance::EmitConsoleCommand(const std::string &command, const std::vector<std::string> &args) {
+        if (!_scriptingModule) {
+            return;
+        }
+        auto *engine          = _scriptingModule->GetEngine();
+        auto *resourceManager = _scriptingModule->GetResourceManager();
+        if (!engine || !resourceManager || !engine->IsInitialized()) {
+            return;
+        }
+
+        v8::Isolate *isolate = engine->GetIsolate();
+        v8::Locker locker(isolate);
+        v8::Isolate::Scope isolateScope(isolate);
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = engine->GetContext();
+        v8::Context::Scope contextScope(context);
+
+        v8::Local<v8::Array> argsArr = v8::Array::New(isolate, static_cast<int>(args.size()));
+        for (size_t i = 0; i < args.size(); ++i) {
+            argsArr->Set(context, static_cast<uint32_t>(i), v8pp::to_v8(isolate, args[i])).Check();
+        }
+
+        std::vector<v8::Local<v8::Value>> eventArgs;
+        eventArgs.push_back(v8pp::to_v8(isolate, command));
+        eventArgs.push_back(argsArr);
+        resourceManager->GetEvents().EmitReserved(isolate, context, "consoleCommand", eventArgs);
+    }
+
+    void Instance::DispatchVoiceChanges() {
+        // Drained even without scripting, or the relay's queues grow for the life of the process.
+        _voiceServer.DrainTalkingChanges(_voiceTalkingChanges);
+        _voiceServer.DrainTierChanges(_voiceTierChanges);
+        if (_voiceTalkingChanges.empty() && _voiceTierChanges.empty()) {
+            return;
+        }
+
+        auto *engine          = _scriptingModule ? _scriptingModule->GetEngine() : nullptr;
+        auto *resourceManager = _scriptingModule ? _scriptingModule->GetResourceManager() : nullptr;
+        const bool scripting  = engine != nullptr && resourceManager != nullptr && engine->IsInitialized();
+
+        auto *networking  = GetNetworkingEngine();
+        auto *server      = networking ? networking->GetNetworkServer() : nullptr;
+        auto *replication = server ? server->GetReplicationManager() : nullptr;
+
+        // A peer whose viewer is already gone is skipped rather than reported against a
+        // network id that no longer names anyone.
+        const auto networkIdOf = [replication](uint64_t guid) -> std::optional<uint64_t> {
+            auto *viewer = replication ? replication->GetViewer(static_cast<MafiaNet::PeerGuid>(guid)) : nullptr;
+            return viewer ? std::optional<uint64_t>(static_cast<uint64_t>(viewer->GetNetworkID())) : std::nullopt;
+        };
+
+        for (const Voice::TalkingChange &change : _voiceTalkingChanges) {
+            if (const std::optional<uint64_t> networkId = networkIdOf(change.guid)) {
+                OnPlayerVoiceStateChanged(*networkId, change.talking);
+            }
+        }
+
+        if (!scripting) {
+            return;
+        }
+
+        v8::Isolate *isolate = engine->GetIsolate();
+        v8::Locker locker(isolate);
+        v8::Isolate::Scope isolateScope(isolate);
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = engine->GetContext();
+        v8::Context::Scope contextScope(context);
+
+        for (const Voice::TalkingChange &change : _voiceTalkingChanges) {
+            if (const std::optional<uint64_t> networkId = networkIdOf(change.guid)) {
+                std::vector<v8::Local<v8::Value>> args {WrapScriptPlayer(isolate, *networkId)};
+                resourceManager->GetEvents().EmitReserved(isolate, context, change.talking ? "playerVoiceStart" : "playerVoiceStop", args);
+            }
+        }
+
+        for (const Voice::TierChange &change : _voiceTierChanges) {
+            if (const std::optional<uint64_t> networkId = networkIdOf(change.guid)) {
+                std::vector<v8::Local<v8::Value>> args {WrapScriptPlayer(isolate, *networkId), v8pp::to_v8(isolate, static_cast<uint32_t>(change.tier))};
+                resourceManager->GetEvents().EmitReserved(isolate, context, "playerVoiceTierChange", args);
+            }
+        }
+    }
+
+    void Instance::Shutdown() {
+        if (_shuttingDown) {
+            return;
+        }
+
+        _shuttingDown = true;
+
+        PreShutdown();
+
+        Integrations::Shared::Scripting::ReleaseStateBagEvents(_stateBagEvents);
+
+        // Holds Promises of the engine torn down below.
+        _connectionGate.Shutdown();
+        CoreModules::SetConnectionGate(nullptr);
+
+        if (_scriptingModule) {
+            _scriptingModule->PreShutdown();
+        }
+
+        // Detach from the peer before the networking engine tears it down.
+        _voiceServer.Shutdown();
+
+        if (_networkingEngine) {
+            _networkingEngine->Shutdown();
+        }
+
+        if (_scriptingModule) {
+            _scriptingModule->Shutdown();
+        }
+
+        if (_webServer) {
+            _webServer->Shutdown();
+        }
+
+        if (_commandListener) {
+            _commandListener->Shutdown();
+        }
+
+        // Drain, never close: the reporter outlives this instance.
+        if (_crashReporter && _crashReporter->IsInitialized()) {
+            _crashReporter->Flush();
+        }
+
+        // Detach signal handlers
+        sig_detach(SIGINT, sig_slot(this, &Instance::OnSignal));
+        sig_detach(SIGTERM, sig_slot(this, &Instance::OnSignal));
+
+        CoreModules::SetNetworkPeer(nullptr);
+        CoreModules::SetReplication(nullptr);
+        CoreModules::SetVoiceServer(nullptr);
+        CoreModules::SetScriptingModule(nullptr);
+        CoreModules::Reset();
+
+        Lifecycle::Shutdown();
+
+        // Last: flush and tear down the async logging thread pool before static
+        // destruction can race it.
+        Logging::GetInstance()->Shutdown();
+    }
+
+    void Instance::Update() {
+        const auto start = std::chrono::steady_clock::now();
+        if (_nextTick <= start) {
+            FW_PROFILE_SCOPE_N("Server::Tick");
+
+            // Before the packet pump: voice frames are routed inline there, and must see the worlds
+            // scripts and PostUpdate set last tick, not the ones from before them.
+            auto *replication = _networkingEngine ? _networkingEngine->GetNetworkServer()->GetReplicationManager() : nullptr;
+            if (replication) {
+                FW_PROFILE_SCOPE_N("Server::VoicePositions");
+                _voiceServer.SyncAvatars(*replication);
+            }
+
+            if (_networkingEngine) {
+                FW_PROFILE_SCOPE_N("Server::Networking");
+                _networkingEngine->Update();
+            }
+
+            if (replication) {
+                _voiceServer.Update();
+            }
+
+            DispatchVoiceChanges();
+
+            if (_scriptingModule) {
+                FW_PROFILE_SCOPE_N("Server::Scripting");
+                _scriptingModule->Update();
+            }
+
+            if (_networkingEngine) {
+                FW_PROFILE_SCOPE_N("Server::Admission");
+                ApplyAdmissionDecisions();
+            }
+
+            if (_commandListener) {
+                FW_PROFILE_SCOPE_N("Server::Commands");
+                _commandListener->Update();
+            }
+
+            if (_masterlist->IsInitialized()) {
+                FW_PROFILE_SCOPE_N("Server::MasterlistPing");
+                Services::ServerInfo info {};
+                info.port           = _opts.bindPort;
+                info.gameMode       = _opts.modName;
+                info.version        = _opts.modVersion;
+                info.maxPlayers     = _opts.maxPlayers;
+                info.currentPlayers = _networkingEngine->GetNetworkServer()->GetPeer()->NumberOfConnections();
+                info.passworded     = !_opts.bindPassword.empty();
+                _masterlist->Ping(info);
+            }
+
+            {
+                FW_PROFILE_SCOPE_N("Server::PostUpdate");
+                PostUpdate();
+            }
+
+            FW_PROFILE_FRAME();
+
+            const auto end      = std::chrono::steady_clock::now();
+            const double tickMs = std::chrono::duration<double, std::milli>(end - start).count();
+            if (tickMs >= kTickHitchWarnMs) {
+                ++_suppressedHitches;
+                if (std::chrono::duration<double, std::milli>(end - _lastHitchWarnAt).count() >= kTickHitchWarnIntervalMs) {
+                    Logging::GetLogger(FRAMEWORK_INNER_SERVER)->warn("Server tick took {:.0f} ms against a {:.0f} ms budget ({} slow tick(s) since the last warning)", tickMs, Utils::Time::SecondsToMs(_opts.worldConfig.tickInterval), _suppressedHitches);
+                    _lastHitchWarnAt   = end;
+                    _suppressedHitches = 0;
+                }
+            }
+
+            // Tick work consumes the interval; overruns leave no wait and no catch-up backlog.
+            _nextTick = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(_opts.worldConfig.tickInterval));
+        }
+        else {
+            std::this_thread::sleep_until(_nextTick);
+        }
+    }
+    void Instance::Run() {
+        const TimerResolutionScope timerResolution;
+        while (_initialized && !_stopRequested) {
+            Update();
+            std::this_thread::yield();
+        }
+
+        if (_stopRequested) {
+            Logging::GetLogger(FRAMEWORK_INNER_SERVER)->info("Received shutdown signal, shutting down");
+        }
+    }
+
+    void Instance::OnSignal(const sig_signal_t signal) {
+        // Runs inside the signal handler, on top of whatever the interrupted
+        // thread was doing -- a V8 call, a socket read, a malloc. Tearing the
+        // server down from here frees everything under that frame and returns
+        // into it, which ends in SIGABRT, and logging or allocating is not
+        // signal-safe either. Only raise the flag; Run() returns on its next
+        // check and the caller's Shutdown() does the rest on the main thread.
+        if (signal.context != sig_ctx_sys()) {
+            return;
+        }
+
+        _stopRequested = true;
+    }
+
+    void Instance::RegisterScriptingBuiltins(Framework::Scripting::Engine *engine) {
+        // JS bindings are registered by ServerScriptingModule::RegisterFrameworkBindings
+        // This method is called to allow mod-specific customization
+        ModuleRegister(engine);
+    }
+
+} // namespace Framework::Integrations::Server

@@ -1,0 +1,275 @@
+name: Build MafiaHub Services
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+
+jobs:
+  check_submodule:
+    name: Check for services-adapter changes
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_changes.outputs.changed }}
+    steps:
+      - name: Checkout services-adapter repository
+        if: github.event_name == 'push'
+        uses: actions/checkout@v5
+        with:
+          repository: MafiaHub/services-adapter
+          path: services-adapter-repo
+          token: ${{ secrets.FW_SERVICES_PAT }}
+          fetch-depth: 0
+      
+      - name: Get latest commits and check for changes
+        id: check_changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual build requested. Triggering build."
+            echo "changed=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          cd services-adapter-repo
+          
+          # Get the timestamp of the last successful build from build.txt
+          LAST_BUILD_TIMESTAMP=$(curl -s -f -L https://github.com/MafiaHub/Framework/releases/download/MafiaHub-Services/build.txt || echo "0")
+          
+          echo "Raw timestamp response: '$LAST_BUILD_TIMESTAMP'"
+          
+          # Trim whitespace and make sure we have a valid number
+          LAST_BUILD_TIMESTAMP=$(echo "$LAST_BUILD_TIMESTAMP" | tr -d '[:space:]')
+          
+          if ! [[ "$LAST_BUILD_TIMESTAMP" =~ ^[0-9]+$ ]]; then
+            echo "Invalid timestamp format, defaulting to 0"
+            LAST_BUILD_TIMESTAMP=0
+          fi
+          
+          # Convert UNIX timestamp to date format for git log (Linux format)
+          if [ "$LAST_BUILD_TIMESTAMP" -gt 0 ]; then
+            LAST_BUILD_TIME=$(date -d "@$LAST_BUILD_TIMESTAMP" "+%Y-%m-%d %H:%M:%S")
+          else
+            # Default to a very old date if build.txt doesn't exist or can't be retrieved
+            LAST_BUILD_TIME="2000-01-01 00:00:00"
+          fi
+          
+          echo "Last successful build timestamp: $LAST_BUILD_TIMESTAMP"
+          echo "Last successful build time: $LAST_BUILD_TIME"
+          
+          # Check if there are any commits after the last build time
+          RECENT_COMMITS=$(git log --since="$LAST_BUILD_TIME" --pretty=format:"%h %s" --no-merges)
+          
+          if [ -n "$RECENT_COMMITS" ]; then
+            echo "Recent commits found in services-adapter:"
+            echo "$RECENT_COMMITS"
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Services adapter has changed since last build. Triggering build."
+          else
+            echo "No new commits in services-adapter since last build."
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+  notify_start:
+    name: Send Start Notification
+    needs: check_submodule
+    if: needs.check_submodule.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord Notification
+        uses: sarisia/actions-status-discord@v1
+        with:
+            webhook: ${{ secrets.RELEASES_WEBHOOK }}
+            title: "MafiaHub Services updating..."
+            nodetail: true
+            description: |
+              Do not sync your Framework repository until this process is finished.
+            color: 0x440000
+            username: MafiaHub Services
+            
+  build:
+    name: Build MafiaHubServices (${{ matrix.artifact_name }})
+    runs-on: ${{ matrix.os }}
+    needs: notify_start
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: mafiahub-services-windows-x64
+            msvc_arch: x64
+            build_type: "Release"
+          - os: windows-latest
+            artifact_name: mafiahub-services-windows-x86
+            msvc_arch: x86
+            build_type: "Release"
+          - os: ubuntu-latest
+            artifact_name: mafiahub-services-ubuntu-latest
+            cmake_generator: "Unix Makefiles"
+            build_type: "Release"
+          - os: macos-latest
+            artifact_name: mafiahub-services-macos-latest
+            cmake_generator: "Unix Makefiles"
+            build_type: "Release"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: false
+
+      - name: Checkout private services adapter
+        uses: actions/checkout@v5
+        with:
+          repository: MafiaHub/services-adapter
+          path: code/framework/src/services/src
+          token: ${{ secrets.FW_SERVICES_PAT }}
+                              
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+            xcode-version: '26.3'
+        if: runner.os == 'macOS'
+    
+      - name: Install tools on Ubuntu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build build-essential libcurl4-openssl-dev autoconf autoconf-archive automake libtool
+        if: runner.os == 'Linux'
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.31.0"
+      - name: Set up Visual Studio shell
+        if: runner.os == 'Windows'
+        uses: egor-tensin/vs-shell@v2
+        with:
+          arch: ${{ matrix.msvc_arch }}
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DMAFIAHUB_SERVICES_BUILD_FROM_SOURCE=ON
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -G "${{ matrix.cmake_generator }}" -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DMAFIAHUB_SERVICES_BUILD_FROM_SOURCE=ON
+      - name: Build MafiaHubServices
+        run: |
+          cmake --build build --target MafiaHubServices --config ${{ matrix.build_type }}
+      - name: Build MafiaHubUpdater
+        if: runner.os == 'Windows'
+        run: |
+          cmake --build build --target MafiaHubUpdater --config ${{ matrix.build_type }}
+      - name: Upload MafiaHub Services
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ github.workspace }}/code/framework/src/services/lib
+            ${{ github.workspace }}/code/framework/src/services/bin
+            ${{ github.workspace }}/code/framework/src/services/services
+          if-no-files-found: error
+          # Consumed by the release job in this same run and then published as
+          # release assets, which do not count against Actions storage. Keeping
+          # them for the default 90 days stored four platform builds per run
+          # for no reader.
+          retention-days: 1
+          compression-level: 9
+
+  release:
+    name: Create or Update Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+      
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: temp-artifacts
+          
+      - name: Create build.txt with timestamp
+        run: |
+          mkdir -p release-artifacts
+          # Create a clean timestamp without newlines or whitespace
+          echo -n "$(date +%s)" > release-artifacts/build.txt
+          cat release-artifacts/build.txt
+          echo "Created build.txt with timestamp: $(cat release-artifacts/build.txt)"
+          
+      - name: Zip artifacts by platform
+        run: |
+          # Zip each platform's artifacts separately
+          for platform in temp-artifacts/*; do
+            platform_name=$(basename "$platform")
+            cd "$platform"
+            zip -r "../../release-artifacts/$platform_name.zip" .
+            cd "../.."
+          done
+
+      - name: Check for existing release
+        id: check_release
+        run: |
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/MafiaHub-Services" | \
+            jq -r '.id // "null"')
+          echo "RELEASE_ID=$RELEASE_ID" >> $GITHUB_ENV
+          if [ "$RELEASE_ID" != "null" ]; then
+            echo "release_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "release_exists=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Delete existing release assets
+        if: steps.check_release.outputs.release_exists == 'true'
+        run: |
+          # Get all assets for the release
+          assets=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/${{ env.RELEASE_ID }}/assets")
+          
+          # Delete each asset
+          for asset_id in $(echo $assets | jq -r '.[].id'); do
+            curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/assets/$asset_id"
+          done
+      
+      - name: Create or update release
+        id: create_release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: MafiaHub-Services
+          name: MafiaHub Services
+          draft: false
+          prerelease: false
+          body: "MafiaHub Services automated build from ${{ github.sha }}"
+          files: release-artifacts/*.*
+          fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Discord Notification
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.RELEASES_WEBHOOK }}
+          title: "MafiaHub Services updated! 🎉"
+          nodetail: true
+          description: |
+            Make sure your Framework repository is up-to-date to avoid any conflicts.
+          color: 0x440000
+          username: MafiaHub Services
+
+  notify_failure:
+    name: Send Failure Notification
+    needs: [check_submodule, notify_start, build, release]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord Notification
+        uses: sarisia/actions-status-discord@v1
+        with:
+          webhook: ${{ secrets.RELEASES_WEBHOOK }}
+          title: "MafiaHub Services update failed!"
+          nodetail: true
+          description: |
+            The MafiaHub Services build or release failed.
+            [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          color: 0xFF0000
+          username: MafiaHub Services

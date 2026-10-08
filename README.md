@@ -50,9 +50,17 @@ people all look like Tommy for now. No cutscene sync: friends wait while you wat
 
 ## Source layout (GitHub: JustAddMP/MafiaDE)
 
-This repository holds the scripts, docs and the co-op gamemode, plus `overlay\`: every file we changed or added in
-the two upstream projects, [MafiaHub/Framework](https://github.com/MafiaHub/Framework) and
-[MafiaHub/MafiaMP](https://github.com/MafiaHub/MafiaMP), pinned to the commits in `overlay\VERSIONS.txt`.
-To rebuild from scratch: clone Framework at that commit into `Framework\`, MafiaMP at its commit into
-`Framework\code\projects\MafiaMP`, run `dev\apply_overlay.cmd`, then `dev\build_all.cmd`. After changing code,
-run `python dev\tools\export_overlay.py` before committing.
+Everything is in this repository as plain files:
+
+- `Framework\` — the MafiaHub Framework (multiplayer engine) with our changes. Upstream: MafiaHub/Framework, commit `dfecf5e`.
+- `Framework\code\projects\MafiaMP\` — the MafiaMP mod with our changes: story host, world mirror, NPC humans,
+  launcher, and the gamemode in `resources\coop-story\`. Upstream: MafiaHub/MafiaMP, commit `957905b`.
+- `dev\` scripts, this README, `server\server.json`.
+
+Not in the repo: build output (`Frameworkuilds`), vendor downloads the build fetches itself (vcpkg, CEF, libnode,
+Steam and Discord SDKs), MafiaMP's `files\` (loading videos, taken from an upstream clone or the friend package),
+`dist\`, and logs. Build from a clone with `devuild_all.cmd` (Visual Studio 2022 build tools; the first configure
+downloads the vendors).
+
+Committing: `python dev	ools\git_stage.py`, then `git commit` and `git push`. The two source trees keep their own
+upstream git metadata, which the staging script hides while adding.
