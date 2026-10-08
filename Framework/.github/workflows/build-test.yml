@@ -1,0 +1,89 @@
+name: Test Build
+
+on:
+    push:
+         branches: [ 'master' ]
+    pull_request:
+         branches: [ 'develop' ]
+    workflow_dispatch:
+
+env:
+    BUILD_TYPE: Debug
+    # vcpkg binary cache. Without one, every cold runner builds openssl, curl and sentry-native
+    # from source before a single Framework file compiles. x-gha needs no secrets, but GitHub
+    # scopes cache entries per ref: a run on a tag can only read what the default branch wrote.
+    # Set the VCPKG_BINARY_SOURCES repository variable to an S3/R2 or NuGet store to escape that,
+    # and to share one cache across every project and architecture.
+    VCPKG_BINARY_SOURCES: ${{ vars.VCPKG_BINARY_SOURCES || 'clear;x-gha,readwrite' }}
+
+jobs:
+  build:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        include:
+          - os: windows-latest
+            cmake_generator: "Visual Studio 17 2022"
+            build_type: "Debug"
+          - os: ubuntu-latest
+            cmake_generator: "Unix Makefiles"
+            build_type: "Debug"
+            extra_cmake_args: "-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++"
+          - os: macos-latest
+            cmake_generator: "Unix Makefiles"
+            build_type: "Debug"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: ${{ secrets.FW_SERVICES_PAT != '' && 'recursive' || 'false' }}
+          token: ${{ secrets.FW_SERVICES_PAT || github.token }}
+                              
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+            xcode-version: '26.3'
+        if: runner.os == 'macOS'
+    
+      - name: Install tools on Ubuntu
+        run: |
+          sudo apt-get update
+          # autoconf/automake/libtool are for vcpkg, not for us: sentry-native pulls libunwind
+          # on Linux, whose port is autotools-based and refuses to configure without them.
+          sudo apt-get install -y ninja-build build-essential g++ libcurl4-openssl-dev autoconf autoconf-archive automake libtool
+          echo "Building with:"; gcc --version; g++ --version
+        if: runner.os == 'Linux'
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: "~3.31.0"
+      
+      - name: Set up Visual Studio shell
+        if: runner.os == 'Windows'
+        uses: egor-tensin/vs-shell@v2
+
+      # vcpkg's x-gha backend reads these two out of the environment; the runner does not export
+      # them to job steps on its own.
+      - name: Export the Actions cache tokens for vcpkg
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -G "${{ matrix.cmake_generator }}" -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} ${{ matrix.extra_cmake_args }}
+
+      - name: Run the tests
+        run: |
+          cmake --build build --target RunFrameworkTests

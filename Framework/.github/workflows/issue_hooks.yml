@@ -1,0 +1,16 @@
+name: Add issues to MafiaHub Dashboard
+
+on:
+  issues:
+    types:
+      - opened
+
+jobs:
+  add-issue:
+    name: Add issue to project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/add-to-project@v2
+        with:
+          project-url: https://github.com/orgs/MafiaHub/projects/1
+          github-token: ${{ secrets.ISSUE_PAT }}

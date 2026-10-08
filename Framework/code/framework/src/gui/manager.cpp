@@ -1,0 +1,686 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2024, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "manager.h"
+
+#include <logging/logger.h>
+#include <utils/path.h>
+#include <utils/process_shutdown.h>
+#include <utils/profiler.h>
+
+#include "gui/backend/view_d3d11.h"
+#include "gui/backend/view_d3d12.h"
+#include "gui/backend/view_d3d9.h"
+#include "gui/resources/scheme.h"
+
+#include "include/cef_scheme.h"
+
+#include <imgui.h>
+
+#include <cstdlib>
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace Framework::GUI {
+    namespace {
+        constexpr std::size_t kMaxCefCacheProfiles = 16;
+
+        // ImGui has no wait/help/crosshair/zoom shapes; those fall back to the arrow.
+        ImGuiMouseCursor ToImGuiCursor(cef_cursor_type_t type) {
+            switch (type) {
+            case CT_IBEAM:
+            case CT_VERTICALTEXT: return ImGuiMouseCursor_TextInput;
+            case CT_HAND:
+            case CT_GRAB:
+            case CT_GRABBING: return ImGuiMouseCursor_Hand;
+            case CT_NODROP:
+            case CT_NOTALLOWED:
+            case CT_DND_NONE: return ImGuiMouseCursor_NotAllowed;
+            case CT_CELL:
+            case CT_MIDDLEPANNING:
+            case CT_MOVE: return ImGuiMouseCursor_ResizeAll;
+            case CT_MIDDLE_PANNING_VERTICAL:
+            case CT_NORTHRESIZE:
+            case CT_NORTHSOUTHRESIZE:
+            case CT_ROWRESIZE:
+            case CT_SOUTHRESIZE: return ImGuiMouseCursor_ResizeNS;
+            case CT_COLUMNRESIZE:
+            case CT_EASTRESIZE:
+            case CT_EASTWESTRESIZE:
+            case CT_MIDDLE_PANNING_HORIZONTAL:
+            case CT_WESTRESIZE: return ImGuiMouseCursor_ResizeEW;
+            case CT_NORTHEASTRESIZE:
+            case CT_NORTHEASTSOUTHWESTRESIZE:
+            case CT_SOUTHWESTRESIZE: return ImGuiMouseCursor_ResizeNESW;
+            case CT_NORTHWESTRESIZE:
+            case CT_NORTHWESTSOUTHEASTRESIZE:
+            case CT_SOUTHEASTRESIZE: return ImGuiMouseCursor_ResizeNWSE;
+            case CT_NONE: return ImGuiMouseCursor_None;
+            default: return ImGuiMouseCursor_Arrow;
+            }
+        }
+
+        // Guard the pump: some exit paths tear CEF down before our Shutdown runs.
+        // TODO(cef-exit): an exit-path-independent Shutdown trigger would remove this.
+        bool PumpCefMessageLoopGuarded() {
+            __try {
+                CefDoMessageLoopWork();
+                return true;
+            }
+            __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+                return false;
+            }
+        }
+
+        const char *CefResultCodeName(int code) {
+            switch (code) {
+            case CEF_RESULT_CODE_NORMAL_EXIT: return "NORMAL_EXIT";
+            case CEF_RESULT_CODE_KILLED: return "KILLED";
+            case CEF_RESULT_CODE_HUNG: return "HUNG";
+            case CEF_RESULT_CODE_KILLED_BAD_MESSAGE: return "KILLED_BAD_MESSAGE";
+            case CEF_RESULT_CODE_GPU_DEAD_ON_ARRIVAL: return "GPU_DEAD_ON_ARRIVAL";
+            case CEF_RESULT_CODE_BAD_PROCESS_TYPE: return "BAD_PROCESS_TYPE";
+            case CEF_RESULT_CODE_MISSING_DATA: return "MISSING_DATA";
+            case CEF_RESULT_CODE_UNSUPPORTED_PARAM: return "UNSUPPORTED_PARAM";
+            case CEF_RESULT_CODE_PROFILE_IN_USE: return "PROFILE_IN_USE";
+            case CEF_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED: return "NORMAL_EXIT_PROCESS_NOTIFIED";
+            case CEF_RESULT_CODE_INVALID_SANDBOX_STATE: return "INVALID_SANDBOX_STATE";
+            case CEF_RESULT_CODE_SYSTEM_RESOURCE_EXHAUSTED: return "SYSTEM_RESOURCE_EXHAUSTED";
+            default: return "unmapped";
+            }
+        }
+
+        const char *CefResultCodeHint(int code) {
+            switch (code) {
+            case CEF_RESULT_CODE_MISSING_DATA: return "a CEF runtime file is missing or unreadable";
+            case CEF_RESULT_CODE_PROFILE_IN_USE: return "another process still holds this cache profile; delete cache/profiles or end leftover cef_subprocess.exe";
+            case CEF_RESULT_CODE_NORMAL_EXIT_PROCESS_NOTIFIED: return "the profile was handed to an already-running browser process";
+            case CEF_RESULT_CODE_SYSTEM_RESOURCE_EXHAUSTED: return "the system is out of a resource CEF needs (handles, memory, desktop heap)";
+            default: return "";
+            }
+        }
+
+        std::string ResolveUiLocaleName() {
+            wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
+            if (LCIDToLocaleName(MAKELCID(GetUserDefaultUILanguage(), SORT_DEFAULT), name, LOCALE_NAME_MAX_LENGTH, 0) == 0) {
+                return {};
+            }
+            return std::filesystem::path(name).string();
+        }
+
+        void AuditCefRuntimeFiles(const std::filesystem::path &moduleDir) {
+            const auto logger = Framework::Logging::GetLogger("Web");
+
+            static constexpr const char *kRequiredFiles[] = {"libcef.dll", "cef_subprocess.exe", "chrome_elf.dll", "icudtl.dat", "resources.pak", "chrome_100_percent.pak", "chrome_200_percent.pak", "v8_context_snapshot.bin"};
+
+            std::error_code error;
+            bool complete = true;
+            for (const char *file : kRequiredFiles) {
+                const std::filesystem::path candidate = moduleDir / file;
+                if (!std::filesystem::is_regular_file(candidate, error)) {
+                    logger->error("CEF runtime file is missing: {}", candidate.string());
+                    complete = false;
+                }
+            }
+
+            const std::filesystem::path localesDir = moduleDir / "locales";
+            if (!std::filesystem::is_directory(localesDir, error)) {
+                logger->error("CEF locales directory is missing: {}", localesDir.string());
+                return;
+            }
+
+            std::size_t pakCount = 0;
+            for (const auto &entry : std::filesystem::directory_iterator(localesDir, error)) {
+                if (entry.path().extension() == ".pak") {
+                    ++pakCount;
+                }
+            }
+
+            const std::string uiLocale = ResolveUiLocaleName();
+            if (uiLocale.empty()) {
+                logger->error("CEF locales: {} pak(s) in '{}', OS UI locale could not be resolved", pakCount, localesDir.string());
+            }
+            else {
+                // Chromium falls back from the full name to the bare language.
+                const std::size_t separator          = uiLocale.find('-');
+                const std::filesystem::path exact    = localesDir / (uiLocale + ".pak");
+                const std::filesystem::path language = separator == std::string::npos ? exact : localesDir / (uiLocale.substr(0, separator) + ".pak");
+                const bool localeAvailable           = std::filesystem::is_regular_file(exact, error) || std::filesystem::is_regular_file(language, error);
+
+                logger->error("CEF locales: {} pak(s) in '{}', OS UI locale '{}', matching pak {}", pakCount, localesDir.string(), uiLocale, localeAvailable ? "present" : "MISSING");
+                complete = complete && localeAvailable;
+            }
+
+            if (complete) {
+                logger->error("CEF runtime files are all present; the failure is not a missing file");
+            }
+        }
+
+        std::optional<std::pair<std::filesystem::path, HANDLE>> ClaimCefCacheProfile(const std::string &rootDir) {
+            std::error_code error;
+            const std::filesystem::path profilesRoot = std::filesystem::absolute(std::filesystem::path(rootDir) / "cache" / "profiles", error);
+            if (error) {
+                return std::nullopt;
+            }
+
+            for (std::size_t index = 0; index < kMaxCefCacheProfiles; ++index) {
+                const std::filesystem::path profileRoot = profilesRoot / std::to_string(index);
+                std::filesystem::create_directories(profileRoot, error);
+                if (error) {
+                    return std::nullopt;
+                }
+
+                const std::filesystem::path lockPath = profileRoot / ".framework-profile.lock";
+                HANDLE profileLock = CreateFileW(lockPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN, nullptr);
+                if (profileLock != INVALID_HANDLE_VALUE) {
+                    return std::make_pair(profileRoot, profileLock);
+                }
+            }
+
+            return std::nullopt;
+        }
+    } // namespace
+    Manager::Manager() {
+        _clipboard        = std::make_unique<SystemClipboard>();
+        _resourceRegistry = new Resources::ResourceRegistry();
+    }
+
+    Manager::~Manager() {
+        if (IsInitialized()) {
+            Shutdown();
+        }
+    }
+
+    void Manager::Shutdown() {
+        bool cefStopped = false;
+        {
+            std::scoped_lock lock(_renderMutex);
+            for (auto &view : _views) {
+                view.reset();
+            }
+            _views.clear();
+            _dyingViews.clear();
+        }
+
+        if (_cefInitialized && _cefPumpFailed) {
+            Framework::Logging::GetLogger("Web")->debug("CEF pump previously faulted, skipping CefShutdown");
+            _cefInitialized = false;
+        }
+        else if (_cefInitialized) {
+            if (Framework::Utils::IsProcessShutdownInProgress()) {
+                // CEF's threads are already gone; CefShutdown would deadlock.
+                Framework::Logging::GetLogger("Web")->debug("Process teardown in progress, skipping CefShutdown");
+            }
+            else {
+                CefClearSchemeHandlerFactories();
+
+                // CloseBrowser is async: pump (guarded) until every browser hits
+                // OnBeforeClose, 3s cap, then a settle pass.
+                bool pumpOk   = true;
+                int drainedMs = 0;
+                while (pumpOk && CEF::LifeSpanHandler::GetLiveBrowserCount() > 0 && drainedMs < 3000) {
+                    pumpOk = PumpCefMessageLoopGuarded();
+                    Sleep(10);
+                    drainedMs += 10;
+                }
+                for (int i = 0; pumpOk && i < 50; i++) {
+                    pumpOk = PumpCefMessageLoopGuarded();
+                    Sleep(10);
+                }
+
+                if (pumpOk) {
+                    CefShutdown();
+                    cefStopped = true;
+                }
+                else {
+                    _cefPumpFailed = true;
+                    Framework::Logging::GetLogger("Web")->warn("CEF pump faulted during shutdown drain, skipping CefShutdown");
+                }
+            }
+            _cefInitialized = false;
+        }
+
+        // A skipped CefShutdown can leave CEF owning the profile until process
+        // exit. Keep our lock too so another client cannot claim that root.
+        if (cefStopped && _cacheProfileLock != INVALID_HANDLE_VALUE) {
+            CloseHandle(_cacheProfileLock);
+            _cacheProfileLock = INVALID_HANDLE_VALUE;
+        }
+
+        Lifecycle::Shutdown();
+    }
+
+    Utils::Result<void, Error> Manager::Init(const std::string &rootDir, ViewportConfiguration initialViewport, Graphics::Renderer *renderer, bool gpuAccelerated) {
+        if (_cefInitialized) {
+            return {};
+        }
+        _graphicsRenderer = renderer;
+        _gpuAccelerated   = gpuAccelerated;
+
+        SetViewportConfiguration(initialViewport);
+
+        // Configure CEF settings
+        CefSettings settings;
+        settings.windowless_rendering_enabled = true;
+        settings.multi_threaded_message_loop  = false;
+        settings.no_sandbox                   = true;
+        // Chromium logs a failed Hyper-V CPU counter every 15 seconds on any
+        // machine running VBS (CpuHealthTracker, which no switch or feature
+        // disables), burying every real error. CEF filters by severity only,
+        // so ERROR is opt-in for when the browser itself is being debugged.
+        const char *cefErrorLog = std::getenv("MafiaHubCefErrorLog");
+        settings.log_severity   = (cefErrorLog && *cefErrorLog) ? LOGSEVERITY_ERROR : LOGSEVERITY_FATAL;
+
+        std::error_code logDirError;
+        const std::filesystem::path logDir = std::filesystem::path(rootDir) / "logs";
+        std::filesystem::create_directories(logDir, logDirError);
+        const std::filesystem::path cefLogPath = logDir / "cef.log";
+        CefString(&settings.log_file)          = cefLogPath.wstring();
+
+        // CEF requires an absolute path for the subprocess executable
+        // Resolve next to THIS module (injected DLL), not the process exe.
+        const std::wstring moduleDirName = Framework::Utils::GetModuleDirW();
+        if (moduleDirName.empty()) {
+            Framework::Logging::GetLogger("Web")->error("Failed to resolve owning module for the CEF subprocess path");
+            return Error("Failed to resolve owning module for the CEF subprocess path");
+        }
+        const std::filesystem::path moduleDir        = moduleDirName;
+        const std::filesystem::path subprocessPath   = moduleDir / "cef_subprocess.exe";
+        CefString(&settings.browser_subprocess_path) = subprocessPath.wstring();
+
+        // CEF holds a process-singleton lock on root_cache_path. Stable numbered
+        // profiles keep browser storage across launches while the extra lock
+        // gives concurrent clients different roots. The OS releases it after a
+        // crash, so the lowest available profile is reusable on the next run.
+        const auto cacheProfile = ClaimCefCacheProfile(rootDir);
+        if (!cacheProfile) {
+            Framework::Logging::GetLogger("Web")->error("Failed to claim a CEF cache profile under '{}' ({} profiles tried, last error {}); is the directory writable?", (std::filesystem::path(rootDir) / "cache" / "profiles").string(), kMaxCefCacheProfiles, GetLastError());
+            return Error("Failed to claim a persistent CEF cache profile");
+        }
+        const std::filesystem::path &cacheRoot = cacheProfile->first;
+        _cacheProfileLock                      = cacheProfile->second;
+        CefString(&settings.root_cache_path)   = cacheRoot.wstring();
+        CefString(&settings.cache_path)        = cacheRoot.wstring();
+
+        // Create the CEF app
+        _cefApp = new CEF::App();
+        _cefApp->SetGPUAccelerated(gpuAccelerated);
+
+        Framework::Logging::GetLogger("Web")->debug("Initializing CEF: module '{}', cache profile '{}', log '{}'", moduleDir.string(), cacheRoot.string(), cefLogPath.string());
+
+        // Initialize CEF
+        CefMainArgs mainArgs(GetModuleHandle(nullptr));
+        if (!CefInitialize(mainArgs, settings, _cefApp, nullptr)) {
+            // CefGetExitCode is the only CEF call allowed after a failed init.
+            const int exitCode = CefGetExitCode();
+            const auto logger  = Framework::Logging::GetLogger("Web");
+            logger->error("CefInitialize failed: exit code {} ({})", exitCode, CefResultCodeName(exitCode));
+            if (const char *hint = CefResultCodeHint(exitCode); *hint) {
+                logger->error("{}", hint);
+            }
+            logger->error("CefInitialize inputs: module '{}', cache profile '{}'", moduleDir.string(), cacheRoot.string());
+            AuditCefRuntimeFiles(moduleDir);
+            if (std::filesystem::exists(cefLogPath, logDirError)) {
+                logger->error("Chromium logged the underlying error to '{}'", cefLogPath.string());
+            }
+            else {
+                logger->error("No '{}' was written; CEF bailed before its own logging came up", cefLogPath.string());
+            }
+
+            CloseHandle(_cacheProfileLock);
+            _cacheProfileLock = INVALID_HANDLE_VALUE;
+            return Error("Failed to initialize CEF");
+        }
+
+        // One factory for the whole scheme; an empty domain matches every host
+        // and the registry routes them, so CEF never learns about a root.
+        CefRegisterSchemeHandlerFactory(Resources::kResourceScheme, "", _resourceRegistry);
+
+        _cefInitialized = true;
+        _initialized    = true;
+        Framework::Logging::GetLogger("Web")->debug("Using persistent CEF cache profile '{}'", cacheRoot.string());
+        Framework::Logging::GetLogger("Web")->info("CEF initialized successfully");
+        return {};
+    }
+
+    void Manager::Update() {
+        if (!_cefInitialized || _cefPumpFailed) {
+            return;
+        }
+
+        // Pump OUTSIDE _renderMutex: it dispatches window messages that can block
+        // on the render thread (exit-flow RHI flush) and deadlock against Render.
+        {
+            // OnPaint runs inside here, on this thread: its zone nests under this one.
+            FW_PROFILE_SCOPE_N("Cef::Pump");
+            if (!PumpCefMessageLoopGuarded()) {
+                _cefPumpFailed = true;
+                Framework::Logging::GetLogger("Web")->warn("CEF message pump faulted (exit teardown race) — disabling further pumps");
+                return;
+            }
+        }
+
+        // Render() takes the same mutex from the Present hook, so this can be a stall
+        // rather than work; time it separately from what it guards.
+        std::unique_lock<std::recursive_mutex> lock;
+        {
+            FW_PROFILE_SCOPE_N("Cef::LockWait");
+            lock = std::unique_lock<std::recursive_mutex>(_renderMutex);
+        }
+
+        // One external begin frame per render frame bounds CEF's cadence to our loop.
+        {
+            FW_PROFILE_SCOPE_N("Cef::BeginFrames");
+            int visible = 0;
+            for (auto &view : _views) {
+                ReconcileSuppression(view.get());
+                view->RequestBeginFrame();
+                view->Update();
+                visible += view->IsOnScreen() ? 1 : 0;
+            }
+            FW_PROFILE_PLOT("cef.views", static_cast<int64_t>(_views.size()));
+            FW_PROFILE_PLOT("cef.views.visible", static_cast<int64_t>(visible));
+        }
+
+        // Free retired views once in-flight frames referencing their textures drained
+        constexpr int kDyingViewTicks = 8;
+        for (auto it = _dyingViews.begin(); it != _dyingViews.end();) {
+            if (++it->second > kDyingViewTicks) {
+                it = _dyingViews.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+
+    std::vector<GUI::View *> Manager::GetViewsByZIndex() const {
+        std::vector<GUI::View *> views;
+        for (const auto &view : _views) {
+            views.push_back(view.get());
+        }
+        std::sort(views.begin(), views.end(), [](GUI::View *a, GUI::View *b) {
+            return a->GetZIndex() < b->GetZIndex();
+        });
+        return views;
+    }
+
+    void Manager::SetCompositingSuppressed(bool suppressed) {
+        _compositingSuppressed.store(suppressed, std::memory_order_release);
+    }
+
+    bool Manager::IsCompositingSuppressed() const {
+        return _compositingSuppressed.load(std::memory_order_acquire);
+    }
+
+    bool Manager::IsViewComposited(const View *view) const {
+        return !IsCompositingSuppressed() || view->AlwaysComposites();
+    }
+
+    void Manager::ReconcileSuppression(View *view) {
+        // Per view per tick, not on the suppression edge: a view created or focused while
+        // suppression is up has to be caught too.
+        const bool composited = IsViewComposited(view);
+        view->SetAudioMuted(!composited);
+        if (!composited) {
+            if (view->HasFocus()) {
+                _focusSuspended.insert(view->GetId());
+                view->Focus(false); // a real blur, so the page gets its keyup instead of nothing
+            }
+            return;
+        }
+        if (_focusSuspended.erase(view->GetId()) > 0) {
+            view->Focus(true);
+        }
+    }
+
+    void Manager::SubmitImGuiDraws() {
+        if (!_cefInitialized || _cefPumpFailed) {
+            return;
+        }
+
+        std::scoped_lock lock(_renderMutex);
+
+        const View *cursorOwner = nullptr;
+        for (auto *view : GetViewsByZIndex()) {
+            view->SubmitImGuiDraw();
+            if (view->HasFocus() && view->IsOnScreen()) {
+                cursorOwner = view;
+            }
+        }
+
+        // Blink's cursor is set on the OS cursor, which a host drawing ImGui's software cursor
+        // never shows, so mirror the focused view's shape onto that instead. Topmost focused view
+        // wins; ImGui resets to the arrow each frame, so this only has to hold while one is up.
+        if (cursorOwner && ImGui::GetCurrentContext()) {
+            ImGui::SetMouseCursor(ToImGuiCursor(cursorOwner->GetCursorType()));
+        }
+    }
+
+    void Manager::Render() {
+        if (!_cefInitialized || _cefPumpFailed) {
+            return;
+        }
+
+        std::scoped_lock lock(_renderMutex);
+
+        for (auto *view : GetViewsByZIndex()) {
+            view->Render();
+        }
+    }
+
+    void Manager::ProcessMouseEvent(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) const {
+        std::scoped_lock lock(_renderMutex);
+        for (auto &view : _views) {
+            view->ProcessMouseEvent(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    void Manager::ProcessKeyboardEvent(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) const {
+        std::scoped_lock lock(_renderMutex);
+        for (auto &view : _views) {
+            view->ProcessKeyboardEvent(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    int Manager::CreateView(const std::string &url, int width, int height, int offsetX, int offsetY) {
+        if (!_cefInitialized) {
+            Framework::Logging::GetLogger("Web")->error("Failed to create view: CEF is not initialized");
+            return -1;
+        }
+
+        // 0x0 means "fill the viewport" and follow it across resizes
+        const bool autoResize = (width == 0 && height == 0);
+
+        const auto viewport = GetViewportConfiguration();
+        if (width == 0) {
+            width = viewport.width;
+        }
+
+        if (height == 0) {
+            height = viewport.height;
+        }
+
+        // Create the view based on the graphics backend
+        std::unique_ptr<View> view;
+        switch (_graphicsRenderer->GetBackendType()) {
+        case Graphics::RendererBackend::BACKEND_D3D_9:
+            view = std::make_unique<ViewD3D9>(++_id, _graphicsRenderer, this);
+            break;
+        case Graphics::RendererBackend::BACKEND_D3D_11:
+            view = std::make_unique<ViewD3D11>(++_id, _graphicsRenderer, this);
+            break;
+        case Graphics::RendererBackend::BACKEND_D3D_12:
+            view = std::make_unique<ViewD3D12>(++_id, _graphicsRenderer, this);
+            break;
+        default:
+            Framework::Logging::GetLogger("Web")->error("Failed to create view: Unsupported renderer backend");
+            return -1;
+        }
+        if (!view) {
+            Framework::Logging::GetLogger("Web")->error("Failed to create view: failed");
+            return -1;
+        }
+
+        if (auto result = view->Init(url, width, height, offsetX, offsetY, _gpuAccelerated); !result) {
+            Framework::Logging::GetLogger("Web")->error("Failed to create view: {}", result.GetError().message);
+            return -1;
+        }
+
+        view->SetAutoResize(autoResize);
+
+        {
+            std::scoped_lock lock(_renderMutex);
+            _views.push_back(std::move(view));
+        }
+
+        Framework::Logging::GetLogger("Web")->debug("Created view with id {}", _id);
+        return _id;
+    }
+
+    void Manager::Resize(int width, int height) {
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+
+        std::scoped_lock lock(_renderMutex);
+
+        // Callers hand us a size per window message, so the same size arrives many
+        // times over a drag-resize. Re-applying it costs a CEF relayout per view and,
+        // on the next Render(), a GPU drain plus texture reallocation.
+        if (width == _viewportConfiguration.width && height == _viewportConfiguration.height) {
+            return;
+        }
+
+        _viewportConfiguration.width  = width;
+        _viewportConfiguration.height = height;
+
+        for (auto &view : _views) {
+            if (view && view->IsAutoResize()) {
+                view->Resize(width, height);
+            }
+        }
+    }
+
+    void Manager::RetireView(std::unique_ptr<View> view) {
+        // Caller holds _renderMutex. Hide it, then let it age out in Update.
+        _focusSuspended.erase(view->GetId());
+        view->Display(false);
+        view->Focus(false);
+        _dyingViews.emplace_back(std::move(view), 0);
+    }
+
+    bool Manager::DestroyView(int id) {
+        if (!_cefInitialized) {
+            Framework::Logging::GetLogger("Web")->error("Failed to destroy view: CEF is not initialized");
+            return false;
+        }
+
+        std::scoped_lock lock(_renderMutex);
+
+        for (auto it = _views.begin(); it != _views.end(); ++it) {
+            if ((*it)->GetId() == id) {
+                RetireView(std::move(*it));
+                _views.erase(it);
+
+                Framework::Logging::GetLogger("Web")->debug("Destroyed view with id {}", id);
+                return true;
+            }
+        }
+
+        Framework::Logging::GetLogger("Web")->error("Failed to destroy view: View does not exist");
+        return false;
+    }
+
+    void Manager::CleanupViews() {
+        std::scoped_lock lock(_renderMutex);
+
+        for (auto it = _views.begin(); it != _views.end();) {
+            if ((*it)->IsGarbageCollected()) {
+                RetireView(std::move(*it));
+                it = _views.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+    }
+
+    bool Manager::IsAnyViewFocused() const {
+        std::scoped_lock lock(_renderMutex);
+        for (const auto &view : _views) {
+            if (view->HasFocus()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool Manager::IsAnyGCViewFocused() const {
+        std::scoped_lock lock(_renderMutex);
+        for (const auto &view : _views) {
+            if (view->HasFocus() && view->IsGarbageCollected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::vector<GUI::View *> Manager::GetAllViews() const {
+        std::scoped_lock lock(_renderMutex);
+        std::vector<GUI::View *> views;
+        for (const auto &view : _views) {
+            views.push_back(view.get());
+        }
+        return views;
+    }
+
+    std::vector<GUI::View *> Manager::GetGCViews() const {
+        std::scoped_lock lock(_renderMutex);
+        std::vector<GUI::View *> views;
+        for (const auto &view : _views) {
+            if (view->IsGarbageCollected()) {
+                views.push_back(view.get());
+            }
+        }
+        return views;
+    }
+
+    View *Manager::GetView(int id) const {
+        std::scoped_lock lock(_renderMutex);
+        for (auto it = _views.begin(); it != _views.end(); ++it) {
+            if ((*it)->GetId() == id) {
+                return it->get();
+            }
+        }
+        return nullptr;
+    }
+
+    void Manager::RegisterSchemeHandlerFactory(const std::string &schema, const std::string &domain, Framework::GUI::CEF::SchemaHandlerFactoryCallback callback) {
+        _cefApp->RegisterSchemeHandlerFactory(schema, domain, callback);
+        CefRegisterSchemeHandlerFactory(schema, domain, _cefApp);
+    }
+
+    void Manager::RegisterResourceRoot(const std::string &host, std::shared_ptr<Resources::ResourceProvider> provider) {
+        _resourceRegistry->RegisterRoot(host, std::move(provider));
+    }
+
+    void Manager::RegisterResourceDirectory(const std::string &host, const std::filesystem::path &root) {
+        RegisterResourceRoot(host, std::make_shared<Resources::DirectoryProvider>(root));
+    }
+
+    bool Manager::UnregisterResourceRoot(const std::string &host) {
+        return _resourceRegistry->UnregisterRoot(host);
+    }
+
+    std::string Manager::ResourceURL(const std::string &host, const std::string &path) {
+        return Resources::MakeResourceURL(host, path);
+    }
+} // namespace Framework::GUI

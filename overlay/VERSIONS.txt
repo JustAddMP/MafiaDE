@@ -1,5 +1,0 @@
-Framework https://github.com/MafiaHub/Framework.git dfecf5e8aee2c8a9661ae6c5b789c594d4fefbcb
-MafiaMP https://github.com/MafiaHub/MafiaMP.git 957905b51f4634c5855709d5f818d0f6b170b5e4
-
-Apply: clone Framework at that commit into G:\MafiaCoop\Framework, clone MafiaMP at its commit into
-Framework\code\projects\MafiaMP, then run dev\apply_overlay.cmd and dev\build_all.cmd.

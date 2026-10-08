@@ -1,0 +1,1477 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "instance.h"
+
+#include "integrations/shared/rpc/emit_script_event.h"
+#include "integrations/shared/scripting/state_bag_events.h"
+#include "scripting/builtins/entity.h"
+
+#include "networking/rpc/rpc.h"
+#include "networking/rpc/chat_message.h"
+#include "networking/rpc/voice_settings.h"
+#include "networking/rpc/client_identity.h"
+#include "networking/rpc/client_join.h"
+#include "networking/rpc/resource_refresh.h"
+#include "networking/rpc/server_resources.h"
+
+#include "integrations/client/scripting/builtins/keybinds.h"
+
+#include "scripting/resource/resource_manager.h"
+#include "scripting/builtins/events.h"
+
+#include "networking/channels.h"
+#include "networking/state.h"
+#include "networking/replication/replication_manager.h"
+
+#include <cppfs/cppfs.h>
+#include <cppfs/FilePath.h>
+#include <cppfs/FileHandle.h>
+#include <cppfs/fs.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <iterator>
+
+#include <logging/logger.h>
+
+#include "utils/path.h"
+#include "utils/streamed_assets/pak_archive.h"
+#include "utils/vfs.h"
+#include "utils/profiler.h"
+#include "utils/version.h"
+#include "utils/time.h"
+#include "utils/hardware_id.h"
+
+#include "core_modules.h"
+
+#include "graphics/backend/d3d11.h"
+#include "graphics/backend/d3d12.h"
+#include "graphics/backend/d3d9.h"
+
+namespace Framework::Integrations::Client {
+    namespace {
+        // A status line is one sentence on a connecting screen; the server caps it the same way.
+        constexpr size_t kMaxAdmissionStatusLength = 256;
+
+        // Handler for server-emitted scripting events; reaches the scripting engine through the
+        // CoreModules singleton.
+        void OnEmitScriptEvent(const Shared::RPC::EmitScriptEvent &rpc, MafiaNet::Packet *packet) {
+            (void)packet;
+            const auto eventName = rpc.GetEventName();
+            if (eventName.empty()) {
+                return;
+            }
+            const auto payloadStr = rpc.GetPayload();
+
+            auto *scriptingModule = static_cast<Client::Scripting::ClientScriptingModule *>(Framework::CoreModules::GetScriptingModule());
+            if (!scriptingModule) {
+                return;
+            }
+
+            // Emit to JavaScript resources via the Events system
+            auto resourceManager = scriptingModule->GetResourceManager();
+            if (!resourceManager) {
+                return;
+            }
+
+            auto *engine = scriptingModule->GetEngine();
+            if (!engine || !engine->IsInitialized()) {
+                return;
+            }
+
+            v8::Isolate *isolate = engine->GetIsolate();
+            v8::Locker locker(isolate);
+            v8::Isolate::Scope isolateScope(isolate);
+            v8::HandleScope handleScope(isolate);
+            v8::Local<v8::Context> context = engine->GetContext();
+            v8::Context::Scope contextScope(context);
+
+            // Parse JSON payload and emit event
+            std::vector<v8::Local<v8::Value>> args;
+            if (!payloadStr.empty()) {
+                v8::Local<v8::String> jsonStr;
+                if (!v8::String::NewFromUtf8(isolate, payloadStr.c_str()).ToLocal(&jsonStr)) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Failed to create V8 string from event payload: {}", payloadStr);
+                    return;
+                }
+
+                v8::TryCatch tryCatch(isolate);
+                v8::Local<v8::Value> parsed;
+                if (!v8::JSON::Parse(context, jsonStr).ToLocal(&parsed)) {
+                    if (tryCatch.HasCaught()) {
+                        v8::String::Utf8Value errorMsg(isolate, tryCatch.Exception());
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Failed to parse event payload JSON: {}", *errorMsg ? *errorMsg : "unknown error");
+                    }
+                    else {
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Failed to parse event payload JSON: {}", payloadStr);
+                    }
+                    return;
+                }
+                args.push_back(parsed);
+            }
+
+            Framework::Scripting::Builtins::Events &events = resourceManager->GetEvents();
+            events.EmitReserved(isolate, context, eventName, args);
+        }
+
+        // Reserved "chatMessage" event carrying { author, text, color }.
+        void EmitChatMessageEvent(const Framework::Networking::RPC::ChatMessage &msg) {
+            auto *scriptingModule = static_cast<Client::Scripting::ClientScriptingModule *>(Framework::CoreModules::GetScriptingModule());
+            if (!scriptingModule) {
+                return;
+            }
+            auto resourceManager = scriptingModule->GetResourceManager();
+            if (!resourceManager) {
+                return;
+            }
+            auto *engine = scriptingModule->GetEngine();
+            if (!engine || !engine->IsInitialized()) {
+                return;
+            }
+
+            v8::Isolate *isolate = engine->GetIsolate();
+            v8::Locker locker(isolate);
+            v8::Isolate::Scope isolateScope(isolate);
+            v8::HandleScope handleScope(isolate);
+            v8::Local<v8::Context> context = engine->GetContext();
+            v8::Context::Scope contextScope(context);
+
+            v8::Local<v8::String> authorStr;
+            v8::Local<v8::String> textStr;
+            if (!v8::String::NewFromUtf8(isolate, msg.author.c_str()).ToLocal(&authorStr) || !v8::String::NewFromUtf8(isolate, msg.text.c_str()).ToLocal(&textStr)) {
+                return;
+            }
+            v8::Local<v8::Object> obj = v8::Object::New(isolate);
+            obj->Set(context, v8::String::NewFromUtf8Literal(isolate, "author"), authorStr).Check();
+            obj->Set(context, v8::String::NewFromUtf8Literal(isolate, "text"), textStr).Check();
+            obj->Set(context, v8::String::NewFromUtf8Literal(isolate, "color"), v8::Uint32::NewFromUnsigned(isolate, msg.color)).Check();
+
+            std::vector<v8::Local<v8::Value>> args {obj};
+            Framework::Scripting::Builtins::Events &events = resourceManager->GetEvents();
+            events.EmitReserved(isolate, context, "chatMessage", args);
+        }
+
+        // Reserved "chatSend" event. False means a handler blocked the line; no scripting, no veto.
+        bool EmitChatSendEvent(const std::string &text) {
+            auto *scriptingModule = static_cast<Client::Scripting::ClientScriptingModule *>(Framework::CoreModules::GetScriptingModule());
+            if (!scriptingModule) {
+                return true;
+            }
+            auto resourceManager = scriptingModule->GetResourceManager();
+            if (!resourceManager) {
+                return true;
+            }
+            auto *engine = scriptingModule->GetEngine();
+            if (!engine || !engine->IsInitialized()) {
+                return true;
+            }
+
+            v8::Isolate *isolate = engine->GetIsolate();
+            v8::Locker locker(isolate);
+            v8::Isolate::Scope isolateScope(isolate);
+            v8::HandleScope handleScope(isolate);
+            v8::Local<v8::Context> context = engine->GetContext();
+            v8::Context::Scope contextScope(context);
+
+            v8::Local<v8::String> textStr;
+            if (!v8::String::NewFromUtf8(isolate, text.c_str()).ToLocal(&textStr)) {
+                return true;
+            }
+
+            std::vector<v8::Local<v8::Value>> args {textStr};
+            return resourceManager->GetEvents().EmitReservedSync(isolate, context, "chatSend", args);
+        }
+    } // namespace
+
+    void Instance::DispatchReceivedChat(const Framework::Networking::RPC::ChatMessage &msg) {
+        EmitChatMessageEvent(msg);
+        if (_chatBox.IsVisible()) {
+            _chatBox.AddMessage(msg.author, msg.text, msg.color);
+        }
+        OnChatMessageReceived(msg);
+    }
+
+    bool AssetDownloadFileProgress::OnFile(MafiaNet::FileListTransferCBInterface::OnFileStruct *onFileStruct) {
+        if (onFileStruct->numberOfFilesInThisSet > 0) {
+            auto &downloadStatus           = _instance->GetAssetDownloadStatus();
+            downloadStatus.downloading     = true;
+            downloadStatus.setID           = onFileStruct->setID;
+            downloadStatus.filesTotal      = onFileStruct->numberOfFilesInThisSet;
+            downloadStatus.bytesTotal      = onFileStruct->byteLengthOfThisSet;
+            downloadStatus.bytesDownloaded = onFileStruct->bytesDownloadedForThisSet;
+            downloadStatus.currentFile     = onFileStruct->fileName;
+            downloadStatus.progress        = onFileStruct->byteLengthOfThisSet > 0 ? onFileStruct->bytesDownloadedForThisSet / float(onFileStruct->byteLengthOfThisSet) : 0.0f;
+            if (onFileStruct->bytesDownloadedForThisFile == onFileStruct->byteLengthOfThisFile) {
+                downloadStatus.filesDownloaded = onFileStruct->fileIndex + 1;
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Asset downloaded ({}/{} - {}%): {}", onFileStruct->fileIndex + 1, onFileStruct->numberOfFilesInThisSet, int(downloadStatus.progress * 100.0f), onFileStruct->fileName);
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+            }
+            _instance->OnAssetsDownloadProgress(downloadStatus);
+        }
+        return true;
+    }
+
+    void AssetDownloadFileProgress::OnFileProgress(MafiaNet::FileListTransferCBInterface::FileProgressStruct *fps) {
+        auto *onFileStruct = fps->onFileStruct;
+        if (!onFileStruct || onFileStruct->byteLengthOfThisSet == 0) {
+            return;
+        }
+        auto &downloadStatus           = _instance->GetAssetDownloadStatus();
+        downloadStatus.downloading     = true;
+        downloadStatus.setID           = onFileStruct->setID;
+        downloadStatus.filesTotal      = onFileStruct->numberOfFilesInThisSet;
+        downloadStatus.bytesTotal      = onFileStruct->byteLengthOfThisSet;
+        downloadStatus.bytesDownloaded = onFileStruct->bytesDownloadedForThisSet;
+        downloadStatus.currentFile     = onFileStruct->fileName;
+        downloadStatus.progress        = onFileStruct->bytesDownloadedForThisSet / float(onFileStruct->byteLengthOfThisSet);
+        _instance->OnAssetsDownloadProgress(downloadStatus);
+    }
+
+    bool AssetDownloadFileProgress::OnDownloadComplete(DownloadCompleteStruct *dcs) {
+        (void)dcs;
+
+        auto &downloadStatus           = _instance->GetAssetDownloadStatus();
+        downloadStatus.progress        = 1.0f;
+        downloadStatus.downloading     = false;
+        downloadStatus.bytesDownloaded = downloadStatus.bytesTotal;
+        downloadStatus.filesDownloaded = downloadStatus.filesTotal;
+        _instance->OnAssetsDownloadProgress(downloadStatus);
+        _instance->OnAssetsDownloaded(true);
+        return false;
+    }
+
+    Instance::Instance() {
+        _networkingEngine = std::make_unique<Networking::Engine>();
+        _presence         = std::make_unique<External::Discord::Wrapper>();
+        _imguiApp         = std::make_unique<External::ImGUI::Wrapper>();
+        _renderer         = std::make_unique<Graphics::Renderer>();
+        _renderIO         = std::make_unique<Graphics::RenderIO>();
+        _scriptingModule  = std::make_unique<Client::Scripting::ClientScriptingModule>();
+        _webManager = std::make_unique<Framework::GUI::Manager>();
+        _crashReporter = &External::Sentry::GetCrashReporter();
+
+        // Typed lines go through "chatSend" first; Chat.send is the raw path, so a handler can
+        // veto and resend without re-entering itself.
+        _chatBox.SetSubmitHandler([this](const std::string &text) {
+            if (!EmitChatSendEvent(text)) {
+                return;
+            }
+            SendChatMessage(text);
+        });
+    }
+
+    Instance::~Instance() = default;
+
+    Utils::Result<void, Error> Instance::Init(InstanceOptions &opts) {
+        _opts = opts;
+
+        if (opts.gameName.empty() || opts.gameVersion.empty()) {
+            return Error("Game name and version are required");
+        }
+
+        CoreModules::SetClientInstance(this);
+
+        // Crash reporting comes up first so its handler is installed before anything else can fault.
+        // An entry-point InitCrashReporter already installed it; this is then a no-op and only the
+        // decoration below applies.
+        if (_crashReporter && !opts.sentryDSN.empty()) {
+            External::Sentry::InitOptions sentryOpts;
+            sentryOpts.dsn         = opts.sentryDSN;
+            sentryOpts.handlerPath = opts.sentryModulePath.empty() ? "." : opts.sentryModulePath;
+            sentryOpts.release     = opts.sentryRelease.empty() ? opts.gameName + "@" + opts.gameVersion : opts.sentryRelease;
+            sentryOpts.environment = opts.sentryEnvironment;
+            sentryOpts.attachments = opts.sentryAttachments;
+            if (auto sentryResult = External::Sentry::InitCrashReporter(sentryOpts); !sentryResult) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Crash reporting disabled: {}", sentryResult.GetError().message);
+            }
+            else {
+                _crashReporter->SetGameInformation({opts.gameName, opts.gameVersion + " / mod " + opts.modVersion});
+                _crashReporter->SetTag("net.role", "client");
+                _crashReporter->SetTag("build.game_version", opts.gameVersion);
+                _crashReporter->SetTag("build.mod_version", opts.modVersion);
+
+                const auto *logger = Logging::GetInstance();
+                _crashReporter->AddAttachment(logger->GetLogFolder() + "/" + logger->GetLogName() + ".log");
+
+                auto *reporter = _crashReporter;
+                Logging::GetInstance()->SetLogForwarder([reporter](int level, const std::string &name, const std::string &message) {
+                    External::Sentry::Level mapped = External::Sentry::Level::Info;
+                    if (level >= spdlog::level::critical) {
+                        mapped = External::Sentry::Level::Fatal;
+                    }
+                    else if (level >= spdlog::level::err) {
+                        mapped = External::Sentry::Level::Error;
+                    }
+                    else if (level >= spdlog::level::warn) {
+                        mapped = External::Sentry::Level::Warning;
+                    }
+                    reporter->AddBreadcrumb(name, message, mapped);
+                });
+
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Crash reporting initialized");
+            }
+        }
+
+        if (opts.usePresence) {
+            if (_presence && opts.discordAppId > 0) {
+                if (auto discordResult = _presence->Init(opts.discordAppId); !discordResult) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Discord Presence failed to initialize: {}", discordResult.GetError().message);
+                }
+                else {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Discord presence initialized");
+                }
+            }
+        }
+
+        if (_networkingEngine) {
+            if (auto netResult = _networkingEngine->Init(); !netResult) {
+                return netResult;
+            }
+            CoreModules::SetNetworkPeer(_networkingEngine->GetNetworkClient());
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Networking engine initialized");
+
+            // Attaches RakVoice to the live peer, so it must follow the networking engine.
+            // The relay session itself opens later, on connect.
+            if (_voiceClient.Init(_networkingEngine->GetNetworkClient())) {
+                CoreModules::SetVoiceClient(&_voiceClient);
+            }
+            else {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice client unavailable; voice chat disabled");
+            }
+        }
+
+        CoreModules::SetWebManager(_webManager.get());
+
+        InitNetworkingMessages();
+        InitAssetDownloader();
+        
+        if (!opts.initRendererManually) {
+            if (auto renderResult = RenderInit(); !renderResult) {
+                return renderResult;
+            }
+        }
+
+        PostInit();
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Mod subsystems initialized");
+
+        // Store reference to the input system
+        CoreModules::SetInput(GetBaseInput());
+
+        // Default gate, so a mod overrides IsLocalInputAvailable() instead of wiring a callback
+        // that drifts from it.
+        Client::Scripting::Builtins::Keybinds::SetActiveCallback([this]() {
+            return IsLocalInputAvailable();
+        });
+
+        Framework::Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Client has been initialized");
+        _initialized = true;
+        InitProtocolHandler();
+        return {};
+    }
+
+    void Instance::InitAssetDownloader() {
+        InitCacheAssetFolders();
+
+        GetNetworkingEngine()->GetNetworkClient()->SetOnAssetsDownloadFailedCallback([this]() {
+            this->OnAssetsDownloaded(false);
+        });
+    }
+
+    bool Instance::IsLocalInputAvailable() const {
+        // The chat box's session flag is the framework's own record of "connected and finalized".
+        if (!_chatBox.IsSessionActive() || _chatBox.IsInputActive()) {
+            return false;
+        }
+        if (_webManager && _webManager->IsAnyViewFocused()) {
+            return false;
+        }
+#ifdef _WIN32
+        const HWND foreground = ::GetForegroundWindow();
+        if (const HWND window = _renderer ? _renderer->GetWindow() : nullptr) {
+            return foreground == window;
+        }
+        // No window to compare (renderer not up yet, or a mod running without one): owning the
+        // foreground at all beats reporting the whole process backgrounded.
+        DWORD pid = 0;
+        ::GetWindowThreadProcessId(foreground, &pid);
+        return pid == ::GetCurrentProcessId();
+#else
+        return true;
+#endif
+    }
+
+    void Instance::InitProtocolHandler() {
+#ifdef _WIN32
+        char urlBuffer[2048] = {};
+        if (GetEnvironmentVariableA("MafiaHubLaunchURL", urlBuffer, sizeof(urlBuffer)) > 0 && urlBuffer[0]) {
+            SetEnvironmentVariableA("MafiaHubLaunchURL", nullptr); // clear so it can't leak into children
+            OnProtocolLaunch(urlBuffer);
+        }
+#endif
+    }
+
+    std::string Instance::GetCacheRoot() const {
+        if (!_opts.cacheRoot.empty()) {
+            return _opts.cacheRoot;
+        }
+        return fmt::format("{}\\MafiaHubIntegration", Framework::Utils::GetAppDataPathA());
+    }
+
+    void Instance::InitCacheAssetFolders() {
+        std::error_code code;
+        std::filesystem::create_directories(std::filesystem::path(GetCacheRoot()) / "servers", code);
+    }
+
+    Utils::Result<void, Error> Instance::RenderInit() {
+        if (_renderInitialized) {
+            return {};
+        }
+
+        // Init the render device
+        if (_opts.useRenderer) {
+            if (_renderer) {
+                if (auto renderResult = _renderer->Init(_opts.rendererOptions); !renderResult) {
+                    return renderResult;
+                }
+
+                // Renderer::Init already built and initialized the backend for the
+                // configured API; initializing it a second time here rebuilt every
+                // descriptor heap, allocator and command list, leaking the first set
+                // along with a device reference.
+                _renderer->SetWindow(_opts.rendererOptions.windowHandle);
+
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Rendering systems initialized");
+            }
+
+            if (_opts.useImGUI) {
+                // Init the ImGui internal instance
+                External::ImGUI::Config imguiConfig;
+                imguiConfig.renderBackend = _opts.rendererOptions.backend;
+                imguiConfig.windowBackend = _opts.rendererOptions.platform;
+                imguiConfig.renderer      = _renderer.get();
+                imguiConfig.windowHandle  = _renderer->GetWindow();
+                imguiConfig.fontPath      = _opts.imguiFontPath;
+                imguiConfig.fontSize      = _opts.imguiFontSize;
+                imguiConfig.fonts         = _opts.imguiFonts;
+                if (auto imguiResult = _imguiApp->Init(imguiConfig); !imguiResult) {
+                    Logging::GetLogger(FRAMEWORK_INNER_GRAPHICS)->info("ImGUI has failed to init: {}", imguiResult.GetError().message);
+                }
+            }
+        }
+
+        _renderInitialized = true;
+        return {};
+    }
+
+    void Instance::Shutdown() {
+        PreShutdown();
+
+        Integrations::Shared::Scripting::ReleaseStateBagEvents(_stateBagEvents);
+
+        // Before the renderer: CefShutdown must drain the browsers while the device is
+        // alive, else the guarded pump faults and orphans cef_subprocess.exe.
+        if (_webManager && _webManager->IsInitialized()) {
+            _webManager->Shutdown();
+        }
+
+        // Also before the renderer: ImGui frees its font atlas through wrapper.cpp's
+        // SRV callbacks, which read the heap and device off D3D12Backend. Shutdown()
+        // nulls both, so freeing the atlas after it faults.
+        if (_imguiApp && _imguiApp->IsInitialized()) {
+            _imguiApp->Shutdown();
+            if (_imguiApp->IsInitialized()) {
+                // A failed GPU drain retains ImGui's resources. Keep their renderer
+                // and this instance alive so a later Shutdown() can retry safely.
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Client shutdown deferred: ImGui is waiting for the GPU");
+                return;
+            }
+        }
+
+        if (_renderer && _renderer->IsInitialized()) {
+            _renderer->Shutdown();
+        }
+
+        if (_presence && _presence->IsInitialized()) {
+            _presence->Shutdown();
+        }
+
+        // Before the networking engine: this detaches the plugin from the peer.
+        _voiceClient.Shutdown();
+
+        if (_networkingEngine) {
+            _networkingEngine->Shutdown();
+        }
+
+        if (_scriptingModule) {
+            _scriptingModule->Shutdown();
+        }
+
+        // Drain, never close: the reporter outlives this instance.
+        if (_crashReporter && _crashReporter->IsInitialized()) {
+            _crashReporter->Flush();
+        }
+
+        CoreModules::SetScriptingModule(nullptr);
+        CoreModules::SetWebManager(nullptr);
+        CoreModules::SetVoiceClient(nullptr);
+        CoreModules::SetNetworkPeer(nullptr);
+        CoreModules::SetReplication(nullptr);
+        CoreModules::SetInput(nullptr);
+        CoreModules::SetClientInstance(nullptr);
+        Client::Scripting::Builtins::Keybinds::SetActiveCallback(nullptr); // captures `this`
+        CoreModules::Reset();
+
+        Lifecycle::Shutdown();
+
+        // Last: flush and tear down the async logging thread pool before static
+        // destruction can race it.
+        Logging::GetInstance()->Shutdown();
+    }
+
+    v8::Local<v8::Value> Instance::WrapScriptEntity(v8::Isolate *isolate, uint64_t networkId) {
+        return Integrations::Shared::Scripting::WrapEntityDefault(isolate, networkId);
+    }
+
+    void Instance::Update() {
+        FW_PROFILE_SCOPE_N("Client::Update");
+
+        if (_presence && _presence->IsInitialized()) {
+            FW_PROFILE_SCOPE_N("Client::Presence");
+            _presence->Update();
+        }
+
+        UpdateNetworking();
+
+        if (_scriptingModule) {
+            FW_PROFILE_SCOPE_N("Client::Scripting");
+            _scriptingModule->Update();
+        }
+
+        if (_imguiApp && _imguiApp->IsInitialized()) {
+            FW_PROFILE_SCOPE_N("Client::ImGui");
+            _imguiApp->Update();
+        }
+
+        if (_renderIO) {
+            FW_PROFILE_SCOPE_N("Client::RenderIO");
+            _renderIO->UpdateMainThread();
+        }
+
+        if (_webManager) {
+            FW_PROFILE_SCOPE_N("Client::WebManager");
+            _webManager->Update();
+        }
+
+        {
+            FW_PROFILE_SCOPE_N("Client::PostUpdate");
+            PostUpdate();
+        }
+
+        FW_PROFILE_FRAME();
+    }
+
+    void Instance::UpdateNetworking() {
+        if (!_networkingEngine) {
+            return;
+        }
+
+        FW_PROFILE_SCOPE_N("Client::Networking");
+        _networkingEngine->Update();
+
+        // After the peer pump: RakVoice decodes inbound frames from inside RakPeer::Receive,
+        // so draining speakers here picks up this tick's audio rather than last tick's.
+        {
+            FW_PROFILE_SCOPE_N("Client::Voice");
+
+            // The chat box and web views belong to the framework, so it enforces this itself
+            // rather than trusting every mod to remember.
+            _voiceClient.SetInputSuppressed(_chatBox.IsInputActive() || (_webManager && _webManager->IsAnyViewFocused()));
+
+            // Speaker positions come from each player's avatar, as the server's voice router gets
+            // them. Done here so a mod only has to supply the listener transform.
+            if (auto *replication = _networkingEngine->GetNetworkClient()->GetReplicationManager()) {
+                _voiceClient.BeginSpeakerUpdate();
+                replication->ForEachAvatar([this](MafiaNet::PeerGuid guid, Framework::Networking::Replication::NetworkEntity *avatar) {
+                    _voiceClient.SetSpeakerPosition(static_cast<uint64_t>(guid), avatar->position);
+                });
+                _voiceClient.EndSpeakerUpdate();
+            }
+
+            _voiceClient.Update();
+        }
+
+        DispatchVoiceTalkingChanges();
+    }
+
+    void Instance::DispatchVoiceTalkingChanges() {
+        const bool talking = _voiceClient.IsLocalTalking();
+        if (talking == _voiceLocalTalking) {
+            return;
+        }
+        _voiceLocalTalking = talking;
+
+        OnLocalVoiceStateChanged(talking);
+
+        auto *scriptingModule = static_cast<Client::Scripting::ClientScriptingModule *>(Framework::CoreModules::GetScriptingModule());
+        auto resourceManager  = scriptingModule ? scriptingModule->GetResourceManager() : nullptr;
+        auto *engine          = scriptingModule ? scriptingModule->GetEngine() : nullptr;
+        if (!resourceManager || !engine || !engine->IsInitialized()) {
+            return;
+        }
+
+        v8::Isolate *isolate = engine->GetIsolate();
+        v8::Locker locker(isolate);
+        v8::Isolate::Scope isolateScope(isolate);
+        v8::HandleScope handleScope(isolate);
+        v8::Local<v8::Context> context = engine->GetContext();
+        v8::Context::Scope contextScope(context);
+
+        std::vector<v8::Local<v8::Value>> args;
+        resourceManager->GetEvents().EmitReserved(isolate, context, talking ? "voiceStart" : "voiceStop", args);
+    }
+
+    void Instance::Render() {
+        FW_PROFILE_SCOPE_N("Client::Render");
+
+        if (_renderer && _renderer->IsInitialized()) {
+            FW_PROFILE_SCOPE_N("Client::Renderer");
+            _renderer->Update();
+        }
+
+        if (_renderIO) {
+            FW_PROFILE_SCOPE_N("Client::RenderThreadIO");
+            _renderIO->UpdateRenderThread();
+        }
+
+        {
+            FW_PROFILE_SCOPE_N("Client::PostRender");
+            PostRender();
+        }
+
+        FW_PROFILE_FRAME_N("Render");
+    }
+
+    void Instance::InitNetworkingMessages() {
+        const auto net = _networkingEngine->GetNetworkClient();
+        // Build gate: NetworkClient challenges automatically on connect; a mismatch drops us.
+        if (_opts.verifyBuildToken) {
+            net->SetBuildToken(Framework::Networking::NetworkPeer::BuildToken(_opts.gameName, _opts.gameVersion, Utils::Version::rel, _opts.modVersion));
+        }
+        else {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Build token verification DISABLED; connecting to any server version");
+            net->SetBuildToken(Framework::Networking::NetworkPeer::kBuildVerificationDisabledToken);
+        }
+
+        net->SetOnPlayerConnectedCallback([this, net](MafiaNet::Packet *packet) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Connection accepted by server, verifying build");
+
+            // ID_CONNECTION_REQUEST_ACCEPTED is withheld by MafiaNet until the session handshake
+            // completes, so the server's payload is already in hand here -- earlier than the
+            // resource list, the asset download, or any client script.
+            _serverConfig = nlohmann::json::object();
+            if (packet) {
+                const std::string_view raw = net->GetRemoteSessionConfig(packet->guid);
+                if (!raw.empty()) {
+                    // Remote input: a server can publish anything at all here, so a parse failure is
+                    // an ordinary outcome rather than an error worth dropping the connection over.
+                    auto parsed = nlohmann::json::parse(raw.begin(), raw.end(), nullptr, false);
+                    if (parsed.is_discarded() || !parsed.is_object()) {
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Server config is not a JSON object; ignoring {} byte(s)", raw.size());
+                    }
+                    else {
+                        _serverConfig = std::move(parsed);
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Received {} server config key(s)", _serverConfig.size());
+                    }
+                }
+            }
+
+            // The connection exists only because the server's admission gate accepted the request.
+            _admitted = true;
+            _admissionStatus.clear();
+            SetConnectionPhase(ConnectionPhase::Authenticating);
+        });
+
+        // A line from the server's admission gate while the connection request waits for its answer.
+        net->SetOnSessionStatusCallback([this](const std::string &status) {
+            if (_admitted) {
+                return;
+            }
+            _admissionStatus = status.substr(0, kMaxAdmissionStatusLength);
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Server admission status: {}", _admissionStatus);
+            OnAdmissionStatus(_admissionStatus);
+        });
+
+        // Server's resource list. Store it (survives a scripting module reset) and start the asset
+        // phase; the ready-event id and tick rate are held until the spawn barrier completes.
+        net->RegisterRPC<Framework::Networking::RPC::ServerResources>([this](const Framework::Networking::RPC::ServerResources &payload, MafiaNet::Packet *) {
+            ++_assetProcessingGeneration;
+            _deferredInitialAssetProcessingGeneration = 0;
+            _resumingDeferredInitialAssetProcessing    = false;
+            _readyEventId   = payload.readyEventId;
+            _serverTickRate = payload.tickRate;
+
+            _pendingServerResources = payload.resources;
+            _assetPaks.clear();
+            _assetPaksDownloaded = false;
+            _assetConsentBytes   = 0;
+            AnnounceAssetPaks(_pendingServerResources);
+
+            // A server that predates encrypted resource packages writes a different layout, so the
+            // key lands on whatever followed it and the rest of the stream is garbage. Fail here
+            // rather than acting on thousands of nonsense entries.
+            if (!_packageMounter.SetKey(payload.packageKey) && !_pendingServerResources.empty()) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Server {}:{} did not send a usable resource package key; it is running an incompatible version. Disconnecting.", _currentState.host, _currentState.port);
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+                _pendingServerResources.clear();
+                (void)GetNetworkingEngine()->GetNetworkClient()->Disconnect();
+                return;
+            }
+
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Received resource list from server with {} resources and {} asset pak(s)", _pendingServerResources.size(), _assetPaks.size());
+
+            SetConnectionPhase(ConnectionPhase::Downloading);
+            DownloadsAssetsFromConnectedServer();
+        });
+
+        // Server hot-reloaded a client resource (dev mode): re-sync its files
+        // (delta) and restart just that resource, leaving the rest running.
+        net->RegisterRPC<Framework::Networking::RPC::ResourceRefresh>([this](const Framework::Networking::RPC::ResourceRefresh &payload, MafiaNet::Packet *) {
+            if (payload.resources.empty()) {
+                return;
+            }
+            // Ignore until connected with a running module, else we'd cancel
+            // the initial download (which already fetches current files).
+            auto *sm = GetScriptingModule();
+            if (!sm || !sm->GetScriptingEngine() || !sm->GetScriptingEngine()->IsInitialized()) {
+                return;
+            }
+            // Accumulate (deduped): one reload arrives as several RPCs and a
+            // single delta download covers them all; overwriting would drop all but the last.
+            for (const auto &r : payload.resources) {
+                bool known = false;
+                for (const auto &e : _pendingRefreshResources) {
+                    if (e.name == r.name) { known = true; break; }
+                }
+                if (!known) {
+                    _pendingRefreshResources.push_back(r);
+                }
+            }
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Server hot-reloaded {} resource(s); re-syncing", payload.resources.size());
+            // An in-flight re-sync already covers these; it drains the full set on complete.
+            if (!_downloadStatus.downloading) {
+                SyncResourceUpdatesFromServer();
+            }
+        });
+
+        // Server stopped a client resource at runtime: stop it here too.
+        net->RegisterRPC<Framework::Networking::RPC::ResourceStop>([this](const Framework::Networking::RPC::ResourceStop &payload, MafiaNet::Packet *) {
+            if (payload.resources.empty()) {
+                return;
+            }
+            auto *sm = GetScriptingModule();
+            if (!sm || !sm->GetScriptingEngine() || !sm->GetScriptingEngine()->IsInitialized()) {
+                return;
+            }
+            auto *rm = sm->GetResourceManager();
+            if (!rm) {
+                return;
+            }
+            for (const auto &res : payload.resources) {
+                // Drop any queued refresh so a pending sync can't resurrect it.
+                for (auto it = _pendingRefreshResources.begin(); it != _pendingRefreshResources.end();) {
+                    it = (it->name == res.name) ? _pendingRefreshResources.erase(it) : it + 1;
+                }
+                const auto paks = std::remove_if(_assetPaks.begin(), _assetPaks.end(), [&res](const ResourceAssetPak &pak) {
+                    return pak.resource == res.name;
+                });
+                if (paks != _assetPaks.end()) {
+                    _assetPaks.erase(paks, _assetPaks.end());
+                    OnResourceAssetPaksChanged();
+                }
+                if (rm->IsResourceRunning(res.name)) {
+                    auto result = rm->StopResource(res.name);
+                    if (!result) {
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Failed to stop client resource '{}': {}", res.name, result.GetError());
+                    }
+                }
+            }
+        });
+
+        net->SetOnInitialReplicationDownloadedCallback([this]() {
+            TrySignalConnectionSpawnReady();
+            OnInitialReplicationDownloaded();
+        });
+
+        // Spawn barrier complete: activate replication and report the connection final.
+        net->SetOnConnectionReadyCallback([this, net](int eventId) {
+            // Only the event the server assigned in ServerResources finalizes this connection, and
+            // only once — a stray or repeated completion must not re-run the mod's spawn logic.
+            if (eventId != _readyEventId || _connectionFinalized) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Ignoring ready event {} (expected {}, finalized: {})", eventId, _readyEventId, _connectionFinalized);
+                return;
+            }
+            _connectionFinalized = true;
+            _spawnBarrierArmed   = false;
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Connection ready (event {}), finalizing", eventId);
+            // tickInterval is in seconds; SetAutoSerializeInterval wants milliseconds.
+            if (auto *replication = net->GetReplicationManager()) {
+                CoreModules::SetReplication(replication);
+                replication->SetAutoSerializeInterval(static_cast<MafiaNet::Time>(Framework::Utils::Time::SecondsToMs(_serverTickRate)));
+            }
+            // Visibility is left alone: resources have already started, and a
+            // Chat.setUIVisible(false) they issued must survive the session opening.
+            _chatBox.SetSessionActive(true);
+            SetConnectionPhase(ConnectionPhase::InGame);
+            OnConnectionFinalized(_serverTickRate);
+        });
+
+        // Version mismatches don't reach here — they fail the build challenge (WRONG_VERSION).
+        net->SetOnPlayerDisconnectedCallback([this](MafiaNet::Packet *packet, Framework::Networking::DisconnectionReason reasonId, const std::string &customReason) {
+            std::string reason = "Unknown.";
+            switch (reasonId) {
+            case Framework::Networking::DisconnectionReason::BANNED: reason = "You are banned."; break;
+            case Framework::Networking::DisconnectionReason::KICKED: reason = "You have been kicked."; break;
+            case Framework::Networking::DisconnectionReason::KICKED_CUSTOM: reason = "You have been kicked. Reason: " + customReason; break;
+            case Framework::Networking::DisconnectionReason::KICKED_INVALID_PACKET: reason = "You have been kicked (invalid packet)."; break;
+            case Framework::Networking::DisconnectionReason::WRONG_VERSION: reason = "You have been kicked (wrong client version)."; break;
+            case Framework::Networking::DisconnectionReason::BUILD_VERIFICATION_TIMEOUT: reason = "Could not verify your build with the server in time. Check your connection and try again."; break;
+            case Framework::Networking::DisconnectionReason::INVALID_PASSWORD: reason = "The server refused the password."; break;
+            case Framework::Networking::DisconnectionReason::NO_FREE_SLOT: reason = "The server is full."; break;
+            case Framework::Networking::DisconnectionReason::GRACEFUL_SHUTDOWN: reason = "The server closed the connection."; break;
+            case Framework::Networking::DisconnectionReason::LOST: reason = "Connection to the server lost."; break;
+            case Framework::Networking::DisconnectionReason::FAILED: reason = "Could not connect to the server."; break;
+            // The server's own words, as its script wrote them.
+            case Framework::Networking::DisconnectionReason::CONNECTION_REFUSED: reason = customReason.empty() ? "The server refused the connection." : customReason; break;
+            default: break;
+            }
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Connection dropped: {}", reason);
+
+            // A null packet means the disconnect was locally initiated (user quit) — no reason to surface.
+            _lastDisconnectionReason = packet ? reason : "";
+
+            // Reset initial asset download state
+            ++_assetProcessingGeneration;
+            _deferredInitialAssetProcessingGeneration = 0;
+            _resumingDeferredInitialAssetProcessing    = false;
+            _serverConfig                              = nlohmann::json::object();
+            _initialDownloadDone                       = false;
+            _downloadStatus                            = {};
+            _assetPaks.clear();
+            _assetPaksDownloaded = false;
+            _assetConsentBytes   = 0;
+            _connectionFinalized                       = false;
+            _spawnBarrierArmed                         = false;
+            _projectSpawnReady                         = false;
+            _admitted                                  = false;
+            _admissionStatus.clear();
+            SetConnectionPhase(ConnectionPhase::Disconnected);
+            
+            // Entity teardown is native: ReplicaManager3 deletes server-created replicas when the
+            // connection drops (QueryActionOnPopConnection_Client).
+            CoreModules::SetReplication(nullptr);
+
+            _chatBox.SetSessionActive(false);
+            // Restored here rather than on finalize, so the next server's resources start
+            // from a visible box and whatever they choose is what the session shows.
+            _chatBox.SetVisible(true);
+
+            // Notify mod-level that network integration got closed
+            OnConnectionClosed();
+
+            // Reset the scripting engine (keeps engine alive, just stops resources)
+            _scriptingModule->Reset();
+
+            _packageMounter.Reset();
+
+            // Unregister from CoreModules so a subsequent reconnect can re-register
+            // without tripping the "already registered" assertion
+            CoreModules::SetScriptingModule(nullptr);
+
+            // Destroy scriptable web views
+            if (_webManager) {
+                _webManager->CleanupViews();
+            }
+        });
+
+        net->RegisterRPC<Shared::RPC::EmitScriptEvent>(&OnEmitScriptEvent);
+
+        // Chat lines from the server are forwarded to the mod's UI via the received callback.
+        net->RegisterRPC<Framework::Networking::RPC::ChatMessage>([this](const Framework::Networking::RPC::ChatMessage &payload, MafiaNet::Packet *) {
+            DispatchReceivedChat(payload);
+        });
+
+        // The server's voice ranges, so the mixer fades a talker out where the frames stop.
+        net->RegisterRPC<Framework::Networking::RPC::VoiceSettings>([this](const Framework::Networking::RPC::VoiceSettings &payload, MafiaNet::Packet *) {
+            _voiceClient.SetDefaultSpeakerRange(payload.proximityRange);
+            _voiceClient.SetTierRanges(payload.tierRanges);
+        });
+
+        net->RegisterRPC<Framework::Networking::RPC::VoiceSpeakerRange>([this](const Framework::Networking::RPC::VoiceSpeakerRange &payload, MafiaNet::Packet *) {
+            _voiceClient.SetSpeakerRange(payload.player, payload.range, static_cast<Framework::Voice::VoiceTier>(payload.tier));
+        });
+
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Networking messages registered");
+    }
+
+    void Instance::SendChatMessage(const std::string &text) {
+        if (text.empty()) {
+            return;
+        }
+        const auto net = GetNetworkingEngine()->GetNetworkClient();
+        if (!net) {
+            return;
+        }
+        Framework::Networking::RPC::ChatMessage payload {text};
+        net->BroadcastRPC(payload);
+    }
+
+    void Instance::SetConnectionPhase(ConnectionPhase phase) {
+        if (_connectionPhase == phase) {
+            return;
+        }
+        _connectionPhase = phase;
+        OnConnectionPhaseChanged(phase);
+    }
+
+    Utils::Result<void, Error> Instance::ConnectToServer(const std::string &host, int32_t port, const std::string &password) {
+        // Who is asking, carried in the connection request itself: the server's admission gate
+        // decides on it before either side reports a connection.
+        //
+        // The Steam id is launcher-set when the game was located through Steam; Win32 read, the CRT's
+        // getenv copy predates it.
+        char steamId[32] = {};
+#ifdef _WIN32
+        GetEnvironmentVariableA("MafiaHubSteamId", steamId, sizeof(steamId));
+#endif
+        Framework::Networking::RPC::ClientIdentity identity;
+        identity.name       = _currentState.nickname;
+        identity.steamId    = steamId;
+        identity.discordId  = _presence ? _presence->GetUserId() : "";
+        identity.hardwareId = Framework::Utils::GetHardwareId();
+        identity.ticket     = _currentState.ticket;
+
+        _admitted = false;
+        _admissionStatus.clear();
+        auto result = _networkingEngine->Connect(host, port, password, identity.Encode());
+        SetConnectionPhase(result ? ConnectionPhase::Connecting : ConnectionPhase::Disconnected);
+        return result;
+    }
+
+    void Instance::DownloadsAssetsFromConnectedServer() {
+        const auto net = GetNetworkingEngine()->GetNetworkClient();
+
+        // Make sure we're connected to the server already, otherwise bail with warning
+        if (net->GetConnectionState() != Framework::Networking::PeerState::CONNECTED) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("We can't download assets if we are not connected to the server yet!");
+            return;
+        }
+
+        // Stop running resources before redownloading (preserves server resource list)
+        _scriptingModule->StopAllResources();
+
+        // Destroy scriptable web views
+        if (_webManager) {
+            _webManager->CleanupViews();
+        }
+
+        // Setup the asset downloader
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Setting up asset downloads...");
+        const auto streamer = net->GetAssetStreamer();
+
+        // Compute the destination path
+        const auto cacheDir = fmt::format("{}\\servers\\{}", GetCacheRoot(), _currentState.serverIDHash);
+
+        if (!Framework::Utils::Vfs::Get().Init(nullptr)) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Could not initialize the virtual file system; client resources will not load");
+        }
+
+        // Let the system know where our scripts are stored
+        SetAssetCachePath(cacheDir);
+
+        // Pre-packaging builds left plaintext resource directories here, which discovery would
+        // still pick up and run unverified. Only .fwpak containers belong in the cache.
+        PurgeLegacyPlaintextCache(cacheDir);
+        streamer->SetApplicationDirectory(cacheDir.c_str());
+        auto cacheDirHandle = cppfs::fs::open(cacheDir);
+
+        // Ensure we stop existing downloads since the server has pushed new changes already
+        // (also before the bail below, so a failed cache dir doesn't leave a transfer running)
+        if (_downloadStatus.downloading) {
+            net->GetFileListTransfer()->CancelReceive(_downloadStatus.setID);
+            _downloadStatus = {};
+        }
+
+        if (!cacheDirHandle.exists()) {
+            InitCacheAssetFolders();
+            if (cacheDirHandle.createDirectory()) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Client asset cache: {}", _currentState.serverIDHash);
+            }
+            else {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Could not create folder for client asset cache: {}", cacheDir);
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Skip downloading assets.");
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+
+                // Ensure we finish the download flow gracefully
+                OnAssetsDownloaded(false);
+                return;
+            }
+        }
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+
+        // Asset paks can be large: what this cache lacks waits for the player's consent above the
+        // mod's threshold. Scripts alone never ask.
+        PruneAssetPaks(cacheDir);
+        uint64_t missing = 0;
+        for (auto &pak : _assetPaks) {
+            pak.path = (std::filesystem::path(cacheDir) / Framework::Utils::StreamedAssets::PakFileName(pak.resource, pak.info.lane, pak.info.sha256)).string();
+            std::error_code code;
+            if (std::filesystem::file_size(pak.path, code) != pak.info.size || code) {
+                missing += pak.info.size;
+            }
+        }
+        if (missing > _opts.assetConsentThreshold) {
+            _assetConsentBytes = missing;
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("The server ships {} bytes of asset paks this cache lacks; waiting for consent", missing);
+            return;
+        }
+
+        StartAssetDownload();
+    }
+
+    void Instance::GrantAssetConsent() {
+        if (_assetConsentBytes == 0) {
+            return;
+        }
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Asset download of {} bytes accepted", _assetConsentBytes);
+        _assetConsentBytes = 0;
+        StartAssetDownload();
+    }
+
+    void Instance::AnnounceAssetPaks(const std::vector<Client::Scripting::ServerResourceInfo> &resources) {
+        for (const auto &resource : resources) {
+            _assetPaks.erase(std::remove_if(_assetPaks.begin(), _assetPaks.end(), [&resource](const ResourceAssetPak &pak) {
+                return pak.resource == resource.name;
+            }), _assetPaks.end());
+            for (const auto &info : resource.assetPaks) {
+                // Untrusted: a lane or hash that could not name a cache file is dropped, and the
+                // mod's own validation decides what the rest may carry.
+                if (!info.IsSane() || !Framework::Utils::StreamedAssets::IsSha256(info.sha256) || !Framework::Utils::StreamedAssets::IsValidResourceName(resource.name)) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Ignoring a malformed asset pak of '{}'", resource.name);
+                    continue;
+                }
+                ResourceAssetPak pak;
+                pak.resource = resource.name;
+                pak.info     = info;
+                if (!GetAssetCachePath().empty()) {
+                    pak.path = (std::filesystem::path(GetAssetCachePath()) / Framework::Utils::StreamedAssets::PakFileName(resource.name, info.lane, info.sha256)).string();
+                }
+                _assetPaks.push_back(std::move(pak));
+            }
+        }
+    }
+
+    bool Instance::VerifyAssetPaks() const {
+        for (const auto &pak : _assetPaks) {
+            std::error_code code;
+            if (pak.path.empty() || std::filesystem::file_size(pak.path, code) != pak.info.size || code) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Asset pak '{}' {} is missing or incomplete after the download", pak.resource, pak.info.lane);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void Instance::PruneAssetPaks(const std::string &cacheDir) const {
+        std::error_code code;
+        for (const auto &entry : std::filesystem::directory_iterator(cacheDir, code)) {
+            if (entry.path().extension() != ".pak") {
+                continue;
+            }
+            const std::string name = entry.path().filename().string();
+            const bool announced   = std::any_of(_assetPaks.begin(), _assetPaks.end(), [&name](const ResourceAssetPak &pak) {
+                return Framework::Utils::StreamedAssets::PakFileName(pak.resource, pak.info.lane, pak.info.sha256) == name;
+            });
+            if (!announced) {
+                std::error_code removeError;
+                std::filesystem::remove(entry.path(), removeError);
+            }
+        }
+    }
+
+    void Instance::StartAssetDownload() {
+        const auto net      = GetNetworkingEngine()->GetNetworkClient();
+        const auto streamer = net->GetAssetStreamer();
+
+        if (_downloadStatus.downloading) {
+            net->GetFileListTransfer()->CancelReceive(_downloadStatus.setID);
+            _downloadStatus = {};
+        }
+
+        _downloadStatus.downloading = true;
+        _downloadStatus.setID = streamer->DownloadFromSubdirectory(nullptr, nullptr, true, net->GetPeer()->GetSystemAddressFromIndex(0), &_assetDownloadProgress, MafiaNet::Priority::High, Framework::Networking::ToOrderingChannel(Framework::Networking::Channel::Assets), nullptr);
+    }
+
+    void Instance::SyncResourceUpdatesFromServer() {
+        const auto net = GetNetworkingEngine()->GetNetworkClient();
+        if (net->GetConnectionState() != Framework::Networking::PeerState::CONNECTED) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Cannot re-sync resources while not connected");
+            _pendingRefreshResources.clear();
+            return;
+        }
+
+        // Unlike DownloadsAssetsFromConnectedServer, does NOT stop all resources
+        // or tear down web views; cache path is already set from connect.
+        const auto streamer = net->GetAssetStreamer();
+        const auto cacheDir = GetAssetCachePath();
+        if (cacheDir.empty()) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("No asset cache path set; cannot re-sync resources");
+            _pendingRefreshResources.clear();
+            return;
+        }
+        streamer->SetApplicationDirectory(cacheDir.c_str());
+
+        StartAssetDownload();
+    }
+
+    void Instance::PurgeLegacyPlaintextCache(const std::string &cacheDir) {
+        // Sweep every server's cache, not just the one being connected to: extracted plaintext
+        // left by an older build (including server bundles that predate the packaging fix) would
+        // otherwise sit on disk until the user happened to reconnect to that exact server.
+        std::error_code ec;
+        const auto serversRoot = std::filesystem::path(cacheDir).parent_path();
+
+        std::vector<std::filesystem::path> roots;
+        if (!serversRoot.empty() && std::filesystem::exists(serversRoot, ec) && !ec) {
+            for (const auto &server : std::filesystem::directory_iterator(serversRoot, ec)) {
+                if (ec) {
+                    break;
+                }
+                if (server.is_directory(ec) && !ec) {
+                    roots.push_back(server.path());
+                }
+            }
+        }
+        if (roots.empty()) {
+            roots.emplace_back(cacheDir);
+        }
+
+        size_t removed = 0;
+        for (const auto &root : roots) {
+            std::error_code rootError;
+            if (!std::filesystem::exists(root, rootError) || rootError) {
+                continue;
+            }
+            for (const auto &entry : std::filesystem::directory_iterator(root, rootError)) {
+                if (rootError) {
+                    break;
+                }
+                if (!entry.is_directory(rootError) || rootError) {
+                    continue;
+                }
+                std::error_code removeError;
+                const auto count = std::filesystem::remove_all(entry.path(), removeError);
+                if (removeError) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Could not remove legacy plaintext resource cache '{}': {}", entry.path().string(), removeError.message());
+                    continue;
+                }
+                removed += static_cast<size_t>(count);
+            }
+        }
+
+        if (removed > 0) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Removed {} file(s) of legacy plaintext resource cache", removed);
+        }
+    }
+
+    std::vector<std::string> Instance::MountResourcePackages(const std::vector<Client::Scripting::ServerResourceInfo> &resources) {
+        std::vector<std::string> failed;
+        const auto cacheDir = GetAssetCachePath();
+        if (cacheDir.empty()) {
+            for (const auto &resource : resources) {
+                failed.push_back(resource.name);
+            }
+            return failed;
+        }
+
+        // Bounded so a desynced resource list cannot turn one bad handshake into thousands of
+        // identical log lines.
+        constexpr size_t kMaxReportedFailures = 8;
+        size_t reported                       = 0;
+
+        for (const auto &resource : resources) {
+            // Assets only: nothing to decrypt or run.
+            if (resource.packageHash.empty() && !resource.assetPaks.empty()) {
+                continue;
+            }
+            std::string error;
+            if (!_packageMounter.Mount(cacheDir, resource.name, resource.packageHash, error)) {
+                if (reported < kMaxReportedFailures) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Refusing client resource '{}': {}", resource.name, error);
+                }
+                ++reported;
+                failed.push_back(resource.name);
+            }
+        }
+
+        if (reported > kMaxReportedFailures) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("{} further client resources were refused", reported - kMaxReportedFailures);
+        }
+        return failed;
+    }
+
+    bool Instance::OnAssetsDownloaded(bool success) {
+        if (success && _deferredInitialAssetProcessingGeneration != 0 && !_resumingDeferredInitialAssetProcessing) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Ignoring duplicate initial asset completion while generation {} is deferred", _deferredInitialAssetProcessingGeneration);
+            return false;
+        }
+
+        const auto net = GetNetworkingEngine()->GetNetworkClient();
+        if (success) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("All the assets have been downloaded!");
+
+            auto scriptingModule = GetScriptingModule();
+
+            // Hot-reload path: module already running, refresh just the flagged
+            // resources instead of re-initializing everything.
+            if (scriptingModule && scriptingModule->GetScriptingEngine()
+                && scriptingModule->GetScriptingEngine()->IsInitialized()
+                && !_pendingRefreshResources.empty()) {
+                AnnounceAssetPaks(_pendingRefreshResources);
+                if (VerifyAssetPaks()) {
+                    OnResourceAssetPaksChanged();
+                }
+                if (auto *rm = scriptingModule->GetResourceManager()) {
+                    const auto failed = MountResourcePackages(_pendingRefreshResources);
+                    for (const auto &res : _pendingRefreshResources) {
+                        if (std::find(failed.begin(), failed.end(), res.name) != failed.end() || res.packageHash.empty()) {
+                            continue;
+                        }
+                        // Newly started server-side: discover from cache first.
+                        if (!rm->HasResource(res.name)) {
+                            const std::string resPath = Framework::Utils::Vfs::ResourcePath(res.name);
+                            if (!rm->DiscoverResource(resPath)) {
+                                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Could not discover new client resource '{}' at {}", res.name, resPath);
+                                continue;
+                            }
+                        }
+                        // Reload if running, start if newly discovered/stopped.
+                        auto result = rm->IsResourceRunning(res.name) ? rm->RefreshResource(res.name) : rm->StartResource(res.name);
+                        if (!result) {
+                            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Failed to sync client resource '{}': {}", res.name, result.GetError());
+                        }
+                    }
+                }
+                _pendingRefreshResources.clear();
+                // Run the shared completion cleanup, skipping only the
+                // first-connect spawn barrier below.
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+                _downloadStatus = {};
+                OnAssetsDownloadFinished(success);
+                return true;
+            }
+            // A refresh that raced an initial connect falls through to full init.
+            _pendingRefreshResources.clear();
+
+            if (!_resumingDeferredInitialAssetProcessing) {
+                if (!VerifyAssetPaks()) {
+                    (void)net->Disconnect();
+                    return false;
+                }
+                _assetPaksDownloaded = true;
+                if (!_assetPaks.empty()) {
+                    OnResourceAssetPaksChanged();
+                }
+
+                const uint64_t generation = _assetProcessingGeneration;
+                if (OnInitialAssetDownloadReady(generation, _downloadStatus) == InitialAssetProcessingDecision::Defer) {
+                    if (generation != _assetProcessingGeneration || net->GetConnectionState() != Framework::Networking::PeerState::CONNECTED) {
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Initial asset processing generation {} requested deferral after the connection became stale", generation);
+                        return false;
+                    }
+                    _deferredInitialAssetProcessingGeneration = generation;
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Initial asset processing deferred for generation {} before scripting startup", generation);
+                    return false;
+                }
+            }
+
+            SetConnectionPhase(ConnectionPhase::Starting);
+            const uint64_t startupGeneration = _assetProcessingGeneration;
+
+            if (scriptingModule) {
+                // Set resource cache path before init
+                scriptingModule->SetResourceCachePath(GetAssetCachePath());
+                scriptingModule->SetModVersion(_opts.modVersion);
+
+                RegisterResourceSchemeHandler();
+
+                // Initialize the scripting module with builtin registration callback
+                const auto sdkCallback = [this](Framework::Scripting::Engine *engine) {
+                    this->RegisterScriptingBuiltins(engine);
+                };
+
+                if (scriptingModule->Init(sdkCallback) != Framework::Scripting::ScriptingError::SCRIPTING_NONE) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Client scripting engine failed to initialize");
+                    (void)net->Disconnect();
+                    return false;
+                }
+                CoreModules::SetScriptingModule(scriptingModule);
+
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Client scripting engine initialized");
+
+                _stateBagEvents = Integrations::Shared::Scripting::InstallStateBagEvents([this](v8::Isolate *isolate, uint64_t networkId) {
+                    return WrapScriptEntity(isolate, networkId);
+                });
+
+                PostScriptInit();
+
+                // Before anything is discovered or started. A package that fails verification is
+                // not a resource to skip: the server said it should run and its bytes are not what
+                // the server described, so the session is refused rather than left half-working.
+                if (!_pendingServerResources.empty()) {
+                    const auto failed = MountResourcePackages(_pendingServerResources);
+                    if (!failed.empty()) {
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("{} of {} client resource(s) failed verification; refusing to join", failed.size(), _pendingServerResources.size());
+                        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+                        _pendingServerResources.clear();
+                        _packageMounter.Reset();
+                        (void)net->Disconnect();
+                        return false;
+                    }
+                    // Resources that ship assets only have nothing to run here.
+                    std::vector<Client::Scripting::ServerResourceInfo> scripted;
+                    std::copy_if(_pendingServerResources.begin(), _pendingServerResources.end(), std::back_inserter(scripted), [](const Client::Scripting::ServerResourceInfo &resource) {
+                        return !resource.packageHash.empty() || resource.assetPaks.empty();
+                    });
+                    scriptingModule->SetServerResourceList(scripted);
+                }
+
+                // Start all resources via ResourceManager
+                if (!scriptingModule->StartAllResources()) {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("Failed to start client resources; refusing to join");
+                    (void)net->Disconnect();
+                    return false;
+                }
+                else {
+                    Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->info("Client resources started successfully");
+                }
+            }
+            // Startup executes user scripts; a lifecycle callback can close
+            // or replace the connection whose resources were being started.
+            if (startupGeneration != _assetProcessingGeneration || net->GetConnectionState() != Framework::Networking::PeerState::CONNECTED) {
+                return false;
+            }
+        }
+        else {
+            _deferredInitialAssetProcessingGeneration = 0;
+            _resumingDeferredInitialAssetProcessing    = false;
+            (void)net->Disconnect();
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->error("There has been an issue downloading assets!");
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+            return false;
+        }
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->flush();
+
+        // Ask to join (server builds the avatar and opens the replication gate), then arm our half
+        // of the spawn barrier. First connect only.
+        if (!_initialDownloadDone) {
+            _initialDownloadDone = true;
+
+            const auto serverGuid = net->GetPeer()->GetGUIDFromIndex(0);
+            Framework::Networking::RPC::ClientJoin join;
+            net->SendRPC(join, serverGuid);
+
+            net->GetReadyEvent()->SetEvent(_readyEventId, false);
+            net->GetReadyEvent()->AddToWaitList(_readyEventId, serverGuid);
+            _spawnBarrierArmed = true;
+            _projectSpawnReady = !RequiresExplicitConnectionSpawnReady();
+            TrySignalConnectionSpawnReady();
+        }
+
+        _downloadStatus = {};
+
+        // Let the mod-level know assets have just been finished processing
+        OnAssetsDownloadFinished(success);
+        return true;
+    }
+
+    bool Instance::CompleteDeferredInitialAssetProcessing(uint64_t generation, bool success) {
+        if (generation == 0 || _deferredInitialAssetProcessingGeneration != generation || _assetProcessingGeneration != generation) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Ignoring stale deferred initial asset completion for generation {} (current {}, deferred {})", generation, _assetProcessingGeneration, _deferredInitialAssetProcessingGeneration);
+            return false;
+        }
+
+        Framework::Networking::NetworkClient *net = GetNetworkingEngine() ? GetNetworkingEngine()->GetNetworkClient() : nullptr;
+        if (success && (!net || net->GetConnectionState() != Framework::Networking::PeerState::CONNECTED)) {
+            _deferredInitialAssetProcessingGeneration = 0;
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Cannot resume deferred initial asset processing for generation {} after the connection closed", generation);
+            return false;
+        }
+
+        _deferredInitialAssetProcessingGeneration = 0;
+        _resumingDeferredInitialAssetProcessing    = true;
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("{} deferred initial asset processing for generation {}", success ? "Resuming" : "Failing", generation);
+        const bool started                      = OnAssetsDownloaded(success);
+        _resumingDeferredInitialAssetProcessing = false;
+        return started;
+    }
+
+    void Instance::SignalConnectionSpawnReady() {
+        _projectSpawnReady = true;
+        TrySignalConnectionSpawnReady();
+    }
+
+    void Instance::TrySignalConnectionSpawnReady() {
+        if (!_spawnBarrierArmed || !_projectSpawnReady || _connectionFinalized || !_networkingEngine) {
+            return;
+        }
+
+        Framework::Networking::NetworkClient *net = _networkingEngine->GetNetworkClient();
+        if (!net || !net->IsInitialReplicationDownloadComplete()) {
+            return;
+        }
+
+        _spawnBarrierArmed = false;
+        net->GetReadyEvent()->SetEvent(_readyEventId, true);
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Initial replication download and project spawn are ready (event {})", _readyEventId);
+    }
+
+    void Instance::RegisterResourceSchemeHandler() {
+        // Not gated on the manager being initialized: the registry exists from
+        // its constructor, so a root claimed before Manager::Init is in place by
+        // the time the first request arrives.
+        if (!_webManager || GetAssetCachePath().empty()) {
+            return;
+        }
+
+        // Internal origin for scripted web views: fw://resources/<resource>/<file>
+        // comes from the per-server asset cache, so a resource can ship its own
+        // pages. Reconnecting elsewhere moves that cache under the same origin.
+        if (!_resourceProvider) {
+            _resourceProvider = std::make_shared<Framework::GUI::Resources::DirectoryProvider>(GetAssetCachePath());
+            _resourceProvider->SetVirtualPrefix(Framework::Utils::Vfs::kResourceMountRoot);
+        }
+        else {
+            _resourceProvider->SetRoot(GetAssetCachePath());
+        }
+
+        if (_resourceSchemeRegistered) {
+            return;
+        }
+        _resourceSchemeRegistered = true;
+
+        _webManager->RegisterResourceRoot("resources", _resourceProvider);
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Serving {}://resources from the asset cache", Framework::GUI::Resources::kResourceScheme);
+    }
+
+    void Instance::RegisterScriptingBuiltins(Framework::Scripting::Engine *engine) {
+        // JavaScript bindings are registered by ClientScriptingModule::RegisterFrameworkBindings
+        // This method is called to allow mod-specific customization
+        ModuleRegister(engine);
+    }
+} // namespace Framework::Integrations::Client

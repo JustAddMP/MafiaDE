@@ -1,0 +1,1065 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2026, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "voice_client.h"
+
+#include <logging/logger.h>
+#include <networking/channels.h>
+#include <networking/network_client.h>
+#include <networking/rpc/voice_settings.h>
+#include <utils/time.h>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+
+namespace Framework::Voice {
+    namespace {
+        // Sized to sit on the device thread's stack.
+        constexpr uint32_t kRenderChunkSamples = 480;
+
+        // How much nearer, in squared distance, a newcomer must be to take the farthest
+        // talker's slot. Stops two speakers at similar range trading it every tick.
+        constexpr float kEvictionHysteresis = 1.2f;
+
+        // Envelope follower time constants, in seconds.
+        constexpr float kEnvelopeAttack  = 0.02f;
+        constexpr float kEnvelopeRelease = 0.12f;
+
+        // Below this the envelope is noise.
+        constexpr float kEnvelopeFloor = 0.02f;
+
+        // A hitch must not slam every mouth shut.
+        constexpr float kMaxEnvelopeStep = 0.25f;
+
+        // Frames arrive in bursts: hold until the queued audio has played out, plus this.
+        constexpr int64_t kEnvelopeHoldSlackMs = 30;
+
+        constexpr int64_t kFrameMs = (kFrameSamples * 1000) / kSampleRate;
+
+        // Full-scale RMS, so levels compare across speakers rather than microphone gains.
+        float FrameLevel(const int16_t *mono, uint32_t samples) {
+            if (mono == nullptr || samples == 0) {
+                return 0.0f;
+            }
+
+            double sum = 0.0;
+            for (uint32_t i = 0; i < samples; i++) {
+                const double s = static_cast<double>(mono[i]) / 32768.0;
+                sum += s * s;
+            }
+
+            return std::min(1.0f, static_cast<float>(std::sqrt(sum / samples)));
+        }
+
+        // Time based, so the same speech drives the same mouth at 30 and at 200 frames a second.
+        // A meter keeps what a mouth floors: the quiet end is exactly where a threshold is set.
+        float FollowEnvelope(float current, float target, float dt, float floor = kEnvelopeFloor) {
+            const float tau  = target > current ? kEnvelopeAttack : kEnvelopeRelease;
+            const float next = current + (target - current) * (1.0f - std::exp(-dt / tau));
+            return next < floor ? 0.0f : next;
+        }
+
+        // Below this the input meter reads silence; far under any sensible threshold.
+        constexpr float kInputMeterFloor = 0.0005f;
+    } // namespace
+
+    // ------------------------------------------------------------------------------------
+    // LocalVoiceSink
+    // ------------------------------------------------------------------------------------
+
+    LocalVoiceSink::~LocalVoiceSink() {
+        Stop();
+    }
+
+    bool LocalVoiceSink::Start() {
+        return _device.Start(&LocalVoiceSink::Render, this);
+    }
+
+    void LocalVoiceSink::Stop() {
+        // Joins the device thread first, so the teardown below cannot race a render.
+        _device.Stop();
+
+        for (Slot &slot : _slots) {
+            slot.id.store(0, std::memory_order_relaxed);
+            slot.audio.Clear();
+        }
+    }
+
+    int LocalVoiceSink::FindSlot(uint64_t speaker) const {
+        for (size_t i = 0; i < _slots.size(); i++) {
+            if (_slots[i].id.load(std::memory_order_relaxed) == speaker) {
+                return static_cast<int>(i);
+            }
+        }
+
+        return -1;
+    }
+
+    int LocalVoiceSink::AcquireSlot(uint64_t speaker) {
+        for (size_t i = 0; i < _slots.size(); i++) {
+            Slot &slot = _slots[i];
+            if (slot.id.load(std::memory_order_relaxed) != 0) {
+                continue;
+            }
+
+            // Wait for the audio thread to drain what the previous occupant left. Clearing
+            // from this thread would race the consumer.
+            if (slot.audio.Available() != 0) {
+                continue;
+            }
+
+            // Before the id is published: the producer side is this thread's alone until then.
+            slot.audio.ResetEstimate();
+            slot.id.store(speaker, std::memory_order_release);
+            return static_cast<int>(i);
+        }
+
+        return -1;
+    }
+
+    void LocalVoiceSink::Submit(uint64_t speaker, const int16_t *mono, uint32_t samples) {
+        if (speaker == 0 || mono == nullptr || samples == 0) {
+            return;
+        }
+
+        int slot = FindSlot(speaker);
+        if (slot < 0) {
+            slot = AcquireSlot(speaker);
+        }
+
+        if (slot < 0) {
+            return;
+        }
+
+        // A full ring means the device is not consuming; dropping beats playing stale audio.
+        _slots[slot].audio.Push(mono, samples, Utils::Time::GetTime());
+    }
+
+    void LocalVoiceSink::ReleaseSpeaker(uint64_t speaker) {
+        const int slot = FindSlot(speaker);
+        if (slot < 0) {
+            return;
+        }
+
+        _slots[slot].id.store(0, std::memory_order_release);
+    }
+
+    void LocalVoiceSink::PublishWorld(const ListenerTransform &listener, const SpeakerPlacement *speakers, size_t count) {
+        World &back = _world[_writeSlot];
+
+        back.listener = listener;
+        back.id.fill(0);
+
+        for (size_t i = 0; i < count; i++) {
+            const int slot = FindSlot(speakers[i].speaker);
+            if (slot < 0) {
+                continue;
+            }
+
+            back.id[slot]       = speakers[i].speaker;
+            back.position[slot] = speakers[i].position;
+            back.range[slot]    = speakers[i].range;
+        }
+
+        _publishedSlot.store(_writeSlot, std::memory_order_release);
+
+        // The three indices sum to 3, so the one no reader can hold falls out arithmetically.
+        const uint32_t next = 3 - _writeSlot - _previousSlot;
+        _previousSlot       = _writeSlot;
+        _writeSlot          = next;
+    }
+
+    void LocalVoiceSink::SetMasterVolume(float volume) {
+        // Same NaN hole as the fraction below, and the same answer: keep the last good volume
+        // rather than store a value that silences the mix.
+        if (!std::isfinite(volume)) {
+            return;
+        }
+
+        _masterVolume.store(std::clamp(volume, 0.0f, 4.0f), std::memory_order_relaxed);
+    }
+
+    void LocalVoiceSink::SetFullVolumeFraction(float fraction) {
+        // Dropped rather than clamped: std::clamp passes NaN through, and the last good value is a
+        // better answer for a settings UI that reads it back than a curve that silences everyone.
+        if (!std::isfinite(fraction)) {
+            return;
+        }
+
+        _fullVolumeFraction.store(std::clamp(fraction, 0.0001f, 1.0f), std::memory_order_relaxed);
+    }
+
+    void LocalVoiceSink::Render(float *stereoOut, uint32_t frameCount, void *user) {
+        static_cast<LocalVoiceSink *>(user)->RenderInto(stereoOut, frameCount);
+    }
+
+    void LocalVoiceSink::RenderInto(float *stereoOut, uint32_t frameCount) {
+        const World &world = _world[_publishedSlot.load(std::memory_order_acquire)];
+
+        // Read once per callback so every speaker in this buffer is mixed against the same curve.
+        const float fullVolumeFraction = _fullVolumeFraction.load(std::memory_order_relaxed);
+
+        int16_t scratch[kRenderChunkSamples];
+        bool mixedAnything = false;
+
+        // The clock Submit stamps arrivals with, so a playout buffer can tell a word that has
+        // ended from one still arriving.
+        const int64_t nowMs = Utils::Time::GetTime();
+
+        for (size_t i = 0; i < _slots.size(); i++) {
+            Slot &slot = _slots[i];
+
+            const uint64_t id = slot.id.load(std::memory_order_acquire);
+            if (id == 0) {
+                // Draining here rather than on release keeps the ring single-consumer.
+                slot.audio.Discard();
+                continue;
+            }
+
+            // A slot that changed hands since the last publish has no trustworthy position,
+            // so its audio is consumed and dropped for one tick rather than mispanned.
+            const bool positioned = world.id[i] == id;
+
+            SpeakerGain gain;
+            if (positioned) {
+                gain = ComputeGain(world.listener, world.position[i], world.range[i], fullVolumeFraction);
+            }
+
+            const bool audible = gain.left > 0.0f || gain.right > 0.0f;
+
+            // Out-of-range speakers are consumed too, just not mixed: queued audio would pile
+            // up and burst out the moment they came back into earshot.
+            uint32_t remaining = frameCount;
+            uint32_t offset    = 0;
+
+            // The playout buffer decides priming, underrun and drift; a false is silence.
+            while (remaining > 0) {
+                const uint32_t chunk = std::min(remaining, kRenderChunkSamples);
+                if (!slot.audio.Pull(scratch, chunk, nowMs)) {
+                    break;
+                }
+
+                if (audible) {
+                    MixFrameInto(stereoOut + static_cast<size_t>(offset) * 2, scratch, chunk, gain);
+                    mixedAnything = true;
+                }
+
+                offset += chunk;
+                remaining -= chunk;
+            }
+        }
+
+        if (!mixedAnything) {
+            return;
+        }
+
+        LimitStereoBuffer(stereoOut, frameCount, _masterVolume.load(std::memory_order_relaxed));
+    }
+
+    // ------------------------------------------------------------------------------------
+    // VoiceClient
+    // ------------------------------------------------------------------------------------
+
+    VoiceClient::~VoiceClient() {
+        Shutdown();
+    }
+
+    bool VoiceClient::Init(Networking::NetworkClient *client) {
+        if (client == nullptr || client->GetPeer() == nullptr) {
+            return false;
+        }
+
+        _client = client;
+
+        client->GetPeer()->AttachPlugin(&_voice);
+        _voice.SetOrderingChannels(Framework::Networking::ToOrderingChannel(Framework::Networking::Channel::VoiceFrames), Framework::Networking::ToOrderingChannel(Framework::Networking::Channel::VoiceControl));
+        _attached = true;
+
+        _sink   = &_localSink;
+        _source = &_capture;
+
+        // Devices are deliberately NOT opened here. A client Instance is initialized from inside
+        // the host game's startup, which for an injected mod can be before the game has run any of
+        // its own: miniaudio's WASAPI backend calls CoInitializeEx(COINIT_MULTITHREADED) on the
+        // calling thread and holds it for the device's lifetime, so opening one here claims the
+        // host's main thread for the MTA. A game that then wants an STA main thread -- Unreal
+        // OleInitializes one for drag-and-drop -- gets RPC_E_CHANGED_MODE and never finishes
+        // booting. Waiting for the session means the host has established its own apartment first
+        // and miniaudio inherits it.
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Voice client attached; devices open with the session");
+        return true;
+    }
+
+    void VoiceClient::Shutdown() {
+        CutGates();
+        CloseSession();
+
+        // CloseSession stops the devices only when a session was open, and the installed source
+        // is not necessarily the built-in one. Null is the destructor on a client Init never ran.
+        if (_source != nullptr) {
+            _source->Stop();
+        }
+
+        _capture.Stop();
+        _localSink.Stop();
+
+        if (_attached && _client != nullptr && _client->GetPeer() != nullptr) {
+            _client->GetPeer()->DetachPlugin(&_voice);
+        }
+
+        _attached = false;
+        _client   = nullptr;
+        _sink     = nullptr;
+        _source   = nullptr;
+        _placements.clear();
+        _speakerRanges.clear();
+        _speakerTiers.clear();
+        _published.clear();
+    }
+
+    void VoiceClient::OpenSession() {
+        MafiaNet::RakPeerInterface *peer = _client->GetPeer();
+
+        _self = peer->GetMyGUID();
+        if (_self == MafiaNet::UNASSIGNED_RAKNET_GUID) {
+            return;
+        }
+
+        _voice.SetRelayMode(true);
+        // One decoded stream per speaker; the mixer needs them separate to position each.
+        _voice.SetPerSpeakerOutput(true);
+        _voice.Init(kSampleRate, kFrameBytes);
+
+        // Opus picks its own rate from the sample rate unless told otherwise.
+        _voice.SetEncoderBitrate(kBitrate);
+        _voice.SetVAD(true);
+        _voice.SetVBR(true);
+
+        // Only the codec can bound decode: relay frames are decoded in OnReceive, before any
+        // of our code sees them, so the mixer's slot array bounds mixing rather than CPU.
+        _voice.SetMaxDecodedSpeakers(kMaxDecodedTalkers);
+
+        // No SetNoiseFilter: RakVoice only runs RNNoise on 480-sample frames and voice runs at
+        // 960. NoiseSuppressor runs it on each half instead, in PumpCapture.
+        _voice.SetRelayTarget(_server);
+
+        _sessionOpen = true;
+        StartDevices();
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Voice session open (relay {}, self {}, microphone {}, playback {})", _server.g, _self.g, _capture.IsRunning(), _localSink.IsRunning());
+    }
+
+    void VoiceClient::CloseSession() {
+        if (!_sessionOpen) {
+            return;
+        }
+
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            ReleaseAdmitted(static_cast<int>(i));
+        }
+        _localTalking      = false;
+        _localTalkingUntil = 0;
+        _inputLevel        = 0.0f;
+        CutGates();
+        _denoiser.Reset();
+
+        _voice.Deinit();
+        _voice.SetRelayMode(false);
+        _voice.SetRelayTarget(MafiaNet::UNASSIGNED_RAKNET_GUID);
+
+        // The same peer GUID may be a different player on the next server.
+        _placements.clear();
+        _speakerRanges.clear();
+        _speakerTiers.clear();
+
+        _self         = MafiaNet::UNASSIGNED_RAKNET_GUID;
+        _sessionOpen  = false;
+        _transmitting = false;
+
+        // Nothing to capture or play between servers, and holding the microphone open there would
+        // leave the OS recording indicator lit in the main menu.
+        StopDevices();
+
+        Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->debug("Voice session closed");
+    }
+
+    void VoiceClient::StartDevices() {
+        // Idempotent: both return true when already running.
+        if (_sink == &_localSink && !_localSink.Start()) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice: playback unavailable; remote players will be inaudible");
+        }
+
+        if (!_source->Start()) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice: no microphone; push-to-talk will do nothing");
+        }
+    }
+
+    void VoiceClient::StopDevices() {
+        _source->Stop();
+        _localSink.Stop();
+    }
+
+    void VoiceClient::UpdateSession() {
+        const bool connected = _client->GetConnectionState() == Networking::PeerState::CONNECTED;
+
+        if (!connected) {
+            if (_sessionOpen) {
+                CloseSession();
+            }
+
+            // The next server inherits nothing from this one.
+            _server              = MafiaNet::UNASSIGNED_RAKNET_GUID;
+            _preferenceSent      = false;
+            _tierSent            = false;
+            _tierSentAtMs        = 0;
+            _defaultSpeakerRange = kDefaultProximityRange;
+            _tierRanges          = kDefaultTierRanges;
+            return;
+        }
+
+        if (_server == MafiaNet::UNASSIGNED_RAKNET_GUID) {
+            // A client is joined to exactly one server, so index 0 is it. Unassigned means the
+            // connection has not settled; retry next tick rather than key the session on nothing.
+            _server = _client->GetPeer()->GetGUIDFromIndex(0);
+            if (_server == MafiaNet::UNASSIGNED_RAKNET_GUID) {
+                return;
+            }
+        }
+
+        // Announced whether or not a session follows: voice being off is exactly what lets
+        // the server stop relaying frames we would drop.
+        if (!_preferenceSent) {
+            PublishPreference();
+        }
+
+        // Whether or not a session follows, like the preference: the tier is how far our voice
+        // would carry, and the others draw it.
+        PublishTier(Utils::Time::GetTime());
+
+        if (_enabled && !_sessionOpen) {
+            OpenSession();
+        }
+        else if (!_enabled && _sessionOpen) {
+            CloseSession();
+        }
+    }
+
+    void VoiceClient::PublishPreference() {
+        if (_client == nullptr || _server == MafiaNet::UNASSIGNED_RAKNET_GUID) {
+            return;
+        }
+
+        Networking::RPC::VoicePreference payload;
+        payload.enabled = _enabled;
+        _client->SendRPC(payload, _server);
+        _preferenceSent = true;
+    }
+
+    void VoiceClient::SetEnabled(bool enabled) {
+        if (_enabled == enabled) {
+            return;
+        }
+
+        _enabled = enabled;
+
+        // Cleared before the attempt so a send that cannot land yet is retried, not lost.
+        _preferenceSent = false;
+        PublishPreference();
+
+        // Re-enabling reopens from UpdateSession, once the connection is confirmed.
+        if (!enabled) {
+            CutGates();
+            CloseSession();
+        }
+    }
+
+    void VoiceClient::SetTransmitMode(TransmitMode mode) {
+        if (mode == _transmitMode) {
+            return;
+        }
+
+        CutGates();
+        _transmitMode = mode;
+    }
+
+    void VoiceClient::SetNoiseSuppression(bool enabled) {
+        _noiseSuppression = enabled;
+        if (!enabled) {
+            _denoiser.Reset();
+        }
+    }
+
+    std::vector<std::string> VoiceClient::ListCaptureDevices() const {
+        return _source != nullptr ? _source->ListDevices() : std::vector<std::string> {};
+    }
+
+    std::string VoiceClient::GetCaptureDevice() const {
+        return _source != nullptr ? _source->GetSelectedDevice() : std::string {};
+    }
+
+    void VoiceClient::SetCaptureDevice(const std::string &name) {
+        if (_source == nullptr || _source->GetSelectedDevice() == name) {
+            return;
+        }
+
+        _source->SelectDevice(name);
+
+        // What the old microphone taught the denoiser about the room is wrong for this one.
+        _denoiser.Reset();
+        CutGates();
+
+        if (_source->IsRunning()) {
+            _source->Stop();
+            if (!_source->Start()) {
+                Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice: the chosen microphone would not open; continuing listen-only");
+            }
+        }
+    }
+
+    void VoiceClient::CutGates() {
+        _denoiserFed = false;
+        _ptt.Cut();
+        _vad.Cut();
+        _gateWasOpen  = false;
+        _preRollCount = 0;
+        _preRollNext  = 0;
+    }
+
+    void VoiceClient::SetPushToTalk(bool held) {
+        _ptt.SetHeld(held, Utils::Time::GetTime());
+    }
+
+    void VoiceClient::SetInputSuppressed(bool suppressed) {
+        _inputSuppressed = suppressed;
+        if (suppressed) {
+            CutGates();
+        }
+    }
+
+    void VoiceClient::SetTransmitBlocked(bool blocked) {
+        _transmitBlocked = blocked;
+        if (blocked) {
+            CutGates();
+        }
+    }
+
+    void VoiceClient::SetHearingRange(float range) {
+        _hearingRange = range > 0.0f ? range : 0.0f;
+    }
+
+    void VoiceClient::SetDefaultSpeakerRange(float range) {
+        _defaultSpeakerRange = range > 0.0f ? range : kDefaultProximityRange;
+    }
+
+    float VoiceClient::ResolveRange(uint64_t speaker) const {
+        const auto it     = _speakerRanges.find(speaker);
+        const float own   = it != _speakerRanges.end() ? it->second : 0.0f;
+        const float tier  = _tierRanges[static_cast<size_t>(GetSpeakerTier(speaker))];
+        const float range = own > 0.0f ? own : (tier > 0.0f ? tier : _defaultSpeakerRange);
+
+        return _hearingRange > 0.0f ? std::min(range, _hearingRange) : range;
+    }
+
+    void VoiceClient::Update() {
+        if (_client == nullptr) {
+            return;
+        }
+
+        const int64_t nowMs = Utils::Time::GetTime();
+        _envelopeStep       = _envelopeMs != 0 ? std::min(static_cast<float>(nowMs - _envelopeMs) * 0.001f, kMaxEnvelopeStep) : 0.0f;
+        _envelopeMs         = nowMs;
+
+        UpdateSession();
+        PumpCapture();
+        PumpSpeakers();
+        PublishWorld();
+    }
+
+    void VoiceClient::PumpCapture() {
+        if (!_source->IsRunning()) {
+            _localLevel   = 0.0f;
+            _inputLevel   = 0.0f;
+            _localTalking = false;
+            return;
+        }
+
+        const int64_t nowMs = Utils::Time::GetTime();
+        const bool allowed  = _sessionOpen && !_inputSuppressed && !_transmitBlocked;
+        const bool activity = _transmitMode == TransmitMode::VoiceActivity;
+
+        // Drained whether or not we transmit: left alone the ring fills, and the next
+        // push-to-talk press would send all of it before anything the player just said.
+        uint32_t frames = 0;
+        float loudest   = 0.0f;
+        float heard     = 0.0f;
+        bool sent       = false;
+        // Push-to-talk's gate does not depend on the level, so with the key up there is nothing
+        // to denoise for: the frame is thrown away. Voice activation gates on the denoised
+        // level, so it has to process every frame.
+        const bool denoise = _noiseSuppression && (activity || (allowed && _ptt.IsOpen(nowMs)));
+
+        while (_source->ReadFrame(_frame.data())) {
+            frames++;
+
+            if (denoise) {
+                if (!_denoiserFed) {
+                    _denoiser.Restart();
+                }
+                _denoiser.Process(_frame.data());
+            }
+            _denoiserFed = denoise;
+
+            const float level = FrameLevel(_frame.data(), static_cast<uint32_t>(_frame.size()));
+            heard             = std::max(heard, level);
+
+            // The level gate is fed while blocked too, so it does not reopen on a stale hold the
+            // moment the block lifts.
+            const bool gate = activity ? _vad.Update(level, nowMs) : _ptt.IsOpen(nowMs);
+            const bool open = allowed && gate;
+
+            if (!open) {
+                _gateWasOpen = false;
+                if (activity) {
+                    KeepPreRoll(_frame.data());
+                }
+                continue;
+            }
+
+            // Push-to-talk never sends what came before the key: that is audio the player did
+            // not choose to send. Voice activation does, because the frame that crossed the
+            // threshold is already part of the word.
+            if (!_gateWasOpen && activity) {
+                SendPreRoll();
+            }
+            _gateWasOpen = true;
+
+            _voice.SendFrame(_self, _frame.data());
+            loudest = std::max(loudest, level);
+            sent    = true;
+        }
+
+        _transmitting = sent;
+
+        const bool gateOpen = allowed && (activity ? _vad.IsOpen() : _ptt.IsOpen(nowMs));
+
+        // Debounced like the server's inbound frames, so a tick that drained nothing does not
+        // flicker the edge. Closing the gate cuts it immediately.
+        if (_transmitting) {
+            _localTalkingUntil = nowMs + static_cast<int64_t>(kTalkingTimeoutMs);
+        }
+        _localTalking = gateOpen && nowMs < _localTalkingUntil;
+
+        // From what we send, so a blocked transmit reads as silence. A tick with no frame holds.
+        if (frames > 0) {
+            _localLevel = FollowEnvelope(_localLevel, sent ? loudest : 0.0f, _envelopeStep);
+            _inputLevel = FollowEnvelope(_inputLevel, heard, _envelopeStep, kInputMeterFloor);
+        }
+        else if (!gateOpen) {
+            _localLevel = FollowEnvelope(_localLevel, 0.0f, _envelopeStep);
+        }
+    }
+
+    void VoiceClient::KeepPreRoll(const int16_t *frame) {
+        std::copy(frame, frame + kFrameSamples, _preRoll[_preRollNext].begin());
+        _preRollNext  = (_preRollNext + 1) % kVoiceActivationPreRollFrames;
+        _preRollCount = std::min(_preRollCount + 1, kVoiceActivationPreRollFrames);
+    }
+
+    void VoiceClient::SendPreRoll() {
+        // Oldest first: once the ring is full, the next write position is the oldest entry.
+        const uint32_t first = (_preRollNext + kVoiceActivationPreRollFrames - _preRollCount) % kVoiceActivationPreRollFrames;
+        for (uint32_t i = 0; i < _preRollCount; i++) {
+            _voice.SendFrame(_self, _preRoll[(first + i) % kVoiceActivationPreRollFrames].data());
+        }
+        _preRollCount = 0;
+        _preRollNext  = 0;
+    }
+
+    void VoiceClient::PumpSpeakers() {
+        if (!_sessionOpen) {
+            return;
+        }
+
+        const int64_t nowMs = Utils::Time::GetTime();
+
+        // RakVoice drops a speaker from the active list the moment they stop, so decay here.
+        for (AdmittedSpeaker &admitted : _admitted) {
+            if (admitted.id != 0 && nowMs >= admitted.audioUntil) {
+                admitted.level = FollowEnvelope(admitted.level, 0.0f, _envelopeStep);
+            }
+        }
+
+        _voice.GetActiveSpeakers(_activeSpeakers);
+
+        for (unsigned i = 0; i < _activeSpeakers.Size(); i++) {
+            const MafiaNet::RakNetGUID guid = _activeSpeakers[i];
+            const uint64_t speaker          = static_cast<uint64_t>(MafiaNet::ToPeerGuid(guid));
+
+            // Admitted on their first frame, not on being listed: RakVoice lists every channel it
+            // still holds a decoder for, audio or not, so admitting on the listing would re-admit
+            // a silent talker the tick after the silence timeout released them -- and read them
+            // as talking.
+            int slot            = FindAdmitted(speaker);
+            bool admissionTried = slot >= 0;
+
+            // Drained admitted or not: the decode is already paid for, and leaving frames
+            // queued only delays the audio handed back once a slot opens up.
+            bool received     = false;
+            float loudest     = 0.0f;
+            int64_t submitted = 0;
+            while (_voice.ReceiveFrameFrom(guid, _frame.data())) {
+                if (!admissionTried) {
+                    admissionTried = true;
+                    slot           = AdmitSpeaker(speaker, nowMs);
+                }
+
+                if (slot >= 0 && _sink != nullptr) {
+                    _sink->Submit(speaker, _frame.data(), kFrameSamples);
+                    loudest = std::max(loudest, FrameLevel(_frame.data(), kFrameSamples));
+                    submitted++;
+                }
+                received = true;
+            }
+
+            if (received && slot >= 0) {
+                _admitted[slot].lastFrame  = nowMs;
+                _admitted[slot].audioUntil = nowMs + submitted * kFrameMs + kEnvelopeHoldSlackMs;
+                _admitted[slot].level      = FollowEnvelope(_admitted[slot].level, loudest, _envelopeStep);
+            }
+        }
+
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            if (_admitted[i].id == 0) {
+                continue;
+            }
+
+            if ((nowMs - _admitted[i].lastFrame) > static_cast<int64_t>(kSpeakerSilenceTimeoutMs)) {
+                ReleaseAdmitted(static_cast<int>(i));
+            }
+        }
+    }
+
+    void VoiceClient::PublishWorld() {
+        _published.clear();
+
+        for (const AdmittedSpeaker &admitted : _admitted) {
+            if (admitted.id == 0) {
+                continue;
+            }
+
+            const auto it = _placements.find(admitted.id);
+            if (it == _placements.end()) {
+                continue;
+            }
+
+            _published.push_back(it->second.placement);
+            _published.back().range = ResolveRange(admitted.id);
+        }
+
+        // Without a listener every gain is computed against the origin, so a mod that forgot
+        // to publish one would debug silence.
+        if (!_listenerSet && !_listenerWarned && !_published.empty()) {
+            _listenerWarned = true;
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice: no listener transform published; call VoiceClient::SetListenerTransform from the game camera");
+        }
+
+        // To the installed sink: an engine sink positions its own voices, and this is the
+        // only thing that tells it where anyone is.
+        _sink->PublishWorld(_listener, _published.data(), _published.size());
+    }
+
+    int VoiceClient::FindAdmitted(uint64_t speaker) const {
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            if (_admitted[i].id == speaker) {
+                return static_cast<int>(i);
+            }
+        }
+
+        return -1;
+    }
+
+    float VoiceClient::ReachSqTo(uint64_t speaker) const {
+        const auto it = _placements.find(speaker);
+        if (it == _placements.end()) {
+            return std::numeric_limits<float>::infinity();
+        }
+
+        // ResolveRange is never 0: the default range and the hearing range are both positive.
+        const glm::vec3 delta = it->second.placement.position - _listener.position;
+        const float range     = ResolveRange(speaker);
+        return glm::dot(delta, delta) / (range * range);
+    }
+
+    int VoiceClient::AdmitSpeaker(uint64_t speaker, int64_t nowMs) {
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            if (_admitted[i].id == 0) {
+                _admitted[i].id         = speaker;
+                _admitted[i].lastFrame  = nowMs;
+                _admitted[i].level      = 0.0f;
+                _admitted[i].audioUntil = 0;
+                return static_cast<int>(i);
+            }
+        }
+
+        // Measured against each talker's own range rather than in metres: a shout at 30m is
+        // heard better than a whisper at 6m, and a crowd of whisperers must not drown it out.
+        // Unplaceable speakers sort as infinitely far, so they are evicted first and never
+        // displace one the player can actually see.
+        const float candidateReachSq = ReachSqTo(speaker);
+
+        int farthest          = -1;
+        float farthestReachSq = 0.0f;
+
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            const float reachSq = ReachSqTo(_admitted[i].id);
+            if (farthest < 0 || reachSq > farthestReachSq) {
+                farthest        = static_cast<int>(i);
+                farthestReachSq = reachSq;
+            }
+        }
+
+        if (farthest < 0 || !(candidateReachSq * kEvictionHysteresis < farthestReachSq)) {
+            return -1;
+        }
+
+        ReleaseAdmitted(farthest);
+        _admitted[farthest].id         = speaker;
+        _admitted[farthest].lastFrame  = nowMs;
+        _admitted[farthest].level      = 0.0f;
+        _admitted[farthest].audioUntil = 0;
+        return farthest;
+    }
+
+    void VoiceClient::ReleaseAdmitted(int slot) {
+        if (_admitted[slot].id == 0) {
+            return;
+        }
+
+        if (_sink != nullptr) {
+            _sink->ReleaseSpeaker(_admitted[slot].id);
+        }
+
+        _admitted[slot].id         = 0;
+        _admitted[slot].lastFrame  = 0;
+        _admitted[slot].level      = 0.0f;
+        _admitted[slot].audioUntil = 0;
+    }
+
+    bool VoiceClient::IsSpeakerTalking(uint64_t speaker) const {
+        if (speaker == 0) {
+            return false;
+        }
+
+        const int slot = FindAdmitted(speaker);
+        if (slot < 0 || _admitted[slot].lastFrame == 0) {
+            return false;
+        }
+
+        // The later of the last arrival plus the hold, and the end of what is still queued to
+        // play: a burst can hand over more audio than the hold covers.
+        const int64_t until = std::max(_admitted[slot].lastFrame + static_cast<int64_t>(kSpeakerTalkingHoldMs), _admitted[slot].audioUntil + static_cast<int64_t>(kTalkingTimeoutMs));
+        return Utils::Time::GetTime() < until;
+    }
+
+    float VoiceClient::GetSpeakerLevel(uint64_t speaker) const {
+        // 0 marks a free slot, which FindAdmitted would match.
+        if (speaker == 0) {
+            return 0.0f;
+        }
+
+        const int slot = FindAdmitted(speaker);
+        return slot >= 0 ? _admitted[slot].level : 0.0f;
+    }
+
+    void VoiceClient::BeginSpeakerUpdate() {
+        _placementGeneration++;
+    }
+
+    void VoiceClient::EndSpeakerUpdate() {
+        for (auto it = _placements.begin(); it != _placements.end();) {
+            if (it->second.generation == _placementGeneration) {
+                ++it;
+                continue;
+            }
+
+            // No longer replicated: drop the slot too, or it holds a decoder open for
+            // someone who can no longer be heard.
+            const int slot = FindAdmitted(it->first);
+            if (slot >= 0) {
+                ReleaseAdmitted(slot);
+            }
+
+            it = _placements.erase(it);
+        }
+    }
+
+    bool VoiceClient::IsSelf(uint64_t speaker) const {
+        return _sessionOpen && speaker == static_cast<uint64_t>(MafiaNet::ToPeerGuid(_self));
+    }
+
+    void VoiceClient::SetSpeakerPosition(uint64_t speaker, const glm::vec3 &position) {
+        if (speaker == 0 || IsSelf(speaker)) {
+            return;
+        }
+
+        PlacementEntry &entry    = _placements[speaker];
+        entry.placement.speaker  = speaker;
+        entry.placement.position = position;
+        entry.generation         = _placementGeneration;
+    }
+
+    void VoiceClient::SetSpeakerRange(uint64_t speaker, float range, VoiceTier tier) {
+        if (speaker == 0 || tier >= VoiceTier::Count) {
+            return;
+        }
+
+        if (IsOwnGuid(speaker)) {
+            // The server's answer to a request we sent is not news, and adopting it would undo
+            // a newer press still waiting its turn. A tier we never asked for is the server's
+            // decision, and wins.
+            if (_tierSent && tier != _sentTier) {
+                _tier          = tier;
+                _sentTier      = tier;
+                _tierShownAtMs = Utils::Time::GetTime();
+            }
+            return;
+        }
+
+        if (range > 0.0f) {
+            _speakerRanges[speaker] = range;
+        }
+        else {
+            _speakerRanges.erase(speaker);
+        }
+
+        if (tier != VoiceTier::Normal) {
+            _speakerTiers[speaker] = tier;
+        }
+        else {
+            _speakerTiers.erase(speaker);
+        }
+    }
+
+    VoiceTier VoiceClient::GetSpeakerTier(uint64_t speaker) const {
+        const auto it = _speakerTiers.find(speaker);
+        return it != _speakerTiers.end() ? it->second : VoiceTier::Normal;
+    }
+
+    bool VoiceClient::IsOwnGuid(uint64_t speaker) const {
+        if (_client == nullptr || _client->GetPeer() == nullptr) {
+            return false;
+        }
+
+        const MafiaNet::RakNetGUID self = _client->GetPeer()->GetMyGUID();
+        return self != MafiaNet::UNASSIGNED_RAKNET_GUID && speaker == static_cast<uint64_t>(MafiaNet::ToPeerGuid(self));
+    }
+
+    void VoiceClient::SetTier(VoiceTier tier) {
+        if (tier >= VoiceTier::Count) {
+            return;
+        }
+
+        if (tier == _tier) {
+            return;
+        }
+
+        // Sent from Update, which paces it: a key pressed three times in a frame is one request.
+        _tier          = tier;
+        _tierShownAtMs = Utils::Time::GetTime();
+    }
+
+    void VoiceClient::CycleTier(uint32_t steps) {
+        constexpr uint32_t kTiers = static_cast<uint32_t>(VoiceTier::Count);
+        SetTier(static_cast<VoiceTier>((static_cast<uint32_t>(_tier) + steps) % kTiers));
+    }
+
+    float VoiceClient::GetIndicatorAlpha() const {
+        if (_localTalking) {
+            return 1.0f;
+        }
+        if (_tierShownAtMs == 0) {
+            return 0.0f;
+        }
+
+        const int64_t left = static_cast<int64_t>(kTierShownMs) - (Utils::Time::GetTime() - _tierShownAtMs);
+        return std::clamp(static_cast<float>(left) / static_cast<float>(kTierFadeMs), 0.0f, 1.0f);
+    }
+
+    void VoiceClient::PublishTier(int64_t nowMs) {
+        if (_client == nullptr || _server == MafiaNet::UNASSIGNED_RAKNET_GUID) {
+            return;
+        }
+        if (_tierSent && _sentTier == _tier) {
+            return;
+        }
+        if (_tierSentAtMs != 0 && (nowMs - _tierSentAtMs) < static_cast<int64_t>(kTierRequestIntervalMs)) {
+            return;
+        }
+
+        Networking::RPC::VoiceTierRequest payload;
+        payload.tier = static_cast<uint8_t>(_tier);
+        _client->SendRPC(payload, _server);
+        _sentTier     = _tier;
+        _tierSent     = true;
+        _tierSentAtMs = nowMs;
+    }
+
+    void VoiceClient::RemoveSpeaker(uint64_t speaker) {
+        _placements.erase(speaker);
+        _speakerRanges.erase(speaker);
+        _speakerTiers.erase(speaker);
+
+        const int slot = FindAdmitted(speaker);
+        if (slot >= 0) {
+            ReleaseAdmitted(slot);
+        }
+    }
+
+    void VoiceClient::SetSink(IVoiceSink *sink) {
+        IVoiceSink *next = sink != nullptr ? sink : static_cast<IVoiceSink *>(&_localSink);
+        if (next == _sink) {
+            return;
+        }
+
+        // Hand admitted speakers back before switching, so an outgoing engine sink is never
+        // left holding voices it will not be told to release.
+        for (size_t i = 0; i < _admitted.size(); i++) {
+            ReleaseAdmitted(static_cast<int>(i));
+        }
+
+        _sink = next;
+
+        if (next == &_localSink) {
+            // Outside a session there is no device open to hand back to; OpenSession starts it.
+            if (_sessionOpen) {
+                _localSink.Start();
+            }
+        }
+        else {
+            // Only one renderer at a time.
+            _localSink.Stop();
+        }
+    }
+
+    void VoiceClient::SetSource(IVoiceSource *source) {
+        IVoiceSource *next = source != nullptr ? source : static_cast<IVoiceSource *>(&_capture);
+        if (next == _source) {
+            return;
+        }
+
+        // One holder at a time, outgoing one closed first: an exclusive-mode capture device
+        // would otherwise refuse to open for whoever takes over.
+        _source->Stop();
+        _source = next;
+
+        // Outside a session there is no microphone to open yet; OpenSession starts it.
+        if (_sessionOpen && !_source->Start()) {
+            Logging::GetLogger(FRAMEWORK_INNER_CLIENT)->warn("Voice: no microphone; push-to-talk will do nothing");
+        }
+    }
+} // namespace Framework::Voice

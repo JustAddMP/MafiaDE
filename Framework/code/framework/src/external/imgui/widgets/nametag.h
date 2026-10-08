@@ -1,0 +1,220 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2026, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include "world_text.h"
+
+#include <imgui.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace Framework::External::ImGUI::Widgets {
+    // Wire values are shared with Networking::Replication::NametagComponent; keep in sync.
+    enum class NameTagComponent : uint8_t {
+        Name   = 1 << 0,
+        Health = 1 << 1,
+    };
+
+    // The viewer's own switches over every tag they see, driven by the client Nametags builtin.
+    // showSelf is read by the mod's draw pass, which owns the choice of which avatars get a tag.
+    struct NameTagView {
+        inline static bool showTags   = true;
+        inline static bool showHealth = true;
+        inline static bool showSelf   = false;
+    };
+
+    // Distance behaviour of a world-anchored tag.
+    struct NameTagLayout {
+        float drawDistance = 50.0f; // hard cull
+        float fadeStart    = 35.0f; // alpha ramp start; <=0 derives from drawDistance
+        float nearScale    = 1.35f;
+        float farScale     = 0.75f;
+        float scaleStart   = 10.0f; // scale ramp runs nearScale -> farScale between these
+        float scaleEnd     = 70.0f;
+        float shiftStart   = 15.0f; // distance where the pixel lift starts
+        float shiftMax     = 20.0f; // pixels, at drawDistance
+    };
+
+    inline bool NameTagHasComponent(uint8_t components, NameTagComponent component) {
+        return (components & static_cast<uint8_t>(component)) != 0;
+    }
+
+    // The fade a tag would draw at, 0 when culled. Cheap pre-check before a bone lookup or projection.
+    inline float NameTagAlpha(float distance, uint8_t components, const NameTagLayout &layout = {}) {
+        if (!NameTagView::showTags || !NameTagHasComponent(components, NameTagComponent::Name)) {
+            return 0.0f;
+        }
+        return WorldTextAlpha(distance, layout.drawDistance, layout.fadeStart);
+    }
+
+    // Step a 0..1 occlusion fade toward `visible`; speed is full fades per second.
+    inline float NameTagFadeStep(float current, bool visible, float deltaTime, float speed = 8.0f) {
+        const float step = deltaTime > 0.0f ? deltaTime * speed : 1.0f;
+        return std::clamp(visible ? current + step : current - step, 0.0f, 1.0f);
+    }
+
+    enum class NameTagAnchor {
+        TextCenter,
+        BottomCenter,
+    };
+
+    struct NameTagStyle {
+        ImFont *font          = nullptr; // null = current font; a mod's own is Wrapper::GetFont
+        ImU32 textColor       = IM_COL32(255, 255, 255, 255);
+        ImU32 bgColor         = IM_COL32(0, 0, 0, 153);
+        float fontSize        = 0.0f; // 0 = current font size
+        float rounding        = 4.0f;
+        float padding         = 4.0f;
+        float healthBarWidth  = 50.0f; // used when a healthPercent is supplied
+        float healthBarHeight = 5.0f;
+        NameTagAnchor anchor  = NameTagAnchor::TextCenter;
+
+        // The talking indicator, drawn inside the plate to the left of the name. < 0 draws none;
+        // [0, 1] is how loud the speaker is right now (VoiceClient::GetSpeakerLevel), which
+        // swells the waves -- a player who is talking but between syllables still shows the
+        // speaker and its first wave.
+        float voiceLevel = -1.0f;
+        ImU32 voiceColor = IM_COL32(255, 255, 255, 255);
+        // How many waves the speaker has, 1 to 3: the voice tier, whisper to shout.
+        int voiceWaves = 3;
+    };
+
+    // A loudspeaker with `waves` sound waves, 1 to 3, sized to `height` and centred on `center`.
+    // The count says how far the voice carries -- whisper, normal, shout -- and is always drawn;
+    // the waves light up with `level` in [0, 1]. The first is always on, so a quiet moment
+    // mid-sentence does not look like the speaker stopped. Returns the width it took, which
+    // does not depend on the count, so switching tier never moves what sits beside the icon.
+    inline float DrawVoiceIcon(ImDrawList *drawList, ImVec2 center, float height, float level, ImU32 color, int waves = 3) {
+        if (!drawList || height <= 0.0f) {
+            return 0.0f;
+        }
+
+        const float h         = height * 0.8f;
+        const float left      = center.x - h * 0.5f;
+        const float bodyW     = h * 0.22f;
+        const float bodyH     = h * 0.36f;
+        const float coneW     = h * 0.24f;
+        const float coneH     = h * 0.8f;
+        const float thickness = std::max(1.0f, h * 0.09f);
+
+        // Body and cone as one convex outline, so the join does not show a seam.
+        const ImVec2 points[] = {
+            ImVec2(left, center.y - bodyH * 0.5f),
+            ImVec2(left + bodyW, center.y - bodyH * 0.5f),
+            ImVec2(left + bodyW + coneW, center.y - coneH * 0.5f),
+            ImVec2(left + bodyW + coneW, center.y + coneH * 0.5f),
+            ImVec2(left + bodyW, center.y + bodyH * 0.5f),
+            ImVec2(left, center.y + bodyH * 0.5f),
+        };
+        drawList->AddConvexPolyFilled(points, 6, color);
+
+        const ImVec2 origin(left + bodyW + coneW * 0.35f, center.y);
+        const float baseAlpha = static_cast<float>((color >> IM_COL32_A_SHIFT) & 0xFF) / 255.0f;
+        const float clamped   = std::clamp(level, 0.0f, 1.0f);
+        constexpr float kSpan = 0.8f; // radians either side of horizontal
+        const int drawn       = std::clamp(waves, 1, 3);
+        for (int wave = 0; wave < drawn; wave++) {
+            // The first wave is always lit; the other two need a louder voice to fill in.
+            const float lit       = wave == 0 ? 1.0f : std::clamp((clamped - 0.08f * static_cast<float>(wave)) * 6.0f, 0.0f, 1.0f);
+            const float radius    = coneW * 0.9f + static_cast<float>(wave) * h * 0.2f;
+            const ImU32 waveAlpha = static_cast<ImU32>(255.0f * baseAlpha * (0.25f + 0.75f * lit));
+            const ImU32 waveColor = (color & ~IM_COL32_A_MASK) | (waveAlpha << IM_COL32_A_SHIFT);
+            drawList->PathArcTo(origin, radius, -kSpan, kSpan, 8);
+            drawList->PathStroke(waveColor, 0, thickness);
+        }
+
+        return h * 1.1f;
+    }
+
+    // The local player's own voice on a HUD: the speaker icon over a drop shadow, faded by
+    // `alpha` (VoiceClient::GetIndicatorAlpha). Where it sits is the mod's call.
+    inline void DrawVoiceIndicator(ImDrawList *drawList, ImVec2 center, float height, float level, int waves, float alpha) {
+        if (!drawList || alpha <= 0.0f) {
+            return;
+        }
+
+        const float opacity = std::clamp(alpha, 0.0f, 1.0f);
+        const float shadow  = std::max(1.0f, height * 0.06f);
+        DrawVoiceIcon(drawList, ImVec2(center.x + shadow, center.y + shadow), height, level, IM_COL32(0, 0, 0, static_cast<int>(160.0f * opacity)), waves);
+        DrawVoiceIcon(drawList, center, height, level, IM_COL32(255, 255, 255, static_cast<int>(230.0f * opacity)), waves);
+    }
+
+    // BottomCenter anchors the full widget, including the health bar.
+    inline void DrawNameTag(ImDrawList *drawList, ImVec2 screenPos, const char *name, const NameTagStyle &style = {}, float alpha = 1.0f, float healthPercent = -1.0f) {
+        if (!drawList || !name || !name[0] || alpha <= 0.0f) {
+            return;
+        }
+
+        ImFont *font   = style.font ? style.font : ImGui::GetFont();
+        float fontSize = style.fontSize > 0.0f ? style.fontSize : ImGui::GetFontSize();
+
+        const bool drawHealth    = healthPercent >= 0.0f && style.healthBarWidth > 0.0f && style.healthBarHeight > 0.0f;
+        const bool drawVoice     = style.voiceLevel >= 0.0f;
+        const ImVec2 textSize    = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, name);
+        const float bottomOffset = style.anchor == NameTagAnchor::BottomCenter ? textSize.y * 0.5f + style.padding + (drawHealth ? 3.0f + style.healthBarHeight : 0.0f) : 0.0f;
+        const ImVec2 textPos(screenPos.x - textSize.x * 0.5f, screenPos.y - textSize.y * 0.5f - bottomOffset);
+
+        // The icon hangs off the left of the name rather than recentring it, so a player who
+        // starts talking does not make their name jump sideways.
+        const float iconWidth = drawVoice ? textSize.y + style.padding : 0.0f;
+
+        drawList->AddRectFilled(ImVec2(textPos.x - style.padding - iconWidth, textPos.y - style.padding), ImVec2(textPos.x + textSize.x + style.padding, textPos.y + textSize.y + style.padding), WorldTextModulateAlpha(style.bgColor, alpha), style.rounding);
+        if (drawVoice) {
+            DrawVoiceIcon(drawList, ImVec2(textPos.x - iconWidth + textSize.y * 0.5f, textPos.y + textSize.y * 0.5f), textSize.y, style.voiceLevel, WorldTextModulateAlpha(style.voiceColor, alpha), style.voiceWaves);
+        }
+        drawList->AddText(font, fontSize, textPos, WorldTextModulateAlpha(style.textColor, alpha), name);
+
+        if (!drawHealth) {
+            return;
+        }
+
+        const float t            = std::clamp(healthPercent / 100.0f, 0.0f, 1.0f);
+        const float halfBarWidth = style.healthBarWidth * 0.5f;
+        const float barTop       = textPos.y + textSize.y + style.padding + 3.0f;
+        const ImVec2 barMin(screenPos.x - halfBarWidth, barTop);
+        const ImVec2 barMax(screenPos.x + halfBarWidth, barTop + style.healthBarHeight);
+
+        drawList->AddRectFilled(barMin, barMax, WorldTextModulateAlpha(IM_COL32(0, 0, 0, 175), alpha), style.rounding * 0.5f);
+
+        const ImU32 fillLeft  = WorldTextModulateAlpha(IM_COL32(80, 0, 0, 255), alpha);
+        const ImU32 fillRight = WorldTextModulateAlpha(IM_COL32(80 + static_cast<int>(175.0f * t), static_cast<int>(40.0f * t), static_cast<int>(80.0f * t), 255), alpha);
+        drawList->AddRectFilledMultiColor(barMin, ImVec2(barMin.x + style.healthBarWidth * t, barMax.y), fillLeft, fillRight, fillRight, fillLeft);
+    }
+
+    // Draw a replicated avatar's tag at a projected screen position, fading, scaling and lifting it
+    // with distance. Returns false when culled; healthPercent < 0 draws no bar; alphaScale multiplies
+    // the distance fade.
+    inline bool DrawNameTagAt(ImDrawList *drawList, ImVec2 screenPos, float distance, const char *name, uint8_t components, ImU32 color, float healthPercent = -1.0f, const NameTagLayout &layout = {}, NameTagStyle style = {}, float alphaScale = 1.0f) {
+        const float alpha = NameTagAlpha(distance, components, layout) * alphaScale;
+        if (alpha <= 0.0f) {
+            return false;
+        }
+
+        const float scaleSpan   = layout.scaleEnd - layout.scaleStart;
+        const float scaleFactor = scaleSpan > 0.0f ? std::clamp((distance - layout.scaleStart) / scaleSpan, 0.0f, 1.0f) : 0.0f;
+        const float scale       = layout.nearScale + (layout.farScale - layout.nearScale) * scaleFactor;
+
+        style.textColor = color;
+        style.fontSize  = (style.fontSize > 0.0f ? style.fontSize : ImGui::GetFontSize()) * scale;
+        style.rounding *= scale;
+        style.padding *= scale;
+        style.healthBarWidth *= scale;
+        style.healthBarHeight *= scale;
+
+        const float shiftSpan   = layout.drawDistance - layout.shiftStart;
+        const float shiftFactor = shiftSpan > 0.0f ? std::clamp((distance - layout.shiftStart) / shiftSpan, 0.0f, 1.0f) : 0.0f;
+        screenPos.y -= shiftFactor * layout.shiftMax;
+
+        const bool drawHealth = NameTagView::showHealth && NameTagHasComponent(components, NameTagComponent::Health);
+        DrawNameTag(drawList, screenPos, name, style, alpha, drawHealth ? healthPercent : -1.0f);
+        return true;
+    }
+} // namespace Framework::External::ImGUI::Widgets

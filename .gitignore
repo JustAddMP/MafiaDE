@@ -1,6 +1,15 @@
-# Upstream source trees are their own repos (MafiaHub/Framework and MafiaHub/MafiaMP); our changes live in overlay/
-Framework/
-# Build output, packages, logs, runtime files
+# The upstream checkouts keep their own git metadata (hidden during staging by dev/tools/git_stage.py)
+.git_upstream/
+# Build output, vendor downloads (restored by the build), packages, logs, runtime files
+Framework/builds/
+Framework/vendors/vcpkg/
+Framework/vendors/cef/
+Framework/vendors/discord/
+Framework/vendors/steamworks/
+Framework/vendors/libnode/
+Framework/code/projects/MafiaMP/files/
+Framework/.idea/
+Framework/.cursor/
 dist/
 dev/logs/
 server/logs/

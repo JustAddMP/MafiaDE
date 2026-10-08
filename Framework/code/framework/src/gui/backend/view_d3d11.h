@@ -1,0 +1,51 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2024, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#pragma once
+
+#include <utils/safe_win32.h>
+
+#include <d3d11.h>
+#include <mutex>
+#include <wrl/client.h>
+
+#include "graphics/renderer.h"
+#include "gui/view.h"
+
+namespace Framework::GUI {
+    class ViewD3D11 final: public View {
+      private:
+        // GPU path: texture received from CEF's OnAcceleratedPaint
+        uint32_t _textureID  = 0;
+        uint32_t _geometryID = 0;
+        bool _geometryCreated = false;
+
+        // GPU path: a popup widget (a <select> list) comes as its own texture, drawn over the page
+        uint32_t _popupTextureID   = 0;
+        uint32_t _popupGeometryID  = 0;
+        bool _popupGeometryCreated = false;
+
+        // CPU path: texture created from pixel data
+        uint32_t _cpuTextureID = 0;
+
+        // What _cpuTextureID was created at; a resize makes it stale.
+        int _cpuTextureWidth  = 0;
+        int _cpuTextureHeight = 0;
+
+      public:
+        ViewD3D11(int id, Graphics::Renderer *graphicsRenderer, Manager *manager);
+
+        [[nodiscard]] Utils::Result<void, Framework::Error> Init(const std::string &url, int width, int height, int offsetX, int offsetY, bool gpuAccelerated = false) override;
+
+        void Render() override;
+
+      private:
+        void CreateOrUpdateGeometry(uint32_t &geometryID, bool &created, int x, int y, int width, int height);
+        void DrawPopup(Graphics::D3D11Backend *backend, Graphics::GPUState gpuState);
+    };
+} // namespace Framework::GUI

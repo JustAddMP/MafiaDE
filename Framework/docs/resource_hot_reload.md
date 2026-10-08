@@ -1,0 +1,158 @@
+# Resource Hot-Reload
+
+The scripting layer can reload a JavaScript resource from disk without
+restarting the server, and propagate that reload to connected clients. This is
+a development aid: edit a resource's `.js`, and the running resource picks up
+the change.
+
+## Enabling
+
+Hot-reload triggers come in two forms:
+
+- **Console commands** (always available), registered on the server `Instance`
+  (FiveM-style verbs):
+  - `start <resource>` — start a stopped resource.
+  - `stop <resource>` — stop a running resource. With **no** argument, `stop`
+    shuts down the server (back-compat); `quit` always shuts down the server.
+  - `restart <resource>` — reload a running resource's code.
+  - `ensure <resource>` — start if stopped, reload if running. The canonical
+    reload verb.
+  - `refresh` — re-scan the resources directory for new resources (no restart).
+  - `refreshall` — re-scan and reload everything that was running.
+- **Automatic file watcher** (opt-in): set `InstanceOptions.developmentMode =
+  true` on the server. The watcher polls running resources' files and reloads
+  any that change. It is **off by default** — leave it off in production.
+
+```cpp
+Framework::Integrations::Server::InstanceOptions opts;
+opts.developmentMode = true; // enable the file watcher
+```
+
+The watcher interval defaults to 1s (`ResourceManagerConfig::fileWatchIntervalMs`)
+and skips `node_modules`/`.git`.
+
+## Asynchronous lifecycle handlers
+
+The existing `resourceStart` and `resourceStop` events are Promise-aware. The
+resource manager pumps the scripting runtime while it waits, so handlers may do
+real asynchronous work such as database migrations, final saves, or connection
+shutdown:
+
+```js
+Events.on("resourceStart", async (resourceName) => {
+    if (resourceName !== "my-resource") return;
+    await database.migrate();
+});
+
+Events.on("resourceStop", async (resourceName) => {
+    if (resourceName !== "my-resource") return;
+    await saveInventory();
+    await database.close();
+});
+```
+
+Startup does not transition the resource to `Running`, invoke its started
+callback, or start a dependent resource until every matching handler settles.
+If a start handler rejects or exceeds the timeout, startup fails and the
+partially loaded resource's handlers, messages, timers, and exports are cleaned
+up.
+
+Shutdown waits before removing those runtime-owned objects, allowing the stop
+handler to use them during finalization. A rejected or timed-out stop is logged
+loudly, then cleanup is forced so one resource cannot indefinitely block a
+reload or server shutdown.
+
+The defaults are 30 seconds for start and 10 seconds for stop. Native hosts can
+override them with `ResourceManagerConfig::resourceStartTimeoutMs` and
+`ResourceManagerConfig::resourceStopTimeoutMs`; non-positive values are treated
+as a 1ms bounded timeout.
+
+## What a reload does
+
+`ResourceManager::RefreshResource(name)` (and `RefreshAll`):
+
+1. **Stops** the resource (and any dependents that cascade), firing
+   `resourceStop` and running `Events::CleanupResource` so the resource's
+   framework event listeners are removed.
+2. **Drops what the resource left running.** On the server every resource runs
+   in a Node environment of its own (see
+   [scripting_resource_isolation.md](scripting_resource_isolation.md)), and
+   stopping the resource destroys it: its timers, sockets, worker threads and
+   module cache go with it. The client shares one V8 isolate between resources,
+   so there `Engine::ClearResourceTimers` cancels the resource's
+   `setTimeout`/`setInterval` and `Engine::EvictModulesUnderPath` removes its
+   modules from the V8 module cache.
+3. **Re-parses `package.json`** from disk (manifest edits — entry points,
+   dependencies — take effect) and rebuilds the dependency graph.
+4. **Restarts** the resource and the dependents that were stopped. On the server
+   the restart is a fresh environment, so every file is read from disk again.
+
+`RefreshAll` additionally rescans the resources directory and registers
+newly-added resource directories (left stopped — `start` them explicitly).
+
+## Client propagation
+
+Whenever a client resource **starts at runtime** — a reload restart, an error
+auto-restart, or a newly started resource — the server notifies connected
+clients so they re-sync and apply it in place:
+
+1. Any `StartResource` after the initial boot fires
+   `ResourceManager::SetOnResourceStarted`; the server `Instance` reacts (boot
+   starts are skipped — clients get the full list on connect).
+2. The server rebuilds the asset streamer's upload list (`ClearUploads` +
+   `InitAssetStreamer`). This is required: MafiaNet's `DirectoryDeltaTransfer`
+   compares the file hashes captured when files were added, so without
+   rebuilding, an edited file looks up-to-date and is never re-sent.
+3. The server broadcasts a `ResourceRefresh` RPC (affected resource
+   names/versions), for resources with a client entry point.
+4. The client re-runs a **targeted** delta download (only changed files
+   transfer; unlike the connect-time download it does not stop all resources),
+   then for each flagged resource: reloads it if running, or — if the client
+   doesn't know it yet (newly added on the server) — discovers it from the
+   just-synced cache and starts it.
+
+Symmetrically, when a client resource **stops** at runtime (operator `stop`,
+error-stop, or the transient stop within a reload), the server broadcasts a
+`ResourceStop` RPC and clients stop it — no files transfer. A reload therefore
+mirrors as stop-then-start on the client.
+
+Clients that haven't finished connecting ignore `ResourceRefresh`/`ResourceStop`
+— their initial asset sync already fetches the current files.
+
+## Limitations
+
+- **Timeouts cannot cancel arbitrary JavaScript work.** The manager releases its
+  native wait state and cleans up the resource after a lifecycle timeout, but a
+  third-party Promise has no general cancellation mechanism. Code after a late
+  external I/O completion may still resume and must tolerate the resource
+  already being stopped.
+- **The client's shared isolate.** On the client, only framework event
+  listeners (`on(...)`) and engine timers are cleaned up; listeners a resource
+  adds to its own emitters must be removed in a `resourceStop` handler. The
+  server has no such limit: whatever a resource created dies with its
+  environment. Client scripts support CommonJS only.
+
+## Design notes (vs FiveM / MTASA)
+
+FiveM and MTASA run **each resource in its own script runtime** (V8 isolate /
+Mono domain / native script state). Reloading destroys and recreates that runtime, so
+modules, timers, and event listeners are freed automatically — there is no
+cache to evict or timer to cancel.
+
+The server does the same: each resource runs in its own Node environment, and
+stopping it frees the environment with everything in it. Values that cross
+between resources are copied, and functions cross as references into their
+owner; [scripting_resource_isolation.md](scripting_resource_isolation.md) has
+the details. The client still shares one V8 isolate between resources, which
+is what the timer cancellation and module eviction above are for.
+
+Where this framework is already ahead of FiveM: reloading a dependency restarts
+the dependents that cascaded down (FiveM leaves them stopped — see its
+`#TODO: restarting behavior of stopped dependencies at runtime`).
+
+## Versioning
+
+Client propagation is a netcode change (new RPC, both client and server) — a
+**MAJOR** change requiring matching client and server builds. The server-only
+pieces (eviction, `refresh` commands, watcher, timer cleanup) do not affect the
+wire protocol.

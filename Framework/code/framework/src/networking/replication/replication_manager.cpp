@@ -1,0 +1,638 @@
+/*
+ * MafiaHub OSS license
+ * Copyright (c) 2021-2023, MafiaHub. All rights reserved.
+ *
+ * This file comes from MafiaHub, hosted at https://github.com/MafiaHub/Framework.
+ * See LICENSE file in the source repository for information regarding licensing.
+ */
+
+#include "replication_manager.h"
+
+#include "../channels.h"
+#include "../network_peer.h"
+#include "../rpc/rpc_identifier.h"
+#include "../rpc/state_bag_sync.h"
+#include "entity_registry.h"
+#include "replication_connection.h"
+
+#include <utils/time.h>
+
+#include <algorithm>
+#include <cstddef>
+
+namespace Framework::Networking::Replication {
+    namespace {
+        // Raw RPC: the tail is the entity's polymorphic SerializeForcedState payload.
+        constexpr const char *kForceStateId = FW_RPC_IDENTIFIER("Framework::ForceState");
+
+        struct SetOwnerRPC {
+            static constexpr const char *kIdentifier = FW_RPC_IDENTIFIER("Framework::SetOwner");
+
+            MafiaNet::NetworkID networkId;
+            MafiaNet::PeerGuid ownerGUID {};
+            // The new owner adopts the server's current epoch, or every update it sends would be
+            // rejected as stale (see NetworkEntity::stateEpoch).
+            uint8_t stateEpoch = 0;
+
+            void Serialize(MafiaNet::BitStream *bs, bool write) {
+                bs->SerializeCompressed(write, networkId);
+                bs->Serialize(write, ownerGUID);
+                bs->Serialize(write, stateEpoch);
+            }
+        };
+    } // namespace
+
+    ReplicationManager::ReplicationManager()  = default;
+    ReplicationManager::~ReplicationManager() = default;
+
+    void ReplicationManager::Update() {
+        if (_networkUpdateActive && std::exchange(_updatedThisNetworkUpdate, true)) {
+            return;
+        }
+        MafiaNet::ReplicaManager3::Update();
+        // Flush in the same pass that queued the poses, never on the next tick.
+        for (unsigned int world = 0; world < worldsList.Size(); ++world) {
+            const MafiaNet::WorldId worldId = worldsList[world]->worldId;
+            for (unsigned int i = 0; i < GetConnectionCount(worldId); ++i) {
+                static_cast<ReplicationConnection *>(GetConnectionAtIndex(i, worldId))->FlushTransforms(GetRakPeerInterface());
+            }
+        }
+    }
+
+    MafiaNet::PluginReceiveResult ReplicationManager::OnReceive(MafiaNet::Packet *packet) {
+        if (!TransformBatch::IsBatch(packet->data, packet->length)) {
+            return MafiaNet::ReplicaManager3::OnReceive(packet);
+        }
+        MafiaNet::BitStream input(packet->data, packet->length, false);
+        MafiaNet::Time timestamp;
+        MafiaNet::WorldId worldId;
+        TransformBatch::Entries entries;
+        if (!TransformBatch::Read(input, timestamp, worldId, entries) || worldsArray[worldId] == nullptr) {
+            return MafiaNet::RR_STOP_PROCESSING_AND_DEALLOCATE;
+        }
+        MafiaNet::Connection_RM3 *connection = GetConnectionByGUID(packet->guid, worldId);
+        if (connection == nullptr) {
+            return MafiaNet::RR_STOP_PROCESSING_AND_DEALLOCATE;
+        }
+        // One set of parameters for the whole packet: its pose stream keeps whatever capacity a large
+        // pose grew it to.
+        MafiaNet::DeserializeParameters parameters {};
+        parameters.timeStamp             = timestamp; // RakPeer already shifted ID_TIMESTAMP to local time.
+        parameters.sourceConnection      = connection;
+        parameters.bitstreamWrittenTo[0] = true;
+        for (const TransformBatch::Entry &entry : entries) {
+            auto *replica = GetNetworkIDManager(worldId)->GET_OBJECT_FROM_ID<MafiaNet::Replica3 *>(entry.networkId);
+            if (replica == nullptr) {
+                // Construction still in flight, or a destruction overtook this unreliable batch; the
+                // other entries are unaffected.
+                continue;
+            }
+            parameters.serializationBitstream[0].Reset();
+            parameters.serializationBitstream[0].WriteBits(input.GetData() + BITS_TO_BYTES(entry.offset), entry.bits, false);
+            // The same owner, epoch and per-entity timestamp gates as an RM3 serialize message.
+            replica->Deserialize(&parameters);
+        }
+        return MafiaNet::RR_STOP_PROCESSING_AND_DEALLOCATE;
+    }
+
+    void ReplicationManager::ConfigureGrid(float cellSize, float worldMin, float worldMax) {
+        _interest.Configure(cellSize, worldMin, worldMax);
+    }
+
+    void ReplicationManager::Init(NetworkPeer *owner, bool isServer) {
+        _owner    = owner;
+        _isServer = isServer;
+        _myGUID   = MafiaNet::ToPeerGuid(owner->GetPeer()->GetMyGUID());
+        SetNetworkIDManager(owner->GetNetworkIDManager());
+        SetDefaultOrderingChannel(ToOrderingChannel(Channel::Construction));
+        owner->GetPeer()->AttachPlugin(this);
+        _delegation.Init(this, isServer);
+
+        // Client-only: these are server->owner pushes, so the server must never accept them inbound.
+        if (!_isServer && !_clientRPCsRegistered) {
+            owner->RegisterRawRPC(kForceStateId, [this](MafiaNet::BitStream *bs, MafiaNet::Packet *) {
+                MafiaNet::NetworkID networkId;
+                bs->ReadCompressed(networkId);
+                uint8_t epoch = 0;
+                bs->Read(epoch);
+                bool poseForced = true;
+                bs->Read(poseForced);
+                if (auto *entity = GetEntityByNetworkID(networkId)) {
+                    // Adopting the epoch is what acknowledges the override: updates we send from here
+                    // on carry it, so the server stops dropping them.
+                    entity->stateEpoch  = epoch;
+                    entity->_poseForced = poseForced;
+                    FieldSerializer fields(bs, false);
+                    entity->SerializeForcedState(fields);
+                    entity->OnStateForced();
+                }
+            });
+            owner->RegisterRPC<SetOwnerRPC>([this](const SetOwnerRPC &payload, MafiaNet::Packet *) {
+                if (auto *entity = GetEntityByNetworkID(payload.networkId)) {
+                    entity->ownerGUID  = payload.ownerGUID;
+                    entity->stateEpoch = payload.stateEpoch;
+                }
+            });
+            owner->RegisterRPC<RPC::StateBagSync>([this](const RPC::StateBagSync &payload, MafiaNet::Packet *) {
+                for (const auto &change : payload.changes) {
+                    NetworkEntity *entity = GetEntityByNetworkID(change.networkId);
+                    if (entity == nullptr) {
+                        // Streamed out between the server's flush and this packet. A normal race;
+                        // logging it would bury the failures that matter.
+                        continue;
+                    }
+                    entity->state.Apply(change.key, change.value, change.removed);
+                }
+            });
+            _clientRPCsRegistered = true;
+        }
+    }
+
+    uint32_t ReplicationManager::TransformSendIntervalMs(const SerializeRateBands &bands, float distSq) {
+        if (distSq <= bands.nearDistance * bands.nearDistance) {
+            return bands.nearIntervalMs;
+        }
+        if (distSq <= bands.midDistance * bands.midDistance) {
+            return bands.midIntervalMs;
+        }
+        return bands.farIntervalMs;
+    }
+
+    void ReplicationManager::ForceState(NetworkEntity *entity) {
+        // Server-only, like SetOwner: on a client this must be a no-op, not an RPC misaddressed to a
+        // peer we aren't connected to (the shared scripting builtins call it on both sides).
+        if (!entity || !_owner || !_isServer || entity->ownerGUID == MafiaNet::UNASSIGNED_PEER_GUID) {
+            return;
+        }
+        // The epoch fences the override: the owner echoes the new value back in its updates, and
+        // Deserialize drops owner state still carrying the old one — in-flight packets sent before
+        // the owner saw this override can no longer revert it.
+        ++entity->stateEpoch;
+        MafiaNet::BitStream bs;
+        MafiaNet::NetworkID networkId = entity->GetNetworkID();
+        // NetworkIDs are small and monotonic, so WriteCompressed strips the leading zero bytes.
+        bs.WriteCompressed(networkId);
+        bs.Write(entity->stateEpoch);
+        // Whether the pose below is a move or an echo, so the owner warps only for the first.
+        bs.Write(entity->IsPoseServerAuthored());
+        FieldSerializer fields(&bs, true);
+        entity->SerializeForcedState(fields);
+        _owner->SendRawRPC(kForceStateId, bs, MafiaNet::ToGuid(entity->ownerGUID));
+    }
+
+    void ReplicationManager::InvalidateInterestOf(MafiaNet::PeerGuid guid) {
+        if (guid == MafiaNet::UNASSIGNED_PEER_GUID) {
+            return;
+        }
+        if (auto *connection = static_cast<ReplicationConnection *>(GetConnectionByGUID(MafiaNet::ToGuid(guid)))) {
+            connection->InvalidateInterest();
+        }
+    }
+
+    void ReplicationManager::SetOwner(NetworkEntity *entity, MafiaNet::PeerGuid guid) {
+        if (!entity) {
+            return;
+        }
+
+        // Captured before the grant: the peer losing authority is holding every owner-scoped value it
+        // was ever sent, and a client stores what it is sent regardless of the scope it was sent
+        // under, so withholding future updates would leave those values in place. This has to happen
+        // here rather than in the flush, which by then would compare the key's audience against the
+        // new owner.
+        const MafiaNet::PeerGuid previousOwner = entity->ownerGUID;
+        if (_owner && _isServer && previousOwner != guid && previousOwner != MafiaNet::UNASSIGNED_PEER_GUID) {
+            RPC::StateBagSync revoke;
+            for (const std::string &key : entity->state.OwnerRevokeKeys()) {
+                RPC::StateBagSync::Change change;
+                change.networkId = entity->GetNetworkID();
+                change.key       = key;
+                change.removed   = true;
+                revoke.changes.push_back(change);
+            }
+            if (!revoke.changes.empty()) {
+                _owner->SendRPC(revoke, MafiaNet::ToGuid(previousOwner));
+            }
+        }
+
+        entity->ownerGUID = guid;
+        entity->ResetTransformOrdering();
+        // Before anything can query relevance again: see InterestGrid::Reown for what a stale owned
+        // index costs the peer that just gained authority.
+        _interest.Reown(entity, previousOwner);
+        // Owned entities bypass range and budget, so the two owners' sets changed and nobody else's
+        // did: only they skip their refresh phase.
+        if (previousOwner != guid) {
+            InvalidateInterestOf(previousOwner);
+            InvalidateInterestOf(guid);
+        }
+        // Serialize to an owner is withheld, so the grant can't ride normal replication: tell the new
+        // owner directly. Other peers (and any prior owner) pick it up through serialize.
+        if (_owner && _isServer && guid != MafiaNet::UNASSIGNED_PEER_GUID) {
+            SetOwnerRPC payload;
+            payload.networkId  = entity->GetNetworkID();
+            payload.ownerGUID  = guid;
+            payload.stateEpoch = entity->stateEpoch;
+            _owner->SendRPC(payload, MafiaNet::ToGuid(guid));
+
+            // Owner-scoped keys only ever went to the previous owner, and this owner's construction
+            // snapshot predates the grant. Nothing else would resend them.
+            const std::vector<std::string> ownerKeys = entity->state.OwnerKeys();
+            if (!ownerKeys.empty()) {
+                RPC::StateBagSync seed;
+                for (const std::string &key : ownerKeys) {
+                    const StateValue *value = entity->state.Get(key);
+                    if (value == nullptr) {
+                        continue;
+                    }
+                    RPC::StateBagSync::Change change;
+                    change.networkId = entity->GetNetworkID();
+                    change.key       = key;
+                    change.value     = *value;
+                    seed.changes.push_back(change);
+                }
+                if (!seed.changes.empty()) {
+                    _owner->SendRPC(seed, MafiaNet::ToGuid(guid));
+                }
+            }
+        }
+    }
+
+    StateChangeHandle ReplicationManager::AddStateChangeHandler(const StateChangeFilter &filter, fu2::function<void(const StateChange &) const> callback) {
+        if (!callback) {
+            return kInvalidStateChangeHandle;
+        }
+
+        const StateChangeHandle handle = ++_nextStateChangeHandle;
+        _stateChangeHandlers.emplace(handle, StateChangeSubscription {filter, std::move(callback)});
+        if (filter.key.empty()) {
+            _stateChangeAnyKey.push_back(handle);
+        }
+        else {
+            _stateChangeByKey[filter.key].push_back(handle);
+        }
+        return handle;
+    }
+
+    void ReplicationManager::RemoveStateChangeHandler(StateChangeHandle handle) {
+        const auto it = _stateChangeHandlers.find(handle);
+        if (it == _stateChangeHandlers.end()) {
+            return;
+        }
+
+        const std::string key = it->second.filter.key;
+        _stateChangeHandlers.erase(it);
+
+        const auto drop = [handle](std::vector<StateChangeHandle> &bucket) {
+            bucket.erase(std::remove(bucket.begin(), bucket.end(), handle), bucket.end());
+        };
+        if (key.empty()) {
+            drop(_stateChangeAnyKey);
+            return;
+        }
+        const auto bucket = _stateChangeByKey.find(key);
+        if (bucket != _stateChangeByKey.end()) {
+            drop(bucket->second);
+            if (bucket->second.empty()) {
+                _stateChangeByKey.erase(bucket);
+            }
+        }
+    }
+
+    void ReplicationManager::NotifyStateChanged(const StateChange &change) {
+        if (_stateChangeHandlers.empty()) {
+            return;
+        }
+
+        const uint64_t networkId = change.entity != nullptr ? change.entity->GetNetworkID() : 0;
+        std::vector<StateChangeHandle> matched;
+
+        const auto collect = [&](const std::vector<StateChangeHandle> &bucket) {
+            for (const StateChangeHandle handle : bucket) {
+                const auto it = _stateChangeHandlers.find(handle);
+                if (it == _stateChangeHandlers.end()) {
+                    continue;
+                }
+                const uint64_t wanted = it->second.filter.networkId;
+                if (wanted == 0 || wanted == networkId) {
+                    matched.push_back(handle);
+                }
+            }
+        };
+
+        collect(_stateChangeAnyKey);
+        const auto keyed = _stateChangeByKey.find(change.key);
+        if (keyed != _stateChangeByKey.end()) {
+            collect(keyed->second);
+        }
+
+        // Each handle is looked up again at call time: a handler is free to unsubscribe itself or
+        // another during dispatch, and one added during dispatch is not called for this change.
+        for (const StateChangeHandle handle : matched) {
+            const auto it = _stateChangeHandlers.find(handle);
+            if (it != _stateChangeHandlers.end() && it->second.callback) {
+                it->second.callback(change);
+            }
+        }
+    }
+
+    void ReplicationManager::MarkStateBagDirty(NetworkEntity *entity) {
+        if (entity != nullptr) {
+            _dirtyStateBags.insert(entity->GetNetworkID());
+        }
+    }
+
+    void ReplicationManager::ForEachStreamingPeer(NetworkEntity *entity, const fu2::function<void(MafiaNet::PeerGuid) const> &fn) const {
+        if (!_isServer || _owner == nullptr || entity == nullptr) {
+            return;
+        }
+        const unsigned connectionCount = GetConnectionCount();
+        for (unsigned i = 0; i < connectionCount; ++i) {
+            MafiaNet::Connection_RM3 *connection = GetConnectionAtIndex(i);
+            if (connection != nullptr && connection->HasReplicaConstructed(entity)) {
+                fn(MafiaNet::ToPeerGuid(connection->GetRakNetGUID()));
+            }
+        }
+    }
+
+    void ReplicationManager::FlushStateBags() {
+        if (_dirtyStateBags.empty()) {
+            return;
+        }
+
+        // A client sends nothing outbound, and with no connections there is nowhere to send. Drop
+        // the marks rather than let them accumulate for a flush that never comes.
+        const unsigned connectionCount = (_isServer && _owner != nullptr) ? GetConnectionCount() : 0;
+        if (connectionCount == 0) {
+            for (const uint64_t networkId : _dirtyStateBags) {
+                if (auto *entity = GetEntityByNetworkID(networkId)) {
+                    entity->state.ClearDirty();
+                }
+            }
+            _dirtyStateBags.clear();
+            return;
+        }
+
+        // One buffer per connection, filled once and sent once. Placement asks the connection
+        // whether it has the entity constructed — the question interest, virtual worlds and budgets
+        // have already answered, so none of it is repeated here.
+        std::vector<std::vector<RPC::StateBagSync::Change>> buffers(connectionCount);
+        for (const uint64_t networkId : _dirtyStateBags) {
+            NetworkEntity *entity = GetEntityByNetworkID(networkId);
+            if (entity == nullptr) {
+                continue; // Destroyed since it dirtied.
+            }
+
+            for (const auto &[key, dirty] : entity->state.Dirty()) {
+                const StateValue *current = entity->state.Get(key);
+
+                RPC::StateBagSync::Change update;
+                update.networkId = entity->GetNetworkID();
+                update.key       = key;
+                update.removed   = current == nullptr;
+                if (current != nullptr) {
+                    update.value = *current;
+                }
+
+                // Sent to a connection that held the key and is no longer meant to. Nothing else takes
+                // a value back off a peer: a client stores what it is sent and filtering later updates
+                // would leave the old one sitting there.
+                RPC::StateBagSync::Change revoke;
+                revoke.networkId = entity->GetNetworkID();
+                revoke.key       = key;
+                revoke.removed   = true;
+
+                for (unsigned i = 0; i < connectionCount; ++i) {
+                    MafiaNet::Connection_RM3 *connection = GetConnectionAtIndex(i);
+                    if (connection == nullptr || !connection->HasReplicaConstructed(entity)) {
+                        continue;
+                    }
+
+                    const MafiaNet::PeerGuid peer = MafiaNet::ToPeerGuid(connection->GetRakNetGUID());
+                    const auto inAudience         = [&](StateScope scope) {
+                        switch (scope) {
+                        case StateScope::Broadcast: return true;
+                        case StateScope::Owner: return peer == entity->ownerGUID;
+                        case StateScope::Server: return false;
+                        }
+                        return false;
+                    };
+
+                    if (inAudience(dirty.scope)) {
+                        buffers[i].push_back(update);
+                    }
+                    else if (dirty.previous.has_value() && inAudience(*dirty.previous)) {
+                        buffers[i].push_back(revoke);
+                    }
+                }
+            }
+            entity->state.ClearDirty();
+        }
+        _dirtyStateBags.clear();
+
+        for (unsigned i = 0; i < connectionCount; ++i) {
+            if (buffers[i].empty()) {
+                continue;
+            }
+            MafiaNet::Connection_RM3 *connection = GetConnectionAtIndex(i);
+            if (connection == nullptr) {
+                continue;
+            }
+            // Chunked to what the receiver accepts, so the reader never trusts a count off the wire.
+            for (size_t offset = 0; offset < buffers[i].size(); offset += RPC::StateBagSync::kMaxChanges) {
+                const size_t end = std::min(offset + RPC::StateBagSync::kMaxChanges, buffers[i].size());
+                RPC::StateBagSync payload;
+                payload.changes.assign(buffers[i].begin() + static_cast<ptrdiff_t>(offset), buffers[i].begin() + static_cast<ptrdiff_t>(end));
+                _owner->SendRPC(payload, connection->GetRakNetGUID());
+            }
+        }
+    }
+
+    NetworkEntity *ReplicationManager::CreateEntity(uint32_t typeId) {
+        NetworkEntity *entity = EntityRegistry::Get().Create(typeId);
+        if (!entity) {
+            return nullptr;
+        }
+        // Assign a small, sequential id before Reference() so the NetworkIDManager tracks the entity
+        // under it. Ids must stay within JavaScript's 2^53 exact-integer range so scripts can hold
+        // them as plain numbers. Clients adopt this id via the construction snapshot.
+        entity->SetNetworkID(++_nextNetworkId);
+        Reference(entity);
+        _interestDirty = true;
+        if (_onEntityCreated) {
+            _onEntityCreated(entity->GetNetworkID());
+        }
+        return entity;
+    }
+
+    void ReplicationManager::DestroyEntity(NetworkEntity *entity) {
+        if (!entity) {
+            return;
+        }
+        // Erase by value, not by ownerGUID: the owner key may have been reassigned since SetViewer,
+        // and on a respawn flow (SetViewer(newAvatar) then DestroyEntity(oldAvatar)) an erase by key
+        // would take out the replacement's mapping and silence that connection's streaming.
+        for (auto it = _viewers.begin(); it != _viewers.end();) {
+            if (it->second == entity) {
+                it = _viewers.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+        // Scrub the interest indices so this delete can't dangle before the next rebuild.
+        _interest.Remove(entity);
+        ++_interestUrgentGeneration;
+        _interestDirty = true;
+        // And the delegation bookkeeping, which is keyed by NetworkID: ids are monotonic, but an
+        // entry left behind would still be found by a later entity that reused the id after a
+        // reconnect, and would carry a stale pin into it.
+        _delegation.OnEntityDestroyed(entity->GetNetworkID());
+        if (_onEntityDestroyed) {
+            _onEntityDestroyed(entity->GetNetworkID());
+        }
+        // BroadcastDestruction must precede deletion; ~Replica3 dereferences automatically.
+        entity->BroadcastDestruction();
+        delete entity;
+    }
+
+    NetworkEntity *ReplicationManager::GetEntityByNetworkID(MafiaNet::NetworkID networkId) const {
+        auto *idm = GetNetworkIDManager();
+        if (!idm) {
+            return nullptr;
+        }
+        return idm->GET_OBJECT_FROM_ID<NetworkEntity *>(networkId);
+    }
+
+    void ReplicationManager::ForEachEntity(const fu2::function<void(NetworkEntity *) const> &fn) const {
+        const unsigned count = GetReplicaCount();
+        for (unsigned i = 0; i < count; ++i) {
+            auto *entity = static_cast<NetworkEntity *>(GetReplicaAtIndex(i));
+            if (entity) {
+                fn(entity);
+            }
+        }
+    }
+
+    void ReplicationManager::SetViewer(MafiaNet::PeerGuid guid, NetworkEntity *entity) {
+        // A replaced avatar stops being a viewer, or the flag would outlive the mapping and confuse
+        // later lifecycle decisions keyed on it.
+        if (auto *previous = GetViewer(guid); previous && previous != entity) {
+            previous->streaming.isViewer = false;
+        }
+        if (entity) {
+            entity->streaming.isViewer = true;
+        }
+        _viewers[guid] = entity;
+    }
+
+    NetworkEntity *ReplicationManager::GetViewer(MafiaNet::PeerGuid guid) const {
+        const auto it = _viewers.find(guid);
+        return it != _viewers.end() ? it->second : nullptr;
+    }
+
+    void ReplicationManager::ForEachViewer(const fu2::function<void(MafiaNet::PeerGuid, NetworkEntity *) const> &fn) const {
+        for (const auto &[guid, viewer] : _viewers) {
+            if (viewer != nullptr) {
+                fn(guid, viewer);
+            }
+        }
+    }
+
+    void ReplicationManager::ForEachAvatar(const fu2::function<void(MafiaNet::PeerGuid, NetworkEntity *) const> &fn) const {
+        // Owning an entity does not make it the player: a delegated NPC, a ridden horse or a dropped
+        // item all carry the player's guid, and taking the last of them as the avatar is what moved
+        // voice away from the speaker. The server has the viewer map; a client has the flag the
+        // server replicates off it.
+        if (_isServer) {
+            ForEachViewer(fn);
+            return;
+        }
+        ForEachEntity([&fn](NetworkEntity *entity) {
+            if (entity->streaming.isViewer && entity->ownerGUID != MafiaNet::UNASSIGNED_PEER_GUID) {
+                fn(entity->ownerGUID, entity);
+            }
+        });
+    }
+
+    void ReplicationManager::ClearViewer(MafiaNet::PeerGuid guid) {
+        const auto it = _viewers.find(guid);
+        if (it == _viewers.end()) {
+            return;
+        }
+        if (it->second) {
+            it->second->streaming.isViewer = false;
+        }
+        _viewers.erase(it);
+    }
+
+    void ReplicationManager::RebuildInterest() {
+        if (!_isServer) {
+            return;
+        }
+        const int64_t now = Utils::Time::GetTime();
+        if (!_interestDirty && _interestRebuildInterval > 0 && now - _lastInterestRebuild < static_cast<int64_t>(_interestRebuildInterval)) {
+            return;
+        }
+        if (_interestDirty) {
+            ++_interestUrgentGeneration;
+        }
+        _lastInterestRebuild = now;
+        _interestDirty       = false;
+        _interest.BeginRebuild();
+        ForEachEntity([this](NetworkEntity *entity) {
+            _interest.Insert(entity);
+        });
+    }
+
+    void ReplicationManager::CollectInterest(NetworkEntity *viewer, MafiaNet::PeerGuid viewerGUID, const std::unordered_set<NetworkEntity *> &previous, std::unordered_set<NetworkEntity *> &out) {
+        _interest.CollectVisible(viewer, viewerGUID, previous, out);
+    }
+
+    void ReplicationManager::OnClosedConnection(const MafiaNet::SystemAddress &systemAddress, MafiaNet::RakNetGUID rakNetGUID, MafiaNet::PI2_LostConnectionReason lostConnectionReason) {
+        // The player's avatar is server-created, so the base PopConnection (which only tears down
+        // replicas a dropped peer itself created) leaves it behind. Notify the game while the avatar
+        // is still resolvable, then destroy it — DestroyEntity broadcasts the destruction to the
+        // remaining clients and clears the viewer mapping. Clients keep the base behaviour: their
+        // replicas all originate from the server, so PopConnection cleans them up on its own.
+        if (_isServer) {
+            const auto guid = MafiaNet::ToPeerGuid(rakNetGUID);
+            // This plugin callback fires for every closed connection, including peers dropped before
+            // they completed identity (build mismatch, quit during the asset phase). Those never
+            // produced a player-connect notification, so gate the disconnect notification on the
+            // replication connection that PushReplicationConnection creates alongside it — keeping
+            // the connect/disconnect callbacks paired for the game.
+            if (_onClientDisconnect && GetConnectionByGUID(rakNetGUID) != nullptr) {
+                _onClientDisconnect(guid);
+            }
+            // Before the blanket hand-back below, so entities this peer was *simulating* go through
+            // delegation and raise its change notification, rather than silently losing an owner.
+            _delegation.OnClientDisconnected(guid);
+            NetworkEntity *viewer = GetViewer(guid);
+            // Return any other entity the dropped peer owned (e.g. a vehicle it was driving) to the
+            // server, or its authority gate would freeze it against an owner that no longer exists.
+            ForEachEntity([&](NetworkEntity *entity) {
+                if (entity != viewer && entity->ownerGUID == guid) {
+                    SetOwner(entity, MafiaNet::UNASSIGNED_PEER_GUID);
+                }
+            });
+            if (viewer) {
+                DestroyEntity(viewer);
+            }
+            // Now that the departed peer can no longer be elected, re-run the election so whatever
+            // it was simulating is picked up by whoever else is near it this instant rather than at
+            // the next scheduled pass.
+            _delegation.UpdateNow();
+        }
+        ReplicaManager3::OnClosedConnection(systemAddress, rakNetGUID, lostConnectionReason);
+    }
+
+    MafiaNet::Connection_RM3 *ReplicationManager::AllocConnection(const MafiaNet::SystemAddress &systemAddress, MafiaNet::RakNetGUID rakNetGUID) const {
+        // ReplicaManager3 declares this const, but the connection needs a mutable manager back-pointer
+        // for its QueryReplicaList interest queries; the const_cast is forced by the upstream API.
+        return new ReplicationConnection(systemAddress, rakNetGUID, const_cast<ReplicationManager *>(this), _isServer);
+    }
+
+    void ReplicationManager::DeallocConnection(MafiaNet::Connection_RM3 *connection) const {
+        delete connection;
+    }
+} // namespace Framework::Networking::Replication
