@@ -1,0 +1,37 @@
+#include "core/server.h"
+
+#include "shared/version.h"
+
+#include <logging/logger.h>
+
+int main(int argc, char **argv) {
+    Framework::Integrations::Server::InstanceOptions opts;
+    opts.bindHost      = "0.0.0.0";
+    opts.bindPort      = 27015;
+    opts.webBindHost   = "0.0.0.0";
+    opts.webBindPort   = 27016;
+    opts.maxPlayers    = 10;
+    opts.modName       = "MafiaMP";
+    opts.modSlug       = "mafiamp_server";
+    opts.gameName      = "Mafia: Definitive Edition";
+    opts.gameVersion   = "3168979183";
+    opts.modVersion    = MafiaMP::Version::rel;
+    opts.bindPassword  = "";
+    opts.enableSignals = true;
+    opts.developmentMode = false; // file watcher off: a stray save mid-session would restart the gamemode and wipe mission state. Use `ensure coop-story` to reload.
+    opts.bindSecretKey = "qskdnkjsqndq12312312qsdqsds";
+
+    opts.services.masterlistUrl = "https://masterlist.mafia.mp";
+
+    opts.argc = argc;
+    opts.argv = argv;
+
+    MafiaMP::Server server;
+    if (const auto result = server.Init(opts); !result) {
+        Framework::Logging::GetLogger(FRAMEWORK_INNER_SERVER)->error("Failed to start server: {}", result.GetError().message);
+        return 1;
+    }
+    server.Run();
+    server.Shutdown();
+    return 0;
+}

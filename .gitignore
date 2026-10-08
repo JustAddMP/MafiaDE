@@ -1,0 +1,14 @@
+# Upstream source trees are their own repos (MafiaHub/Framework and MafiaHub/MafiaMP); our changes live in overlay/
+Framework/
+# Build output, packages, logs, runtime files
+dist/
+dev/logs/
+server/logs/
+server/.packages/
+server/*.exe
+server/*.pdb
+server/*.dll
+server/resources/
+*.log
+*.dmp
+Thumbs.db

@@ -1,0 +1,11 @@
+{
+    "apihost": "0.0.0.0",
+    "apiport": 27016,
+    "host": "0.0.0.0",
+    "map": "",
+    "maxplayers": 10,
+    "mod": {},
+    "password": "",
+    "port": 27015,
+    "server-token": ""
+}
