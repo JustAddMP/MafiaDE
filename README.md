@@ -1,72 +1,37 @@
-# Mafia: Definitive Edition — co-op
+# Mafia: Definitive Edition — Co-op
 
-Play the real single-player campaign with friends riding along.
+**Status: playable, but not optimal.** The host plays the real campaign and friends ride along.
+Expect rough edges: NPCs all look like Tommy on the guests' screens, punches don't show for the other
+player, and mission objectives only track the host.
 
-## Get it
+## What you need
 
-Download `MafiaDE-Coop.zip` from the Releases page of this repository and extract it anywhere, on any PC.
-It contains the server and the client; nothing needs installing. Requirements: Windows 10/11 x64, Mafia:
-Definitive Edition on Steam (current version), Steam running and logged in, the Microsoft Visual C++
-2015-2022 x64 redistributable.
+- Windows 10/11 (64-bit)
+- Mafia: Definitive Edition on Steam, up to date, with Steam running
+- Microsoft Visual C++ 2015-2022 x64 redistributable (most PCs already have it)
+- The latest `MafiaDE-Coop.zip` from the [Releases page](https://github.com/JustAddMP/MafiaDE/releases), extracted anywhere
 
-## Host (you)
+## Host
 
-1. Double-click **`1 - HOST - Play Campaign.cmd`**. It starts the co-op server if needed, then the game.
-2. In the game's own menu start a New Game or pick a chapter. The game connects to the server by itself
-   (top-right corner shows it connecting; you keep full control).
-3. Play. Friends appear next to you and see what you see.
+1. Forward UDP port 27015 on your router to your PC.
+2. Double-click `1 - HOST - Play Campaign.cmd`.
+3. In the game's menu start a New Game or pick a chapter. The game connects by itself.
+4. Give your friends your public IP.
 
-Forward **UDP 27015** on your router to this PC. That is the only port. Give friends your public IP.
+## Join
 
-## Friends
-
-Same zip. Double-click **`3 - JOIN - Join a Game.cmd`**, type the host's IP (remembered for next time) and a
-name. The game starts and connects by itself.
-
-## Testing alone
-
-Start `1 - HOST - Play Campaign.cmd`, load a chapter, then `5 - TEST - Second Client.cmd`: a second game starts
-from the package and joins your own server as "Tester" (enter `127.0.0.1` and `27015` in its menu if it
-does not connect by itself). You should see the second Tommy next to you, and in the second window `/mirror`
-should list your NPCs and cars. Play both windowed; it needs a lot of RAM.
+1. Double-click `3 - JOIN - Join a Game.cmd`.
+2. Type the host's IP and your name. The game starts and connects by itself.
+3. You appear next to the host. Type `/join` in chat at any time to get back to them.
 
 ## In game
 
-| What | How |
-| --- | --- |
-| Teleport to the host | `/join` (friends) |
-| What is being streamed | `/mirror` |
-| Co-op panel / hide overlay / console / disconnect | `F4` / `F7` / `F8` / `F9` |
-| Stuck, no controls | `Esc` closes the panel; `F1` bypasses the control lock |
-| Scripted co-op chapters instead of the story | `/mode campaign` (host), `/mode story` to go back |
+- `F7` hide the overlay, `F8` console, `F9` disconnect
+- `/join` teleport to the host, `/guns` get a pistol and a Thompson again
+- If you can't move: press `Esc`, then `F1`, or type `/unstick`
 
-Everyone's microphone is live on connect (proximity voice).
+## For developers
 
-## Folders
-
-- `dev\` — build scripts, developer notes (`README-dev.md`), simulator, build logs. Only needed to change code.
-- `server\` — the running server (logs in `server\logs`).
-- `dist\` — the friend package.
-- `Framework\` — source and build output (`Framework\builds\build-64\bin`, game logs in its `logs` folder).
-
-## Known limits (experimental)
-
-Mission logic only knows the host: friends can drive, shoot and follow, but objectives are yours. Mirrored
-people all look like Tommy for now. No cutscene sync: friends wait while you watch one.
-
-## Source layout (GitHub: JustAddMP/MafiaDE)
-
-Everything is in this repository as plain files:
-
-- `Framework\` — the MafiaHub Framework (multiplayer engine) with our changes. Upstream: MafiaHub/Framework, commit `dfecf5e`.
-- `Framework\code\projects\MafiaMP\` — the MafiaMP mod with our changes: story host, world mirror, NPC humans,
-  launcher, and the gamemode in `resources\coop-story\`. Upstream: MafiaHub/MafiaMP, commit `957905b`.
-- `dev\` scripts, this README, `server\server.json`.
-
-Not in the repo: build output (`Frameworkuilds`), vendor downloads the build fetches itself (vcpkg, CEF, libnode,
-Steam and Discord SDKs), MafiaMP's `files\` (loading videos, taken from an upstream clone or the release package),
-`dist\`, and logs. Build from a clone with `devuild_all.cmd` (Visual Studio 2022 build tools; the first configure
-downloads the vendors).
-
-Committing: `python dev	ools\git_stage.py`, then `git commit` and `git push`. The two source trees keep their own
-upstream git metadata, which the staging script hides while adding.
+The full source is in this repository (`Framework\` is the MafiaHub engine, `Framework\code\projects\MafiaMP\`
+the mod with our changes, the gamemode in its `resources\coop-story\`). Build with `dev\build_all.cmd`,
+package with `4 - Make Package.cmd`, commit with `python dev\tools\git_stage.py`. Notes in `dev\README-dev.md`.
