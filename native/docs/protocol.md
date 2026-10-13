@@ -1,6 +1,6 @@
 # MafiaCoop network protocol
 
-Phase 2 (connection). Code: `src/net/`. All integers are little-endian. `varint` = unsigned LEB128.
+Phase 2 (connection) and phase 3 (player sync, below). Code: `src/net/`, `src/game/player_sync.*`. All integers are little-endian. `varint` = unsigned LEB128.
 `str` = varint byte length + UTF-8 bytes (no terminator). Everything runs single-threaded inside `Poll()` on the
 game's render thread; there are no network threads.
 
@@ -75,6 +75,54 @@ App id allocation (u16, varint-encoded):
 | 0x0200-0x02FF | phase 4: world (NPCs, cars, weather, time, mission state) |
 | 0x0300-0x03FF | phase 5: UI / notifications |
 | 0x0400-0x04FF | phase 6: damage, objectives |
+
+## Phase 3: player sync (app ids 0x0100-0x01FF)
+
+Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation) and `src/game/player_sync.lua`
+(game side, embedded into the dll). Allocated ids:
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 20 Hz | see below |
+| 0x0101-0x01FF | reserved (phase 3 events: seat changes, shots, ...) | | | |
+
+PlayerState body (41 bytes on foot + weapon name, ~120 bytes in a car):
+
+```
+u8  version (1)
+u32 senderTimeMs          sender's monotonic clock (QueryPerformanceCounter), for interpolation only
+f32 x, y, z               player position (world metres)
+f32 hx, hy                heading, unit vector in the ground plane
+f32 vx, vy, vz            velocity (m/s; on foot differentiated from positions, in a car the car's GetSpeed())
+u8  mode                  0 idle, 1 walk, 2 run, 3 sprint (from the speed; sprint also when IsSprinting())
+u8  flags                 bit0 in vehicle, bit1 crouch, bit2 sprint
+u8  health                p.health (0..100)
+str weapon                weapon in hand (InventoryGetSelected), "" = none
+-- only when flags bit0:
+str model                 vehicle model name (GetVehicleModelName, e.g. "smith_v12")
+u8  seat                  0 = driver, 1..3 passengers
+u32 vehId                 the sender's entity GUID of that car (a change = a different car)
+f32 cx, cy, cz            car position
+f32 qx, qy, qz, qw        car rotation (quaternion, GetRot: v.x v.y v.z s)
+f32 cvx, cvy, cvz         car velocity
+```
+
+Receivers keep up to 64 snapshots per player and render them **100 ms in the past** on the sender's clock:
+`renderTime = now - offset - 0.1`, where `offset = localReceiveTime - senderTime` is tracked as a running minimum
+(slowly relaxed upward, 1 % per message, to follow drift). Between two snapshots everything is lerped (heading
+renormalised, car quaternion nlerp with sign fix, discrete fields from the nearer one); past the newest snapshot the
+position is extrapolated with the velocity for at most 250 ms, then held. Old/duplicate snapshots (sender time not
+newer) are dropped, so loss and reordering need no reliability.
+
+Vehicle rule: **the driver's game owns the car.** Everyone else spawns the same model (`ObtainSpecificCar` +
+`SpawnCar`), freezes it (`FixCarPos`) and sets the interpolated transform every tick. A passenger's puppet does not
+spawn a car (the driver's state does). Puppets are hidden while their player is in a vehicle (the game does not seat
+our NPCs, docs/game-api.md 7).
+
+Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
+session end (the whole set, including the hidden "factory" car, is removed when the session ends). Model per player:
+`visuals/hero/game_main_tommy_{gangster_trenchcoat, gangster_suit_2_hat, cab_driver_flatcap, racing_outfit}` by
+player id (0..3), overridable per machine with `puppet_model = <spawn profile>`.
 
 ## UDP transport
 

@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "game/player_sync.h"
 #include "net/multi_transport.h"
 #include "net/session.h"
 #include "net/steam_flat.h"
@@ -141,6 +142,7 @@ void SetError(const std::string& why) {
 void Teardown() {
     State& s = S();
     s.teardown = false;
+    game::PlayerSync::Detach();
     if (s.session) s.session->Leave();
     s.session.reset();
     s.net.reset();
@@ -173,6 +175,7 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
     s.net = std::move(transport);
     s.session = std::make_unique<net::Session>(*s.net, cfg);
     net::Session& session = *s.session;
+    game::PlayerSync::Attach(session);
     MC_LOG_INFO("coop: session as '%s' over %s (protocol %u, build %08x)", session.Config().playerName.c_str(),
                 s.net->Name(), cfg.protocolVersion, cfg.modBuild);
 
@@ -187,6 +190,7 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
     };
     session.onPlayerLeft = [](const net::PlayerInfo& p, const std::string& reason) {
         MC_LOG_INFO("coop: player %u '%s' left: %s", p.id, p.name.c_str(), reason.c_str());
+        game::PlayerSync::OnPlayerLeft(p.id);
     };
     session.onChat = [](net::PlayerId from, const std::string& text) {
         MC_LOG_INFO("coop: chat from %u: %s", from, text.c_str());
@@ -230,6 +234,7 @@ void OnJoinRequested(uint64_t lobbyId) {
     }
     if (s.session) {
         MC_LOG_INFO("coop: leaving the current session to follow the invite");
+        game::PlayerSync::Detach();
         s.session->Leave();
         s.session.reset();
         s.net.reset();
@@ -400,6 +405,7 @@ void Coop::Tick(float dt) {
     PollSteam();
     if (!s.started) TryStart();
     if (s.session) s.session->Poll();
+    if (s.session) game::PlayerSync::Tick(dt);
     if (s.teardown) Teardown();
 }
 
@@ -443,6 +449,7 @@ void Coop::GetStatus(std::vector<render::OverlayLine>& out) {
             break;
         }
         if (session.IsActive()) {
+            game::PlayerSync::GetStatus(out);
             // Ping column: RTT of each player to the host (the host's own row has none).
             for (const auto& p : players) {
                 std::string line = "  " + p.name;

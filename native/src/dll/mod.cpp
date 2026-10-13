@@ -4,6 +4,7 @@
 #include "core/crash.h"
 #include "core/log.h"
 #include "dll/coop.h"
+#include "game/lua.h"
 #include "render/overlay.h"
 #include "render/present_hook.h"
 
@@ -85,6 +86,7 @@ void Mod::Tick(float dt) {
         for (const auto& l : lines) MC_LOG_INFO("status: %s", l.text.c_str());
     }
 
+    game::lua::PollRender(dt);
     Coop::Tick(dt);
 
     PollToggleKey();

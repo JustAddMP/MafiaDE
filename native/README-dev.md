@@ -18,6 +18,8 @@ G:\MafiaCoop\native\build.cmd
   - `MafiaCoop.exe` (+ `MafiaCoop-launcher.pdb`): the launcher, built from `src\launcher\*.cpp`
   - `mafiacoop.dll` (+ `mafiacoop.pdb`): every `.cpp` in `src\core`, `src\render`, `src\game`, `src\net` and
     `src\dll`, plus MinHook. New files are picked up automatically.
+  - Lua that runs inside the game (`src\game\*.lua`) is embedded into the dll: `tools\embed_lua.ps1` turns
+    `player_sync.lua` into `out\obj\gen\player_sync_lua.h` (`kPlayerSyncLua`) on every build.
   - `<name>.exe` for each `tests\<name>.cpp`, linked with `src\core` + `src\net` (+ MinHook). Skipped if there
     are none.
   - Object files go to `out\obj\<group>\`.
@@ -99,6 +101,71 @@ Both windows open; the games sit at the title screen. Check `out\logs\mafiacoop-
 `status:` lines for pings. Both instances share one SteamID, so they can only connect over UDP; Steam P2P needs
 two accounts on two PCs. Stop with `taskkill /IM mafiadefinitiveedition.exe /F`.
 
+## Lua bridge and dev console
+
+`src/game/lua.cpp` hooks `C_ScriptMachine::Tick`/`TickPaused` (pattern scan; docs/re-notes.md 1.5) and, after the
+game's own scripts, runs queued jobs and the per-tick callbacks on **GameMainThread** against the game's main
+`lua_State` (`luaL_loadbuffer` + `lua_pcall`, stack top restored after every job). Scripts tick from the main menu on
+(not on the title screen, not while the game is paused). Missing patterns disable the bridge (logged), an access
+violation inside a job disables it for the rest of the session instead of crashing.
+
+Globals the dll adds: `mc_log(...)` (writes to our log), `mc_u64(str|num)` / `mc_u64str(v)` (HKS ui64 values).
+
+Dev console, to explore the API live:
+
+- **F8** (game window focused) runs `out\dev.lua`; the chunk's first return value is logged and written to
+  `out\dev\<tag>.out.txt`.
+- **File drop:** write `out\dev\<tag>.in.lua` (`<tag>` = the `--log` tag, `default` without one); the dll picks it up
+  within 0.5 s, deletes it, runs it and writes `out\dev\<tag>.out.txt` (`ok` or `error`, then the result).
+  `tools\devlua.ps1 -Tag host -Code 'return game.game:GetActivePlayer():GetPos()'` does the round trip.
+- What was found this way is in `docs/game-api.md`.
+
+## Player sync (phase 3)
+
+Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x0100, docs/protocol.md) at 20 Hz and
+shows every other player as a **puppet**: an AI human with its own outfit (host = trench coat, guest 1 = suit and
+hat, ...) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (100 ms
+buffer), snaps when more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
+When a player drives, the others see a copy of the car following the driver's transform (the puppet is hidden: the
+game does not seat our NPCs). Puppets are removed when their player leaves and all at once when the session ends.
+
+The overlay shows `Sync: in world, puppet factory ready` and one line per remote player
+(`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago` = state, metres off the target, receive rate, age of the newest
+snapshot). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
+
+**background_run** (default on): the game pauses its simulation when its window loses focus (`WM_ACTIVATEAPP`). The
+dll swallows that message so an unfocused game keeps running and sending (needed for co-op and for two instances on
+one PC). Set `background_run = 0` to get the original pause-on-alt-tab.
+
+### In-world test with two instances on one PC
+
+1. Back up the save folder first (`%USERPROFILE%\Documents\My Games\Mafia Definitive Edition`, OneDrive-redirected
+   on some PCs) and never pick "New Game".
+2. `out\MafiaCoop.exe --host --name Host --log host`; at the title press Enter, then Enter on **Continue**, then Enter
+   when the loading screen says "Continue".
+3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest`, same three Enters.
+4. Both stand at the save's spawn point; each sees the other's puppet next to them. Move one player and watch the
+   other window (`tools\devlua.ps1` can teleport/step the player: see the test snippets below).
+5. `taskkill /IM mafiadefinitiveedition.exe /F`.
+
+Test snippets (run with `tools\devlua.ps1 -Tag host -Code '...'`):
+
+```lua
+-- walk the local player 12 m along +x in 4 s (the remote puppet runs after it)
+local p = game.game:GetActivePlayer(); local p0 = p:GetPos(); local t0 = MafiaCoop.now
+StartThread(function() while true do Sleep(0); local t = math.min(MafiaCoop.now - t0, 4)
+  p:SetPos(Math:newVector(p0.x + 3 * t, p0.y, p0.z)); p:SetDir(Math:newVector(1, 0, 0)); if t >= 4 then break end end end)
+-- get into a car (the remote side spawns a copy that follows it)
+carpls("smith_v12")
+-- give the player a pistol (the puppet draws one too)
+local p = game.game:GetActivePlayer(); p:InventoryAddWeapon("p_mast_a_v1", 50); p:InventorySelect("p_mast_a_v1", true)
+-- puppet state on this machine
+local r = {} for id, pp in pairs(MafiaCoop.pup) do r[#r+1] = id .. " " .. pp.st .. " " .. tostring(pp.dist) end return table.concat(r, "\n")
+```
+
+`out\player_sync.lua` (a copy of `src\game\player_sync.lua`), if present, is loaded instead of the embedded glue: edit
+it, restart the game, no rebuild needed.
+
 ## MafiaCoop.ini (optional, next to the exe/dll)
 
 ```
@@ -107,6 +174,8 @@ inject_method = apc        ; or thread
 window_timeout_s = 300     ; how long the dll waits for the game window
 crash_test = 0             ; 1 = raise an access violation in Tick after crash_test_delay seconds (debug only)
 crash_test_delay = 20
+background_run = 1         ; 0 = the game pauses when its window loses focus (original behaviour)
+puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (default: by player id)
 ```
 
 ## Logs and crashes

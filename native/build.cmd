@@ -57,6 +57,14 @@ for %%f in ("%ROOT%\src\render\*.hlsl") do (
   if errorlevel 1 ( type "%GEN%\%%~nf_ps.log" & echo [build] ERROR: shader %%~nxf PS failed & goto :fail )
 )
 
+rem ---- embedded Lua: src\game\*.lua -> out\obj\gen\<name>_lua.h (const char k<Name>Lua[], raw string chunks) ----
+rem The Lua glue that runs inside the game's VM ships inside the dll; build.cmd regenerates it on every build.
+for %%f in ("%ROOT%\src\game\*.lua") do (
+  echo [build] embed %%~nxf
+  powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\tools\embed_lua.ps1" -In "%%f" -Out "%GEN%\%%~nf_lua.h"
+  if errorlevel 1 ( echo [build] ERROR: embedding %%~nxf failed & goto :fail )
+)
+
 rem ---- dll source groups (every .cpp in each dir) ------------------------------
 set "DLLOBJS="%OBJ%\minhook\*.obj""
 for %%d in (core render game net dll) do (

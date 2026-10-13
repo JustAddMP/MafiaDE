@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file native/docs/re-tools/patterns.txt   (all 54 patterns below; prints OK/FAIL each)
+python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file native/docs/re-tools/patterns.txt   (all 55 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -238,10 +238,19 @@ if (g_ScriptGameMachine) g_ScriptGameMachine->vfptr[+0x20](g_ScriptGameMachine, 
 C_ScriptMachine::Tick runs `hks_tick` (thunk 0x4920F00 → "hksi_hks_tick" 0x49212E0) on `L`, then the script scheduler (0x3C08AA0, which calls lua_resume via thunk 0x49118F0), which resumes
 script threads and coroutines.
 
-**Recommendation:**
-1. Hook 0x2D70880 (Tick), plus 0x2D71850 (TickPaused) for the paused case.
+**Runtime correction [confirmed in game, phase 3]:** the registered handler 0x2D70880 is **never called** in this
+build. Hooked with MinHook (patch verified in memory), it got zero calls in the main menu and in the world while scripts
+were clearly running. `C_ScriptMachine::Tick` (vtable slot +0x20, 0x3C092F0) is the only caller of `hks_tick` and of
+the scheduler 0x3C08AA0 (checked with an xref scan), and it IS called every frame once the title screen has been
+left (not on the title screen itself, not while the game is paused by focus loss, see 2.1).
+
+**What the bridge does (src/game/lua.cpp):**
+1. Hook `C_ScriptMachine::Tick` 0x3C092F0 and `C_ScriptMachine::TickPaused` 0x3C093A0 (patterns
+   `C_ScriptMachine_Tick` / `C_ScriptMachine_TickPaused`). Both are shared by every `C_ScriptMachine`, so the detour
+   only acts when `this == g_ScriptGameMachine`.
 2. In the hook, call the original first.
-3. Then drain our queued Lua work on `*(g_ScriptGameMachine+0xD0)`.
+3. Then drain our queued Lua work on `*(g_ScriptGameMachine+0xD0)`. `g_ScriptGameMachine` still comes from the
+   `C_GameScriptModule_Tick` pattern (rip operand at +3).
 
 This runs on the game's own script thread, at exactly the point where the engine itself runs Lua and outside any
 running chunk, so lua_pcall and luaL_loadbuffer are safe there. Two rules:
@@ -249,8 +258,14 @@ running chunk, so lua_pcall and luaL_loadbuffer are safe there. Two rules:
 - Always use pcall. An unprotected error longjmps through game code.
 
 The tick manager runs on the game logic thread. That is the thread that ran the boot step "Threads", which registers
-itself as `GameMainThread` (0x240CA0A). [likely; verify by logging GetCurrentThreadId() in this hook and in the
-Present hook]
+itself as `GameMainThread` (0x240CA0A). [confirmed at runtime: the script tick thread id differs from the Present
+(render) thread id in every log, e.g. `lua: first script tick on thread 37632` vs Present on 77144; it is stable for
+the whole session]
+
+Observed at runtime: the stack top/base at the hook are those of the main state outside any C frame; `luaL_loadbuffer`
++ `lua_pcall` with the top saved/restored (`(top-base)/16`) work every frame (thousands of calls per test, no leak). The
+VM also accepts text chunks (not a secure state). `string.dump` works and returns HKS bytecode whose constant strings
+reveal which methods a game script function calls; that is how most of docs/game-api.md was found.
 
 ---------------------------------------------------------------------------------------------------------------
 
@@ -296,6 +311,18 @@ thread that the tick hook drains.
 0x3B17D50). `D3D11CreateDeviceAndSwapChain` is not imported; the swap chain is created through the factory.
 
 ---------------------------------------------------------------------------------------------------------------
+
+### 2.1 Focus loss pauses the simulation [confirmed]
+
+The window class "Scotch" uses window procedure exe+0x5E0E00, which forwards to 0x5DF0D0 (`App_WndProc`). For
+`WM_ACTIVATEAPP` (0x1C), `WM_SIZE` and `WM_WTSSESSION_CHANGE` it queues an engine event (0x6C30F0 / 0x5E0D30 /
+0x6DDA40); the app handler (0x5DF350, event 0xB) stores "active" at `app+0xDF` and suspends/resumes the game
+(0x17ACCB0 / 0x17ACC80). While inactive, neither `C_ScriptMachine::Tick` nor `TickPaused` runs (Present still does).
+`WM_ACTIVATE`/`WM_KILLFOCUS` are not handled specially.
+
+The dll subclasses the game window and swallows `WM_ACTIVATEAPP(FALSE)` (`background_run = 1`, default), so an
+unfocused game keeps simulating and sending its player. Verified: two instances on one PC both tick scripts while
+either one has the focus.
 
 ## 3. Steam and single-instance
 
@@ -488,6 +515,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | ScriptGameMachine_Create | 0x1AB89D0 | `40 53 48 83 EC 30 B9 30 02 00 00 E8 ?? ?? ?? ?? 48 85 C0 74` |
 | C_GameScriptModule_Tick | 0x2D70880 | `48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3` |
 | C_GameScriptModule_TickPaused | 0x2D71850 | `48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 28 C3` |
+| C_ScriptMachine_TickPaused | 0x3C093A0 | `40 53 48 83 EC 20 48 83 B9 D0 00 00 00 00 48 8B D9 74 2D 80` |
 | C_GameScriptModule_Register | 0x2D51BD0 | `40 53 48 83 EC 60 0F 29 74 24 50 E8 ?? ?? ?? ?? F3 0F 10 35 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? 48 89 4C 24 40 4C 8D 0D ?? ?? ?? ?? 33 DB 48 8D 0D ?? ?? ?? ?? 4C 8B 10 41 B8 A0 28 00 00` |
 | Steam_Init | 0x3C51070 | `48 83 EC 28 80 3D ?? ?? ?? ?? 00 C6 05 ?? ?? ?? ?? 01 74 64` |
 | Steam_MemLoadApi | 0x3DF0880 | `40 56 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? 48` |

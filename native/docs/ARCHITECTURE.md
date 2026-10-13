@@ -35,12 +35,14 @@ native/
                          (module info, pattern scan with ?? wildcards, RIP-relative resolve)
     render/              present_hook.{h,cpp}: hooks IDXGISwapChain::Present -> per-frame Tick on the game's
                          render thread
-    game/                lua.{h,cpp} (bridge into the game's Lua VM), later player/world sync
+    game/                lua.{h,cpp} (bridge into the game's Lua VM, dev console), player_sync.{h,cpp} + player_sync.lua
+                         (phase 3: local player sampling, puppets, copy cars; the .lua is embedded at build time)
     net/                 transport.h (interface), udp_transport.{h,cpp} (own reliability), steam_transport
                          .{h,cpp} (ISteamNetworkingMessages, flat API), steam_lobby.{h,cpp}, session.{h,cpp}
                          (host-authoritative star; host relays), wire.{h,cpp} (byte writer/reader)
     dll/                 dllmain.cpp: init thread -> wait for game ready -> install hooks
   tests/                 net_loopback.cpp (two sessions over UDP in one process), steam_smoke.cpp
+  tools/                 fontgen.cpp, embed_lua.ps1 (build step), devlua.ps1 (run Lua in a running game)
   out/                   build output (gitignored): MafiaCoop.exe, mafiacoop.dll, *.pdb, tests
 ```
 
@@ -48,9 +50,14 @@ native/
 
 - `DllMain` only spawns the init thread. The init thread logs, installs the crash handler, waits until the game
   window/D3D device exists, then installs hooks.
-- All mod logic runs on ONE thread: the Present hook calls `Mod::Tick(dt)` once per frame. Network pumping, Lua calls
-  and sync happen there. No locks in game-facing code. (If game Lua must run on the game's main/script thread, the
-  Lua bridge queues work and drains it from a hook on that thread instead; see re-notes.)
+- Two threads (confirmed at runtime, re-notes 1.5):
+  - **Render thread:** the Present hook calls `Mod::Tick(dt)` once per frame: networking (Session/Steam), the overlay,
+    sending the 20 Hz player state, receiving snapshots.
+  - **GameMainThread:** the `C_ScriptMachine::Tick` hook drains the Lua bridge's job queue and runs the per-tick
+    callbacks (player sync: sample the local player, drive puppets and copy cars). **Every game/Lua call happens
+    here.**
+  - Hand-over: one mutex per subsystem (bridge job/result queues; player sync snapshots + local sample), held only for
+    copies. The game window procedure is subclassed (background_run) on the window's own thread.
 - Logs: `<dll dir>\logs\mafiacoop.log`; crash dumps `<dll dir>\logs\crash-<time>.dmp`.
 
 ## Networking
