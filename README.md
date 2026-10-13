@@ -4,9 +4,6 @@
 server, Steam invites. Players see each other walking, running, armed and driving. The host's NPCs, traffic,
 weather and missions are not shared yet.
 
-The previous MafiaMP-based version (host's NPCs and weather mirrored, but a 400 MB download) is still available
-as release [v0.1.0](https://github.com/JustAddMP/MafiaDE/releases/tag/v0.1.0).
-
 ## What you need
 
 - Windows 10/11 (64-bit) and Mafia: Definitive Edition on Steam, with Steam running
