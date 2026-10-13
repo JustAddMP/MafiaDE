@@ -15,7 +15,7 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
 
 ## Working rules
 
-- Clean-room: never use MafiaHub/MafiaMP code (deleted from the repo; it's only in old git history — don't look).
+- Clean-room: no code from other multiplayer mods (see ARCHITECTURE.md).
 - The game folder is read-only. Back up the save folder before in-world tests
   (`%TEMP%\claude\G--MafiaCoop\save-backup`), never start New Game, kill all game instances after a test,
   capture only game windows.
@@ -37,7 +37,7 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
 - [x] 3 Car copies follow the driver; cleanup on leave/timeout; game keeps running when unfocused
 - [x] 5 CO-OP entry in the main menu (host / join friend / join by IP) and pause menu (players, invite, leave)
 - [x] 5 Banners for join/leave/disconnect; in-game panels block game input
-- [x] Old MafiaHub-based version removed; README with screenshots; pushed to GitHub
+- [x] README with screenshots; pushed to GitHub
 
 ## Next steps, in order
 
@@ -53,7 +53,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
    and become drivable by others; decide owner = last driver.
 - [ ] **Crouch, aim direction, firing, reload** shown on puppets; health synced.
 - [ ] **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
-   owner), deaths/respawn; ramming. Melee (punches) was the big gap in the old version.
+   owner), deaths/respawn; ramming.
 - [ ] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it.
 - [ ] **Faster first spawn**: puppet factory currently takes ~20 s if the other game is still loading; retry

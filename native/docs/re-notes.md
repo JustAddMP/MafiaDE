@@ -1,6 +1,6 @@
 # re-notes: mafiadefinitiveedition.exe (Steam, CRC32 3168979183)
 
-This is static reverse engineering of the game binary only. Clean-room rule: nothing from `Framework\` was opened.
+This is static reverse engineering of the game binary only. Clean-room rule: no other mod's code was used.
 All addresses are **RVAs**. Add the runtime module base to get an address; the preferred image base is
 0x140000000. Every pattern listed here was checked to match **exactly once** in `.text` with
 `re-tools/scan.py` (see "Pattern table" at the end). Re-run that check after any game update:

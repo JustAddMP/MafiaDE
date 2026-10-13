@@ -1,12 +1,11 @@
 # MafiaCoop native — architecture
 
 A from-scratch, self-contained co-op mod for Mafia: Definitive Edition (Steam build, exe CRC32 3168979183).
-No MafiaHub code. Goal: co-op that feels like a built-in game feature.
+All code is our own. Goal: co-op that feels like a built-in game feature.
 
 ## Clean-room rule (binding)
 
-Do NOT open, read, copy or adapt anything under `G:\MafiaCoop\Framework\` (MafiaHub Framework and MafiaMP,
-licence forbids reuse). Allowed sources: the game's own binaries and data, the ScriptHook (MPlus) Lua scripts in the
+Do NOT copy or adapt code from other multiplayer mods. Allowed sources: the game's own binaries and data, the ScriptHook (MPlus) Lua scripts in the
 game folder as API reference, public documentation (Microsoft, Steamworks, Lua 5.x manual), and code we write here.
 Every game address/struct offset is derived by us from `mafiadefinitiveedition.exe` and recorded in `docs/re-notes.md`
 with how it was found.
