@@ -1,7 +1,8 @@
 // MafiaCoop.exe: finds Mafia: Definitive Edition, starts it suspended with SteamAppId set, injects
 // mafiacoop.dll (from this exe's directory) and resumes it.
 //
-// Usage: MafiaCoop.exe [--host] [--join <ip[:port]>] [--name <name>] [--<key> [value]] [--game <exe path>]
+// Usage: MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <name>] [--log <tag>]
+//                      [--<key> [value]] [--game <exe path>] [+connect_lobby <id>]
 // Every --<key> [value] (except --game) is passed to the dll as environment variable MAFIACOOP_<KEY>=<value>
 // ("1" for a bare flag); core::Config gives these precedence over MafiaCoop.ini.
 #include <windows.h>
@@ -241,23 +242,28 @@ int Run() {
     GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
     std::wstring selfDir = selfPath;
     selfDir = selfDir.substr(0, selfDir.find_last_of(L'\\'));
-    CreateDirectoryW((selfDir + L"\\logs").c_str(), nullptr);
-    _wfopen_s(&_log, (selfDir + L"\\logs\\launcher.log").c_str(), L"w, ccs=UTF-8");
-    Log(L"MafiaCoop launcher, built " __DATE__ " " __TIME__);
-
     const std::wstring iniPath = selfDir + L"\\MafiaCoop.ini";
     const std::wstring dllPath = selfDir + L"\\" + kDllName;
 
     // ---- arguments ----
+    // --key [value] -> MAFIACOOP_KEY env var for the dll; +word args (e.g. "+connect_lobby <id>", which Steam
+    // passes for "Join Game") go to the game's command line unchanged.
     std::vector<std::pair<std::wstring, std::wstring>> passEnv;
-    std::wstring gameOverride;
+    std::wstring gameOverride, logTag, gameArgs;
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
-        if (a.rfind(L"--", 0) != 0 || a.size() < 3) return Fail(L"Unexpected argument: " + a +
-                                                                L"\n\nUsage: MafiaCoop.exe [--host] [--join <ip>] "
-                                                                L"[--name <name>] [--<key> [value]] [--game <exe>]");
+        if (a.size() > 1 && a[0] == L'+') {
+            gameArgs += L" " + a;
+            if (i + 1 < argc && argv[i + 1][0] != L'-' && argv[i + 1][0] != L'+') gameArgs += L" " + std::wstring(argv[++i]);
+            continue;
+        }
+        if (a.rfind(L"--", 0) != 0 || a.size() < 3) {
+            return Fail(L"Unexpected argument: " + a +
+                        L"\n\nUsage: MafiaCoop.exe [--host] [--join <ip>] [--join-lobby <id>] [--name <name>] "
+                        L"[--<key> [value]] [--game <exe>]");
+        }
         std::wstring key = a.substr(2);
         std::wstring value = L"1";
         if (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) value = argv[++i];
@@ -265,12 +271,25 @@ int Run() {
             gameOverride = value;
             continue;
         }
+        if (Lower(key) == L"log") logTag = value;
         std::wstring envName = L"MAFIACOOP_";
         for (wchar_t c : key) envName += (c == L'-' || c == L'.') ? L'_' : static_cast<wchar_t>(towupper(c));
         passEnv.emplace_back(envName, value);
-        Log(L"arg: %s=%s", envName.c_str(), value.c_str());
     }
     if (argv) LocalFree(argv);
+
+    // ---- log: one per launch when several games run (launcher-<tag>.log / launcher-<pid>.log) ----
+    const std::vector<DWORD> running = FindProcesses(kGameExe);
+    std::wstring logName = L"launcher.log";
+    if (!logTag.empty())
+        logName = L"launcher-" + logTag + L".log";
+    else if (!running.empty())
+        logName = L"launcher-" + std::to_wstring(GetCurrentProcessId()) + L".log";
+    CreateDirectoryW((selfDir + L"\\logs").c_str(), nullptr);
+    _wfopen_s(&_log, (selfDir + L"\\logs\\" + logName).c_str(), L"w, ccs=UTF-8");
+    Log(L"MafiaCoop launcher, built " __DATE__ " " __TIME__);
+    for (auto& [k, v] : passEnv) Log(L"arg: %s=%s", k.c_str(), v.c_str());
+    if (!gameArgs.empty()) Log(L"arg: game command line extra:%s", gameArgs.c_str());
 
     // ---- find the game ----
     std::wstring gameExe;
@@ -297,15 +316,16 @@ int Run() {
     const std::wstring gameDir = gameExe.substr(0, gameExe.find_last_of(L'\\'));
     Log(L"game: %s", gameExe.c_str());
 
-    if (!FindProcesses(kGameExe).empty()) {
-        return Fail(L"Mafia: Definitive Edition is already running. Close it first, then start MafiaCoop.exe.");
-    }
+    // A second instance is allowed (two games on one PC for testing, joined over UDP 127.0.0.1). The exe has no
+    // working single-instance check (docs/re-notes.md 3.2); /multiinst also skips its leftover Mafia II mutex.
+    if (!running.empty()) Log(L"note: %zu game instance(s) already running; starting another", running.size());
 
     // ---- start suspended ----
     passEnv.emplace_back(L"SteamAppId", kAppId);
     passEnv.emplace_back(L"SteamGameId", kAppId);
     std::vector<wchar_t> env = BuildEnvironment(passEnv);
-    std::wstring cmdLine = L"\"" + gameExe + L"\"";
+    std::wstring cmdLine = L"\"" + gameExe + L"\" /multiinst" + gameArgs;
+    Log(L"command line: %s", cmdLine.c_str());
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(gameExe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE,
@@ -376,7 +396,9 @@ int Run() {
         DWORD code = 0;
         GetExitCodeProcess(pi.hProcess, &code);
         Sleep(2000);
-        bool relaunched = !FindProcesses(kGameExe).empty();
+        bool relaunched = false;  // a game process that was not running before we started ours
+        for (DWORD p : FindProcesses(kGameExe))
+            if (std::find(running.begin(), running.end(), p) == running.end()) relaunched = true;
         Log(L"game exited early with code %lu (relaunched by Steam: %s)", code, relaunched ? L"yes" : L"no");
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);

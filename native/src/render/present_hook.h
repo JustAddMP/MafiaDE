@@ -8,8 +8,10 @@ namespace mc::render {
 
 using FrameCallback = void (*)(float dt);
 using ResizeCallback = void (*)(unsigned width, unsigned height);
+using BeforeResizeCallback = void (*)();  // release backbuffer references here
 
-bool InstallPresentHook(FrameCallback onFrame, ResizeCallback onResize = nullptr);
+bool InstallPresentHook(FrameCallback onFrame, ResizeCallback onResize = nullptr,
+                        BeforeResizeCallback onBeforeResize = nullptr);
 void RemovePresentHook();
 
 IDXGISwapChain* GameSwapChain();  // last swapchain seen in Present (not AddRef'd), nullptr before the first frame

@@ -128,12 +128,20 @@ reorders them. `tests/net_loopback.cpp` runs at 20% loss + 20 +-15 ms + 5% dupli
 
 ## Steam transport
 
-**Interface versions.** The game ships its own `steam_api64.dll` (Steam Client API, source-control id 5697398). Its
+**Which steam_api.** The game does not load the `steam_api64.dll` in its folder: it memory-loads an embedded 2015
+steam_api without a flat API (`docs/re-notes.md` 3.1). So the dll loads the on-disk `steam_api64.dll` itself
+(`LoadLibraryW` from the game folder, falling back to a copy next to mafiacoop.dll), three seconds after the first
+frame calls ITS `SteamAPI_Init` (a second pipe to the same running Steam client; the game's own Steam keeps working)
+and from then on calls ITS `SteamAPI_RunCallbacks` once per frame from `Coop::Tick` (`src/dll/coop.cpp`). We never
+call `SteamAPI_Shutdown`. Verified in game: `SteamAPI_Init` succeeds in two concurrent instances, persona name and
+SteamID are read, and a friends-only lobby is created.
+
+**Interface versions.** That on-disk `steam_api64.dll` (Steam Client API, source-control id 5697398). Its
 exports, checked with pefile, are flat-API accessors `SteamAPI_SteamUser_v020`, `SteamAPI_SteamFriends_v017`,
 `SteamAPI_SteamMatchmaking_v009`, `SteamAPI_SteamUtils_v009`, `SteamAPI_SteamNetworking_v006`,
 `SteamAPI_SteamNetworkingSockets_v008`, `SteamAPI_SteamNetworkingUtils_v003`. We target exactly those
 (`src/net/steam_flat.h`). (The game exe itself was built against older headers - SteamFriends015,
-SteamNetworking005 - and loads steam_api64 dynamically; we do not use its copies.)
+SteamNetworking005 - and uses its embedded copy; we never touch that one.)
 
 **Why ISteamNetworking006 and not ISteamNetworkingMessages.** This dll predates ISteamNetworkingMessages: there
 is no `SteamAPI_SteamNetworkingMessages_*` / `SteamAPI_ISteamNetworkingMessages_*` export. (The Steam client itself
@@ -167,6 +175,11 @@ accepts their session, so the guest side needs nothing.
 
 Two instances on one PC share a SteamID and cannot use this transport; use UDP (`127.0.0.1`) for that.
 
+**Host = UDP + Steam at once.** The host's Session runs over a `MultiTransport` (`src/net/multi_transport.h`) that
+owns a `UdpTransport` and a `SteamTransport`, hosts on both and routes each peer to the part it connected through.
+Peer ids cannot collide: UDP ids are small counters, Steam ids are SteamID64s (a collision would be logged and the
+new peer dropped). Guests use a single transport.
+
 ## Steam lobby and invites
 
 `SteamLobby` (ISteamMatchmaking009 + ISteamFriends017):
@@ -190,35 +203,34 @@ Two kinds of results are needed:
    `ISteamUtils::IsAPICallCompleted` / `GetAPICallResult`. No registration needed.
 2. **Broadcast callbacks** (`P2PSessionRequest_t`, `P2PSessionConnectFail_t`, `GameLobbyJoinRequested_t`,
    `GameRichPresenceJoinRequested_t`, `LobbyChatUpdate_t`, `LobbyEnter_t`): these only reach code that registered for
-   them. Options were (a) `SteamAPI_ManualDispatch_*` or (b) `SteamAPI_RegisterCallback` with a hand-built object.
-   Manual dispatch is out: it switches the WHOLE process to manual dispatch and the game's own
-   `SteamAPI_RunCallbacks` would stop delivering the game's callbacks. The game exe references
-   `SteamAPI_RunCallbacks`/`SteamAPI_RegisterCallback` (classic dispatch) and no ManualDispatch function.
+   them, through the steam_api instance they were registered with.
 
-We use (b): `steam_flat.cpp` builds a `CCallbackBase`-compatible object (MSVC x64 layout: vtable at +0,
+`steam_flat.cpp` builds a `CCallbackBase`-compatible object (MSVC x64 layout: vtable at +0,
 `uint8 m_nCallbackFlags` at +8, `int m_iCallback` at +12; three virtuals: the two `Run` overloads and
-`GetCallbackSizeBytes`) and registers it with `SteamAPI_RegisterCallback(obj, id)`. The game's own
-`SteamAPI_RunCallbacks` then calls us on the game's thread. Our `Run` only copies the payload into an SRWLOCK-guarded
-queue; `steam::Pump()` (called from `SteamTransport::Poll` / `SteamLobby::Poll` on the render thread) hands it to
-the subscribers. Both `Run` slots do the same thing (enqueue, ignore extra arguments), so the MSVC
-overload-ordering quirk (overloaded virtuals are laid out in reverse declaration order) cannot misroute a call.
+`GetCallbackSizeBytes`) and registers it with OUR steam_api's `SteamAPI_RegisterCallback(obj, id)`. Because the
+game's callbacks go through its embedded steam_api, nobody else pumps ours: `Coop::Tick` calls our
+`SteamAPI_RunCallbacks` every frame on the render thread, which calls `Run`. `Run` only copies the payload into an
+SRWLOCK-guarded queue; `steam::Pump()` (called from `SteamTransport::Poll` / `SteamLobby::Poll`) hands it to the
+subscribers. Both `Run` slots do the same thing (enqueue, ignore extra arguments), so the MSVC overload-ordering
+quirk (overloaded virtuals are laid out in reverse declaration order) cannot misroute a call. (Classic dispatch is
+kept rather than `SteamAPI_ManualDispatch_*`; with our own instance either would work, the registration path is the
+one verified by the smoke test and in game.)
 
-Verified by `tests/steam_smoke.cpp` against a copy of the game's dll: the `LobbyEnter_t` broadcast is delivered
+Verified by `tests/steam_smoke.cpp` against a copy of the dll and in game: the `LobbyEnter_t` broadcast is delivered
 through our registered object, and the `LobbyCreated_t` call result is still readable by polling after
 `SteamAPI_RunCallbacks` ran.
 
 Risks:
 
-- **Layout assumption.** If a future steam_api changed `CCallbackBase` (it has been stable across SDK releases for many years), registration would
-  break. The game's dll is fixed, so this only matters if the game updates it.
-- **Callbacks only flow while the game pumps.** If the game stops calling `SteamAPI_RunCallbacks` (e.g. during
-  long loads), invites/session requests wait until it resumes. Receiving packets is polling and is unaffected.
-- **Cross-thread delivery.** `Run` is invoked on the game's thread. It touches nothing but the locked queue.
-  Unregistering while the game might be dispatching would race, so the dll never unregisters (objects live until
-  process exit); only the standalone smoke test calls `steam::UnregisterAll()` before `SteamAPI_Shutdown`.
-- **Call result consumed by the game's dispatcher.** Steam might drop a call result nobody registered for when
-  `RunCallbacks` sees its completion. Not observed (the smoke test reads it fine after RunCallbacks), but as a
-  safety net `SteamLobby` also listens for the `LobbyEnter_t` broadcast (posted for both create and join) and uses
-  it if the call result cannot be read or does not arrive within 2 s.
-- **Flat calls from the render thread.** Steam API calls are internally synchronised; we never call
-  `SteamAPI_RunCallbacks`, `SteamAPI_Init` or `SteamAPI_Shutdown` from the dll.
+- **Layout assumption.** If a future steam_api changed `CCallbackBase` (stable across SDK releases for many years),
+  registration would break. We load a fixed dll from the game folder, so this only matters if the game updates it.
+- **Two steam_api instances in one process.** Ours and the game's embedded one each have their own pipe to
+  steamclient64.dll. Seen working (init, persona, lobby create); the game's overlay was not exercised by hand yet.
+- **Unregistering** while dispatching would race; the dll never unregisters (objects live until process exit); only
+  the standalone smoke test calls `steam::UnregisterAll()` before `SteamAPI_Shutdown`.
+- **Call result consumed by RunCallbacks.** Steam might drop a call result nobody registered for when
+  `RunCallbacks` sees its completion. Not observed, but as a safety net `SteamLobby` also listens for the
+  `LobbyEnter_t` broadcast (posted for both create and join) and uses it if the call result cannot be read or does
+  not arrive within 2 s.
+- **Flat calls from the render thread.** Steam API calls are internally synchronised. The dll calls `SteamAPI_Init`
+  once and `SteamAPI_RunCallbacks` per frame on its own instance only; never `SteamAPI_Shutdown`.

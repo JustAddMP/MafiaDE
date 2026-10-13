@@ -25,6 +25,7 @@ Present1Fn _origPresent1 = nullptr;
 ResizeBuffersFn _origResizeBuffers = nullptr;
 FrameCallback _onFrame = nullptr;
 ResizeCallback _onResize = nullptr;
+BeforeResizeCallback _onBeforeResize = nullptr;
 IDXGISwapChain* _swapChain = nullptr;
 LARGE_INTEGER _freq{};
 LARGE_INTEGER _last{};
@@ -78,6 +79,7 @@ HRESULT STDMETHODCALLTYPE ResizeBuffersDetour(IDXGISwapChain* sc, UINT count, UI
                                               DXGI_FORMAT format, UINT flags) {
     MC_LOG_INFO("render: ResizeBuffers(%p, count=%u, %ux%u, fmt=%d, flags=0x%x)", sc, count, width, height,
                 static_cast<int>(format), flags);
+    if (_onBeforeResize) _onBeforeResize();  // ResizeBuffers fails while anyone holds a backbuffer reference
     HRESULT hr = _origResizeBuffers(sc, count, width, height, format, flags);
     if (FAILED(hr)) MC_LOG_WARN("render: ResizeBuffers returned 0x%08lx", static_cast<unsigned long>(hr));
     if (_onResize) _onResize(width, height);
@@ -144,7 +146,8 @@ bool GetSwapChainVtable(void** out, size_t count) {
 
 } // namespace
 
-bool InstallPresentHook(FrameCallback onFrame, ResizeCallback onResize) {
+bool InstallPresentHook(FrameCallback onFrame, ResizeCallback onResize, BeforeResizeCallback onBeforeResize) {
+    _onBeforeResize = onBeforeResize;
     _onFrame = onFrame;
     _onResize = onResize;
     QueryPerformanceFrequency(&_freq);

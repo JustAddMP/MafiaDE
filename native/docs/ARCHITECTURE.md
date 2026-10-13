@@ -15,8 +15,9 @@ with how it was found.
 
 - Windows SDK only (Win32, Winsock, D3D11/DXGI, DbgHelp for crash dumps).
 - `third_party/minhook` (BSD-2, vendored source, the only third-party code).
-- At runtime: the game and Steam. Steam is used through the game's own `steam_api64.dll` via `GetProcAddress`
-  on the flat API (no Steamworks SDK headers checked in; we declare the few structs/functions we need).
+- At runtime: the game and Steam. The game memory-loads an embedded old steam_api, so the dll `LoadLibrary`s the
+  `steam_api64.dll` from the game folder itself, calls its `SteamAPI_Init` and pumps its `SteamAPI_RunCallbacks`
+  (flat API via `GetProcAddress`; no Steamworks SDK headers checked in; see docs/protocol.md "Steam transport").
 - Static CRT (`/MT`) so no VC++ redistributable is needed.
 
 ## Layout

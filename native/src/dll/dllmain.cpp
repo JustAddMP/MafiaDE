@@ -74,9 +74,24 @@ void LogEnvironment(const std::wstring& dir) {
     MC_LOG_INFO("env SteamAppId=%s", appId[0] ? appId : "(unset)");
 }
 
+// One log per game instance: --log <tag> -> mafiacoop-<tag>.log. Without it the first instance writes
+// mafiacoop.log and any further concurrent instance mafiacoop-<pid>.log (detected with a named mutex that the
+// first instance keeps for its lifetime), so two games on one PC never rotate or interleave each other's log.
+std::wstring LogFileName() {
+    wchar_t tag[64] = {};
+    DWORD n = GetEnvironmentVariableW(L"MAFIACOOP_LOG", tag, 64);
+    if (n > 0 && n < 64) return std::wstring(L"mafiacoop-") + tag + L".log";
+    HANDLE m = CreateMutexW(nullptr, FALSE, L"Local\\MafiaCoopPrimaryLog");  // intentionally never closed
+    if (m && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(m);
+        return L"mafiacoop-" + std::to_wstring(GetCurrentProcessId()) + L".log";
+    }
+    return L"mafiacoop.log";
+}
+
 DWORD WINAPI InitThread(LPVOID) {
     const std::wstring dir = ModuleDir(_module);
-    core::log::Init(dir + L"\\logs");
+    core::log::Init(dir + L"\\logs", LogFileName().c_str());
     LogEnvironment(dir);
 
     auto& cfg = core::Config::Get();
@@ -85,7 +100,7 @@ DWORD WINAPI InitThread(LPVOID) {
     } else {
         MC_LOG_INFO("config: %s not found, using defaults", Narrow(cfg.Path()).c_str());
     }
-    for (const char* key : {"host", "join", "name", "port"}) {
+    for (const char* key : {"host", "join", "join_lobby", "transport", "name", "port", "log", "steam"}) {
         if (cfg.Has(key)) MC_LOG_INFO("config: %s = %s", key, cfg.GetString(key).c_str());
     }
 
@@ -105,7 +120,7 @@ DWORD WINAPI InitThread(LPVOID) {
     MC_LOG_INFO("init: game window %p class '%s' title '%s'", hwnd, cls, title);
 
     Mod::Init();
-    if (!render::InstallPresentHook(&Mod::Tick, &Mod::OnResize)) {
+    if (!render::InstallPresentHook(&Mod::Tick, &Mod::OnResize, &Mod::OnBeforeResize)) {
         MC_LOG_ERROR("init: Present hook failed; mod inactive");
         return 1;
     }

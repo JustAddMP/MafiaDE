@@ -6,6 +6,7 @@ set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "OUT=%ROOT%\out"
 set "OBJ=%OUT%\obj"
+set "GEN=%OUT%\obj\gen"
 
 rem ---- toolchain -------------------------------------------------------------
 where cl.exe >nul 2>nul
@@ -23,10 +24,11 @@ if errorlevel 1 (
 where cl.exe >nul 2>nul || ( echo [build] ERROR: cl.exe still not on PATH & goto :fail )
 
 if not exist "%OUT%" mkdir "%OUT%" || goto :fail
+if not exist "%GEN%" mkdir "%GEN%"
 for %%d in (minhook launcher core render game net dll tests) do if not exist "%OBJ%\%%d" mkdir "%OBJ%\%%d"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS"
-set "INCS=/I"%ROOT%\src" /I"%ROOT%\third_party\minhook\include""
+set "INCS=/I"%ROOT%\src" /I"%GEN%" /I"%ROOT%\third_party\minhook\include""
 set "CXXFLAGS=/nologo /c /std:c++20 /EHsc /MT /O2 /Zi /FS /W4 /permissive- /utf-8 /Zc:__cplusplus %DEFS% %INCS%"
 set "CFLAGS=/nologo /c /MT /O2 /Zi /FS /W3 /utf-8 %DEFS%"
 set "LDFLAGS=/nologo /DEBUG:FULL /OPT:REF /OPT:ICF /INCREMENTAL:NO /MACHINE:X64"
@@ -38,6 +40,22 @@ cl %CFLAGS% /Fd"%OBJ%\minhook\vc.pdb" /Fo"%OBJ%\minhook\\" ^
   "%ROOT%\third_party\minhook\src\buffer.c" "%ROOT%\third_party\minhook\src\hook.c" ^
   "%ROOT%\third_party\minhook\src\trampoline.c" "%ROOT%\third_party\minhook\src\hde\hde64.c" >"%OBJ%\minhook\cl.log"
 if errorlevel 1 ( type "%OBJ%\minhook\cl.log" & echo [build] ERROR: minhook failed & goto :fail )
+
+rem ---- shaders: src\render\*.hlsl -> out\obj\gen\<name>_vs.h / _ps.h (fxc from the Windows SDK) ------------
+rem Bytecode arrays k<Name>VS / k<Name>PS (e.g. overlay.hlsl -> kOverlayVS in overlay_vs.h). Precompiled so the
+rem dll needs no d3dcompiler_47.dll at runtime.
+where fxc.exe >nul 2>nul || ( echo [build] ERROR: fxc.exe not on PATH ^(Windows SDK^) & goto :fail )
+for %%f in ("%ROOT%\src\render\*.hlsl") do (
+  echo [build] shader %%~nxf
+  set "SN=%%~nf"
+  set "SC=!SN:~0,1!"
+  for %%u in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do if /i "!SC!"=="%%u" set "SC=%%u"
+  set "SC=!SC!!SN:~1!"
+  fxc /nologo /T vs_4_0 /E VSMain /O3 /Vn k!SC!VS /Fh "%GEN%\%%~nf_vs.h" "%%f" >"%GEN%\%%~nf_vs.log" 2>&1
+  if errorlevel 1 ( type "%GEN%\%%~nf_vs.log" & echo [build] ERROR: shader %%~nxf VS failed & goto :fail )
+  fxc /nologo /T ps_4_0 /E PSMain /O3 /Vn k!SC!PS /Fh "%GEN%\%%~nf_ps.h" "%%f" >"%GEN%\%%~nf_ps.log" 2>&1
+  if errorlevel 1 ( type "%GEN%\%%~nf_ps.log" & echo [build] ERROR: shader %%~nxf PS failed & goto :fail )
+)
 
 rem ---- dll source groups (every .cpp in each dir) ------------------------------
 set "DLLOBJS="%OBJ%\minhook\*.obj""
