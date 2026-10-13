@@ -21,3 +21,14 @@ as release [v0.1.0](https://github.com/JustAddMP/MafiaDE/releases/tag/v0.1.0).
 ## For developers
 
 Source, build steps and design notes are in `native/` (`native/README-dev.md`, `native/docs/`).
+
+## Screenshots
+
+| | |
+|---|---|
+| ![CO-OP in the main menu](native/docs/screenshots/main-menu.png) | ![Co-op menu while hosting](native/docs/screenshots/coop-menu-hosting.png) |
+| CO-OP entry in the game's own main menu | The co-op page while hosting |
+| ![Co-op panel in the pause menu](native/docs/screenshots/pause-menu-coop.png) | ![Two players in the world](native/docs/screenshots/in-game-two-players.png) |
+| Pause menu: players, ping, invite friends | Host's view: the guest standing next to them |
+| ![Guest's view](native/docs/screenshots/in-game-guest-view.png) | |
+| Guest's view after joining mid-game | |
