@@ -5,7 +5,9 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "dll/mod.h"
+#include "dll/ui_input.h"
 #include "game/lua.h"
+#include "game/menu.h"
 #include "game/player_sync.h"
 #include "render/present_hook.h"
 
@@ -18,27 +20,34 @@ namespace {
 
 HMODULE _module = nullptr;
 WNDPROC _gameWndProc = nullptr;
+bool _backgroundRun = true;
 
 // The game pauses its simulation (and with it the script tick) when it receives WM_ACTIVATEAPP(FALSE): its window
 // procedure (exe+0x5DF0D0) turns that message into an engine "app inactive" event. In co-op a paused game stops
 // sending its player and stops moving the puppets, and two instances on one PC could never both run. With
 // background_run = 1 (default) the deactivation is swallowed so the world keeps running while unfocused. Nothing
 // else changes: input still only goes to the focused window.
-LRESULT CALLBACK BackgroundRunWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_ACTIVATEAPP && wp == FALSE) return 0;
+// Also the entry point for our UI's keyboard/mouse input: while a co-op panel is open, ui_input swallows the
+// keyboard and mouse messages so the game's menus underneath do not react.
+LRESULT CALLBACK ModWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (_backgroundRun && msg == WM_ACTIVATEAPP && wp == FALSE) return 0;
+    if (ui_input::OnWindowMessage(msg, static_cast<uint64_t>(wp), static_cast<int64_t>(lp))) return 0;
     return CallWindowProcW(_gameWndProc, hwnd, msg, wp, lp);
 }
 
-void InstallBackgroundRun(HWND hwnd) {
+void SubclassWindow(HWND hwnd, bool backgroundRun) {
+    _backgroundRun = backgroundRun;
+    ui_input::SetWindow(hwnd);
     SetLastError(0);
     auto prev = reinterpret_cast<WNDPROC>(
-        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&BackgroundRunWndProc)));
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&ModWndProc)));
     if (!prev && GetLastError() != 0) {
-        MC_LOG_WARN("init: background_run: SetWindowLongPtr failed (%lu)", GetLastError());
+        MC_LOG_WARN("init: SetWindowLongPtr failed (%lu): no background_run, co-op panels cannot block keys",
+                    GetLastError());
         return;
     }
     _gameWndProc = prev;
-    MC_LOG_INFO("init: background_run: window deactivation is ignored (game keeps running unfocused)");
+    if (backgroundRun) MC_LOG_INFO("init: background_run: window deactivation is ignored (game keeps running unfocused)");
 }
 
 std::wstring ModuleDir(HMODULE mod) {
@@ -133,6 +142,7 @@ DWORD WINAPI InitThread(LPVOID) {
     if (!core::hook::Init()) return 1;
     // Lua bridge: hooks the script tick (GameMainThread); independent of the window/D3D. Failure only disables it.
     if (game::lua::Install(dir, cfg.GetString("log"))) game::PlayerSync::Install();
+    game::menu::Install(dir);
 
     const DWORD timeoutMs = static_cast<DWORD>(cfg.GetInt("window_timeout_s", 300)) * 1000;
     MC_LOG_INFO("init: waiting for the game window");
@@ -146,7 +156,8 @@ DWORD WINAPI InitThread(LPVOID) {
     GetClassNameA(hwnd, cls, sizeof(cls));
     MC_LOG_INFO("init: game window %p class '%s' title '%s'", hwnd, cls, title);
 
-    if (cfg.GetBool("background_run", true)) InstallBackgroundRun(hwnd);
+    SubclassWindow(hwnd, cfg.GetBool("background_run", true));
+    ui_input::Install();
     Mod::Init();
     if (!render::InstallPresentHook(&Mod::Tick, &Mod::OnResize, &Mod::OnBeforeResize)) {
         MC_LOG_ERROR("init: Present hook failed; mod inactive");

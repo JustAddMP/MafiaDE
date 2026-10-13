@@ -146,3 +146,45 @@ of police for a long time.
   node tables: their functions show, via `string.dump`, which wrapper methods a node calls).
 - `package.loaded.traffic.GetSpawnProfiles(...)`, `Game.Traffic.SpawnProfileHuman`, `Testscenes.SpawnEnemies`
   (uses `entitywrapper:GetEntityByName("enemy%02d")` on pre-placed test-scene entities).
+
+## 9. Menus and notifications — verified
+
+The menus are not scripted in Lua: they are Scaleform AS3 movies whose entries are built by their own ActionScript
+(docs/re-notes.md 5). What the script side offers, and what we found:
+
+| what | notes |
+|---|---|
+| `game.hud:SendMessageMovie(movie, fn, args...)` | calls `_root.<fn>` of a loaded movie instance (`"HUD"`, `"MainMenu"`, ...); string/number args. Returns true even when the function does not exist |
+| `game.hud:OpenMovie(path)` / `AttachMovie` / `CloseMovie` | open extra movies (test scenes use `/gui/scripted_test.swf` with `OnCreateRootMenu`, `OnSetMenuTitleText`, `OnSelectMenuItem`; not shipped as a usable menu) |
+| `game.hud:RegisterScriptedMenuEvent(movie, enums.ScriptedMenuEvent.X, fn)` | menu events to Lua (`ACCEPT`, `BACK`, `MENU_SELECT_ITEM` with `selectedIndex`, ...); `Game.Hud.MainMenuEvent` registers on `"MainMenu"`. The stock main menu does not need it |
+| `enums.MenuId` | E_MENUID_SERVICES / WEAPONSTORE / HIDEOUTASSIGNMENT / OUTFIT / HERBALISM: in-world (Mafia III style) menus |
+| HUD banners | `SendMessageMovie("HUD", "OnShowWarningBanner", title, text)` (used by `persistent_location` with plain text), `"OnShowUnlockBanner"`, `game.hud:ShowWarning(text)`: all returned true in the world but **showed nothing** in this build, so co-op notifications are our own overlay banners in the menu style |
+
+**How the co-op entries are added** (src/game/menu.cpp, src/game/swf_patch.cpp): the dll hooks the movie loader
+(`LoadProcess::BeginSWFLoading`), and for `/gui/main_menu_main.gfx`, `/gui/pause_menu.gfx` and
+`/gui/pause_menu_game.gfx` reads the file, appends a few constants to the DoABC block and prepends short bytecode
+prologues to existing methods, then hands the loader a memory copy. Nothing on disk changes; if a movie does not have
+the expected classes/methods the patch is skipped (logged) and the menu loads unchanged.
+
+- Main menu, `pages::main_menu_page_main`:
+  - `BuildMenu(vec)` prologue asks C++ `ExternalInterface.call("AttachIface", "MafiaCoop", "build", menuLocation)`
+    and applies the answer (lines `T|title`, `P|id|label` push, `A|afterId|id|label` insert after an entry). Root
+    menu: `A|9|100|CO-OP` puts CO-OP after FREE RIDE (label shows `(HOSTING)` / `(CONNECTED)`); location 50 is our
+    CO-OP page (HOST CO-OP GAME / JOIN FRIEND / JOIN BY IP, or INVITE FRIENDS / STOP HOSTING, or LEAVE CO-OP; BACK).
+  - `ActivateButton(data)` prologue: ids >= 100 are ours; plays the menu's select sound, sends `"select", id` and
+    follows the answer: `open` (enter page 50 the way the game enters sub pages), `back` (`Back()`), `refresh`
+    (`UpdateMenu()`).
+- Pause menu GAME page, `pages::pause_menu_page_game`: `PopulateNavigation()` prologue shows the hidden fifth clip
+  (`entry_4_mc`) as CO-OP on PC (not on Xbox, where it is "switch account"), `Select()` prologue sends `"pause"`.
+- The `ExternalInterface.call("AttachIface", "MafiaCoop", ...)` calls reach the game's `AttachIface` handler, which we
+  hook; anything else goes to the original. Answers are strings; the engine keeps the char pointer until it has
+  converted the value, so replies are kept in a small ring buffer.
+- Everything a native entry can do runs on GameMainThread and only queues a command; the render thread
+  (dll/coop_ui.cpp) executes it (Coop::Host/JoinAddress/Leave, Steam overlay calls) and shows our two panels: the
+  pause CO-OP panel (players with ping, actions) and the JOIN BY IP box, both drawn by our overlay in the menu style.
+  While one is open the game gets no keyboard/mouse/gamepad input (DirectInput state zeroed, presses dropped, releases
+  kept; XInput zeroed; window key/mouse messages swallowed; key releases always pass so Scaleform sees balanced
+  key up/down) and blocking continues until the confirm/back keys are released plus 250 ms.
+- Steam: `ISteamFriends::ActivateGameOverlayInviteDialog(lobby)` (INVITE FRIENDS) and `ActivateGameOverlay("Friends")`
+  (JOIN FRIEND) open over the game (gameoverlayrenderer64.dll is loaded in game processes started by MafiaCoop.exe;
+  with two instances on one account the dialog showed in both windows).

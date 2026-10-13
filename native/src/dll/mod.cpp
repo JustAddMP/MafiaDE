@@ -4,6 +4,7 @@
 #include "core/crash.h"
 #include "core/log.h"
 #include "dll/coop.h"
+#include "dll/coop_ui.h"
 #include "game/lua.h"
 #include "render/overlay.h"
 #include "render/present_hook.h"
@@ -58,6 +59,7 @@ void Mod::Init() {
     }
     _state.overlayVisible = cfg.GetBool("overlay", true);
     Coop::Init();
+    CoopUi::Init();
     MC_LOG_INFO("mod: initialized");
 }
 
@@ -71,6 +73,10 @@ void Mod::Tick(float dt) {
         if (dt < _state.minDt) _state.minDt = dt;
         if (dt > _state.maxDt) _state.maxDt = dt;
     }
+
+    // The game installs its own unhandled-exception filter a few seconds after start; put ours back every frame at
+    // first so an early crash still gets our log + dump, then with every heartbeat.
+    if (_state.uptime < 60.0) core::crash::Reassert();
 
     if (_state.sinceHeartbeat >= kHeartbeatSeconds) {
         double fps = _state.framesSinceHeartbeat / _state.sinceHeartbeat;
@@ -88,13 +94,13 @@ void Mod::Tick(float dt) {
 
     game::lua::PollRender(dt);
     Coop::Tick(dt);
+    render::Overlay::Track(render::GameSwapChain());
+    CoopUi::Tick(dt);
 
     PollToggleKey();
-    if (_state.overlayVisible) {
-        _state.status.clear();
-        Coop::GetStatus(_state.status);
-        render::Overlay::Draw(render::GameSwapChain(), _state.status);
-    }
+    _state.status.clear();
+    if (_state.overlayVisible) Coop::GetStatus(_state.status);
+    render::Overlay::Draw(render::GameSwapChain(), _state.status, CoopUi::Draw());
 
     if (_state.crashTest && _state.uptime >= _state.crashTestDelay) {
         _state.crashTest = false;

@@ -10,11 +10,15 @@
 #include "net/steam_transport.h"
 #include "net/udp_transport.h"
 
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <memory>
 
 namespace mc {
@@ -77,6 +81,10 @@ struct State {
     bool teardown = false;  // set from session callbacks; done at the end of Tick
     std::string lastError;
     double lastErrorAt = -1e9;
+
+    std::deque<Coop::Notice> notices;
+    std::string localAddress;  // computed once
+    std::string lastAddress;   // last JoinAddress target
 };
 
 State& S() {
@@ -137,6 +145,40 @@ void SetError(const std::string& why) {
     s.lastErrorAt = s.now;
 }
 
+void Notify(std::string title, std::string text, bool error = false) {
+    State& s = S();
+    if (s.notices.size() > 16) s.notices.pop_front();
+    s.notices.push_back({std::move(title), std::move(text), error});
+}
+
+// This PC's first non-loopback IPv4 address (for the "join by IP" hint), "" if none.
+std::string LocalAddress() {
+    State& s = S();
+    if (!s.localAddress.empty()) return s.localAddress;
+    WSADATA wsa{};
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return {};
+    char host[256] = {};
+    if (gethostname(host, sizeof(host)) == 0) {
+        addrinfo hints{};
+        hints.ai_family = AF_INET;
+        addrinfo* res = nullptr;
+        if (getaddrinfo(host, nullptr, &hints, &res) == 0) {
+            for (addrinfo* a = res; a; a = a->ai_next) {
+                char buf[64] = {};
+                const auto* in = reinterpret_cast<const sockaddr_in*>(a->ai_addr);
+                inet_ntop(AF_INET, &in->sin_addr, buf, sizeof(buf));
+                if (std::strncmp(buf, "127.", 4) != 0 && std::strncmp(buf, "169.254.", 8) != 0) {
+                    s.localAddress = buf;
+                    break;
+                }
+            }
+            freeaddrinfo(res);
+        }
+    }
+    WSACleanup();
+    return s.localAddress;
+}
+
 // Drops the session and transports and goes back to idle. Never call from inside a session callback (set
 // s.teardown instead; Tick does it after Poll returns).
 void Teardown() {
@@ -155,6 +197,7 @@ void Teardown() {
 void Fail(const std::string& why) {
     MC_LOG_ERROR("coop: %s", why.c_str());
     SetError(why);
+    Notify("CO-OP", why, true);
     Teardown();
 }
 
@@ -184,12 +227,16 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
         MC_LOG_INFO("coop: handshake complete, joined as player %u (%zu players)", st.session->LocalId(),
                     st.session->Players().size());
         LogPlayers();
+        const net::PlayerInfo* host = st.session->FindPlayer(net::kHostPlayer);
+        Notify("CO-OP", "Connected to " + (host ? host->name : st.target) + "'s game");
     };
     session.onPlayerJoined = [](const net::PlayerInfo& p) {
         MC_LOG_INFO("coop: player %u '%s' joined (%zu players)", p.id, p.name.c_str(), S().session->Players().size());
+        if (p.id != S().session->LocalId()) Notify("CO-OP", p.name + " joined the game");
     };
     session.onPlayerLeft = [](const net::PlayerInfo& p, const std::string& reason) {
         MC_LOG_INFO("coop: player %u '%s' left: %s", p.id, p.name.c_str(), reason.c_str());
+        Notify("CO-OP", p.name + " left the game");
         game::PlayerSync::OnPlayerLeft(p.id);
     };
     session.onChat = [](net::PlayerId from, const std::string& text) {
@@ -198,6 +245,7 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
     session.onDisconnected = [](const std::string& reason) {
         MC_LOG_WARN("coop: disconnected: %s", reason.c_str());
         SetError("disconnected: " + reason);
+        Notify("CO-OP", "Disconnected: " + reason, true);
         S().teardown = true;
     };
 }
@@ -227,6 +275,7 @@ void StartLobbyJoin(uint64_t lobbyId) {
 void OnJoinRequested(uint64_t lobbyId) {
     State& s = S();
     MC_LOG_INFO("coop: join requested from Steam for lobby %llu", static_cast<unsigned long long>(lobbyId));
+    Notify("CO-OP", "Joining your friend's game...");
     if (s.mode == Mode::JoinLobby && s.lobbyId == lobbyId &&
         (s.session || s.lobby.GetState() != net::SteamLobby::State::Idle)) {
         MC_LOG_INFO("coop: already in or joining that lobby");
@@ -337,11 +386,23 @@ void TryStart() {
         if (!s.session->Host(s.port)) return Fail("could not host: " + s.session->LastError());
         MC_LOG_INFO("coop: hosting over %s, UDP port %u", s.net->Name(), s.port);
         if (steamPart) s.lobby.Create(net::kMaxPlayers);
+        {
+            std::string how;
+            if (steamPart) how = "Invite friends from the pause menu (CO-OP) or the Steam overlay.";
+            if (s.transport != "steam") {
+                const std::string ip = LocalAddress();
+                if (!how.empty()) how += " ";
+                how += "Join by IP: " + (ip.empty() ? std::string("this PC") : ip) +
+                       (s.port == net::kDefaultPort ? std::string() : ":" + std::to_string(s.port));
+            }
+            Notify("HOSTING CO-OP", how);
+        }
         break;
     }
     case Mode::JoinUdp:
         if (steamPending && s.name.empty()) return;
         s.started = true;
+        Notify("CO-OP", "Connecting to " + s.address + "...");
         MakeSession(std::make_unique<net::UdpTransport>());
         s.target = s.address;
         if (!s.session->Join(s.address)) return Fail("could not join '" + s.address + "': " + s.session->LastError());
@@ -413,6 +474,119 @@ void Coop::Shutdown() {
     State& s = S();
     if (s.session) s.session->Leave();
     if (s.steam == SteamState::Ready) s.lobby.Leave();
+}
+
+// ---- runtime control -------------------------------------------------------------------------------------------------
+namespace {
+void StopCurrent() {
+    State& s = S();
+    if (s.session || s.mode != Mode::None ||
+        (s.steam == SteamState::Ready && s.lobby.GetState() != net::SteamLobby::State::Idle))
+        Teardown();
+    s.lastError.clear();
+}
+}  // namespace
+
+void Coop::Host() {
+    State& s = S();
+    MC_LOG_INFO("coop: host requested from the menu");
+    StopCurrent();
+    s.mode = Mode::Host;
+    s.started = false;  // TryStart (waits for Steam if it is still starting)
+}
+
+void Coop::JoinAddress(const std::string& address) {
+    State& s = S();
+    MC_LOG_INFO("coop: join '%s' requested from the menu", address.c_str());
+    StopCurrent();
+    s.mode = Mode::JoinUdp;
+    s.address = address;
+    s.lastAddress = address;
+    s.started = false;
+}
+
+void Coop::JoinLobby(uint64_t lobbyId) {
+    State& s = S();
+    StopCurrent();
+    s.mode = Mode::JoinLobby;
+    s.lobbyId = lobbyId;
+    s.started = false;
+}
+
+void Coop::Leave() {
+    State& s = S();
+    const bool active = s.session || s.mode != Mode::None;
+    MC_LOG_INFO("coop: leave requested from the menu");
+    StopCurrent();
+    s.started = true;  // stay idle
+    if (active) Notify("CO-OP", "You left the co-op session");
+}
+
+bool Coop::InviteFriends() {
+    State& s = S();
+    if (s.steam != SteamState::Ready) {
+        Notify("CO-OP", "Steam is not available: friends can join by IP instead", true);
+        return false;
+    }
+    if (s.lobby.OpenInviteDialog()) return true;
+    Notify("CO-OP", "Host a co-op game first, then invite friends", true);
+    return false;
+}
+
+bool Coop::OpenSteamFriends() {
+    State& s = S();
+    if (s.steam != SteamState::Ready) {
+        Notify("CO-OP", "Steam is not available: use JOIN BY IP", true);
+        return false;
+    }
+    auto& api = net::steam::Get();
+    api.Friends_ActivateGameOverlay(api.friends, "Friends");
+    Notify("JOIN FRIEND", "Right-click a friend who is hosting and choose Join Game, or accept their invite.");
+    return true;
+}
+
+Coop::Info Coop::GetInfo() {
+    State& s = S();
+    Info info;
+    info.steamReady = s.steam == SteamState::Ready;
+    info.lastAddress = s.lastAddress;
+    info.localAddress = LocalAddress();
+    info.target = s.target;
+    if (s.session) {
+        const net::Session& session = *s.session;
+        switch (session.State()) {
+        case net::SessionState::Hosting: info.phase = Phase::Hosting; break;
+        case net::SessionState::Connected: info.phase = Phase::Connected; break;
+        default: info.phase = Phase::Joining; break;
+        }
+        if (info.phase == Phase::Hosting) {
+            info.port = s.transport == "steam" ? 0 : s.port;
+            info.lobbyOpen = s.lobby.GetState() == net::SteamLobby::State::InLobby;
+        }
+        if (const net::PlayerInfo* host = session.FindPlayer(net::kHostPlayer); host && info.phase == Phase::Connected)
+            info.target = host->name;
+        for (const auto& p : session.Players()) {
+            PlayerRow row;
+            row.name = p.name;
+            row.host = p.id == net::kHostPlayer;
+            row.you = p.id == session.LocalId();
+            row.pingMs = row.host ? -1 : static_cast<int>(p.rttMs + 0.5f);
+            info.players.push_back(row);
+        }
+    } else if (s.mode == Mode::JoinLobby) {
+        info.phase = Phase::Joining;
+    } else if (s.mode != Mode::None) {
+        info.phase = s.mode == Mode::Host ? Phase::Starting : Phase::Joining;
+    }
+    return info;
+}
+
+bool Coop::PopNotice(Notice* out) {
+    State& s = S();
+    if (s.notices.empty()) return false;
+    *out = std::move(s.notices.front());
+    s.notices.pop_front();
+    return true;
 }
 
 void Coop::GetStatus(std::vector<render::OverlayLine>& out) {

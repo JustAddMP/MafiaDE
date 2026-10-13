@@ -102,6 +102,7 @@ bool Load(HINSTANCE__* module) {
     ok &= Resolve(m, a.Friends_GetPersonaName, "SteamAPI_ISteamFriends_GetPersonaName");
     ok &= Resolve(m, a.Friends_GetFriendPersonaName, "SteamAPI_ISteamFriends_GetFriendPersonaName");
     ok &= Resolve(m, a.Friends_ActivateGameOverlayInviteDialog, "SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialog");
+    ok &= Resolve(m, a.Friends_ActivateGameOverlay, "SteamAPI_ISteamFriends_ActivateGameOverlay");
     ok &= Resolve(m, a.Friends_SetRichPresence, "SteamAPI_ISteamFriends_SetRichPresence");
     ok &= Resolve(m, a.Friends_ClearRichPresence, "SteamAPI_ISteamFriends_ClearRichPresence");
     ok &= Resolve(m, a.MM_CreateLobby, "SteamAPI_ISteamMatchmaking_CreateLobby");

@@ -1,6 +1,8 @@
 #pragma once
 // Co-op connection management, driven from Mod::Tick on the render thread.
-// Modes (from launcher args / MafiaCoop.ini, see README-dev.md):
+//
+// Sessions can be started from the game's menus at runtime (Host / JoinAddress / JoinLobby / Leave, see
+// dll/coop_ui.h and game/menu.h) or, as before, from launcher args / MafiaCoop.ini at startup:
 //   --host                 host: UDP on --port (27960) plus a Steam lobby (P2P) when Steam is available
 //   --join <ip[:port]>     guest over UDP
 //   --join-lobby <id>      guest over Steam (also "+connect_lobby <id>" on the game's command line)
@@ -8,8 +10,11 @@
 //   --name <name>          player name (default: Steam persona name, else the Windows user name)
 // Steam: the game memory-loads its own (old) steam_api, so we LoadLibrary the on-disk steam_api64.dll, call its
 // SteamAPI_Init a few seconds after the first frame and pump its SteamAPI_RunCallbacks ourselves every frame.
+// Accepting a Steam invite (or "Join Game" in the friends list) while the game runs leaves the current session and
+// joins the inviting host.
 #include "render/overlay.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -22,6 +27,39 @@ public:
     static void Shutdown();  // leave the session cleanly (process exit)
     // Lines for the on-screen status panel (empty = draw nothing).
     static void GetStatus(std::vector<render::OverlayLine>& out);
+
+    // ---- runtime control (render thread); each one ends the current session first ----
+    static void Host();
+    static void JoinAddress(const std::string& address);  // UDP, "ip[:port]"
+    static void JoinLobby(uint64_t lobbyId);              // Steam lobby; its owner is the host
+    static void Leave();
+    static bool InviteFriends();     // Steam overlay invite dialog for our lobby (hosting over Steam)
+    static bool OpenSteamFriends();  // Steam overlay friends list (Join Game / invites)
+
+    enum class Phase { Idle, Starting, Hosting, Joining, Connected };
+    struct PlayerRow {
+        std::string name;
+        int pingMs = -1;  // -1 = none (the host's own row)
+        bool host = false, you = false;
+    };
+    struct Info {
+        Phase phase = Phase::Idle;
+        std::string target;        // host name / address while joining or connected
+        std::vector<PlayerRow> players;
+        bool steamReady = false;
+        bool lobbyOpen = false;    // hosting with a Steam lobby (friends can join via the overlay)
+        uint16_t port = 0;         // UDP port while hosting
+        std::string localAddress;  // this PC's LAN IPv4 (for "join by IP")
+        std::string lastAddress;   // last address passed to JoinAddress (prefill for the input box)
+    };
+    static Info GetInfo();
+
+    // Events worth telling the player about (joined/left/connected/errors/invites), oldest first.
+    struct Notice {
+        std::string title, text;
+        bool error = false;
+    };
+    static bool PopNotice(Notice* out);
 };
 
 } // namespace mc

@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file native/docs/re-tools/patterns.txt   (all 55 patterns below; prints OK/FAIL each)
+python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file native/docs/re-tools/patterns.txt   (all 61 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -479,6 +479,80 @@ exactly the calls the mission scripts make. For example:
 
 ---------------------------------------------------------------------------------------------------------------
 
+## 5. Menus: Scaleform GFx (AS3) movies [confirmed]
+
+How this was found: exe strings (`/gui/main_menu.swf`, `_root.%s`, `ExternalInterface`, AS3 VM messages such as
+"The method instance::ContextMenu::builtInItemsGet() is not implemented"), the ABC blocks of the loaded movies read
+from process memory and later from our own load hook, disassembled with our AVM2 tool (scratch, not checked in), and
+the code around the xrefs below. Runtime behaviour verified in game (docs/game-api.md 9).
+
+**Movies.** Every menu/HUD screen is a Scaleform GFx movie `/gui/<name>.gfx`: an uncompressed SWF with the signature
+`GFX` (version 21), one `DoABC` tag (code 82, flags 1 = lazy) holding ActionScript 3 built on Scaleform CLIK, plus
+GFx tags 1000 (exporter info) / 1009 (external images). The header parser `LoadProcess::BeginSWFLoading`
+(**0x475BB20**, pattern `GFx_LoadProcess_BeginSWF`) compares the first three bytes with `FWS`/`CWS`/`GFX`/`CFX`
+(`cmp eax, 0x535746` ...) and logs "Loader read failed - file does not start with a SWF header". Signature:
+`(this, File* in, a3, a4, a5 [stack], bool a6 [stack], ...)`: it reads at least six arguments, so a detour must
+forward the stack arguments too (forwarding only four crashed at +0x120 on the garbage 5th argument).
+
+**The file object** passed in is the engine's Scaleform `File` (vtable **0x4F6EAA8**): slot 0 dtor, 1 GetFilePath
+(`/gui/main_menu_main.gfx`), 2 IsValid, 3 IsWritable, 4 Tell, 5 LTell, 6 GetLength (-1: a stream), 7 LGetLength, 8
+GetErrorCode, 9 Write, 10 Read(buf, n), 11 SkipBytes, 12 BytesAvailable, 13 Flush, 14 Seek, 15 LSeek (forward only),
+16 seek-to-0, 17 ChangeSize, 18 CopyFromStream, 19 Close; reference count at +8. Reading it to the end and passing an
+object with the same virtual layout over a memory copy works (that is how we substitute patched movies).
+
+**Main menu.** `/gui/main_menu.gfx` (class `main_menu` : `shell_base`) loads pages with UILoaders:
+`main_menu_main.gfx` (class `pages::main_menu_page_main`), `main_menu_new_game.gfx`, `main_menu_dev.gfx`,
+`menu_options.gfx`. The entries are not data: `main_menu_page_main.UpdateMenu()` (private) builds a
+`Vector.<components::ButtonData>` per `menuLocation` (ROOT_MENU 0, PLAY_MENU 1, STORY_MENU 2, ... LOAD_GAME 11)
+with ids from class constants (NEW_GAME 0, CONTINUE 1, DEV 2, OPTIONS 3, DLC 4, QUIT 5, EXTRAS 6, PLAY 7, STORY 8,
+FREERIDE 9, MISSION_REPLAY 10, LOAD_GAME 11, ..., CARCYCLOPEDIA 14, ..., STORE 25 ...) and labels that are string
+table ids (`$continue`, `$story_title`, `$freeride`, `$carcyclopedia`, `$options`, `$mafia_collection`, `$quit`; a
+label without `$` is shown as is), then calls the public `BuildMenu(vec)` (one `menu_item2` per entry, mouse support
+included). `ActivateButton(ButtonData)` switches on `id`; sub pages push `menuLocation` onto `PreviousMenus`, set
+`menuLocation` and call `UpdateMenu()`; `Back()` pops it. An unknown `menuLocation` builds an empty vector (the
+switch default), which is what our CO-OP page (location 50) uses.
+
+**Pause menu.** `/gui/pause_menu.gfx` (class `pause_menu`) with pages MAP / COLLECTION / OPTIONS / GAME
+(`pause_menu_map.gfx`, `menu_collectibles.gfx`, `menu_options.gfx`, `pause_menu_game.gfx`). Esc opens it on MAP; the
+page keys are VK 187 `=` (MA_RB/MA_NEXT) and VK 189 `-` (MA_LB/MA_PREVIOUS); Tab (MA_START) closes it.
+`pages::pause_menu_page_game` uses timeline clips `entries_mc.entry_0_mc .. entry_4_mc` collected in `Navigation`;
+`SetupMenu()` fills `Entries[0..4]` (`InitDataEntry(id, name, desc, frameLabel)`), `PopulateNavigation()` copies
+`Entries[i].name` into the clips, `Select()` switches on `current_CID`. On PC `CheckPlatformID()` (Xbox One) is false
+and only four entries are used: `entry_4_mc` ("switch account") exists but is hidden. **`pause_menu.gfx` carries its
+own copy of `pages::pause_menu_page_game`, and that copy is the one that runs** (the parent movie defines the class
+first in the shared application domain), so both files must be patched.
+
+**ActionScript -> C++.** Two mechanisms:
+1. C++ objects exposed as `_root.game.<Name>` (`MainMenu`, `PauseMenu`, `Events`, `Messenger`, `GlobalGui`, ...),
+   attached by AS through `ExternalInterface.call("AttachIface", name, int, int)`. Their methods are registered in
+   tables such as 0x30323D0 (`C_MainMenu`: `CanContinueGame`, `StartNewGame`, `GetSaveList`, ...; entries 0x28 bytes
+   `{vtable, owner, name, member fn, flags}`).
+2. `ExternalInterface.call(name, args...)` goes through GFx 0x461AD00 to the movie's handler (`[movieImpl+0x238]`),
+   the game's adapter 0x37BD1E0 (converts GFx values to engine values, calls the named callback, converts the result
+   back and passes it to 0x477E0C0 [likely Movie::SetExternalInterfaceRetVal]), the per-movie name table 0x37D2630 and finally the
+   callback object's slot 3 `Call(this, args, argc, ret, a5, view)`. The callbacks registered for every movie are
+   `AttachIface`, `DetachIface`, `DestroyMyself` (0x185B090, via the movie view's vtable +0x258 "add callback").
+   `AttachIface`'s `Call` is **0x1842D60** (pattern `Flash_AttachIface_Call`); it reads its 6th argument from the
+   stack.
+3. C++ -> AS: movie view vtable +0x250 `Invoke(path, Value* result, const Value* args, n)` with `"_root.%s"`
+   (0x18152D5: what Lua `game.hud:SendMessageMovie(movie, fn, ...)` ends in).
+
+**Engine Flash values** (`C_FlashASValue`, 0x18 bytes): +0 vtable 0x4F6ADC0, +8 data, +0x10 type (0 undefined, 1 null,
+2 bool, 3 int, 4 uint, 5 number (double), 6 string, 7 wide string, 8 object, 9 array, 10 display object, 11 closure).
+Strings/objects hold a ref-counted object at +8 whose own GFx value is at +0x20. Helpers:
+- **0x37ADFC0** `Value(const char*)` (pattern `FlashValue_CtorString`): stores the **pointer** (an unmanaged
+  Scaleform string; the text must outlive the value until it is converted, e.g. after a callback returned).
+- **0x183EEB0** `const char* GetString(const Value*)` (`FlashValue_GetString`): type 6 only, else null.
+- **0x37B6220** `Assign(dst, src)` (`FlashValue_Assign`), **0x37B31C0** dtor (`FlashValue_Dtor`), 0x37E4DA0
+  SetType(v, type), 0x37ADF60/0x37ADF80/0x37ADFA0/0x37AE030 ctor int/uint/double/bool, 0x37AE010 default ctor.
+
+**Input** (for blocking it under our panels): keyboard and mouse through DirectInput 8 (`DirectInput8Create`
+import; `IDirectInputDevice8::GetDeviceState` slot 9 / `GetDeviceData` slot 10), gamepad through
+`xinput9_1_0.dll!XInputGetState`, plus window messages (Scaleform). `GetKeyboardState`/`GetCursorPos` are imported
+too. No raw input.
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
@@ -541,6 +615,12 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | Lua_EnvEff_SetWeatherSet | 0x2D4DBE0 | `48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 BA 03 00 00 00 0F 29 74 24` |
 | Lua_PushScriptWrapper | 0x1ABD8D0 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48 85 D2 74 6F 48 8B 02` |
 | WrapperFactory_GetByGuid | 0x23E8A10 | `40 53 48 83 EC 20 8B DA E8 ?? ?? ?? ?? 48 8B C8 45 33 C0 8B D3 E8 ?? ?? ?? ?? 48` |
+| GFx_LoadProcess_BeginSWF | 0x475BB20 | `48 89 5C 24 20 55 56 57 41 54 41 57 48 83 EC 40 48 8B 02 48 8B F1 48 8B CA 4D 8B F9 49 8B E8 48 8B DA FF 50 20` |
+| Flash_AttachIface_Call | 0x1842D60 | `48 89 54 24 10 48 89 4C 24 08 53 48 83 EC 60 48 8B 9C 24 98 00 00 00 4C 89 64 24 48 45 8B E0` |
+| FlashValue_CtorString | 0x37ADFC0 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA C7 41 10 00 00 00 00 48 8D 05 ?? ?? ?? ?? BA 06 00 00 00` |
+| FlashValue_GetString | 0x183EEB0 | `40 57 48 83 EC 20 83 79 10 06 75 4B 48 8B 79 08 48 85 FF 74 42` |
+| FlashValue_Assign | 0x37B6220 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 33 D2 E8 ?? ?? ?? ?? 48 8B 43 08 48 89 47 08 8B 43 10 89 47 10` |
+| FlashValue_Dtor | 0x37B31C0 | `40 53 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 33 D2 48 89 01 48 8B D9 E8 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 03 48 83 C4 20` |
 
 Rip/call operand offsets used above: `C_GameScriptModule_Tick` +3 (disp) / +7 (end) gives g_ScriptGameMachine; `Steam_MemLoadApi` +9/+0xD gives g_SteamApiTable; `Steam_Init` +0x2F/+0x33 gives the SteamAPI_Init slot, +0x39/+0x3D SteamUser slot, +0x60/+0x64 SteamClient slot; `Lua_Game_GetActivePlayer` E8 rel32 at +0x14 gives the C_Game getter; `ScriptGameMachine_Create` mov [rip+disp],rax at +0x2B (disp +0x2E, end +0x32) also gives g_ScriptGameMachine.
 

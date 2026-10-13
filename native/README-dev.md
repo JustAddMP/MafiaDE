@@ -9,10 +9,12 @@ G:\MafiaCoop\native\build.cmd
 - Works from any directory. Needs Visual Studio 2022 or newer with the x64 C++ toolset. The script finds
   `vcvars64.bat` through vswhere if `cl.exe` is not already on PATH. It does not use CMake or Ninja.
 - Flags: C++20, `/MT` (static CRT), `/O2 /Zi` with full PDBs, `/W4 /permissive-`. MinHook is compiled as C at `/W3`.
-- Shaders: every `srcender\*.hlsl` is compiled with `fxc.exe` (Windows SDK, on PATH after vcvars) into
+- Shaders: every `src
+ender\*.hlsl` is compiled with `fxc.exe` (Windows SDK, on PATH after vcvars) into
   `out\obj\gen\<name>_vs.h` / `<name>_ps.h` (`vs_4_0`/`ps_4_0`, arrays `k<Name>VS` / `k<Name>PS`). Precompiling
   means the dll needs no `d3dcompiler_47.dll` at runtime and shader errors fail the build, not the game.
-- Overlay font: `srcenderont8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, ASCII
+- Overlay font: `src
+enderont8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, ASCII
   32..126 + a solid cell). To regenerate: build and run `toolsontgen.cpp` (command in its header comment).
 - Output goes to `out\` (gitignored):
   - `MafiaCoop.exe` (+ `MafiaCoop-launcher.pdb`): the launcher, built from `src\launcher\*.cpp`
@@ -56,7 +58,33 @@ before `MafiaCoop.ini`, so `Config::Get().GetString("join")` sees `--join 1.2.3.
 
 ## Co-op: host and join
 
-All connection logic runs in the dll (`src/dll/coop.cpp`), driven by `Mod::Tick` once per frame.
+All connection logic runs in the dll (`src/dll/coop.cpp`), driven by `Mod::Tick` once per frame. Players start
+`MafiaCoop.exe` without arguments and use the game's own menus; the launcher arguments below are for testing and
+scripts and still work.
+
+### Player flow (the game's menus)
+
+- **Main menu:** a **CO-OP** entry after FREE RIDE (it reads `CO-OP (HOSTING)` / `CO-OP (CONNECTED)` while a
+  session runs). It opens a CO-OP page in the same style, with mouse, keyboard and gamepad like every other entry:
+  - **HOST CO-OP GAME** starts hosting (UDP 27960 + a friends-only Steam lobby) and goes back to HOME, where the player
+    starts the game the usual way (CONTINUE, STORY > chapter, ...) with hosting on.
+  - **JOIN FRIEND** opens the Steam overlay's friends list: right-click a friend who hosts and pick *Join Game*, or
+    accept their invite.
+  - **JOIN BY IP** opens a text box (type `ip` or `ip:port`, Ctrl+V pastes; Enter connects, Esc cancels).
+  - While hosting: **INVITE FRIENDS** (Steam invite dialog), **STOP HOSTING**; while joined: **LEAVE CO-OP**; **BACK**.
+- **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
+  **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
+  the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
+- **Steam invites:** accepting an invite (or *Join Game* in the friends list) at the main menu or in the world leaves
+  the current session and joins the host; a banner says "Joining your friend's game..." and then
+  "Connected to <host>'s game".
+- **Banners** at the top of the screen tell about hosting, players joining/leaving, connects, disconnects and errors.
+
+How the entries are added to the game's menus: docs/game-api.md 9 and docs/re-notes.md 5. If the game's menu files
+ever change so that the patch does not apply, the menus load unchanged (logged as `menu: could not patch ...`) and
+the launcher arguments still work.
+
+### Launcher arguments
 
 | Launcher arg | Meaning |
 |---|---|
@@ -68,7 +96,9 @@ All connection logic runs in the dll (`src/dll/coop.cpp`), driven by `Mod::Tick`
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
-`steam = 0` (no Steam at all), `overlay = 0` (start with the overlay hidden).
+`steam = 0` (no Steam at all), `overlay = 0` (start with the status panel hidden), `native_menu = 0` (no CO-OP
+entries in the game's menus), `menu_dump = 1` (write the original and patched menu movies to `out\dev\gfx\`),
+`menu_debug = 1` (log every request from the patched menus).
 
 **Invites:** while hosting, open the Steam overlay (Shift+Tab) and invite a friend to the lobby. A friend who
 accepts while their game (started through MafiaCoop.exe) is running gets `GameLobbyJoinRequested`; the dll leaves
@@ -84,12 +114,25 @@ frame. If that fails, Steam features are off and UDP still works.
 **Disconnects:** no automatic reconnect. The reason is logged (`coop: disconnected: ...`), shown on the overlay
 for 20 s, and the mod goes back to idle.
 
-**Status overlay:** top-left of the game window, drawn by the dll's own D3D11 text renderer
-(`src/render/overlay.cpp`): `Co-op: hosting (2 players)` or `Co-op: connected to Host - 8 ms`, then one line per player with their ping
+**Status overlay:** top-left of the game window, drawn by the dll's own D3D11 renderer (`src/render/overlay.cpp`,
+glyphs rasterised at startup from the Windows font Bahnschrift, `src/render/ui_font.cpp`; the same renderer draws
+the co-op panels and banners): `Co-op: hosting (2 players)` or `Co-op: connected to Host - 8 ms`, then one line per player with their ping
 to the host. **F7** toggles it (only when a game window has focus). The same lines are written to the log with every
 10 s heartbeat (`status: ...`).
 
-### Two instances on one PC (gate test)
+### Two instances on one PC through the menus
+
+```
+out\MafiaCoop.exe --log host
+out\MafiaCoop.exe --log guest      (after the first window is up)
+```
+
+Host window: Enter at the title, CO-OP > HOST CO-OP GAME. Guest window: Enter at the title, CO-OP > JOIN BY IP,
+type `127.0.0.1`, Enter. The guest's HOME then shows `CO-OP (CONNECTED)`; both pick CONTINUE (and Enter on the
+loading screen). In the world, Esc, `=` three times (GAME page), CO-OP shows the players with ping; STOP HOSTING /
+LEAVE CO-OP ends it (the other side gets a "Disconnected" banner).
+
+### Two instances on one PC (gate test, launcher arguments)
 
 ```
 out\MafiaCoop.exe --host --name Host --log host
@@ -188,8 +231,8 @@ puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every p
 - `out\logs\crash-<date>-<time>.dmp`: a minidump written on a fatal exception. The log gets the exception code,
   the faulting module+offset, the registers, and an unwound stack as module+offset. Open the dump in Visual Studio
   or WinDbg with `out\*.pdb` on the symbol path.
-- The game installs its own unhandled-exception filter after we do. The heartbeat puts ours back and chains to
-  the game's.
+- The game installs its own unhandled-exception filter after we do (a second or two after start). Ours is put back
+  every frame for the first minute and then with every heartbeat, chaining to the game's.
 
 ## Stop the game
 

@@ -124,6 +124,7 @@ struct Api {
     const char* (*Friends_GetPersonaName)(void* self) = nullptr;
     const char* (*Friends_GetFriendPersonaName)(void* self, uint64_t id) = nullptr;
     void (*Friends_ActivateGameOverlayInviteDialog)(void* self, uint64_t lobby) = nullptr;
+    void (*Friends_ActivateGameOverlay)(void* self, const char* dialog) = nullptr;  // "Friends", "Players", ...
     bool (*Friends_SetRichPresence)(void* self, const char* key, const char* value) = nullptr;
     void (*Friends_ClearRichPresence)(void* self) = nullptr;
     // ISteamMatchmaking

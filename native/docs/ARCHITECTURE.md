@@ -34,13 +34,19 @@ native/
                          (thin MinHook wrapper), config.{h,cpp} (MafiaCoop.ini next to the dll), mem.{h,cpp}
                          (module info, pattern scan with ?? wildcards, RIP-relative resolve)
     render/              present_hook.{h,cpp}: hooks IDXGISwapChain::Present -> per-frame Tick on the game's
-                         render thread
+                         render thread; overlay.{h,cpp} + overlay.hlsl (status panel, co-op panels, banners);
+                         ui_font.{h,cpp} (glyph atlas rasterised with GDI from Bahnschrift)
     game/                lua.{h,cpp} (bridge into the game's Lua VM, dev console), player_sync.{h,cpp} + player_sync.lua
-                         (phase 3: local player sampling, puppets, copy cars; the .lua is embedded at build time)
+                         (phase 3: local player sampling, puppets, copy cars; the .lua is embedded at build time),
+                         menu.{h,cpp} (phase 5: CO-OP entries in the game's Scaleform main/pause menus) on top of
+                         swf_patch.{h,cpp} (SWF/ABC patcher: constant pool append, method prologues, assembler)
     net/                 transport.h (interface), udp_transport.{h,cpp} (own reliability), steam_transport
                          .{h,cpp} (ISteamNetworkingMessages, flat API), steam_lobby.{h,cpp}, session.{h,cpp}
                          (host-authoritative star; host relays), wire.{h,cpp} (byte writer/reader)
-    dll/                 dllmain.cpp: init thread -> wait for game ready -> install hooks
+    dll/                 dllmain.cpp: init thread -> wait for game ready -> install hooks; mod.cpp (per-frame tick);
+                         coop.{h,cpp} (sessions, startable from config or at runtime); coop_ui.{h,cpp} (menu commands,
+                         pause co-op panel, join-by-IP box, banners); ui_input.{h,cpp} (panel input, blocks the
+                         game's DirectInput/XInput/window input while a panel is open)
   tests/                 net_loopback.cpp (two sessions over UDP in one process), steam_smoke.cpp
   tools/                 fontgen.cpp, embed_lua.ps1 (build step), devlua.ps1 (run Lua in a running game)
   out/                   build output (gitignored): MafiaCoop.exe, mafiacoop.dll, *.pdb, tests
@@ -77,5 +83,7 @@ native/
 2. Connection — Steam lobby + invite + direct-IP fallback, handshake, ping display. Gate: two instances/PCs connect.
 3. Second player — remote player ped spawned and synced (position, heading, anim state, weapon, vehicle seat).
 4. Shared world — host's NPCs/cars/weather/time/mission state mirrored to guests.
-5. Native UI — co-op entries in the game's menus, game HUD notifications.
+5. Native UI — co-op entries in the game's menus (main menu CO-OP page, pause menu CO-OP), invites, notifications
+   (done: entries patched into the game's own AS3 menus; the pause panel, IP box and banners are our overlay in the
+   menu style because the game's HUD banners show nothing from script, docs/game-api.md 9).
 6. Melee/damage sync, guest-side objectives, NPC appearance.
