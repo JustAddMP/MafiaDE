@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <iterator>
 
 #include "net/auth.h"
 #include "net/net_internal.h"
@@ -17,6 +18,7 @@ constexpr size_t kMaxChatLen = 256;
 constexpr size_t kMaxReasonLen = 256;
 constexpr double kRejectLinger = 1.0;
 constexpr double kPingTableInterval = 2.0;
+constexpr size_t kMaxAuthKeys = 256;  // host: addresses with recent password failures kept before stale ones are pruned
 
 enum Msg : uint8_t {
     kHello = 0x01,
@@ -46,10 +48,15 @@ constexpr uint8_t kAppFlagReliable = 0x01;
 
 std::string CleanName(std::string s) {
     for (char& c : s)
-        if (static_cast<unsigned char>(c) < 0x20) c = ' ';
+        if (static_cast<unsigned char>(c) < 0x20 || c == 0x7F) c = ' ';
+    if (s.size() > kMaxNameLen) {
+        // Cut at a UTF-8 character boundary so a multi-byte character is never split into invalid UTF-8.
+        size_t cut = kMaxNameLen;
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+        s.resize(cut);
+    }
     while (!s.empty() && s.back() == ' ') s.pop_back();
     while (!s.empty() && s.front() == ' ') s.erase(s.begin());
-    if (s.size() > kMaxNameLen) s.resize(kMaxNameLen);
     return s.empty() ? std::string("Player") : s;
 }
 
@@ -376,6 +383,15 @@ void Session::HostOnAuth(PeerId peer, ByteReader& r) {
         HostAdmit(peer, name, model);
         return;
     }
+    if (authFailures_.size() >= kMaxAuthKeys) {
+        // Many addresses failed: forget those whose failures are all outside the window (LockedOut prunes only the
+        // key it looks at, so without this the map would grow with every new address).
+        for (auto it = authFailures_.begin(); it != authFailures_.end();) {
+            auto& v = it->second;
+            v.erase(std::remove_if(v.begin(), v.end(), [&](double t) { return now - t > cfg_.authWindowS; }), v.end());
+            it = v.empty() ? authFailures_.erase(it) : std::next(it);
+        }
+    }
     auto& fails = authFailures_[key];
     fails.push_back(now);
     Log(kInfo, "session: wrong password from peer %llu (%s, %zu recent failures)",
@@ -527,15 +543,22 @@ void Session::GuestOnMessage(ByteReader& r) {
             r.U8();  // max players
             uint8_t n = r.U8();
             std::vector<PlayerInfo> list;
+            bool valid = me != kHostPlayer && me < kMaxPlayers;
+            bool haveMe = false, haveHost = false;
             for (int i = 0; i < n && r.Ok(); ++i) {
                 PlayerInfo p;
                 p.id = r.U8();
-                p.name = r.Str(kMaxNameLen * 4);
+                p.name = CleanName(r.Str(kMaxNameLen * 4));
                 p.model = CleanModel(r.Str(kMaxModelLen));
                 p.peer = p.id == kHostPlayer ? hostPeer_ : kInvalidPeer;
+                if (p.id >= kMaxPlayers) valid = false;
+                for (const PlayerInfo& q : list)
+                    if (q.id == p.id) valid = false;
+                haveMe |= p.id == me;
+                haveHost |= p.id == kHostPlayer;
                 list.push_back(std::move(p));
             }
-            if (!r.Ok()) {
+            if (!r.Ok() || !valid || !haveMe || !haveHost) {
                 Fail("invalid welcome from host");
                 return;
             }
@@ -574,9 +597,9 @@ void Session::GuestOnMessage(ByteReader& r) {
         case kPeerJoined: {
             PlayerInfo p;
             p.id = r.U8();
-            p.name = r.Str(kMaxNameLen * 4);
+            p.name = CleanName(r.Str(kMaxNameLen * 4));
             p.model = CleanModel(r.Str(kMaxModelLen));
-            if (!r.Ok() || FindPlayer(p.id)) return;
+            if (!r.Ok() || p.id >= kMaxPlayers || FindPlayer(p.id)) return;
             players_.push_back(p);
             std::sort(players_.begin(), players_.end(),
                       [](const PlayerInfo& a, const PlayerInfo& b) { return a.id < b.id; });
@@ -586,7 +609,7 @@ void Session::GuestOnMessage(ByteReader& r) {
         case kPeerLeft: {
             PlayerId id = r.U8();
             std::string reason = r.Str(kMaxReasonLen);
-            if (!r.Ok()) return;
+            if (!r.Ok() || id == localId_ || id == kHostPlayer) return;  // we and the host never "leave" by message
             auto it = std::find_if(players_.begin(), players_.end(), [&](const PlayerInfo& p) { return p.id == id; });
             if (it == players_.end()) return;
             PlayerInfo info = *it;
