@@ -5,7 +5,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
-#include "game/swf_patch.h"
+#include "swf/swf_patch.h"
 
 #include <windows.h>
 #include <atomic>
@@ -21,6 +21,8 @@
 
 namespace mc::game::menu {
 namespace {
+
+constexpr const char* kFeature = "menu entries";  // optional: launcher arguments still work without it
 
 // ---- engine functions (patterns verified unique, docs/re-notes.md "Menus") ------------------------------------
 // LoadProcess::BeginSWFLoading(this, File* in, ...): reads the movie header from `in` (a Scaleform File). It takes
@@ -617,7 +619,7 @@ void Install(const std::wstring& dllDir) {
         !Resolve(_valueGetString, "FlashValue_GetString", kPatValueGetString) ||
         !Resolve(_valueAssign, "FlashValue_Assign", kPatValueAssign) ||
         !Resolve(_valueDtor, "FlashValue_Dtor", kPatValueDtor)) {
-        core::compat::Failed(core::compat::Feature::NativeMenu);
+        core::compat::Failed(kFeature, false);
         return;
     }
     if (!core::hook::Install("Flash::AttachIface", reinterpret_cast<void*>(attach),
@@ -625,7 +627,7 @@ void Install(const std::wstring& dllDir) {
         !core::hook::Install("GFx::LoadProcess::BeginSWF", reinterpret_cast<void*>(beginLoad),
                              reinterpret_cast<void*>(&BeginLoadDetour), reinterpret_cast<void**>(&_origBeginLoad))) {
         MC_LOG_ERROR("menu: hooks failed; native menu entries disabled");
-        core::compat::Failed(core::compat::Feature::NativeMenu);
+        core::compat::Failed(kFeature, false);
         return;
     }
     _active = true;

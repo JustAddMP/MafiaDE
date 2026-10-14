@@ -195,7 +195,7 @@ The menus are not scripted in Lua: they are Scaleform AS3 movies whose entries a
 | `enums.MenuId` | E_MENUID_SERVICES / WEAPONSTORE / HIDEOUTASSIGNMENT / OUTFIT / HERBALISM: in-world (Mafia III style) menus |
 | HUD banners | `SendMessageMovie("HUD", "OnShowWarningBanner", title, text)` (used by `persistent_location` with plain text), `"OnShowUnlockBanner"`, `game.hud:ShowWarning(text)`: all returned true in the world but **showed nothing** in this build, so co-op notifications are our own overlay banners in the menu style |
 
-**How the co-op entries are added** (src/game/menu.cpp, src/game/swf_patch.cpp): the dll hooks the movie loader
+**How the co-op entries are added** (src/game/menu.cpp, core's external/core/src/swf/swf_patch.cpp): the dll hooks the movie loader
 (`LoadProcess::BeginSWFLoading`), and for `/gui/main_menu_main.gfx`, `/gui/pause_menu.gfx` and
 `/gui/pause_menu_game.gfx` reads the file, appends a few constants to the DoABC block and prepends short bytecode
 prologues to existing methods, then hands the loader a memory copy. Nothing on disk changes; if a movie does not have

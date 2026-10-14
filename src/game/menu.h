@@ -8,32 +8,21 @@
 //     gamepad);
 //   - pause menu (Game page): a fifth "CO-OP" entry (the slot the Xbox build uses for "switch account").
 // The patched code talks to us through ExternalInterface.call("AttachIface", "MafiaCoop", <request>, ...): the
-// game routes that name to its AttachIface handler, which we hook; our requests never reach the original.
+// game routes that name to its AttachIface handler, which we hook; our requests never reach the original. The
+// patcher itself is core's (swf/swf_patch.h); the commands and state are core's MenuCommand / MenuState
+// (mc/game_module.h), handed over through the game module (game/module.cpp).
 //
 // Threads: the Flash callbacks run on GameMainThread, the co-op layer on the render thread. They exchange a small
 // State (render -> Flash) and a Command queue (Flash -> render) under a mutex.
+#include "mc/game_module.h"
+
 #include <string>
 
 namespace mc::game::menu {
 
-enum class Command {
-    Host,          // main menu CO-OP > HOST CO-OP GAME (or pause panel)
-    Leave,         // STOP HOSTING / LEAVE CO-OP
-    JoinFriend,    // JOIN FRIEND
-    JoinByIp,      // JOIN BY IP (opens our text input)
-    Invite,        // INVITE FRIENDS (Steam overlay)
-    PausePanel,    // pause menu > CO-OP
-    SetPassword,   // SET / CHANGE PASSWORD (opens our text input)
-    ClearPassword, // CLEAR PASSWORD
-};
-
-enum class Mode { Idle, Hosting, Joining, Connected };
-
-struct State {
-    Mode mode = Mode::Idle;
-    int players = 0;
-    bool password = false;  // a host password is set
-};
+using Command = MenuCommand;
+using Mode = MenuMode;
+using State = MenuState;
 
 // Installs the hooks (pattern scans; anything missing disables the feature, logged). Any thread, once.
 void Install(const std::wstring& dllDir);

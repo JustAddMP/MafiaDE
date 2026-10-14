@@ -1,30 +1,46 @@
-# MafiaCoop native: developer notes
+# MafiaCoop: developer notes
+
+## Repo layout
+
+This repo is the Mafia: Definitive Edition game layer. The game-agnostic part (launcher, proxy, hooks, networking,
+overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP/core), a git submodule at
+`external\core` (its `docs\ARCHITECTURE.md` describes it and the game-module interface). After cloning:
+`git submodule update --init` (or clone with `--recursive`).
+
+- `src\game\game_info.cpp`: the descriptor core reads (names, Steam app id 1030840, exe name, supported builds,
+  default port, proxy names); linked into all three binaries.
+- `src\game\module.cpp`: the game module core calls (`Init`, render tick, session start/end, player left, menu
+  state/commands).
+- `src\game\lua.*`, `player_sync.*` (+ `player_sync.lua`), `menu.*`: the Lua bridge, player sync and the CO-OP
+  menu entries.
+
+Generic fixes go to core first (commit there, its tests pass), then bump the submodule here (docs/PLAN.md).
 
 ## Build
 
 ```
-G:\MafiaCoop\native\build.cmd
+build.cmd
 ```
 
-- Works from any directory. Needs Visual Studio 2022 or newer with the x64 C++ toolset. The script finds
-  `vcvars64.bat` through vswhere if `cl.exe` is not already on PATH. It does not use CMake or Ninja.
-- Flags: C++20, `/MT` (static CRT), `/O2 /Zi` with full PDBs, `/W4 /permissive-`. MinHook is compiled as C at `/W3`.
-- Shaders: every `src\render\*.hlsl` is compiled with `fxc.exe` (Windows SDK, on PATH after vcvars) into
-  `out\obj\gen\<name>_vs.h` / `<name>_ps.h` (`vs_4_0`/`ps_4_0`, arrays `k<Name>VS` / `k<Name>PS`). Precompiling
-  means the dll needs no `d3dcompiler_47.dll` at runtime and shader errors fail the build, not the game.
-- Overlay font: `src\render\font8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, ASCII
-  32..126 + a solid cell). To regenerate: build and run `tools\fontgen.cpp` (command in its header comment).
+- Works from any directory. Needs Visual Studio 2022 or newer with the x64 C++ toolset (found through vswhere by
+  `external\core\tools\msvc.cmd` if `cl.exe` is not already on PATH). No CMake or Ninja. Fails with "external\core
+  is empty. Run: git submodule update --init" if the submodule is missing.
+- Flags (from core's `tools\msvc.cmd`): C++20, `/MT` (static CRT), `/O2 /Zi` with full PDBs, `/W4 /permissive-`.
+- It first runs `external\core\build.cmd out\obj\core` (core's libraries, shaders, MinHook), then compiles
+  `src\game\*.cpp` and links. It runs nothing.
 - Output goes to `out\` (gitignored):
-  - `MafiaCoop.exe` (+ `MafiaCoop-launcher.pdb`): the launcher, built from `src\launcher\*.cpp`
-  - `mafiacoop.dll` (+ `mafiacoop.pdb`): every `.cpp` in `src\core`, `src\render`, `src\game`, `src\net` and
-    `src\dll`, plus MinHook. New files are picked up automatically.
-  - Lua that runs inside the game (`src\game\*.lua`) is embedded into the dll: `tools\embed_lua.ps1` turns
+  - `MafiaCoop.exe` (+ `MafiaCoop-launcher.pdb`): core's launcher objects + `game_info.obj`
+  - `mafiacoop.dll` (+ `mafiacoop.pdb`): core's `dllmain.obj` + `mc_core.lib` + every `.cpp` in `src\game`.
+    New files are picked up automatically.
+  - Lua that runs inside the game (`src\game\*.lua`) is embedded into the dll: core's `tools\embed_lua.ps1` turns
     `player_sync.lua` into `out\obj\gen\player_sync_lua.h` (`kPlayerSyncLua`) on every build.
-  - `mafiacoop_proxy.dll` (+ `mafiacoop_proxy.pdb`): the optional version.dll proxy from `src\proxy` (`ml64` for
-    the export stubs, `version.def` for the exports); see "Start from Steam" below.
-  - `<name>.exe` for each `tests\<name>.cpp`, linked with `src\core` + `src\net` (+ MinHook). Skipped if there
-    are none.
-  - Object files go to `out\obj\<group>\`.
+  - `mafiacoop_proxy.dll` (+ `mafiacoop_proxy.pdb`): core's version.dll proxy + `game_info.obj`; see "Start from
+    Steam" below.
+  - `proxy_test.exe`: core's `tests\proxy_test.cpp` built against our descriptor (tests our launcher and proxy
+    without the game; see below).
+  - Object files go to `out\obj\game\`, core's to `out\obj\core\`.
+- Core's own tests (net_loopback, net_password, net_interest, net_fuzz, proxy_test with a made-up game):
+  `external\core\build.cmd`, then the exes in `external\core\out\` (see core's README.md).
 - Any compile or link error stops the build with exit code 1.
 
 ## Run
@@ -44,7 +60,7 @@ out\MafiaCoop.exe --install | --uninstall [--game <exe or folder>] [--yes]
    launcher mutex (the exe has no working single-instance check, see `docs/re-notes.md` 3.2). `+word` arguments
    (e.g. `+connect_lobby <id>`) are appended to the game's command line.
 3. **Game version check:** it computes the CRC32 of the exe (slicing-by-8, ~55 ms for the 111 MB exe when it is in
-   the OS file cache) and compares it with `kSupportedGameBuilds` in `src\core\version.h` (today only Steam build
+   the OS file cache) and compares it with `kBuilds` in `src\game\game_info.cpp` (today only Steam build
    16502642, CRC `BCE2C8EF` = 3168979183). The result is cached in `out\version-cache.txt` keyed by exe path, size
    and last-write time, so later launches take under 1 ms. Unknown build: a message box names the supported builds
    and the CRC found; **Yes** starts anyway (the dll then gets `MAFIACOOP_UNSUPPORTED_BUILD=<crc>` and shows an
@@ -53,7 +69,7 @@ out\MafiaCoop.exe --install | --uninstall [--game <exe or folder>] [--yes]
    no message boxes): it prints the result to the console / redirected stdout, logs to `logs\launcher-check.log` and
    exits with 0 = supported, 2 = unsupported, 1 = error. Example:
    `out\MafiaCoop.exe --check-only` or `out\MafiaCoop.exe --check-only --game D:\other\mafiadefinitiveedition.exe`.
-   In the dll, a feature whose patterns are missing reports to `core/compat.h`; if the Lua bridge is missing, co-op
+   In the dll, a feature whose patterns are missing reports to core's `core/compat.h`; if the Lua bridge is missing, co-op
    is disabled (sessions refuse to start) and a banner says "Co-op disabled: unsupported game version".
 4. It starts `mafiadefinitiveedition.exe` with `CREATE_SUSPENDED`. The working directory is the game folder, and
    `SteamAppId=1030840` and `SteamGameId=1030840` are added to the environment. With these set, steam_api does
@@ -83,8 +99,8 @@ Steam (or its exe directly) loads co-op; `MafiaCoop.exe` keeps working as before
   exe's folder first. It has only 17 exports. The game folder has no version.dll of its own; ScriptHook uses the
   `dinput8.dll` slot, so the two do not collide.
 - **Forwarding:** the proxy loads `<GetSystemDirectory>\version.dll` by full path in `DllMain` and fills a table of
-  17 pointers; each export (`src\proxy\version.def`, same names and ordinals as Windows' file) is a one-instruction
-  `jmp [g_real+i*8]` stub (`version_stubs.asm`), so every signature, including the undocumented
+  17 pointers; each export (core's `src\proxy\version.def`, same names and ordinals as Windows' file) is a one-instruction
+  `jmp [g_real+i*8]` stub (core's `version_stubs.asm`), so every signature, including the undocumented
   `GetFileVersionInfoByHandle`, passes through untouched. A missing export fails with `ERROR_PROC_NOT_FOUND`.
 - **Loading the mod:** only when the process is `mafiadefinitiveedition.exe` and `MAFIACOOP_LAUNCHER` is not set, the
   proxy queues an APC on the loading (main) thread. It runs when the loader finishes process initialization, before
@@ -98,7 +114,7 @@ Steam (or its exe directly) loads co-op; `MafiaCoop.exe` keeps working as before
   this mode: the launcher's exe CRC check (the dll's compat banners still report missing patterns) and the
   `--log <tag>` file name (always `logs\mafiacoop.log`).
 - **`--install`:** finds the game like a normal launch (`--game <exe or folder>` overrides), then refuses (exit 3,
-  nothing changed) if the folder has a `version.dll` without our marker string (`proxy_shared.h` `kMarker`, e.g.
+  nothing changed) if the folder has a `version.dll` without our marker string (`GameInfo::proxyMarker` in `src\game\game_info.cpp`, e.g.
   another mod's) or a `mafiacoop_path.txt` without our header, or if a game started from that folder is running.
   Otherwise it shows a Yes/No dialog naming both files, what they do and how to remove them, then writes them (our
   own older proxy is overwritten = update). **`--uninstall`** deletes exactly those two files, each only if it is
@@ -116,7 +132,7 @@ Steam (or its exe directly) loads co-op; `MafiaCoop.exe` keeps working as before
 
 ## Co-op: host and join
 
-All connection logic runs in the dll (`src/dll/coop.cpp`), driven by `Mod::Tick` once per frame. Players start
+All connection logic runs in the dll (`external/core/src/dll/coop.cpp`), driven by `Mod::Tick` once per frame. Players start
 `MafiaCoop.exe` without arguments and use the game's own menus; the launcher arguments below are for testing and
 scripts and still work.
 
@@ -182,8 +198,8 @@ frame. If that fails, Steam features are off and UDP still works.
 for 20 s in the debug status text), and the mod goes back to idle.
 
 **Debug status text:** hidden by default for players; **F7** shows/hides it, `--debug-overlay` / `debug_overlay = 1`
-shows it from the start. Banners and the co-op panels are drawn either way. Top-left of the game window, drawn by the dll's own D3D11 renderer (`src/render/overlay.cpp`,
-glyphs rasterised at startup from the Windows font Bahnschrift, `src/render/ui_font.cpp`; the same renderer draws
+shows it from the start. Banners and the co-op panels are drawn either way. Top-left of the game window, drawn by the dll's own D3D11 renderer (`external/core/src/render/overlay.cpp`,
+glyphs rasterised at startup from the Windows font Bahnschrift, `external/core/src/render/ui_font.cpp`; the same renderer draws
 the co-op panels and banners): `Co-op: hosting (2 players)` or `Co-op: connected to Host - 8 ms`, then one line per player with their ping
 to the host. F7 works only when a game window has focus. The same lines are written to the log with every
 10 s heartbeat (`status: ...`).
@@ -332,7 +348,7 @@ window = left              ; left|right: keep the game window on that half of it
 - `out\logs\crash-<date>-<time>.dmp`: a minidump written on a fatal exception. The log gets the exception code,
   the faulting module+offset, the registers, and an unwound stack as module+offset. Open the dump in Visual Studio
   or WinDbg with `out\*.pdb` on the symbol path.
-- **Crash triage:** `python tools\crashinfo.py` (Python 3.11, standard library + ctypes, dbghelp.dll from Windows)
+- **Crash triage:** `python external\core\tools\crashinfo.py` (from the repo root) (Python 3.11, standard library + ctypes, dbghelp.dll from Windows)
   reads the newest `out\logs\crash-*.dmp` (or the dump given as argument) and prints the exception (code, address,
   read/write/execute address), the faulting module+offset, the registers, the faulting thread's stack and the crash
   block of the log that mentions the dump (`--log <file>` to pick one). The stack is unwound with the x64 unwind data
@@ -342,10 +358,10 @@ window = left              ; left|right: keep the game window on that half of it
   pointer is unwound from `[rsp]`. Frames in our modules get function, inlined functions and `file:line` from the
   PDBs in `out\` (dbghelp `SymLoadModuleEx`/`SymFromAddr`/`SymGetLineFromAddr64`).
   ```
-  python tools\crashinfo.py                                   newest dump
-  python tools\crashinfo.py out\logs\crash-20261013-171825.dmp --log out\logs\mafiacoop.log.1
-  python tools\crashinfo.py <dump> --symbols D:\old-build\out   PDBs of the build that crashed
-  python tools\crashinfo.py <dump> --all-threads --modules      every thread's stack, the module list
+  python external\core\tools\crashinfo.py                                   newest dump
+  python external\core\tools\crashinfo.py out\logs\crash-20261013-171825.dmp --log out\logs\mafiacoop.log.1
+  python external\core\tools\crashinfo.py <dump> --symbols D:\old-build\out   PDBs of the build that crashed
+  python external\core\tools\crashinfo.py <dump> --all-threads --modules      every thread's stack, the module list
   ```
   A PDB is used only when the dump's module has the same CodeView GUID and age as the dll next to it; every rebuild
   changes the age, so **keep the `out\` folder (dll + pdb) of a build whose dumps you may need to read**, or rebuild the

@@ -6,8 +6,8 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 `re-tools/scan.py` (see "Pattern table" at the end). Re-run that check after any game update:
 
 ```
-python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python native/docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file native/docs/re-tools/patterns.txt   (all 61 patterns below; prints OK/FAIL each)
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 61 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:

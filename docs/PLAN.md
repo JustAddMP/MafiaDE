@@ -1,7 +1,9 @@
 # Plan — next steps
 
 Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-14.
-Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes.md`, `game-api.md`, `../README-dev.md`.
+Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
+`game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
+interest.md).
 
 ## Where we are
 
@@ -24,8 +26,15 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
 - When a feature lands, also update the website (C:\AI\Claude\Projects\JS\justaddmp.com): tick the matching task
   in `app/lib/repos.ts` (Mafia entry, `progress.areas[].tasks`), add new tasks there when they're added here, refresh
   highlights / not-synced / known issues if they changed, run `npx tsc --noEmit` and `npm run build`, commit.
-- Build with `build.cmd` (warning-free /W4); `out\net_loopback.exe` must pass. Commit on main after each tested
-  step; no Claude attribution lines; push when the user asks.
+- Repo layout: this repo is the Mafia DE game layer (`src/game/`: descriptor `game_info.cpp`, `module.cpp`, Lua
+  bridge, player sync, menus); everything game-agnostic is JustAddMP/core in the submodule `external/core`
+  (`git submodule update --init` after cloning).
+- Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
+  its README.md), then bump the submodule here (`git -C external\core pull` or checkout the new commit, then commit
+  `external/core`). Never edit core files only inside this repo's submodule checkout without committing them to core.
+- Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
+  (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
+  Commit on main after each tested step; no Claude attribution lines; push when the user asks.
 
 ## Done
 
@@ -97,7 +106,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
 - [ ] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
 - [x] Interest management: only stream within ~300 m of any player; bandwidth budget. (Module + tests in
-  src/net/interest.*, docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
+  core: external/core/src/net/interest.*, external/core/docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
 
 ### C. Phase 5 polish (native UI)
 - [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.

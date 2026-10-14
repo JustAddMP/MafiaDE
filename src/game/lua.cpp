@@ -345,7 +345,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
     if (!moduleTick || !tick || !_api.loadbuffer || !_api.pcall || !_api.getfield || !_api.setfield || !_api.pushlstring ||
         !_api.tostring || !_api.tonumber || !_api.pushnamedcclosure) {
         MC_LOG_ERROR("lua: bridge disabled (missing patterns)");
-        core::compat::Failed(core::compat::Feature::LuaBridge);
+        core::compat::Failed("Lua bridge", true);  // required: player sync runs on it
         return false;
     }
     _api.scriptMachine = reinterpret_cast<void**>(core::mem::ResolveRip(moduleTick, 3, 7));
@@ -356,7 +356,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
     if (!core::hook::Install("C_ScriptMachine::Tick", reinterpret_cast<void*>(tick),
                              reinterpret_cast<void*>(&TickDetour), reinterpret_cast<void**>(&_origTick))) {
         MC_LOG_ERROR("lua: bridge disabled (Tick hook failed)");
-        core::compat::Failed(core::compat::Feature::LuaBridge);
+        core::compat::Failed("Lua bridge", true);  // required: player sync runs on it
         return false;
     }
     if (tickPaused) {
