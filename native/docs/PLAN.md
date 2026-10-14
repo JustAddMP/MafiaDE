@@ -96,7 +96,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] **Vehicles + traffic**: host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
 - [ ] **Cutscenes**: guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
-- [ ] Interest management: only stream within ~300 m of any player; bandwidth budget.
+- [x] Interest management: only stream within ~300 m of any player; bandwidth budget. (Module + tests in
+  src/net/interest.*, docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
 
 ### C. Phase 5 polish (native UI)
 - [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.
@@ -105,7 +106,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible.
 - [ ] Settings page (name, show tags, debug overlay).
 
-- [ ] **Session password**: the host can set an optional password (CO-OP page: "Set password", reusing the text box
+- [ ] **Session password** (network side + tests done in 65c562f; tick after the menus are checked in game): the host can set an optional password (CO-OP page: "Set password", reusing the text box
   from Join by IP; ini `password=`). Joining a passworded game prompts for it. Never sent in plain text: the host
   sends a random challenge after Hello and the guest answers with HMAC-SHA256(password, challenge) via Windows
   BCrypt (no extra libraries); wrong answers get Reject "wrong password", with a short delay and a per-address attempt
