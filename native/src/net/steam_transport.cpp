@@ -213,10 +213,14 @@ struct SteamTransport::Impl {
         if (p->state != PeerState::Connected) return;
         switch (ctrl) {
             case kDataReliable:
+                // Steam allows up to 1 MB per reliable packet; the Transport contract (and every sender of ours) is
+                // kMaxReliableMessage, so anything bigger is not from our code.
+                if (body.size() > kMaxReliableMessage) break;
                 Emit(EventType::Message, from, DisconnectReason::None, std::vector<uint8_t>(body.begin(), body.end()),
                      Reliability::Reliable);
                 break;
             case kDataUnreliable:
+                if (body.size() > kMaxUnreliableMessage) break;
                 Emit(EventType::Message, from, DisconnectReason::None, std::vector<uint8_t>(body.begin(), body.end()),
                      Reliability::Unreliable);
                 break;
