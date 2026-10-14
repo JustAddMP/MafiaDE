@@ -118,7 +118,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
    a version constant, not the build hash.
 - [ ] Package: `MafiaCoop.exe` + `mafiacoop.dll` (+ README) in a zip, a few MB; `tools\make_release.cmd`.
-- [ ] Optional proxy-DLL install mode (drop-in so the game can be started from Steam) — must be opt-in because it
+- [ ] Optional proxy-DLL install mode (built and tested on a fake game folder in afa56cd: `MafiaCoop.exe --install`; tick after a real start from Steam) (drop-in so the game can be started from Steam) — must be opt-in because it
    writes into the game folder.
 - [x] Detect unsupported game builds (exe CRC) and show a clear message. Done: launcher CRC32 check against
    `core/version.h` (cached, `--check-only`, `--skip-version-check`); dll banner when patterns are missing.
