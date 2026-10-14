@@ -125,11 +125,11 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   password and the attempt limit.
 
 - [ ] **Kick**: the host picks a player in the pause-menu CO-OP panel and chooses Kick; the player is disconnected
-  with the banner "You were kicked by the host". Only the host can kick (core Session::Kick).
+  with the banner "You were kicked by the host". Only the host can kick (core Session::Kick). Done includes loopback
+  tests: the kicked player gets the reason, guests can't kick.
 - [ ] **Kick and ban**: Kick plus a ban for the rest of the session (SteamID and IP address); a banned player's
-  rejoin is refused with a clear reason. The ban list clears when the host stops hosting.
-- [ ] **Kick/ban tests**: loopback tests: kicked player gets the reason, banned player refused on rejoin (by SteamID
-  and by address), guests can't kick, the ban list clears on a new session.
+  rejoin is refused with a clear reason. The ban list clears when the host stops hosting. Done includes tests: refused
+  on rejoin by SteamID and by address, list cleared in a new session.
 
 ### D. Release / distribution
 - [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
