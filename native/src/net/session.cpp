@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 
+#include "net/auth.h"
 #include "net/net_internal.h"
 
 namespace mc::net {
@@ -27,6 +28,8 @@ enum Msg : uint8_t {
     kPong = 0x07,
     kChat = 0x08,
     kPingTable = 0x09,
+    kChallenge = 0x0A,
+    kAuth = 0x0B,
     kApp = 0x10,
 };
 
@@ -34,6 +37,9 @@ enum RejectCode : uint8_t {
     kRejectVersion = 1,
     kRejectFull = 2,
     kRejectBadHello = 3,
+    kRejectPasswordRequired = 4,
+    kRejectWrongPassword = 5,
+    kRejectTooManyAttempts = 6,
 };
 
 constexpr uint8_t kAppFlagReliable = 0x01;
@@ -85,6 +91,7 @@ bool Session::Host(uint16_t port) {
         Leave();
     Reset();
     lastError_.clear();
+    lastReject_ = RejectReason::None;
     if (!transport_.Host(port)) {
         lastError_ = "could not start hosting";
         state_ = SessionState::Disconnected;
@@ -101,6 +108,8 @@ bool Session::Join(std::string_view address) {
     if (state_ != SessionState::Idle && state_ != SessionState::Disconnected) Leave();
     Reset();
     lastError_.clear();
+    lastReject_ = RejectReason::None;
+    lastJoinAddress_ = std::string(address);
     hostPeer_ = transport_.Connect(address);
     if (!hostPeer_) {
         lastError_ = "invalid address";
@@ -110,6 +119,13 @@ bool Session::Join(std::string_view address) {
     state_ = SessionState::Connecting;
     Log(kInfo, "session: joining %s over %s", std::string(address).c_str(), transport_.Name());
     return true;
+}
+
+bool Session::RetryWithPassword(std::string password) {
+    if (lastJoinAddress_.empty() || state_ == SessionState::Hosting) return false;
+    cfg_.password = std::move(password);
+    const std::string address = lastJoinAddress_;
+    return Join(address);
 }
 
 void Session::Leave() {
@@ -146,9 +162,20 @@ void Session::Poll() {
     double now = Now();
 
     if (state_ == SessionState::Hosting) {
-        std::vector<PeerId> drop;
+        std::vector<PeerId> drop, rejectNow;
         for (auto& [peer, pend] : pending_) {
-            if (pend.kickAt > 0 ? now >= pend.kickAt : now - pend.since > cfg_.helloTimeoutS) drop.push_back(peer);
+            if (pend.kickAt > 0) {
+                if (now >= pend.kickAt) drop.push_back(peer);
+            } else if (pend.rejectAt > 0) {
+                if (now >= pend.rejectAt) rejectNow.push_back(peer);
+            } else if (now - pend.since > cfg_.helloTimeoutS) {
+                drop.push_back(peer);
+            }
+        }
+        for (PeerId p : rejectNow) {  // delayed answer to a wrong password
+            Pending& pend = pending_[p];
+            pend.rejectAt = 0;
+            Reject(p, pend.rejectCode, pend.rejectReason);
         }
         for (PeerId p : drop) {
             pending_.erase(p);
@@ -277,6 +304,93 @@ void Session::HostOnHello(PeerId peer, ByteReader& r) {
         Reject(peer, kRejectFull, "the session is full (" + std::to_string(cfg_.maxPlayers) + " players)");
         return;
     }
+    const bool invited = isInvitedPeer && isInvitedPeer(peer);
+    if (!cfg_.password.empty() && !(invited && cfg_.invitesSkipPassword)) {
+        if (LockedOut(AttemptKey(peer), Now())) {
+            Reject(peer, kRejectTooManyAttempts, "too many attempts, try again later");
+            return;
+        }
+        Pending& pend = pending_[peer];
+        if (!auth::SecureRandom(pend.challenge.data(), pend.challenge.size())) {
+            Log(kError, "session: no random bytes for the password challenge");
+            Reject(peer, kRejectBadHello, "the host could not start the password check");
+            return;
+        }
+        pend.awaitingAuth = true;
+        pend.since = Now();  // the Auth must come within helloTimeoutS
+        pend.name = std::move(name);
+        pend.model = std::move(model);
+        ByteWriter w(40);
+        w.U8(kChallenge);
+        w.Bytes(pend.challenge.data(), pend.challenge.size());
+        SendRaw(peer, w, Reliability::Reliable);
+        Log(kInfo, "session: password challenge sent to peer %llu", static_cast<unsigned long long>(peer));
+        return;
+    }
+    if (invited && !cfg_.password.empty())
+        Log(kInfo, "session: peer %llu is invited; password skipped", static_cast<unsigned long long>(peer));
+    HostAdmit(peer, name, model);
+}
+
+std::string Session::AttemptKey(PeerId peer) const {
+    std::string a = transport_.PeerAddress(peer);
+    return a.empty() ? "peer:" + std::to_string(peer) : "addr:" + a;
+}
+
+bool Session::LockedOut(const std::string& key, double now) {
+    auto it = authFailures_.find(key);
+    if (it == authFailures_.end()) return false;
+    auto& v = it->second;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](double t) { return now - t > cfg_.authWindowS; }), v.end());
+    if (v.empty()) {
+        authFailures_.erase(it);
+        return false;
+    }
+    return static_cast<int>(v.size()) >= cfg_.authMaxFailures;
+}
+
+void Session::HostOnAuth(PeerId peer, ByteReader& r) {
+    const bool has = r.U8() != 0;
+    uint8_t mac[auth::kMacSize] = {};
+    if (has) r.Bytes(mac, sizeof(mac));
+    if (!r.Ok()) {
+        Reject(peer, kRejectBadHello, "invalid handshake");
+        return;
+    }
+    const std::string key = AttemptKey(peer);
+    const double now = Now();
+    if (LockedOut(key, now)) {
+        Reject(peer, kRejectTooManyAttempts, "too many attempts, try again later");
+        return;
+    }
+    if (!has) {
+        Reject(peer, kRejectPasswordRequired, "password required");
+        return;
+    }
+    Pending& pend = pending_[peer];
+    uint8_t want[auth::kMacSize];
+    const bool computed = auth::Response(cfg_.password, pend.challenge.data(), want);
+    if (computed && auth::ConstantTimeEqual(mac, want, sizeof(want))) {
+        Log(kInfo, "session: peer %llu passed the password check", static_cast<unsigned long long>(peer));
+        const std::string name = pend.name, model = pend.model;
+        HostAdmit(peer, name, model);
+        return;
+    }
+    auto& fails = authFailures_[key];
+    fails.push_back(now);
+    Log(kInfo, "session: wrong password from peer %llu (%s, %zu recent failures)",
+        static_cast<unsigned long long>(peer), key.c_str(), fails.size());
+    // Answer later, without blocking: Poll sends the Reject at rejectAt.
+    pend.rejectAt = now + cfg_.authFailDelayS;
+    pend.rejectCode = kRejectWrongPassword;
+    pend.rejectReason = "wrong password";
+}
+
+void Session::HostAdmit(PeerId peer, const std::string& name, const std::string& model) {
+    if (static_cast<int>(players_.size()) >= cfg_.maxPlayers) {
+        Reject(peer, kRejectFull, "the session is full (" + std::to_string(cfg_.maxPlayers) + " players)");
+        return;
+    }
     PlayerId id = kNoPlayer;
     for (PlayerId c = 1; c < cfg_.maxPlayers; ++c)
         if (!FindPlayer(c)) {
@@ -334,9 +448,11 @@ void Session::HostOnMessage(PeerId peer, ByteReader& r, Reliability ch) {
     if (!r.Ok()) return;
     auto pend = pending_.find(peer);
     if (pend != pending_.end()) {
-        if (pend->second.kickAt > 0) return;  // already rejected
-        if (type == kHello)
+        if (pend->second.kickAt > 0 || pend->second.rejectAt > 0) return;  // already rejected
+        if (!pend->second.awaitingAuth && type == kHello)
             HostOnHello(peer, r);
+        else if (pend->second.awaitingAuth && type == kAuth)
+            HostOnAuth(peer, r);
         else
             Reject(peer, kRejectBadHello, "invalid handshake");
         return;
@@ -429,9 +545,27 @@ void Session::GuestOnMessage(ByteReader& r) {
             state_ = SessionState::Connected;
             Log(kInfo, "session: joined as player %u (%zu players)", me, players_.size());
             if (onJoined) onJoined();
+        } else if (type == kChallenge) {
+            uint8_t challenge[auth::kChallengeSize];
+            if (!r.Bytes(challenge, sizeof(challenge))) {
+                Fail("invalid password challenge from host");
+                return;
+            }
+            ByteWriter w(40);
+            w.U8(kAuth);
+            uint8_t mac[auth::kMacSize];
+            if (!cfg_.password.empty() && auth::Response(cfg_.password, challenge, mac)) {
+                w.U8(1);
+                w.Bytes(mac, sizeof(mac));
+            } else {
+                w.U8(0);  // no password: the host answers "password required"
+            }
+            SendRaw(hostPeer_, w, Reliability::Reliable);
+            Log(kInfo, "session: host asked for a password (%s)", cfg_.password.empty() ? "we have none" : "answered");
         } else if (type == kReject) {
-            r.U8();
+            const uint8_t code = r.U8();
             std::string reason = r.Str(kMaxReasonLen);
+            lastReject_ = code >= 1 && code <= 6 ? static_cast<RejectReason>(code) : RejectReason::None;
             Fail("rejected by host: " + (reason.empty() ? std::string("no reason given") : reason));
         }
         return;

@@ -40,8 +40,10 @@ struct Toast {
     float age = 0;
 };
 
-enum class Panel { None, PauseCoop, JoinIp };
-enum class Action { None, Host, Invite, JoinFriend, JoinIp, Leave, Back, Connect };
+enum class Panel { None, PauseCoop, JoinIp, Password };
+enum class Action {
+    None, Host, Invite, JoinFriend, JoinIp, Leave, Back, Connect, SetPassword, ClearPassword, SubmitPassword
+};
 
 struct Item {
     std::string label;
@@ -55,6 +57,8 @@ struct UiState {
     std::vector<Item> items;
     int selected = 0;
     std::string ipText;
+    std::string pwText;         // Password panel (shown masked)
+    bool pwForHost = false;     // Password panel: true = set the host's password, false = retry the refused join
     float caret = 0;
     uint16_t padPrev = 0;
     float padRepeat = 0;
@@ -106,6 +110,20 @@ void ShowCompatBanner() {
 }
 
 // ---- panels -------------------------------------------------------------------------------------------------------
+// The panels with a text box (same input code and look; the password is shown masked).
+bool TextPanel(Panel p) { return p == Panel::JoinIp || p == Panel::Password; }
+std::string& TextBuf() {
+    UiState& u = U();
+    return u.panel == Panel::Password ? u.pwText : u.ipText;
+}
+Action SubmitAction() { return U().panel == Panel::Password ? Action::SubmitPassword : Action::Connect; }
+
+void PasswordItems() {
+    UiState& u = U();
+    u.items.push_back({u.info.passwordSet ? "CHANGE PASSWORD" : "SET PASSWORD", Action::SetPassword});
+    if (u.info.passwordSet) u.items.push_back({"CLEAR PASSWORD", Action::ClearPassword});
+}
+
 void BuildPauseItems() {
     UiState& u = U();
     u.items.clear();
@@ -114,10 +132,12 @@ void BuildPauseItems() {
         u.items.push_back({"HOST CO-OP GAME", Action::Host});
         u.items.push_back({"JOIN FRIEND", Action::JoinFriend});
         u.items.push_back({"JOIN BY IP", Action::JoinIp});
+        PasswordItems();
         break;
     case Coop::Phase::Starting:
     case Coop::Phase::Hosting:
         u.items.push_back({"INVITE FRIENDS", Action::Invite});
+        PasswordItems();
         u.items.push_back({"STOP HOSTING", Action::Leave});
         break;
     case Coop::Phase::Joining:
@@ -129,7 +149,7 @@ void BuildPauseItems() {
     u.selected = std::clamp(u.selected, 0, static_cast<int>(u.items.size()) - 1);
 }
 
-void Open(Panel p) {
+void Open(Panel p, bool pwForHost = false) {
     UiState& u = U();
     u.panel = p;
     u.selected = 0;
@@ -140,8 +160,14 @@ void Open(Panel p) {
         u.ipText = u.info.lastAddress;
         u.items = {{"CONNECT", Action::Connect}, {"CANCEL", Action::Back}};
     }
+    if (p == Panel::Password) {
+        u.pwText.clear();
+        u.pwForHost = pwForHost;
+        u.items = {{pwForHost ? "SET PASSWORD" : "CONNECT", Action::SubmitPassword}, {"CANCEL", Action::Back}};
+    }
     ui_input::SetCapture(true);
-    MC_LOG_INFO("ui: %s panel opened", p == Panel::PauseCoop ? "co-op" : "join-by-ip");
+    MC_LOG_INFO("ui: %s panel opened",
+                p == Panel::PauseCoop ? "co-op" : p == Panel::JoinIp ? "join-by-ip" : "password");
 }
 
 void Close() {
@@ -162,6 +188,23 @@ void Run(Action a) {
     case Action::JoinIp: Open(Panel::JoinIp); break;
     case Action::Leave: Close(); Coop::Leave(); break;
     case Action::Back: Close(); break;
+    case Action::SetPassword: Open(Panel::Password, true); break;
+    case Action::ClearPassword: Close(); Coop::SetPassword(""); break;
+    case Action::SubmitPassword: {
+        const std::string pw = u.pwText;
+        if (pw.empty()) {
+            AddToast("PASSWORD", "Type the password first", true);
+            return;
+        }
+        const bool forHost = u.pwForHost;
+        u.pwText.clear();
+        Close();
+        if (forHost)
+            Coop::SetPassword(pw);
+        else
+            Coop::RetryWithPassword(pw);
+        break;
+    }
     case Action::Connect: {
         std::string addr = u.ipText;
         addr.erase(std::remove(addr.begin(), addr.end(), ' '), addr.end());
@@ -185,12 +228,12 @@ void Move(int d) {
 }
 
 void Paste() {
-    UiState& u = U();
     if (!OpenClipboard(nullptr)) return;
     if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
         if (const auto* w = static_cast<const wchar_t*>(GlobalLock(h))) {
-            for (; *w && u.ipText.size() < 64; ++w)
-                if (*w > 32 && *w < 127) u.ipText.push_back(static_cast<char>(*w));
+            std::string& text = TextBuf();
+            for (; *w && text.size() < 64; ++w)
+                if (*w > 32 && *w < 127) text.push_back(static_cast<char>(*w));
             GlobalUnlock(h);
         }
     }
@@ -210,18 +253,18 @@ void HandleInput(float dt) {
             case VK_TAB: Move(1); break;
             case VK_RETURN:
             case VK_SPACE:
-                if (u.panel == Panel::JoinIp && e.code == VK_SPACE) break;
-                if (u.panel == Panel::JoinIp && e.code == VK_RETURN) {
+                if (TextPanel(u.panel) && e.code == VK_SPACE) break;
+                if (TextPanel(u.panel) && e.code == VK_RETURN) {
                     Run(u.items[static_cast<size_t>(u.selected)].action == Action::Back ? Action::Back
-                                                                                       : Action::Connect);
+                                                                                       : SubmitAction());
                 } else {
                     Run(u.items[static_cast<size_t>(u.selected)].action);
                 }
                 return;
             case VK_ESCAPE: Run(Action::Back); return;
             case VK_BACK:
-                if (u.panel == Panel::JoinIp) {
-                    if (!u.ipText.empty()) u.ipText.pop_back();
+                if (TextPanel(u.panel)) {
+                    if (!TextBuf().empty()) TextBuf().pop_back();
                 } else {
                     Run(Action::Back);
                     return;
@@ -231,11 +274,11 @@ void HandleInput(float dt) {
             }
             break;
         case ui_input::Event::Char:
-            if (u.panel == Panel::JoinIp) {
+            if (TextPanel(u.panel)) {
                 if (e.code == 0x16) {
                     Paste();  // Ctrl+V
-                } else if (e.code > 32 && e.code < 127 && u.ipText.size() < 64) {
-                    u.ipText.push_back(static_cast<char>(e.code));
+                } else if (e.code > 32 && e.code < 127 && TextBuf().size() < 64) {
+                    TextBuf().push_back(static_cast<char>(e.code));
                 }
                 u.caret = 0;
             }
@@ -268,8 +311,8 @@ void HandleInput(float dt) {
     const uint16_t pressed = static_cast<uint16_t>(pad & ~u.padPrev);
     u.padPrev = pad;
     if (pressed & XINPUT_GAMEPAD_A) {
-        Run(u.panel == Panel::JoinIp && u.items[static_cast<size_t>(u.selected)].action != Action::Back
-                ? Action::Connect
+        Run(TextPanel(u.panel) && u.items[static_cast<size_t>(u.selected)].action != Action::Back
+                ? SubmitAction()
                 : u.items[static_cast<size_t>(u.selected)].action);
         return;
     }
@@ -377,6 +420,17 @@ void DrawItems(render::DrawList& d, float x, float& y, float w, float s) {
     }
 }
 
+// A padlock drawn from rectangles (the overlay font is ASCII only): shackle on top, body below. size = total height.
+void DrawLock(render::DrawList& d, float x, float y, float size, uint32_t col) {
+    const float w = size * 0.8f, bodyH = size * 0.58f, t = std::max(1.0f, size * 0.11f);
+    const float sx = x + w * 0.2f, sw = w * 0.6f, sh = size - bodyH;
+    d.Rect(sx, y, sw, t, col);                   // shackle top
+    d.Rect(sx, y, t, sh, col);                   // shackle left
+    d.Rect(sx + sw - t, y, t, sh, col);          // shackle right
+    d.Rect(x, y + sh, w, bodyH, col);            // body
+    d.Rect(x + w * 0.5f - t * 0.5f, y + sh + bodyH * 0.3f, t, bodyH * 0.4f, kPanelBg);  // keyhole
+}
+
 void DrawPausePanel(render::DrawList& d, float W, float H, float s) {
     UiState& u = U();
     BuildPauseItems();  // follows the session state while open
@@ -393,7 +447,12 @@ void DrawPausePanel(render::DrawList& d, float W, float H, float s) {
     d.Rect(x, top, w, 2 * s, kGoldDim);
     const float pad = 36 * s;
     y += 22 * s;
-    d.Text(x + pad, y, "CO-OP", 50 * s, kGold);
+    const float titleW = d.Text(x + pad, y, "CO-OP", 50 * s, kGold);
+    if (info.passwordSet) {  // lock marker: the session needs a password
+        const float lx = x + pad + titleW + 22 * s, ly = y + 14 * s;
+        DrawLock(d, lx, ly, 26 * s, kGold);
+        d.Text(lx + 36 * s, y + 18 * s, "PASSWORD", 21 * s, kTextDim);
+    }
     y += 62 * s;
     std::string status;
     switch (info.phase) {
@@ -437,7 +496,8 @@ void DrawPausePanel(render::DrawList& d, float W, float H, float s) {
     Hint(d, hx, y, "Esc", "Back", 22 * s);
 }
 
-void DrawJoinIp(render::DrawList& d, float W, float H, float s, float dt) {
+void DrawTextBox(render::DrawList& d, float W, float H, float s, float dt, const std::string& title,
+                 const std::string& label, const std::string& shown, const std::string& submit) {
     UiState& u = U();
     u.caret += dt;
     d.Rect(0, 0, W, H, kShade);
@@ -446,22 +506,33 @@ void DrawJoinIp(render::DrawList& d, float W, float H, float s, float dt) {
     d.RectH(x, top, w, h, kPanelBg, 0xD8121110);
     d.Rect(x, top, w, 2 * s, kGoldDim);
     float y = top + 22 * s;
-    d.Text(x + pad, y, "JOIN BY IP", 50 * s, kGold);
+    d.Text(x + pad, y, title, 50 * s, kGold);
     y += 66 * s;
-    d.Text(x + pad, y, "HOST ADDRESS (IP OR IP:PORT)", 21 * s, kTextDim);
+    d.Text(x + pad, y, label, 21 * s, kTextDim);
     y += 32 * s;
     const float fh = 52 * s;
     d.Rect(x + pad, y, w - pad * 2, fh, 0xFF1D1B18);
     d.Rect(x + pad, y + fh - 2 * s, w - pad * 2, 2 * s, kGold);
-    const float tw = d.Text(x + pad + 14 * s, y + (fh - 30 * s) * 0.5f, u.ipText, 30 * s, kText);
+    const float tw = d.Text(x + pad + 14 * s, y + (fh - 30 * s) * 0.5f, shown, 30 * s, kText);
     if (std::fmod(u.caret, 1.0f) < 0.55f)
         d.Rect(x + pad + 16 * s + tw, y + 10 * s, 2 * s, fh - 20 * s, kText);
     y += fh + 24 * s;
     DrawItems(d, x + pad - 16 * s, y, w - pad * 2 + 16 * s, s);
     y += 20 * s;
     float hx = x + pad;
-    hx += Hint(d, hx, y, "Enter", "Connect", 22 * s);
+    hx += Hint(d, hx, y, "Enter", submit, 22 * s);
     Hint(d, hx, y, "Esc", "Cancel", 22 * s);
+}
+
+void DrawJoinIp(render::DrawList& d, float W, float H, float s, float dt) {
+    DrawTextBox(d, W, H, s, dt, "JOIN BY IP", "HOST ADDRESS (IP OR IP:PORT)", U().ipText, "Connect");
+}
+
+void DrawPassword(render::DrawList& d, float W, float H, float s, float dt) {
+    const UiState& u = U();
+    DrawTextBox(d, W, H, s, dt, u.pwForHost ? "SET PASSWORD" : "PASSWORD",
+                u.pwForHost ? "PLAYERS JOINING BY IP MUST TYPE IT" : "THIS GAME NEEDS A PASSWORD",
+                std::string(u.pwText.size(), '*'), u.pwForHost ? "Set" : "Connect");
 }
 
 }  // namespace
@@ -488,6 +559,7 @@ void CoopUi::Tick(float dt) {
     case Coop::Phase::Connected: ms.mode = game::menu::Mode::Connected; break;
     }
     ms.players = static_cast<int>(u.info.players.size());
+    ms.password = u.info.passwordSet;
     game::menu::SetState(ms);
     game::menu::Command cmd;
     while (game::menu::PopCommand(&cmd)) {
@@ -498,8 +570,11 @@ void CoopUi::Tick(float dt) {
         case game::menu::Command::JoinByIp: Open(Panel::JoinIp); break;
         case game::menu::Command::Invite: Coop::InviteFriends(); break;
         case game::menu::Command::PausePanel: Open(Panel::PauseCoop); break;
+        case game::menu::Command::SetPassword: Open(Panel::Password, true); break;
+        case game::menu::Command::ClearPassword: Coop::SetPassword(""); break;
         }
     }
+    if (Coop::PopPasswordPrompt()) Open(Panel::Password, false);  // a join was refused for its password
 
     Coop::Notice n;
     while (Coop::PopNotice(&n)) AddToast(n.title, n.text, n.error);
@@ -517,6 +592,7 @@ void CoopUi::Tick(float dt) {
     const float W = static_cast<float>(bw), H = static_cast<float>(bh), s = H / 1080.0f;
     if (u.panel == Panel::PauseCoop) DrawPausePanel(u.list, W, H, s);
     if (u.panel == Panel::JoinIp) DrawJoinIp(u.list, W, H, s, dt);
+    if (u.panel == Panel::Password) DrawPassword(u.list, W, H, s, dt);
     DrawToasts(u.list, W, s);
 }
 

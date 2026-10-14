@@ -34,6 +34,7 @@ public:
     bool GetStats(PeerId peer, PeerStats& out) const override;
     bool IsHosting() const override;
     const char* Name() const override { return _name.c_str(); }
+    std::string PeerAddress(PeerId peer) const override;
 
     // Which part a peer belongs to (nullptr if unknown).
     Transport* Owner(PeerId peer) const;

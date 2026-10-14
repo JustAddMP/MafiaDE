@@ -20,7 +20,7 @@ raises no event; remote close, timeout, refused and failed connects raise `Disco
 
 | Value | Where | Rule |
 |---|---|---|
-| `kProtocolVersion` (session.h, currently 3) | Hello | Must match exactly. Bump on ANY incompatible change to session or app messages. |
+| `kProtocolVersion` (session.h, currently 5; 5 added the session password) | Hello | Must match exactly. Bump on ANY incompatible change to session or app messages. |
 | `modBuild` (SessionConfig, set by the dll from its build number) | Hello | Must match exactly (sync code must be identical on both sides). |
 | UDP wire version (byte 2 of every datagram, currently 1) | UDP header | Datagrams with another version are ignored. Bump only if the UDP framing changes. |
 | Lobby data `mc_version` / `mc_proto` | Steam lobby | Informational (shown before connecting); the Hello check is authoritative. |
@@ -36,19 +36,55 @@ Every transport message starts with a one-byte session message type.
 |---|---|---|---|---|
 | 0x01 | Hello | G->H | R | u32 magic `0x504F434D` ("MCOP"), u32 protocolVersion, u32 modBuild, str name (<= 32 bytes used) |
 | 0x02 | Welcome | H->G | R | u8 yourId, u8 maxPlayers, u8 count, count x {u8 id, str name} (includes host and you) |
-| 0x03 | Reject | H->G | R | u8 code (1 version, 2 full, 3 bad handshake), str reason (human readable) |
+| 0x03 | Reject | H->G | R | u8 code (1 version, 2 full, 3 bad handshake, 4 password required, 5 wrong password, 6 too many attempts), str reason (human readable) |
 | 0x04 | PeerJoined | H->G | R | u8 id, str name |
 | 0x05 | PeerLeft | H->G | R | u8 id, str reason ("closed by remote", "timed out", ...) |
 | 0x06 | Ping | both | U | u32 sender time ms |
 | 0x07 | Pong | both | U | u32 echoed time ms |
 | 0x08 | Chat | both | R | u8 from (host overwrites with the real sender), str text (<= 256) |
 | 0x09 | PingTable | H->G | U | u8 count, count x {u8 id, u16 rtt ms} (every 2 s, for a ping display) |
+| 0x0A | Challenge | H->G | R | 32 random bytes (only when the host has a password; see "Session password") |
+| 0x0B | Auth | G->H | R | u8 has (0 = guest has no password), then if has: 32-byte HMAC-SHA256 answer |
 | 0x10 | App | both | R/U | varint appId, u8 from, u8 target, u8 flags (bit0 = sent reliable), payload (rest) |
 
 Handshake: transport connects -> guest sends Hello -> host replies Welcome (and broadcasts PeerJoined to the
 others) or Reject (then drops the connection after 1 s so the Reject is delivered). The host drops connections that
 send no Hello within 5 s and ignores everything but Hello before the handshake completes. Max 4 players; player ids:
 host = 0, guests = 1..3 (lowest free id is reused). `0xFF` = all players.
+
+### Session password
+
+Optional; the host sets it (ini `password=`, launcher `--password <p>`, or CO-OP > SET PASSWORD at runtime; "" = open
+session). The password itself is never sent.
+
+```
+guest                                   host
+  Hello  ---------------------------->    version / full checks as before; no password (or an invited peer,
+                                          below) -> Welcome. Otherwise, if this address is locked out ->
+                                          Reject{6 "too many attempts, try again later"}, else:
+         <----------------------------  Challenge{32 bytes from BCryptGenRandom}, fresh per attempt
+  Auth{has, mac} -------------------->    mac = HMAC-SHA256(key = UTF-8 password,
+                                                            msg = "MafiaCoop session auth v1" || challenge)
+                                          has = 0           -> Reject{4 "password required"} (not a failure)
+                                          mac matches       -> Welcome (constant-time compare)
+                                          mac wrong         -> failure recorded; Reject{5 "wrong password"} sent
+                                                               ~1 s later (queued, Poll sends it; never blocks)
+```
+
+- Attempt limit: 5 wrong answers per address (UDP: the IPv4 without the port, `Transport::PeerAddress`; Steam: the
+  SteamID) within 60 s lock that address out; further attempts, even with the right password, get Reject 6 at Hello
+  until the oldest failure is 60 s old. `SessionConfig::authMaxFailures` / `authWindowS` / `authFailDelayS`.
+- The Auth must arrive within the Hello timeout (5 s) after the Challenge, else the connection is dropped.
+- Invites: `Session::isInvitedPeer` (the dll: a Steam P2P peer that is a member of the host's Steam lobby) skips the
+  challenge while `SessionConfig::invitesSkipPassword` is true (ini `require_password_for_invites = 1` turns it off).
+  Guests joining by IP always need it.
+- Guest side: `Session::LastReject()` / `NeedsPassword()` after the rejection; `RetryWithPassword(p)` joins the same
+  address again. The dll shows a PASSWORD box for "password required" / "wrong password" and repeats the last join
+  (UDP address or Steam lobby) with what was typed.
+- Changing or clearing the password while hosting affects new joins only; players already in stay.
+- Strength: an observer of one Challenge/Auth pair can try passwords offline against the HMAC, so a password only
+  keeps strangers out of a game; it is not an account secret. Use something not reused elsewhere.
+- Crypto: `src/net/auth.{h,cpp}`, Windows BCrypt only (`bcrypt.lib`).
 
 Ping/Pong: each side pings every 1 s (unreliable). Guests keep their own RTT to the host; the host's PingTable fills
 in the others.

@@ -90,6 +90,13 @@ struct State {
     std::deque<Coop::Notice> notices;
     std::string localAddress;  // computed once
     std::string lastAddress;   // last JoinAddress target
+
+    // session password (never logged)
+    std::string password;            // host: required from guests ("" = none)
+    std::string joinPassword;        // guest: sent (as an HMAC answer) when a host asks
+    bool requireInvitePassword = false;  // Steam lobby members need it too
+    bool passwordPrompt = false;     // a join was refused for the password; the UI asks (PopPasswordPrompt)
+    Mode retryMode = Mode::None;     // the join that was refused (JoinUdp: address, JoinLobby: lobbyId)
 };
 
 State& S() {
@@ -222,6 +229,8 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
     cfg.modBuild = BuildNumber();
     cfg.playerName = PlayerName();
     cfg.playerModel = core::Config::Get().GetString("model");  // character we appear as (alias or spawn profile)
+    cfg.password = s.mode == Mode::Host ? s.password : s.joinPassword;
+    cfg.invitesSkipPassword = !s.requireInvitePassword;
     s.net = std::move(transport);
     s.session = std::make_unique<net::Session>(*s.net, cfg);
     net::Session& session = *s.session;
@@ -250,10 +259,22 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
         MC_LOG_INFO("coop: chat from %u: %s", from, text.c_str());
     };
     session.onDisconnected = [](const std::string& reason) {
+        State& st = S();
         MC_LOG_WARN("coop: disconnected: %s", reason.c_str());
         SetError("disconnected: " + reason);
-        Notify("CO-OP", "Disconnected: " + reason, true);
-        S().teardown = true;
+        const net::RejectReason rr = st.session ? st.session->LastReject() : net::RejectReason::None;
+        if (rr == net::RejectReason::PasswordRequired || rr == net::RejectReason::WrongPassword) {
+            Notify("CO-OP", rr == net::RejectReason::WrongPassword ? "Wrong password. Try again."
+                                                                   : "This game needs a password.",
+                   true);
+            st.passwordPrompt = true;
+            st.retryMode = st.mode;
+        } else if (rr == net::RejectReason::TooManyAttempts) {
+            Notify("CO-OP", "Too many wrong passwords. Try again in a minute.", true);
+        } else {
+            Notify("CO-OP", "Disconnected: " + reason, true);
+        }
+        st.teardown = true;
     };
 }
 
@@ -392,14 +413,22 @@ void TryStart() {
             return Fail("--transport steam, but Steam is not available");
         }
         auto multi = std::make_unique<net::MultiTransport>();
+        net::MultiTransport* multiRaw = multi.get();
+        net::Transport* steamRaw = nullptr;
         if (s.transport != "steam") multi->Add(std::make_unique<net::UdpTransport>());
         const bool steamPart = wantSteam && s.steam == SteamState::Ready;
         if (steamPart) {
             auto st = std::make_unique<net::SteamTransport>();
             st->SetAcceptFilter([](net::PeerId id) { return S().lobby.IsMember(id); });
+            steamRaw = st.get();
             multi->Add(std::move(st));
         }
         MakeSession(std::move(multi));
+        // Invited friends (members of our Steam lobby, over Steam P2P) skip the password unless
+        // require_password_for_invites = 1. The transports live as long as the session (Teardown drops it first).
+        s.session->isInvitedPeer = [multiRaw, steamRaw](net::PeerId id) {
+            return steamRaw && multiRaw->Owner(id) == steamRaw && S().lobby.IsMember(id);
+        };
         if (!s.session->Host(s.port)) return Fail("could not host: " + s.session->LastError());
         MC_LOG_INFO("coop: hosting over %s, UDP port %u", s.net->Name(), s.port);
         if (steamPart) s.lobby.Create(net::kMaxPlayers);
@@ -412,6 +441,7 @@ void TryStart() {
                 how += "Join by IP: " + (ip.empty() ? std::string("this PC") : ip) +
                        (s.port == net::kDefaultPort ? std::string() : ":" + std::to_string(s.port));
             }
+            if (!s.password.empty()) how += " Password protected.";
             Notify("HOSTING CO-OP", how);
         }
         break;
@@ -455,6 +485,12 @@ void Coop::Init() {
     }
     s.port = static_cast<uint16_t>(cfg.GetInt("port", net::kDefaultPort));
     if (!cfg.GetBool("steam", true)) s.steam = SteamState::Disabled;
+    s.password = cfg.GetString("password");  // host: required; guest: used to join
+    s.joinPassword = s.password;
+    s.requireInvitePassword = cfg.GetBool("require_password_for_invites", false);
+    if (!s.password.empty())
+        MC_LOG_INFO("coop: session password set from config%s",
+                    s.requireInvitePassword ? " (also for Steam invites)" : " (Steam invites skip it)");
 
     uint64_t lobby = strtoull(cfg.GetString("join_lobby").c_str(), nullptr, 10);
     if (!lobby) lobby = net::SteamLobby::CommandLineLobby();
@@ -584,9 +620,42 @@ bool Coop::OpenSteamFriends() {
     return true;
 }
 
+void Coop::SetPassword(const std::string& password) {
+    State& s = S();
+    s.password = password;
+    if (s.session && s.session->IsHost()) s.session->SetPassword(password);
+    MC_LOG_INFO("coop: host password %s", password.empty() ? "cleared" : "set");
+    if (password.empty())
+        Notify("CO-OP", "Password cleared: anyone with your address can join");
+    else
+        Notify("CO-OP", s.requireInvitePassword ? "Password set: everyone joining needs it"
+                                                : "Password set: players joining by IP need it (Steam invites skip it)");
+}
+
+bool Coop::PopPasswordPrompt() {
+    State& s = S();
+    if (!s.passwordPrompt) return false;
+    s.passwordPrompt = false;
+    return true;
+}
+
+void Coop::RetryWithPassword(const std::string& password) {
+    State& s = S();
+    s.joinPassword = password;
+    MC_LOG_INFO("coop: retrying the join with a password");
+    if (s.retryMode == Mode::JoinLobby && s.lobbyId) {
+        JoinLobby(s.lobbyId);
+    } else if (!s.address.empty()) {
+        JoinAddress(s.address);
+    } else {
+        Notify("CO-OP", "Nothing to retry: join a game first", true);
+    }
+}
+
 Coop::Info Coop::GetInfo() {
     State& s = S();
     Info info;
+    info.passwordSet = !s.password.empty();
     info.steamReady = s.steam == SteamState::Ready;
     info.lastAddress = s.lastAddress;
     info.localAddress = LocalAddress();
@@ -644,6 +713,7 @@ void Coop::GetStatus(std::vector<render::OverlayLine>& out) {
             if (s.transport != "steam") via = "UDP port " + std::to_string(s.port);
             if (s.lobby.GetState() == net::SteamLobby::State::InLobby)
                 via += std::string(via.empty() ? "" : ", ") + "Steam lobby (Shift+Tab to invite)";
+            if (session.HasPassword()) via += std::string(via.empty() ? "" : ", ") + "password";
             else if (s.lobby.GetState() == net::SteamLobby::State::Creating)
                 via += std::string(via.empty() ? "" : ", ") + "creating Steam lobby...";
             if (!via.empty()) out.push_back({"  " + via, kColText});

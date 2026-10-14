@@ -478,7 +478,8 @@ int Run() {
     CreateDirectoryW((selfDir + L"\\logs").c_str(), nullptr);
     _wfopen_s(&_log, (selfDir + L"\\logs\\" + logName).c_str(), L"w, ccs=UTF-8");
     Log(L"MafiaCoop launcher, built " __DATE__ " " __TIME__);
-    for (auto& [k, v] : passEnv) Log(L"arg: %s=%s", k.c_str(), v.c_str());
+    for (auto& [k, v] : passEnv)  // the session password is never written to a log
+        Log(L"arg: %s=%s", k.c_str(), k == L"MAFIACOOP_PASSWORD" ? L"(hidden)" : v.c_str());
     if (!gameArgs.empty()) Log(L"arg: game command line extra:%s", gameArgs.c_str());
 
     // ---- find the game ----

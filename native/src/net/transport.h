@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <string>
 #include <string_view>
 
 namespace mc::net {
@@ -70,6 +71,9 @@ public:
     virtual bool GetStats(PeerId peer, PeerStats& out) const = 0;
     virtual bool IsHosting() const = 0;
     virtual const char* Name() const = 0;
+    // Where a peer connects from, for per-address limits (UDP: its IPv4 without the port). "" = no address (the
+    // session then keys by peer id, e.g. a SteamID).
+    virtual std::string PeerAddress(PeerId) const { return {}; }
 };
 
 constexpr uint16_t kDefaultPort = 27960;

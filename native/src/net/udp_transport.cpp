@@ -237,6 +237,7 @@ struct UdpTransport::Impl {
     }
 
     void RawSend(const sockaddr_in& to, const uint8_t* p, size_t n) {
+        if (opt.testOnSend) opt.testOnSend(std::span<const uint8_t>(p, n));
         sendto(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0, reinterpret_cast<const sockaddr*>(&to),
                sizeof(to));
     }
@@ -881,6 +882,14 @@ void UdpTransport::Disconnect(PeerId id) {
 }
 
 void UdpTransport::Close() { impl_->CloseAll(); }
+
+std::string UdpTransport::PeerAddress(PeerId id) const {
+    auto it = impl_->peers.find(id);
+    if (it == impl_->peers.end()) return {};
+    char ip[INET_ADDRSTRLEN] = {};
+    inet_ntop(AF_INET, &it->second.addr.sin_addr, ip, sizeof(ip));
+    return ip;
+}
 
 bool UdpTransport::GetStats(PeerId id, PeerStats& out) const {
     auto it = impl_->peers.find(id);

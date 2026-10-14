@@ -85,6 +85,10 @@ scripts and still work.
     accept their invite.
   - **JOIN BY IP** opens a text box (type `ip` or `ip:port`, Ctrl+V pastes; Enter connects, Esc cancels).
   - While hosting: **INVITE FRIENDS** (Steam invite dialog), **STOP HOSTING**; while joined: **LEAVE CO-OP**; **BACK**.
+  - Idle or hosting: **SET PASSWORD** (a text box like JOIN BY IP, shown masked; **CHANGE PASSWORD** once set) and
+    **CLEAR PASSWORD**. The password lives until the game exits (the ini/launcher one is the starting value). The
+    pause panel shows a padlock next to its CO-OP title while a password is set. A join refused with "password
+    required" / "wrong password" opens a PASSWORD box; Enter repeats the join with it.
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
@@ -106,11 +110,14 @@ the launcher arguments still work.
 | `--join-lobby <id>` | Join a Steam lobby (its owner is the host) over Steam P2P. `+connect_lobby <id>` on the game's command line does the same (Steam's "Join Game"). |
 | `--transport udp\|steam` | Host only on that transport. With `steam`, `--join <id>` is read as a lobby id. |
 | `--name <n>` | Player name. Default: Steam persona name, else the Windows user name. |
+| `--password <p>` | Host: guests must answer with this password (docs/protocol.md "Session password"). Guest: the password to join with. Never logged (the launcher log shows `(hidden)`). |
+| `--require-password-for-invites 1` | Host: Steam lobby members (invited friends) need the password too. Default: they skip it. |
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
 | `--debug-overlay` | Show the debug status text (top-left) from the start; F7 toggles it. Pass it in test flows whose captures are read for the status lines. |
 | `--window left\|right` | Keep the game window on the left/right half of its monitor's work area (full height, title bar kept), for watching two test instances side by side. Unset = the window is left alone. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
+`password = ...`, `require_password_for_invites = 0|1`,
 `window = left|right`, `steam = 0` (no Steam at all), `debug_overlay = 1` (show the debug status text from the start; hidden by default), `native_menu = 0` (no CO-OP
 entries in the game's menus), `menu_dump = 1` (write the original and patched menu movies to `out\dev\gfx\`),
 `menu_debug = 1` (log every request from the patched menus).

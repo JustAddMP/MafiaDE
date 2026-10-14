@@ -23,6 +23,8 @@ enum class Command {
     JoinByIp,      // JOIN BY IP (opens our text input)
     Invite,        // INVITE FRIENDS (Steam overlay)
     PausePanel,    // pause menu > CO-OP
+    SetPassword,   // SET / CHANGE PASSWORD (opens our text input)
+    ClearPassword, // CLEAR PASSWORD
 };
 
 enum class Mode { Idle, Hosting, Joining, Connected };
@@ -30,6 +32,7 @@ enum class Mode { Idle, Hosting, Joining, Connected };
 struct State {
     Mode mode = Mode::Idle;
     int players = 0;
+    bool password = false;  // a host password is set
 };
 
 // Installs the hooks (pattern scans; anything missing disables the feature, logged). Any thread, once.

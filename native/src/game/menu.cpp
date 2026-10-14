@@ -89,6 +89,8 @@ enum ItemId : int {
     kItemLeave = 104,
     kItemBack = 105,
     kItemInvite = 106,
+    kItemSetPassword = 107,
+    kItemClearPassword = 108,
 };
 
 // ---- a Scaleform File backed by memory (same virtual layout as the engine's file class, vtable exe+0x4F6EAA8:
@@ -480,14 +482,20 @@ std::string BuildSpec(int location) {
     if (location != kCoopMenuLocation) return {};
     std::string s = "T|CO-OP";
     auto item = [&](int id, const char* label) { s += "\nP|" + std::to_string(id) + "|" + label; };
+    auto passwordItems = [&] {
+        item(kItemSetPassword, st.password ? "CHANGE PASSWORD" : "SET PASSWORD");
+        if (st.password) item(kItemClearPassword, "CLEAR PASSWORD");
+    };
     switch (st.mode) {
     case Mode::Idle:
         item(kItemHost, "HOST CO-OP GAME");
         item(kItemJoinFriend, "JOIN FRIEND");
         item(kItemJoinIp, "JOIN BY IP");
+        passwordItems();
         break;
     case Mode::Hosting:
         item(kItemInvite, "INVITE FRIENDS");
+        passwordItems();
         item(kItemLeave, "STOP HOSTING");
         break;
     case Mode::Joining:
@@ -513,6 +521,15 @@ std::string Select(int id) {
     case kItemJoinFriend: Post(Command::JoinFriend); return "";
     case kItemJoinIp: Post(Command::JoinByIp); return "";
     case kItemInvite: Post(Command::Invite); return "";
+    case kItemSetPassword: Post(Command::SetPassword); return "";
+    case kItemClearPassword: {
+        {
+            std::lock_guard lock(_mutex);
+            _state.password = false;  // the rebuilt page drops the entry right away
+        }
+        Post(Command::ClearPassword);
+        return "refresh";
+    }
     case kItemLeave: {
         {
             std::lock_guard lock(_mutex);
@@ -573,6 +590,8 @@ const char* CommandName(Command c) {
     case Command::JoinByIp: return "join by ip";
     case Command::Invite: return "invite friends";
     case Command::PausePanel: return "pause co-op panel";
+    case Command::SetPassword: return "set password";
+    case Command::ClearPassword: return "clear password";
     }
     return "?";
 }

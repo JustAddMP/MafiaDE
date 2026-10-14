@@ -8,6 +8,8 @@
 //   --join-lobby <id>      guest over Steam (also "+connect_lobby <id>" on the game's command line)
 //   --transport udp|steam  restrict the host to one transport; with steam, --join <id> is a lobby id
 //   --name <name>          player name (default: Steam persona name, else the Windows user name)
+//   --password <p>         host: guests must answer with this password; guest: the password to join with
+//   require_password_for_invites = 1   (ini) Steam lobby members (invited friends) need the password too
 // Steam: the game memory-loads its own (old) steam_api, so we LoadLibrary the on-disk steam_api64.dll, call its
 // SteamAPI_Init a few seconds after the first frame and pump its SteamAPI_RunCallbacks ourselves every frame.
 // Accepting a Steam invite (or "Join Game" in the friends list) while the game runs leaves the current session and
@@ -35,6 +37,12 @@ public:
     static void Leave();
     static bool InviteFriends();     // Steam overlay invite dialog for our lobby (hosting over Steam)
     static bool OpenSteamFriends();  // Steam overlay friends list (Join Game / invites)
+    // Session password. Host side: "" = none; applies to the running host session too (players in it stay).
+    static void SetPassword(const std::string& password);
+    // Guest side: the last join was refused for its password (required / wrong); true once per refusal, so the UI
+    // can ask for one and call RetryWithPassword.
+    static bool PopPasswordPrompt();
+    static void RetryWithPassword(const std::string& password);  // repeats the last join with this password
 
     enum class Phase { Idle, Starting, Hosting, Joining, Connected };
     struct PlayerRow {
@@ -52,6 +60,7 @@ public:
         uint16_t port = 0;         // UDP port while hosting
         std::string localAddress;  // this PC's LAN IPv4 (for "join by IP")
         std::string lastAddress;   // last address passed to JoinAddress (prefill for the input box)
+        bool passwordSet = false;  // a host password is set (hosting needs it from guests)
     };
     static Info GetInfo();
 

@@ -1,7 +1,10 @@
 // MafiaCoop net: direct UDP transport (Winsock), own reliability layer. Wire format in docs/protocol.md.
 // IPv4 only. Single-threaded: call everything from the thread that calls Poll().
 #pragma once
+#include <functional>
 #include <memory>
+#include <span>
+#include <string>
 
 #include "net/transport.h"
 
@@ -18,6 +21,8 @@ struct UdpOptions {
     float simJitterMs = 0.0f;       // +- uniform jitter (reorders packets)
     float simDuplicate = 0.0f;      // 0..1 probability a datagram is sent twice
     uint32_t simSeed = 1;
+    // Test-only: sees every datagram as it goes to the socket (after simulation), e.g. to scan for secrets.
+    std::function<void(std::span<const uint8_t>)> testOnSend;
 };
 
 class UdpTransport final : public Transport {
@@ -36,6 +41,7 @@ public:
     bool GetStats(PeerId peer, PeerStats& out) const override;
     bool IsHosting() const override;
     const char* Name() const override { return "udp"; }
+    std::string PeerAddress(PeerId peer) const override;  // "a.b.c.d"
 
     // Options may be changed at any time (e.g. switch simulation on/off mid-test).
     void SetOptions(const UdpOptions& opt);

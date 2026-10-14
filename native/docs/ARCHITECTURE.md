@@ -43,7 +43,8 @@ native/
                          swf_patch.{h,cpp} (SWF/ABC patcher: constant pool append, method prologues, assembler)
     net/                 transport.h (interface), udp_transport.{h,cpp} (own reliability), steam_transport
                          .{h,cpp} (ISteamNetworkingMessages, flat API), steam_lobby.{h,cpp}, session.{h,cpp}
-                         (host-authoritative star; host relays), wire.{h,cpp} (byte writer/reader)
+                         (host-authoritative star; host relays), wire.{h,cpp} (byte writer/reader), auth.{h,cpp}
+                         (session password: BCrypt HMAC-SHA256 challenge/response)
     dll/                 dllmain.cpp: init thread -> wait for game ready -> install hooks; mod.cpp (per-frame tick);
                          coop.{h,cpp} (sessions, startable from config or at runtime); coop_ui.{h,cpp} (menu commands,
                          pause co-op panel, join-by-IP box, banners); window_place.{h,cpp} (--window left|right); ui_input.{h,cpp} (panel input, blocks the

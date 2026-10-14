@@ -85,6 +85,11 @@ bool MultiTransport::GetStats(PeerId peer, PeerStats& out) const {
     return t && t->GetStats(peer, out);
 }
 
+std::string MultiTransport::PeerAddress(PeerId peer) const {
+    Transport* t = Owner(peer);
+    return t ? t->PeerAddress(peer) : std::string();
+}
+
 bool MultiTransport::IsHosting() const {
     for (auto& p : _parts)
         if (p->IsHosting()) return true;
