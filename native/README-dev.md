@@ -287,6 +287,27 @@ window = left              ; left|right: keep the game window on that half of it
 - `out\logs\crash-<date>-<time>.dmp`: a minidump written on a fatal exception. The log gets the exception code,
   the faulting module+offset, the registers, and an unwound stack as module+offset. Open the dump in Visual Studio
   or WinDbg with `out\*.pdb` on the symbol path.
+- **Crash triage:** `python tools\crashinfo.py` (Python 3.11, standard library + ctypes, dbghelp.dll from Windows)
+  reads the newest `out\logs\crash-*.dmp` (or the dump given as argument) and prints the exception (code, address,
+  read/write/execute address), the faulting module+offset, the registers, the faulting thread's stack and the crash
+  block of the log that mentions the dump (`--log <file>` to pick one). The stack is unwound with the x64 unwind data
+  (`.pdata`) of the module files on disk (the game exe from the game folder, Windows DLLs, our dll), so game frames
+  come out as `mafiadefinitiveedition.exe+0x...`; where the unwind stops (no matching image) the rest of the stack is
+  scanned for return addresses that follow a call instruction, marked `[scanned]`. A call through a null/garbage
+  pointer is unwound from `[rsp]`. Frames in our modules get function, inlined functions and `file:line` from the
+  PDBs in `out\` (dbghelp `SymLoadModuleEx`/`SymFromAddr`/`SymGetLineFromAddr64`).
+  ```
+  python tools\crashinfo.py                                   newest dump
+  python tools\crashinfo.py out\logs\crash-20261013-171825.dmp --log out\logs\mafiacoop.log.1
+  python tools\crashinfo.py <dump> --symbols D:\old-build\out   PDBs of the build that crashed
+  python tools\crashinfo.py <dump> --all-threads --modules      every thread's stack, the module list
+  ```
+  A PDB is used only when the dump's module has the same CodeView GUID and age as the dll next to it; every rebuild
+  changes the age, so **keep the `out\` folder (dll + pdb) of a build whose dumps you may need to read**, or rebuild the
+  same commit and pass `--force-symbols` (names are then marked "unverified"; correct only if the code layout is the
+  same). Example: rebuilding commit 93134d5 into a temp folder and running
+  `crashinfo.py out\logs\crash-20261013-171825.dmp --symbols <that out> --force-symbols` names the crash_test fault
+  `mc::Mod::Tick+0x167 src\dll\mod.cpp:65` with `OnFrame` / `PresentDetour` above it, matching the log's stack.
 - The game installs its own unhandled-exception filter after we do (a second or two after start). Ours is put back
   every frame for the first minute and then with every heartbeat, chaining to the game's.
 
