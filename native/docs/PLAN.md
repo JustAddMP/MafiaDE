@@ -70,7 +70,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
-- [ ] **Research**: find the game's model/outfit APIs: spawn profiles for story characters and civilians, outfit/clothing
+- [ ] **Research** (static part done: docs/research-characters-missions.md; confirm in game with its test snippets): find the game's model/outfit APIs: spawn profiles for story characters and civilians, outfit/clothing
   variants, the ModelParts enum (hats, accessories), and whether the local player's model can be swapped at runtime.
   Record what works in game-api.md, including which models can hold every weapon, drive and animate correctly.
 - [ ] **Character list**: a curated list of playable characters (story cast, gangsters, civilians) with their outfit
@@ -86,7 +86,7 @@ Builds on A6 (player models). Each player picks how they look; everyone sees the
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.
 - [x] **Weather + time of day**: host sends `game.gfx` GetTime/weather set every few seconds; guests apply
    (SetTime/SetWeatherSet, re-notes §4). Done: WorldEnv 0x0200 (protocol.md), time flow speed included.
-- [ ] **Mission state**: find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
+- [ ] **Mission state** (static research in docs/research-characters-missions.md): find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
    tables). Guests load the same chapter as the host on join; follow host's checkpoint/chapter changes;
    objective text mirrored. Decide: guests run the mission scripts disabled and mirror the host's world.
 - [ ] **NPC mirroring**: host enumerates relevant humans (mission NPCs, enemies near players), streams
