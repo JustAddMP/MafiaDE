@@ -4,11 +4,16 @@
 // Usage: MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <name>] [--log <tag>]
 //                      [--<key> [value]] [--game <exe path>] [+connect_lobby <id>]
 //                      [--skip-version-check] [--check-only]
+//        MafiaCoop.exe --install | --uninstall [--game <exe or folder>] [--yes]
 // Every --<key> [value] (except --game and the two launcher-only flags) is passed to the dll as environment variable
 // MAFIACOOP_<KEY>=<value> ("1" for a bare flag); core::Config gives these precedence over MafiaCoop.ini.
 // Before starting the game the CRC32 of its exe is checked against core/version.h (cached in version-cache.txt);
 // --check-only does only that, prints the result and exits with 0 (supported), 2 (unsupported) or 1 (error).
+// --install / --uninstall add or remove the optional "start from Steam" files in the game folder (install.cpp);
+// --yes skips their confirmation dialog and prints the result instead (scripts, tests).
 #include "core/version.h"
+#include "launcher/install.h"
+#include "proxy/proxy_shared.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -460,7 +465,7 @@ int Run() {
     // passes for "Join Game") go to the game's command line unchanged.
     std::vector<std::pair<std::wstring, std::wstring>> passEnv;
     std::wstring gameOverride, logTag, gameArgs;
-    bool checkOnly = false, skipVersionCheck = false;
+    bool checkOnly = false, skipVersionCheck = false, install = false, uninstall = false, assumeYes = false;
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; ++i) {
@@ -486,6 +491,14 @@ int Run() {
             skipVersionCheck = true;
             continue;
         }
+        if (Lower(key) == L"install" || Lower(key) == L"uninstall") {
+            (Lower(key) == L"install" ? install : uninstall) = true;
+            continue;
+        }
+        if (Lower(key) == L"yes") {
+            assumeYes = true;
+            continue;
+        }
         std::wstring value = L"1";
         if (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) value = argv[++i];
         if (Lower(key) == L"game") {
@@ -498,7 +511,8 @@ int Run() {
         passEnv.emplace_back(envName, value);
     }
     if (argv) LocalFree(argv);
-    _console = checkOnly;
+    if (install && uninstall) return Fail(L"--install and --uninstall cannot be combined.");
+    _console = checkOnly || ((install || uninstall) && assumeYes);
 
     // ---- log: one per launch when several games run (launcher-<tag>.log / launcher-<pid>.log) ----
     const std::vector<DWORD> running = FindProcesses(kGameExe);
@@ -507,6 +521,8 @@ int Run() {
         logName = L"launcher-" + logTag + L".log";
     else if (checkOnly)
         logName = L"launcher-check.log";
+    else if (install || uninstall)
+        logName = L"launcher-install.log";
     else if (!running.empty())
         logName = L"launcher-" + std::to_wstring(GetCurrentProcessId()) + L".log";
     CreateDirectoryW((selfDir + L"\\logs").c_str(), nullptr);
@@ -535,6 +551,10 @@ int Run() {
     if (gameExe.empty()) {
         return Fail(L"Could not find Mafia: Definitive Edition (Steam app 1030840).\n\nAdd a line\n"
                     L"    game_path = <folder containing mafiadefinitiveedition.exe>\nto " + iniPath);
+    }
+    if (install || uninstall) {  // --game may name the folder here
+        const InstallIo io{[](const std::wstring& s) { Log(L"%s", s.c_str()); }, &Print, _console};
+        return install ? InstallProxy(gameExe, selfDir, io) : UninstallProxy(gameExe, io);
     }
     if (!FileExists(gameExe)) return Fail(L"Game executable not found:\n" + gameExe);
 
@@ -605,6 +625,7 @@ int Run() {
 
     // ---- start suspended ----
     passEnv.emplace_back(L"SteamAppId", kAppId);
+    passEnv.emplace_back(mc::proxy::kEnvLauncher, L"1");  // an installed version.dll proxy must not load a second copy
     passEnv.emplace_back(L"SteamGameId", kAppId);
     std::vector<wchar_t> env = BuildEnvironment(passEnv);
     std::wstring cmdLine = L"\"" + gameExe + L"\" /multiinst" + gameArgs;

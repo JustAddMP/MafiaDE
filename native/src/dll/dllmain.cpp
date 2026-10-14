@@ -110,6 +110,15 @@ void LogEnvironment(const std::wstring& dir) {
     char appId[32] = {};
     GetEnvironmentVariableA("SteamAppId", appId, sizeof(appId));
     MC_LOG_INFO("env SteamAppId=%s", appId[0] ? appId : "(unset)");
+    // How the dll got here: MafiaCoop.exe (injection) or the optional version.dll proxy in the game folder (game
+    // started from Steam; settings then come only from MafiaCoop.ini next to this dll, src/proxy/proxy_shared.h).
+    wchar_t proxy[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"MAFIACOOP_LAUNCHER", nullptr, 0) > 0)
+        MC_LOG_INFO("loaded by MafiaCoop.exe");
+    else if (GetEnvironmentVariableW(L"MAFIACOOP_PROXY", proxy, MAX_PATH) > 0)
+        MC_LOG_INFO("loaded by the version.dll proxy %s (game started without MafiaCoop.exe)", Narrow(proxy).c_str());
+    else
+        MC_LOG_INFO("loaded by an unknown injector (no MAFIACOOP_LAUNCHER / MAFIACOOP_PROXY)");
 }
 
 // One log per game instance: --log <tag> -> mafiacoop-<tag>.log. Without it the first instance writes

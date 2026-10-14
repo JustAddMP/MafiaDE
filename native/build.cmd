@@ -1,6 +1,6 @@
 @echo off
 rem MafiaCoop native build. Usage: build.cmd   (runnable from any directory)
-rem Output: out\MafiaCoop.exe, out\mafiacoop.dll, out\test_*.exe, PDBs next to them, objects in out\obj.
+rem Output: out\MafiaCoop.exe, out\mafiacoop.dll, out\mafiacoop_proxy.dll, out\test_*.exe, PDBs next to them, objects in out\obj.
 setlocal EnableExtensions EnableDelayedExpansion
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
@@ -25,7 +25,7 @@ where cl.exe >nul 2>nul || ( echo [build] ERROR: cl.exe still not on PATH & goto
 
 if not exist "%OUT%" mkdir "%OUT%" || goto :fail
 if not exist "%GEN%" mkdir "%GEN%"
-for %%d in (minhook launcher core render game net dll tests) do if not exist "%OBJ%\%%d" mkdir "%OBJ%\%%d"
+for %%d in (minhook launcher core render game net dll proxy tests) do if not exist "%OBJ%\%%d" mkdir "%OBJ%\%%d"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DNOMINMAX /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS"
 set "INCS=/I"%ROOT%\src" /I"%GEN%" /I"%ROOT%\third_party\minhook\include""
@@ -90,6 +90,18 @@ cl %CXXFLAGS% /Fd"%OBJ%\launcher\vc.pdb" /Fo"%OBJ%\launcher\\" "%ROOT%\src\launc
 if errorlevel 1 ( echo [build] ERROR: compiling launcher failed & goto :fail )
 link %LDFLAGS% /SUBSYSTEM:WINDOWS /OUT:"%OUT%\MafiaCoop.exe" /PDB:"%OUT%\MafiaCoop-launcher.pdb" "%OBJ%\launcher\*.obj" kernel32.lib user32.lib advapi32.lib shell32.lib
 if errorlevel 1 ( echo [build] ERROR: linking MafiaCoop.exe failed & goto :fail )
+
+rem ---- version.dll proxy (optional "start from Steam" mode, src\proxy\proxy_shared.h) ----------------
+rem out\mafiacoop_proxy.dll: MafiaCoop.exe --install copies it into the game folder as version.dll. It is not called
+rem version.dll in out\ so the exes there keep loading Windows' own version.dll.
+echo [build] src\proxy
+del /q "%OBJ%\proxy\*.obj" 2>nul
+ml64 /nologo /c /W3 /Zi /Fo"%OBJ%\proxy\version_stubs.obj" "%ROOT%\src\proxy\version_stubs.asm" >"%OBJ%\proxy\ml.log"
+if errorlevel 1 ( type "%OBJ%\proxy\ml.log" & echo [build] ERROR: assembling the proxy stubs failed & goto :fail )
+cl %CXXFLAGS% /Fd"%OBJ%\proxy\vc.pdb" /Fo"%OBJ%\proxy\\" "%ROOT%\src\proxy\*.cpp"
+if errorlevel 1 ( echo [build] ERROR: compiling src\proxy failed & goto :fail )
+link %LDFLAGS% /DLL /DEF:"%ROOT%\src\proxy\version.def" /OUT:"%OUT%\mafiacoop_proxy.dll" /PDB:"%OUT%\mafiacoop_proxy.pdb" /IMPLIB:"%OBJ%\proxy\mafiacoop_proxy.lib" "%OBJ%\proxy\*.obj" kernel32.lib
+if errorlevel 1 ( echo [build] ERROR: linking mafiacoop_proxy.dll failed & goto :fail )
 
 rem ---- tests: one exe per tests\*.cpp, linked with src\net + src\core ---------
 if exist "%ROOT%\tests\*.cpp" (

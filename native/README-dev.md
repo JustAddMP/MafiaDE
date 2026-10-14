@@ -9,19 +9,19 @@ G:\MafiaCoop\native\build.cmd
 - Works from any directory. Needs Visual Studio 2022 or newer with the x64 C++ toolset. The script finds
   `vcvars64.bat` through vswhere if `cl.exe` is not already on PATH. It does not use CMake or Ninja.
 - Flags: C++20, `/MT` (static CRT), `/O2 /Zi` with full PDBs, `/W4 /permissive-`. MinHook is compiled as C at `/W3`.
-- Shaders: every `src
-ender\*.hlsl` is compiled with `fxc.exe` (Windows SDK, on PATH after vcvars) into
+- Shaders: every `src\render\*.hlsl` is compiled with `fxc.exe` (Windows SDK, on PATH after vcvars) into
   `out\obj\gen\<name>_vs.h` / `<name>_ps.h` (`vs_4_0`/`ps_4_0`, arrays `k<Name>VS` / `k<Name>PS`). Precompiling
   means the dll needs no `d3dcompiler_47.dll` at runtime and shader errors fail the build, not the game.
-- Overlay font: `src
-enderont8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, ASCII
-  32..126 + a solid cell). To regenerate: build and run `toolsontgen.cpp` (command in its header comment).
+- Overlay font: `src\render\font8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, ASCII
+  32..126 + a solid cell). To regenerate: build and run `tools\fontgen.cpp` (command in its header comment).
 - Output goes to `out\` (gitignored):
   - `MafiaCoop.exe` (+ `MafiaCoop-launcher.pdb`): the launcher, built from `src\launcher\*.cpp`
   - `mafiacoop.dll` (+ `mafiacoop.pdb`): every `.cpp` in `src\core`, `src\render`, `src\game`, `src\net` and
     `src\dll`, plus MinHook. New files are picked up automatically.
   - Lua that runs inside the game (`src\game\*.lua`) is embedded into the dll: `tools\embed_lua.ps1` turns
     `player_sync.lua` into `out\obj\gen\player_sync_lua.h` (`kPlayerSyncLua`) on every build.
+  - `mafiacoop_proxy.dll` (+ `mafiacoop_proxy.pdb`): the optional version.dll proxy from `src\proxy` (`ml64` for
+    the export stubs, `version.def` for the exports); see "Start from Steam" below.
   - `<name>.exe` for each `tests\<name>.cpp`, linked with `src\core` + `src\net` (+ MinHook). Skipped if there
     are none.
   - Object files go to `out\obj\<group>\`.
@@ -33,6 +33,7 @@ enderont8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, A
 out\MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <name>] [--transport udp|steam]
                   [--port <n>] [--log <tag>] [--<key> [value]] [--game <path to exe>] [+connect_lobby <id>]
                   [--skip-version-check] [--check-only]
+out\MafiaCoop.exe --install | --uninstall [--game <exe or folder>] [--yes]
 ```
 
 1. The launcher finds the game in this order: `--game`, then the Steam registry (`HKCU\Software\Valve\Steam\SteamPath`,
@@ -43,8 +44,8 @@ out\MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <nam
    launcher mutex (the exe has no working single-instance check, see `docs/re-notes.md` 3.2). `+word` arguments
    (e.g. `+connect_lobby <id>`) are appended to the game's command line.
 3. **Game version check:** it computes the CRC32 of the exe (slicing-by-8, ~55 ms for the 111 MB exe when it is in
-   the OS file cache) and compares it with `kSupportedGameBuilds` in `src\coreersion.h` (today only Steam build
-   16502642, CRC `BCE2C8EF` = 3168979183). The result is cached in `outersion-cache.txt` keyed by exe path, size
+   the OS file cache) and compares it with `kSupportedGameBuilds` in `src\core\version.h` (today only Steam build
+   16502642, CRC `BCE2C8EF` = 3168979183). The result is cached in `out\version-cache.txt` keyed by exe path, size
    and last-write time, so later launches take under 1 ms. Unknown build: a message box names the supported builds
    and the CRC found; **Yes** starts anyway (the dll then gets `MAFIACOOP_UNSUPPORTED_BUILD=<crc>` and shows an
    "Unsupported game version" banner), **No** quits with exit code 2. `--skip-version-check` or
@@ -67,7 +68,51 @@ out\MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <nam
 
 **Passing arguments to the dll:** each `--key value` becomes the environment variable `MAFIACOOP_KEY=value` in the
 game process. A bare flag such as `--host` becomes `MAFIACOOP_HOST=1`. `mc::core::Config` checks `MAFIACOOP_<KEY>`
-before `MafiaCoop.ini`, so `Config::Get().GetString("join")` sees `--join 1.2.3.4`.
+before `MafiaCoop.ini`, so `Config::Get().GetString("join")` sees `--join 1.2.3.4`. The launcher also sets
+`MAFIACOOP_LAUNCHER=1` (tells an installed proxy, below, not to load a second copy).
+
+## Start from Steam (optional proxy dll)
+
+Opt-in, because it is the only feature that writes into the game folder. `MafiaCoop.exe --install` copies
+`mafiacoop_proxy.dll` into the game folder as `version.dll` and writes `mafiacoop_path.txt` next to it (a `# MafiaCoop`
+header line, then the full path of the `mafiacoop.dll` next to `MafiaCoop.exe`). After that the game started from
+Steam (or its exe directly) loads co-op; `MafiaCoop.exe` keeps working as before.
+
+- **Why version.dll:** the exe imports `VERSION.dll` statically (6 functions; checked with pefile: no delay-load,
+  load-config `DependentLoadFlags` = 0) and version.dll is not in `KnownDLLs`, so the loader takes the copy in the
+  exe's folder first. It has only 17 exports. The game folder has no version.dll of its own; ScriptHook uses the
+  `dinput8.dll` slot, so the two do not collide.
+- **Forwarding:** the proxy loads `<GetSystemDirectory>\version.dll` by full path in `DllMain` and fills a table of
+  17 pointers; each export (`src\proxy\version.def`, same names and ordinals as Windows' file) is a one-instruction
+  `jmp [g_real+i*8]` stub (`version_stubs.asm`), so every signature, including the undocumented
+  `GetFileVersionInfoByHandle`, passes through untouched. A missing export fails with `ERROR_PROC_NOT_FOUND`.
+- **Loading the mod:** only when the process is `mafiadefinitiveedition.exe` and `MAFIACOOP_LAUNCHER` is not set, the
+  proxy queues an APC on the loading (main) thread. It runs when the loader finishes process initialization, before
+  the game's entry point: the same moment as the launcher's APC injection. It loads the dll named in
+  `mafiacoop_path.txt` (else `mafiacoop.dll` next to the proxy), skips it if a `mafiacoop.dll` is already loaded, and
+  sets `MAFIACOOP_PROXY=<proxy path>`; the dll logs `loaded by the version.dll proxy ...` (or `loaded by
+  MafiaCoop.exe`). Problems go to `OutputDebugString` (DebugView); the game then runs without co-op.
+- **Settings:** without the launcher there are no `MAFIACOOP_*` variables, so everything comes from `MafiaCoop.ini` next
+  to `mafiacoop.dll` (`core::Config` reads it in either mode; `name`, `password`, `window`, ...). Steam sets
+  `SteamAppId` itself, and Steam's "Join Game" passes `+connect_lobby <id>` straight to the game. Not available in
+  this mode: the launcher's exe CRC check (the dll's compat banners still report missing patterns) and the
+  `--log <tag>` file name (always `logs\mafiacoop.log`).
+- **`--install`:** finds the game like a normal launch (`--game <exe or folder>` overrides), then refuses (exit 3,
+  nothing changed) if the folder has a `version.dll` without our marker string (`proxy_shared.h` `kMarker`, e.g.
+  another mod's) or a `mafiacoop_path.txt` without our header, or if a game started from that folder is running.
+  Otherwise it shows a Yes/No dialog naming both files, what they do and how to remove them, then writes them (our
+  own older proxy is overwritten = update). **`--uninstall`** deletes exactly those two files, each only if it is
+  ours, after a Yes/No dialog; anything else is reported as "left alone". `--yes` skips the dialogs and prints the
+  result instead (scripts/tests). Exit codes: 0 done or nothing to do, 1 error, 3 refused or cancelled. Log:
+  `logs\launcher-install.log`.
+- **Test without the game:** `out\proxy_test.exe [work folder]` (default `%TEMP%\mafiacoop-proxy-test`): forwarding
+  (17 exports, by name and ordinal, results equal to System32's) in a non-game process that must not load the mod; a
+  copy of itself named `mafiadefinitiveedition.exe` next to the proxy, whose static version.dll import resolves to the
+  proxy like the game's (mod loaded before `main` from the pointer path; not loaded with `MAFIACOOP_LAUNCHER=1`;
+  same-folder fallback; nothing without either); `MafiaCoop.exe --install/--uninstall --yes` against a fake game
+  folder (install, update, uninstall twice, foreign `version.dll` / pointer refused and untouched, other files
+  untouched, folder without the exe). A copy of `msimg32.dll` stands in for `mafiacoop.dll`. Never point it at the
+  real game folder.
 
 ## Co-op: host and join
 

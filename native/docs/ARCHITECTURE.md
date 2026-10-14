@@ -29,7 +29,8 @@ native/
   src/
     launcher/            MafiaCoop.exe: finds the game (Steam registry + libraryfolders.vdf), checks its exe CRC32
                          against core/version.h, starts it
-                         suspended with SteamAppId=1030840 in the environment, injects mafiacoop.dll, resumes
+                         suspended with SteamAppId=1030840 in the environment, injects mafiacoop.dll, resumes;
+                         install.{h,cpp}: --install/--uninstall of the optional proxy (src/proxy)
     core/                log.{h,cpp}, crash.{h,cpp} (minidump + log on unhandled exception), hook.{h,cpp}
                          (thin MinHook wrapper), config.{h,cpp} (MafiaCoop.ini next to the dll), mem.{h,cpp}
                          (module info, pattern scan with ?? wildcards, RIP-relative resolve), version.h (mod version,
@@ -49,6 +50,8 @@ native/
                          coop.{h,cpp} (sessions, startable from config or at runtime); coop_ui.{h,cpp} (menu commands,
                          pause co-op panel, join-by-IP box, banners); window_place.{h,cpp} (--window left|right); ui_input.{h,cpp} (panel input, blocks the
                          game's DirectInput/XInput/window input while a panel is open)
+    proxy/               optional version.dll proxy (MafiaCoop.exe --install puts it in the game folder): forwards the
+                         17 exports to System32's version.dll, loads mafiacoop.dll in the game ("start from Steam")
   tests/                 net_loopback.cpp (two sessions over UDP in one process), steam_smoke.cpp
   tools/                 fontgen.cpp, embed_lua.ps1 (build step), devlua.ps1 (run Lua in a running game)
   out/                   build output (gitignored): MafiaCoop.exe, mafiacoop.dll, *.pdb, tests

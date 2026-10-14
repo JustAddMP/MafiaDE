@@ -15,6 +15,15 @@ weather and missions are not shared yet.
    Steam overlay (Shift+Tab).
 3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**.
 
+## Start from Steam (optional)
+
+To start the game from Steam as usual and still have co-op, run `MafiaCoop.exe --install` once (from a command
+prompt in the MafiaCoop folder). It asks first, then puts two small files into the game folder: `version.dll` (loads
+MafiaCoop when the game starts) and `mafiacoop_path.txt` (where your MafiaCoop folder is). Keep the MafiaCoop folder
+where it is; settings come from `MafiaCoop.ini` next to `mafiacoop.dll`. If another mod already uses a
+`version.dll`, MafiaCoop changes nothing and tells you. To remove it, run `MafiaCoop.exe --uninstall` (or delete
+those two files); it only ever deletes its own files.
+
 ## For developers
 
 Source, build steps and design notes are in `native/` (`native/README-dev.md`, `native/docs/`).
