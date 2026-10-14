@@ -131,13 +131,40 @@ of police for a long time.
 | `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | the first waits until unseen; the second is instant and also removes the crew and anything spawned from it |
 | `car:GetPos()`, `car:GetRot()` (quat), `car:GetDir()`, `car:GetSpeed()` (velocity vector), `car:GetSpeedFloat()` | |
 | `car:SetPos(v)`, `car:SetRot(q)`, `car:SetDir(v)` | teleport; on a dynamic car physics continues from there |
-| `car:FixCarPos(true)` | freezes the car (no gravity); `SetPos/SetRot` still move it. Our copy cars are fixed and moved every tick |
-| `car:SetDespawnImmunity(true)`, `car:DisableExplosion(true)`, `car:Lock()` | |
-| `carpls(model)` (global, game_structure_console.lua) | spawns a car next to the player and puts the player in the driver seat: used by the tests |
+| `car:FixCarPos(true)` | freezes the car (no gravity); `SetPos/SetRot` still move it. **Not usable for cars people sit in**, see "Seating" below. Only the puppet factory car (crew seated by the spawner before the freeze) uses it |
+| `car:SetDespawnImmunity(true)`, `car:DisableExplosion(true)`, `car:Lock()` / `Unlock()` | |
+| `car:LockPlayerEntryPoints()` / `UnlockPlayerEntryPoints()` | no args; the player cannot get in by E while locked (scripted `GetOnVehicle` still works) |
+| `car:Deactivate()` (entity) | the car disappears (stays a valid object, `IsActive()` false). Used to hide a real car that is replaced by a copy |
+| `car:GetSeatOwner(i)` | 0-based seat (0 = driver); the human or nil |
+| `car:SetSpeed(n)` | takes a number (AI speed), not a velocity vector; there is no velocity setter |
+| `carpls(model)` (global, game_structure_console.lua) | spawns a car next to the player and seats him as driver. Worked in some sessions and did nothing in others (cause not found); the tests now use the recipe in "Seating" |
 | `game.traffic:ObtainCarWithCrew(model, {profile, ...})` | car + crew humans with those spawn profiles (`SpawnCar` as above) |
-| `h:GetOffVehicle()` | works for AI crew; for the player it returned a sync object but the player stayed in (the test pressed E instead) |
-| `h:GetOnVehicle(car, seat, bool [, "WALK"])` / `h:MakeCarOwnership(car)` | **did not seat our puppets** in any variant tried (3/4 args, seat 0/1, unlocked car, open plaza): the command reports success or stays pending and the human stays outside. Hence puppets are hidden while their player is in a vehicle |
+| `game.traffic:GetClosestPointOnRoad(pos, n)` | 2 args (vector, number); returns the road point and the road direction |
+| `game.traffic:DespawnPlayerCarImmediately(n)` | wants a number (not the car); not used |
+| `h:GetOffVehicle()` | NPC: animated exit; does nothing while the car is fixed or moved by `SetPos` every tick (exit after the car stops). Player: no effect from a plain chunk (the test presses E) |
+| `h:GetOnVehicle(car, seat, animate [, moveStyle [, bool]])` | **seat is 1-based** (1 = driver, 2 = front passenger ...): the binding passes `seat - 1` to the engine, so seat 0 never works (that is why earlier tries failed). `animate = false` puts the human in the seat in the same tick. Works for our puppets and AI crew. For the **player** it only works with `player:LockControls(true)` first (unlock afterwards); used for "ride along" |
+| `h:MakeCarOwnership(car)` | accepted; made no difference to seating |
 | `h:ShowModel(bool)`, `h:SetPhysState(0\|2)` | hide/show a human; 2 = DISABLED (no collision while hidden) |
+
+**Seating (verified 2026-10-14, two instances, park in Omerta):**
+
+- Puppet in a car: `npc:GetOnVehicle(car, seat0 + 1, false, "WALK")`. The car can be moved with `SetPos/SetRot` every
+  tick and the human stays in (tested 4 s at 2 m/s and minutes of following a driven car).
+- **Never seat a human in a car that is `FixCarPos(true)`**: the game crashes 4-60 s later on GameMainThread (call
+  through a null vtable in an event dispatch, exe+0x38A50AA via +0x38A52FC/+0x38A5657, or a null write at
+  +0x3855567 on the same path). Reproduced three times; seating first and fixing afterwards ran 90 s without a crash.
+- `SetPos` on a fixed car builds up a bogus velocity (`GetSpeed()` read 78 m/s on an idle copy); the moment it is
+  unfixed the car jumps and throws its occupants out. Hence copies are never fixed: a normal car moved by
+  `SetPos/SetRot` every tick has ~0 velocity and keeps its occupants.
+- A car the **local player has driven** throws an NPC out of its driver seat a few frames after every
+  `GetOnVehicle` (with or without `MakeCarOwnership`, `DestroyController`, `FakePlayerCar`, and also without any
+  `SetPos`). Passenger seats are fine. Fix: replace that car by a fresh copy (`Deactivate` the real car).
+- Making a hidden puppet DYNAMIC again (`SetPhysState(0)`) right before `GetOnVehicle` gets it thrown out; show it
+  with `ShowModel(true)` only and let the seat command manage physics.
+- A puppet that was walking (`MoveVec` pending) sometimes gets out again right after being seated; retrying a
+  second later sticks.
+- Player as passenger: `p:LockControls(true); p:GetOnVehicle(car, 2, false, "WALK")`, then `p:LockControls(false)`
+  when the sync object is done; E gets out normally.
 
 ## 8. Misc
 

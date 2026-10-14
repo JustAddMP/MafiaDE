@@ -169,12 +169,18 @@ Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x01
 shows every other player as a **puppet**: an AI human with its own outfit (host = trench coat, guest 1 = suit and
 hat, ...) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (100 ms
 buffer), snaps when more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
-When a player drives, the others see a copy of the car following the driver's transform (the puppet is hidden: the
-game does not seat our NPCs). Puppets are removed when their player leaves and all at once when the session ends.
+Puppets only appear once the local player is in a loaded world (not in the main menu).
 
-The overlay shows `Sync: in world, puppet factory ready` and one line per remote player
+Cars: when a player drives, the others see the same car (their own copy of it) following the driver, with the
+driver's puppet in the driver seat. **E** (pad **Y**) next to a car another player drives puts you in its first free
+passenger seat ("ride along"); the others see your puppet sitting there. When the driver gets out, the car stays
+where it was left on every game, and anyone can get in and drive it (owner = last driver). Details and message flow:
+docs/protocol.md "Shared cars, seats and ownership". Puppets are removed when their player leaves and all at once when
+the session ends.
+
+The overlay shows `Sync: in world, puppet factory ready, 1 shared car(s)` and one line per remote player
 (`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago` = state, metres off the target, receive rate, age of the newest
-snapshot). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
+snapshot; `alive/seat0` = sitting in seat 0 of a car, `alive/veh-hidden` = in a car but not seated). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
 
 **background_run** (default on): the game pauses its simulation when its window loses focus (`WM_ACTIVATEAPP`). The
 dll swallows that message so an unfocused game keeps running and sending (needed for co-op and for two instances on
@@ -198,8 +204,14 @@ Test snippets (run with `tools\devlua.ps1 -Tag host -Code '...'`):
 local p = game.game:GetActivePlayer(); local p0 = p:GetPos(); local t0 = MafiaCoop.now
 StartThread(function() while true do Sleep(0); local t = math.min(MafiaCoop.now - t0, 4)
   p:SetPos(Math:newVector(p0.x + 3 * t, p0.y, p0.z)); p:SetDir(Math:newVector(1, 0, 0)); if t >= 4 then break end end end)
--- get into a car (the remote side spawns a copy that follows it)
-carpls("smith_v12")
+-- spawn a car next to the player and get in as driver (the others see a copy with your puppet at the wheel)
+local p = game.game:GetActivePlayer(); local pos, d = p:GetPos(), p:GetDir(); local so, id = game.traffic:ObtainSpecificCar("smith_v12")
+StartThread(function() Wait(so); local s = game.traffic:SpawnCar(id, Math:newVector(pos.x + d.y * 3, pos.y - d.x * 3, pos.z + 0.3), d)
+  Wait(s); local car = game.traffic:GetSpawnedEntity(id); Sleep(0.5)
+  p:LockControls(true); local e = p:GetOnVehicle(car, 1, false, "WALK"); Wait(e); p:LockControls(false) end)
+-- shared cars on this machine
+local r = {} for k, c in pairs(MafiaCoop.cars) do r[#r+1] = k .. " " .. c.st .. " driver=" .. tostring(c.driver) end return table.concat(r, "
+")
 -- give the player a pistol (the puppet draws one too)
 local p = game.game:GetActivePlayer(); p:InventoryAddWeapon("p_mast_a_v1", 50); p:InventorySelect("p_mast_a_v1", true)
 -- puppet state on this machine

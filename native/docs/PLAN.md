@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-13.
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-14.
 Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes.md`, `game-api.md`, `../README-dev.md`.
 
 ## Where we are
@@ -9,7 +9,7 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
 |---|---|
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
-| 3 Second player (Lua bridge, puppets) | On foot + weapons + car following done; gaps below |
+| 3 Second player (Lua bridge, puppets) | On foot, weapons, shared cars (seated drivers, passengers, hand-off) done; gaps below |
 | 5 Native UI (CO-OP in main/pause menus, banners) | Done for keyboard; gamepad/mouse/Steam invite untested |
 | 4 Shared world, 6 polish | Not started |
 
@@ -45,12 +45,15 @@ Tick an item (`- [x]`) in the same commit that lands it.
 
 
 ### A. Finish phase 3 (second player)
-- [ ] **Driver/passenger visible in cars.** `GetOnVehicle` never seats our puppets. Investigate: other seat methods
+- [x] **Driver/passenger visible in cars.** `GetOnVehicle` never seats our puppets. Investigate: other seat methods
    on C_WrapperHuman/C_WrapperCar (game-api.md appendix), AI "enter car" commands, spawning the puppet AS the
    car's crew (ObtainCarWithCrew already gives a driver), or attaching to the seat. Gate: remote driver visible.
-- [ ] **Passengers**: sync seat index; puppet seated in the driver's car copy.
-- [ ] **Car ownership hand-off**: when the driver leaves, the car copy should stay where it was left (not vanish)
-   and become drivable by others; decide owner = last driver.
+   Done: the seat index of `GetOnVehicle` is 1-based; copies are no longer frozen (game-api.md 7).
+- [x] **Passengers**: sync seat index; puppet seated in the driver's car copy. E / pad Y next to a car another
+   player drives = ride along as passenger.
+- [x] **Car ownership hand-off**: when the driver leaves, the car copy should stay where it was left (not vanish)
+   and become drivable by others; decide owner = last driver. Flow in protocol.md "Shared cars, seats and
+   ownership" (car keys, CarParked 0x0101).
 - [ ] **Crouch, aim direction, firing, reload** shown on puppets; health synced.
 - [ ] **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
    owner), deaths/respawn; ramming.

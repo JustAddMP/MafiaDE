@@ -20,7 +20,7 @@ raises no event; remote close, timeout, refused and failed connects raise `Disco
 
 | Value | Where | Rule |
 |---|---|---|
-| `kProtocolVersion` (session.h, currently 1) | Hello | Must match exactly. Bump on ANY incompatible change to session or app messages. |
+| `kProtocolVersion` (session.h, currently 2) | Hello | Must match exactly. Bump on ANY incompatible change to session or app messages. |
 | `modBuild` (SessionConfig, set by the dll from its build number) | Hello | Must match exactly (sync code must be identical on both sides). |
 | UDP wire version (byte 2 of every datagram, currently 1) | UDP header | Datagrams with another version are ignored. Bump only if the UDP framing changes. |
 | Lobby data `mc_version` / `mc_proto` | Steam lobby | Informational (shown before connecting); the Hello check is authoritative. |
@@ -84,12 +84,13 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
 | 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 20 Hz | see below |
-| 0x0101-0x01FF | reserved (phase 3 events: seat changes, shots, ...) | | | |
+| 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw |
+| 0x0102-0x01FF | reserved (phase 3 events: shots, ...) | | | |
 
 PlayerState body (41 bytes on foot + weapon name, ~120 bytes in a car):
 
 ```
-u8  version (1)
+u8  version (2)
 u32 senderTimeMs          sender's monotonic clock (QueryPerformanceCounter), for interpolation only
 f32 x, y, z               player position (world metres)
 f32 hx, hy                heading, unit vector in the ground plane
@@ -100,8 +101,9 @@ u8  health                p.health (0..100)
 str weapon                weapon in hand (InventoryGetSelected), "" = none
 -- only when flags bit0:
 str model                 vehicle model name (GetVehicleModelName, e.g. "smith_v12")
-u8  seat                  0 = driver, 1..3 passengers
-u32 vehId                 the sender's entity GUID of that car (a change = a different car)
+u8  seat                  0 = driver, 1..3 passengers, 9 = getting in/out (no seat yet: claims nothing)
+u8  keyOwner              car key, part 1: id of the player who first drove this car
+u32 vehId                 car key, part 2: the car's entity GUID on keyOwner's game
 f32 cx, cy, cz            car position
 f32 qx, qy, qz, qw        car rotation (quaternion, GetRot: v.x v.y v.z s)
 f32 cvx, cvy, cvz         car velocity
@@ -114,10 +116,46 @@ renormalised, car quaternion nlerp with sign fix, discrete fields from the neare
 position is extrapolated with the velocity for at most 250 ms, then held. Old/duplicate snapshots (sender time not
 newer) are dropped, so loss and reordering need no reliability.
 
-Vehicle rule: **the driver's game owns the car.** Everyone else spawns the same model (`ObtainSpecificCar` +
-`SpawnCar`), freezes it (`FixCarPos`) and sets the interpolated transform every tick. A passenger's puppet does not
-spawn a car (the driver's state does). Puppets are hidden while their player is in a vehicle (the game does not seat
-our NPCs, docs/game-api.md 7).
+### Shared cars, seats and ownership
+
+Every car a player drives gets a network **car key** `(keyOwner, vehId)`: the id of the first player who drove it and
+the car's entity GUID on that player's game. The key never changes, whoever drives the car later; every game maps
+keys to its own entity (`MafiaCoop.cars` in the Lua glue): the real car on the game where it was first driven, a copy
+(`ObtainSpecificCar` + `SpawnCar`, same model) everywhere else. A copy is created when a key is first seen (from a
+driver's PlayerState or a CarParked) and keeps that key, so a passenger reports the key of the car he sits in on his
+own game, which is the same car on every other game.
+
+**Owner = last driver.** The game whose player sits in the driver seat simulates the car; everyone else moves their
+entity for that key to the driver's interpolated transform every tick (`SetPos`/`SetRot` on a normal, unfrozen car;
+`FixCarPos` is not used, docs/game-api.md 7). Puppets sit in the cars like real occupants (`GetOnVehicle`, seat
+1-based, no animation): the driver's puppet in the driver seat, passengers' puppets in their seats. While a remote
+player drives a car, player entry to it is locked on the other games (`LockPlayerEntryPoints`), so E there does not
+carjack the remote driver's puppet.
+
+Message flow:
+
+1. **Drive.** A sends PlayerState with `seat 0` and key K. Every other game spawns/uses its entity for K, seats A's
+   puppet as driver and follows A's transform.
+2. **Ride along.** B presses E (pad Y) within 5 m of a car K driven by someone else: B's game seats B in the first free
+   passenger seat (scripted: `LockControls(true)` + `GetOnVehicle`). B's PlayerState then carries K and his seat;
+   the others seat B's puppet there (on A's game in A's real car). E in the car gets B out the normal way.
+3. **Get out / park.** A's PlayerState stops carrying K (on foot). The others stop moving K: their entity stays where
+   it was (a parked car with normal physics, unlocked) and A's puppet climbs out. When A's car has stopped (speed
+   < 0.3 m/s, or 8 s after getting out) A's game sends **CarParked** (reliable) with K and the final transform; the
+   others put their entity there (creating a copy if they never had one).
+4. **Take over.** Anybody gets into the parked car K's driver seat the normal way (E). That game now simulates K and
+   sends `seat 0` with K: step 1 with the new owner. On a game whose player drove K before (e.g. A's own real car),
+   the entity is swapped for a fresh copy first, because a car the local player has driven throws NPC drivers out
+   (docs/game-api.md 7): a copy we spawned is despawned, a real car is deactivated (hidden).
+
+Conflicts: if two players get into the driver seat of the same parked car at the same moment, each game keeps its
+own player driving (the other's `seat 0` claim for K is ignored and logged) until one of them gets out; then step 3/4
+apply. Copies are capped at 12 per game (the oldest parked copy nobody sits in is despawned). When the session ends,
+copies nobody sits in are despawned; the one the local player sits in stays as a normal car. A player who joins late
+does not see cars parked before he joined until somebody drives them.
+
+Puppets that cannot be seated (seat taken, the game keeps throwing them out) are hidden at the car and retried every
+4 s.
 
 Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
 session end (the whole set, including the hidden "factory" car, is removed when the session ends). Model per player:

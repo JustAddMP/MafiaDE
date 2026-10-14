@@ -2,6 +2,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "dll/ui_input.h"
 #include "game/player_sync.h"
 #include "net/multi_transport.h"
 #include "net/session.h"
@@ -463,13 +464,25 @@ void Coop::Init() {
     if (s.steam == SteamState::Disabled) MC_LOG_INFO("coop: Steam disabled by config (steam = 0)");
 }
 
+namespace {
+// The enter-vehicle control (keyboard E, pad Y) held in our focused window while no panel of ours takes input.
+bool EnterVehicleHeld() {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (!fg || (GetWindowThreadProcessId(fg, &pid), pid != GetCurrentProcessId())) return false;
+    if (ui_input::Blocking()) return false;
+    constexpr uint16_t kPadY = 0x8000;  // XINPUT_GAMEPAD_Y
+    return (GetAsyncKeyState('E') & 0x8000) != 0 || (ui_input::PadButtons() & kPadY) != 0;
+}
+}  // namespace
+
 void Coop::Tick(float dt) {
     State& s = S();
     s.now += dt;
     PollSteam();
     if (!s.started) TryStart();
     if (s.session) s.session->Poll();
-    if (s.session) game::PlayerSync::Tick(dt);
+    if (s.session) game::PlayerSync::Tick(dt, EnterVehicleHeld());
     if (s.teardown) Teardown();
 }
 

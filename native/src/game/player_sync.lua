@@ -3,25 +3,39 @@
 -- a copy at <dll dir>\player_sync.lua overrides it for development.
 --
 -- Input (cmds, one line per command):
---   T id profile x y z hx hy vx vy vz mode weapon veh vehId seat cx cy cz qx qy qz qw   remote player target
+--   L id                                                                         our own player id
+--   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw   remote player target
+--   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
+--   E                                                                            enter key pressed (ride along)
 --   R id                                                                         remove that puppet
 --   X                                                                            remove everything
--- Output: sample, status
---   sample = "P x y z hx hy sprint crouch health weapon veh vehId seat cx cy cz qx qy qz qw cvx cvy cvz" or ""
---   status = "id:state:dist;..." for the overlay
+-- Output: sample, status, events
+--   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz" or ""
+--   status = "factory|id:state:dist;...|cars" for the overlay
+--   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove)
+--
+-- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
+-- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
+-- whoever drives it, a copy that follows the driver's transform everywhere else. When the driver gets out
+-- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 1
+M.version = 2
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
+M.cars = M.cars or {}
+M.localId = M.localId or "0"
+M.events = {}
 
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 local MODES = { [0] = "WALK", [1] = "WALK", [2] = "RUN", [3] = "SPRINT" }
+local MAX_CARS = 12  -- shared car copies kept on this machine (the oldest unused parked copy goes first)
 
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
+local function same(a, b) return valid(a) and valid(b) and a == b end
 local function log(s) if mc_log then mc_log("sync: " .. s) end end
 local function try(what, f, ...)
   local good, a, b = pcall(f, ...)
@@ -52,7 +66,7 @@ function M.FactoryReset(why)
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
   M.fac = { st = "none", t = -3 }
-  for _, pp in pairs(M.pup) do pp.so = nil; pp.st = "queued"; M.DropCar(pp) end
+  for _, pp in pairs(M.pup) do pp.so = nil; pp.st = "queued" end
 end
 
 function M.FactoryTick(dt, need)
@@ -125,6 +139,7 @@ function M.SpawnTick()
     pcall(function() so.invulnerability = true end)
     try("DespawnImmunity", so.DespawnImmunity, so, true)
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
+    pp.seatTries, pp.exitSo = 0, nil
     log("puppet " .. pp.id .. " spawned: " .. tostring(so) .. " profile " .. pp.profile)
     return
   end
@@ -139,49 +154,240 @@ function M.SpawnTick()
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
--- Copy cars: the driver's game owns the real car; everyone else spawns the same model, fixes it (no gravity, no
--- physics fight) and moves it to the interpolated transform every tick.
+-- Shared cars. The driver's game simulates the car; everyone else has a copy (same model) moved to the driver's
+-- interpolated transform every tick. Puppets sit in these cars like real occupants. Copies are NOT frozen with
+-- FixCarPos: seating a human in a fixed car crashes the game seconds later, a fixed car does not let its
+-- occupants out, and SetPos on a fixed car builds up a bogus velocity that throws the car (and whoever sits in
+-- it) around the moment it is unfixed (docs/game-api.md 7). A dynamic copy moved by SetPos/SetRot every tick
+-- stays put and keeps its occupants.
 -- ---------------------------------------------------------------------------------------------------------------
-function M.DropCar(pp)
-  local c = pp.car
-  if not c then return end
-  if c.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.id) end
-  pp.car = nil
+local function guidNum(o)
+  local s = tostring(o:GetGUID())
+  return s:match("(%d+)%s*$") or "0"
 end
 
-function M.CarTick(pp)
-  local c = pp.car
-  if c and (c.model ~= pp.veh or c.vehId ~= pp.vehId) then M.DropCar(pp); c = nil end
-  if not c then
-    local so, id = try("ObtainSpecificCar", game.traffic.ObtainSpecificCar, game.traffic, pp.veh)
-    if not so then pp.car = { model = pp.veh, vehId = pp.vehId, st = "failed" }; return end
-    c = { model = pp.veh, vehId = pp.vehId, st = "obtain", so = so, id = id, t = M.now }
-    pp.car = c
-    log("puppet " .. pp.id .. ": obtaining copy car " .. pp.veh)
+function M.KeyOf(ent)
+  for k, c in pairs(M.cars) do
+    if c.ent and same(c.ent, ent) then return k, c end
   end
-  if c.st == "obtain" then
+end
+
+-- A car the local player has driven does not keep an NPC in its driver seat (the puppet is thrown out a few
+-- frames after GetOnVehicle). When another player takes the wheel of such a car, this game swaps it for a fresh
+-- copy at the same place: our own copy is despawned, a real car (not spawned by us) is deactivated (hidden).
+function M.Swap(c)
+  if c.qid then
+    pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
+  elseif valid(c.ent) then
+    try("Deactivate", c.ent.Deactivate, c.ent)
+  end
+  c.ent, c.qid, c.st, c.closed, c.localDriven = nil, nil, "new", nil, nil
+  log("car " .. c.key .. ": replaced by a fresh copy for the new driver")
+end
+
+function M.DropCar(c)
+  if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
+  M.cars[c.key] = nil
+  log("car " .. c.key .. " removed")
+end
+
+-- Make room: drop the oldest copy nobody drives and the local player is not in.
+local function trimCars()
+  local n, oldest = 0, nil
+  for _, c in pairs(M.cars) do
+    n = n + 1
+    if c.qid and not c.driver and not c.localIn and (not oldest or c.used < oldest.used) then oldest = c end
+  end
+  if n > MAX_CARS and oldest then M.DropCar(oldest) end
+end
+
+-- The car for `key` (a copy is spawned if this game has none) with its target transform.
+function M.EnsureCar(key, model, x, y, z, qx, qy, qz, qw)
+  local c = M.cars[key]
+  if c and c.model ~= model then M.DropCar(c); c = nil end
+  if not c then
+    c = { key = key, model = model, st = "new", used = M.now }
+    M.cars[key] = c
+    trimCars()
+  end
+  c.tx, c.ty, c.tz, c.qx, c.qy, c.qz, c.qw = x, y, z, qx, qy, qz, qw
+  c.used = M.now
+  return c
+end
+
+local function setTransform(c)
+  c.ent:SetPos(V(c.tx, c.ty, c.tz))
+  local q = Math:newQuat()
+  q.v = V(c.qx, c.qy, c.qz)
+  q.s = c.qw
+  c.ent:SetRot(q)
+end
+
+-- Player entry: closed while somebody else drives (E would carjack the remote driver's puppet; riding along is
+-- scripted, M.RideAlong), open otherwise so anyone can take a parked car.
+local function setLock(c, closed)
+  if c.closed == closed then return end
+  c.closed = closed
+  if closed then
+    try("LockPlayerEntryPoints", c.ent.LockPlayerEntryPoints, c.ent)
+  else
+    try("Unlock", c.ent.Unlock, c.ent)
+    try("UnlockPlayerEntryPoints", c.ent.UnlockPlayerEntryPoints, c.ent)
+  end
+end
+
+function M.CarTick(c)
+  if c.st == "new" then
+    local so, id = try("ObtainSpecificCar", game.traffic.ObtainSpecificCar, game.traffic, c.model)
+    if not so then c.st = "failed"; return end
+    c.so, c.qid, c.st = so, id, "obtain"
+    log("car " .. c.key .. ": obtaining copy " .. c.model)
+  elseif c.st == "obtain" then
     if c.so:IsDone() then
-      c.sp = game.traffic:SpawnCar(c.id, V(pp.cx, pp.cy, pp.cz + 0.3), V(pp.hx, pp.hy, 0))
+      c.sp = game.traffic:SpawnCar(c.qid, V(c.tx, c.ty, c.tz + 0.3), V(1, 0, 0))
       c.st = "spawn"
     end
   elseif c.st == "spawn" then
     if c.sp:IsDone() then
-      local car = game.traffic:GetSpawnedEntity(c.id)
+      local car = game.traffic:GetSpawnedEntity(c.qid)
       if not valid(car) then c.st = "failed"; return end
-      try("FixCarPos", car.FixCarPos, car, true)
+      c.ent, c.st = car, "ready"
       try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
       try("DisableExplosion", car.DisableExplosion, car, true)
-      try("Lock", car.Lock, car)
-      c.ent, c.st = car, "ready"
-      log("puppet " .. pp.id .. ": copy car ready " .. tostring(car))
+      setTransform(c)
+      log("car " .. c.key .. ": copy ready " .. tostring(car))
     end
   elseif c.st == "ready" then
-    if not valid(c.ent) then pp.car = nil; return end
-    c.ent:SetPos(V(pp.cx, pp.cy, pp.cz))
-    local q = Math:newQuat()
-    q.v = V(pp.qx, pp.qy, pp.qz)
-    q.s = pp.qw
-    c.ent:SetRot(q)
+    if not valid(c.ent) then M.cars[c.key] = nil; return end
+    if c.driver == "local" then
+      setLock(c, false)
+    elseif c.driver then
+      setLock(c, true)
+      setTransform(c)
+    else  -- parked: a normal car, open for anyone
+      setLock(c, false)
+      if c.parkApply then  -- final resting transform from the last driver
+        c.parkApply = nil
+        setTransform(c)
+      end
+    end
+  end
+end
+
+-- Who drives what: remote states (seat 0) claim cars; the local player claims the car whose driver seat he is in.
+function M.CarsUpdate(p)
+  M.my = nil
+  local car = p and p:GetOwner()
+  if car and valid(car) and car.GetVehicleModelName then
+    local seat
+    for s = 0, 3 do if same(car:GetSeatOwner(s), p) then seat = s break end end
+    if not seat then  -- getting in or out: GetActualPlayerSeatIndex is 1-based, 0 = none
+      local good, i = pcall(car.GetActualPlayerSeatIndex, car)
+      seat = (good and tonumber(i) and i >= 1 and i <= 4) and (i - 1) or 9  -- 9: no seat yet, claims nothing
+    end
+    local key, c = M.KeyOf(car)
+    if not key then
+      key = M.localId .. ":" .. guidNum(car)
+      c = { key = key, model = car:GetVehicleModelName(), st = "ready", ent = car, used = M.now }
+      M.cars[key] = c
+      log("car " .. key .. ": ours, " .. c.model)
+    end
+    M.my = { key = key, seat = seat, c = c }
+    c.used = M.now
+    if seat == 0 and c.driver ~= "local" then
+      if c.driver then log("car " .. key .. ": we took the wheel while player " .. c.driver .. " drove it") end
+      c.driver, c.parkPending, c.parkApply, c.localDriven = "local", nil, nil, true
+      log("car " .. key .. ": we drive it")
+    end
+  end
+  for key, c in pairs(M.cars) do
+    c.localIn = M.my ~= nil and M.my.key == key
+    if c.driver == "local" and not (M.my and M.my.key == key and M.my.seat == 0) then
+      c.driver, c.parkPending, c.exitT = nil, true, M.now
+      log("car " .. key .. ": we got out")
+    end
+  end
+  for id, pp in pairs(M.pup) do
+    if pp.veh and pp.seat == 0 and pp.vkey and pp.cx then
+      local c = M.cars[pp.vkey]
+      if c and c.driver == "local" then
+        if pp.conflict ~= pp.vkey then log("car " .. pp.vkey .. ": player " .. id .. " drives it too; we keep it") end
+        pp.conflict = pp.vkey
+      else
+        c = M.EnsureCar(pp.vkey, pp.veh, pp.cx, pp.cy, pp.cz, pp.qx, pp.qy, pp.qz, pp.qw)
+        if c.driver ~= id then
+          log("car " .. pp.vkey .. ": player " .. id .. " drives it")
+          if c.localDriven and c.st == "ready" and not c.localIn then M.Swap(c) end
+        end
+        c.driver, c.parkPending, c.parkApply = id, nil, nil
+      end
+    end
+  end
+  for key, c in pairs(M.cars) do
+    if c.driver and c.driver ~= "local" then
+      local pp = M.pup[c.driver]
+      if not pp or not pp.veh or pp.vkey ~= key or pp.seat ~= 0 then
+        log("car " .. key .. ": player " .. c.driver .. " got out, parked")
+        c.driver = nil  -- the copy stays at the last transform until the CarParked message
+      end
+    end
+    -- We were the last driver: once the car has stopped, tell everyone where it rests.
+    if c.parkPending and c.ent and valid(c.ent) then
+      local sp = c.ent:GetSpeedFloat() or 0
+      if M.now - c.exitT > 1 and (math.abs(sp) < 0.3 or M.now - c.exitT > 8) then
+        c.parkPending = nil
+        local cp, q = c.ent:GetPos(), c.ent:GetRot()
+        M.events[#M.events + 1] = string.format("CP %s %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f", key, c.model,
+          cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s)
+        log("car " .. key .. ": parked, final transform sent")
+      end
+    end
+  end
+  for _, c in pairs(M.cars) do
+    local good, err = pcall(M.CarTick, c)
+    if not good then log("car " .. c.key .. " error: " .. tostring(err)); c.st = "failed" end
+  end
+end
+
+-- CarParked from the network: the last driver's game says where the car came to rest.
+function M.Parked(key, model, x, y, z, qx, qy, qz, qw)
+  local c = M.cars[key]
+  if c and c.driver then return end  -- somebody (maybe we) drives it again already
+  c = M.EnsureCar(key, model, x, y, z, qx, qy, qz, qw)
+  c.parkApply = true
+  log("car " .. key .. ": parked by its last driver")
+end
+
+-- Ride along: E next to a car somebody else drives seats the local player in its first free passenger seat
+-- (the game would otherwise try the driver's door; player entry is locked on those cars).
+function M.RideAlong(p)
+  if M.ride or p:GetOwner() then return end
+  local pos, best, bestD = p:GetPos(), nil, 25
+  for _, c in pairs(M.cars) do
+    if c.st == "ready" and c.driver and c.driver ~= "local" and valid(c.ent) then
+      local cp = c.ent:GetPos()
+      local d = (cp.x - pos.x) ^ 2 + (cp.y - pos.y) ^ 2
+      if d < bestD then best, bestD = c, d end
+    end
+  end
+  if not best then return end
+  local seat
+  for s = 1, (best.ent:GetSeatCount() or 1) - 1 do
+    if not valid(best.ent:GetSeatOwner(s)) then seat = s break end
+  end
+  if not seat then log("ride along: no free seat in " .. best.key); return end
+  try("LockControls", p.LockControls, p, true)  -- a scripted enter only works for the player with controls locked
+  local so = try("GetOnVehicle", p.GetOnVehicle, p, best.ent, seat + 1, false, "WALK")
+  M.ride = { so = so, t = M.now }
+  log("ride along: seat " .. seat .. " of car " .. best.key)
+end
+
+function M.RideTick(p)
+  local r = M.ride
+  if not r then return end
+  if (r.so and r.so:IsDone()) or M.now - r.t > 2 then
+    try("LockControls", p.LockControls, p, false)
+    M.ride = nil
   end
 end
 
@@ -201,26 +407,84 @@ function M.Weapon(pp)
   try("InventorySelect", so.InventorySelect, so, w, false, true)
 end
 
-function M.Hide(pp, hide)
+-- Hidden puppets have no collision (phys state 2 = DISABLED). forSeat: shown again to be seated, physics stays
+-- off (GetOnVehicle manages it; a puppet made DYNAMIC right before it is seated gets thrown out of the car).
+function M.Hide(pp, hide, forSeat)
   if pp.hidden == hide then return end
   pp.hidden = hide
   try("ShowModel", pp.so.ShowModel, pp.so, not hide)
-  try("SetPhysState", pp.so.SetPhysState, pp.so, hide and 2 or 0)
+  if not forSeat then try("SetPhysState", pp.so.SetPhysState, pp.so, hide and 2 or 0) end
   pp.moving = false
+end
+
+-- Puppet out of whatever car it sits in (animated; the car must not be moving).
+function M.GetOut(pp)
+  if pp.exitSo then return end
+  pp.exitSo, pp.exitT = pp.so:GetOffVehicle(), M.now
+  log("puppet " .. pp.id .. " getting out")
+end
+
+-- Seat the puppet in car record `c`. GetOnVehicle(car, seat, animate, moveStyle): the seat is 1-based (1 = driver) and
+-- animate = false places the human in the seat at once. Returns false when it cannot be seated (seat taken by
+-- someone else, gave up): the caller hides the puppet instead.
+function M.Seat(pp, c)
+  local so, car = pp.so, c.ent
+  local own = so:GetOwner()
+  if own and same(own, car) then
+    pp.seatTries, pp.seated = 0, true
+    return true
+  end
+  if pp.seated then  -- was seated, now is not: thrown out (happens while a fresh copy settles, see also M.Swap)
+    pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
+    if pp.ejects == 3 then log("puppet " .. pp.id .. " keeps getting thrown out of car " .. pp.vkey .. ", retrying slower") end
+  end
+  -- Retry once a second; after repeated failures every 4 s with the puppet hidden in between.
+  local slow = (pp.ejects or 0) >= 3 or (pp.seatTries or 0) >= 6
+  if slow and M.now - (pp.seatT or -10) < 4 then return false end
+  if own then  -- still in another car: out first
+    M.GetOut(pp)
+    return M.now - pp.exitT < 3
+  end
+  pp.exitSo = nil
+  local occ = car:GetSeatOwner(pp.seat)
+  if valid(occ) and not same(occ, so) then return false end
+  if M.now - (pp.seatT or -10) >= 1 then
+    if pp.hidden then M.Hide(pp, false, true) end
+    pp.seatT, pp.seatTries = M.now, (pp.seatTries or 0) + 1
+    try("GetOnVehicle", so.GetOnVehicle, so, car, pp.seat + 1, false, "WALK")
+    if same(so:GetOwner(), car) then
+      if (pp.ejects or 0) < 3 then log("puppet " .. pp.id .. " seated in car " .. pp.vkey .. " seat " .. pp.seat) end
+    elseif pp.seatTries == 6 then
+      log("puppet " .. pp.id .. " could not be seated in car " .. pp.vkey .. ", retrying slower")
+    end
+  end
+  return true
 end
 
 function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if pp.veh then
-    -- In a vehicle: puppets cannot be seated reliably (GetOnVehicle does nothing for these NPCs), so the
-    -- puppet is hidden and parked at the car; the driver's copy car shows the vehicle.
-    if pp.seat == 0 then M.CarTick(pp) else M.DropCar(pp) end
+    local sk = tostring(pp.vkey) .. "/" .. pp.seat
+    if pp.seatKey ~= sk then pp.seatKey, pp.seatTries, pp.ejects, pp.seated = sk, 0, 0, false end
+    local c = pp.vkey and M.cars[pp.vkey]
+    pp.dist = 0
+    if pp.seat <= 3 and c and c.st == "ready" and valid(c.ent) and M.Seat(pp, c) then return end
+    -- No car (yet) or no seat: hide the puppet and park it at the car.
+    if valid(so:GetOwner()) then
+      M.GetOut(pp)
+      return
+    end
     M.Hide(pp, true)
     so:SetPos(V(pp.tx, pp.ty, pp.tz + 3))
     return
   end
-  if pp.car then M.DropCar(pp) end
+  pp.seatKey = nil
+  if valid(so:GetOwner()) then  -- the player got out: let the puppet climb out, then follow on foot again
+    M.GetOut(pp)
+    if M.now - pp.exitT < 3 then return end
+  end
+  pp.exitSo = nil
   if pp.hidden then
     M.Hide(pp, false)
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
@@ -262,7 +526,6 @@ end
 function M.Remove(id)
   local pp = M.pup[id]
   if not pp then return end
-  M.DropCar(pp)
   local f = M.fac
   if f.busy == id then f.busy = nil end
   if valid(pp.so) and f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, pp.so) end
@@ -272,6 +535,15 @@ end
 
 function M.RemoveAll()
   for id, _ in pairs(M.pup) do M.Remove(id) end
+  for _, c in pairs(M.cars) do
+    if c.qid and not c.localIn then
+      M.DropCar(c)
+    elseif c.ent and valid(c.ent) then  -- ours, or the copy we sit in: back to a normal car
+      pcall(c.ent.Unlock, c.ent)
+      pcall(c.ent.UnlockPlayerEntryPoints, c.ent)
+    end
+  end
+  M.cars = {}
   if M.fac.st ~= "none" then M.FactoryReset("session ended") end
   M.fac.t = 0
 end
@@ -279,11 +551,6 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Local player sample
 -- ---------------------------------------------------------------------------------------------------------------
-local function guidNum(o)
-  local s = tostring(o:GetGUID())
-  return s:match("(%d+)%s*$") or "0"
-end
-
 function M.Sample()
   local p = M.Player()
   if not p then return "" end
@@ -293,16 +560,15 @@ function M.Sample()
   local health = tonumber(p.health) or 0
   local weapon = p:InventoryGetSelected() or ""
   if weapon == "" or weapon == "empty" then weapon = "-" end
-  local car = p:GetOwner()
-  if car and valid(car) and car.GetVehicleModelName then
-    local seat = 0
-    for s = 0, 3 do if car:GetSeatOwner(s) == p then seat = s break end end
+  local my = M.my
+  if my and valid(my.c.ent) then
+    local car = my.c.ent
     local cp, q, cv = car:GetPos(), car:GetRot(), car:GetSpeed()
     return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s %s %s %d %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f %.3f",
-      pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon, car:GetVehicleModelName(), guidNum(car), seat,
+      pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon, my.c.model, my.key, my.seat,
       cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, cv.x, cv.y, cv.z)
   end
-  return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s - 0 0 0 0 0 0 0 0 1 0 0 0",
+  return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s - - 0 0 0 0 0 0 0 1 0 0 0",
     pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon)
 end
 
@@ -311,7 +577,9 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 function M.Update(dt, cmds)
   M.now = M.now + dt
+  M.events = {}
   local player = M.Player()
+  local enter = false
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -330,11 +598,19 @@ function M.Update(dt, cmds)
       pp.mode = tonumber(f[12]) or 0
       pp.wantWeapon = (f[13] ~= "-") and f[13] or ""
       pp.veh = (f[14] ~= "-") and f[14] or nil
-      pp.vehId = f[15]
+      pp.vkey = (f[15] ~= "-") and f[15] or nil
       pp.seat = tonumber(f[16]) or 0
       pp.cx, pp.cy, pp.cz = tonumber(f[17]), tonumber(f[18]), tonumber(f[19])
       pp.qx, pp.qy, pp.qz, pp.qw = tonumber(f[20]), tonumber(f[21]), tonumber(f[22]), tonumber(f[23])
       pp.fresh = true
+    elseif op == "K" then
+      local n = {}
+      for i = 4, 10 do n[#n + 1] = tonumber(f[i]) end
+      if #n == 7 then M.Parked(f[2], f[3], n[1], n[2], n[3], n[4], n[5], n[6], n[7]) end
+    elseif op == "L" then
+      M.localId = f[2] or M.localId
+    elseif op == "E" then
+      enter = true
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
@@ -347,27 +623,38 @@ function M.Update(dt, cmds)
   if player then
     M.FactoryTick(dt, need)
     M.SpawnTick()
+    local good, err = pcall(M.CarsUpdate, player)
+    if not good then log("cars error: " .. tostring(err)) end
     for _, pp in pairs(M.pup) do
       if pp.st == "alive" then
-        local good, err = pcall(M.Drive, pp)
+        good, err = pcall(M.Drive, pp)
         if not good then
           pp.errs = (pp.errs or 0) + 1
           if pp.errs < 5 then log("puppet " .. pp.id .. " drive error: " .. tostring(err)) end
         end
       end
     end
+    if enter then
+      good, err = pcall(M.RideAlong, player)
+      if not good then log("ride along error: " .. tostring(err)) end
+    end
+    pcall(M.RideTick, player)
   end
 
   local st = {}
   for id, pp in pairs(M.pup) do
-    st[#st + 1] = id .. ":" .. pp.st .. (pp.hidden and "/veh" or "") .. ":" .. string.format("%.1f", pp.dist or -1)
+    local tag = ""
+    if pp.veh then tag = (pp.hidden and "/veh-hidden" or "/seat" .. tostring(pp.seat)) end
+    st[#st + 1] = id .. ":" .. pp.st .. tag .. ":" .. string.format("%.1f", pp.dist or -1)
   end
+  local nc = 0
+  for _, _ in pairs(M.cars) do nc = nc + 1 end
   local sample = ""
   if player then
     local good, s = pcall(M.Sample)
     if good then sample = s else log("sample error: " .. tostring(s)) end
   end
-  return sample, M.fac.st .. "|" .. table.concat(st, ";")
+  return sample, M.fac.st .. "|" .. table.concat(st, ";") .. "|" .. nc, table.concat(M.events, "\n")
 end
 
 return M.version

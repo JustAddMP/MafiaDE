@@ -23,7 +23,8 @@ namespace {
 
 // ---- protocol (docs/protocol.md "Phase 3") ---------------------------------------------------------------------
 constexpr uint16_t kMsgPlayerState = 0x0100;
-constexpr uint8_t kStateVersion = 1;
+constexpr uint16_t kMsgCarParked = 0x0101;
+constexpr uint8_t kStateVersion = 2;
 constexpr double kSendInterval = 0.05;      // 20 Hz
 constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
 constexpr double kMaxExtrapolate = 0.25;    // then hold
@@ -49,7 +50,8 @@ struct PlayerState {
     // vehicle (flags & kInVehicle)
     std::string model;
     uint8_t seat = 0;
-    uint32_t vehId = 0;  // sender-local entity GUID: a change means another car
+    uint8_t keyOwner = 0;  // car key = (keyOwner, vehId): the first driver's id and the car's GUID on his game
+    uint32_t vehId = 0;
     float cpos[3] = {};
     float quat[4] = {0, 0, 0, 1};
     float cvel[3] = {};
@@ -83,6 +85,10 @@ struct Shared {
     bool localValid = false;
     double localAt = 0;
     std::string luaStatus;
+    std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
+    std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
+    bool enterPressed = false;
+    double enterAt = 0;
 };
 
 Shared& S() {
@@ -92,6 +98,7 @@ Shared& S() {
 
 // render-thread only
 net::Session* _session = nullptr;
+bool _enterWasDown = false;
 double _sendAccum = 0;
 uint32_t _sent = 0;
 
@@ -139,6 +146,7 @@ void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
     if (s.flags & kInVehicle) {
         w.Str(s.model);
         w.U8(s.seat);
+        w.U8(s.keyOwner);
         w.U32(s.vehId);
         for (float v : s.cpos) w.F32(v);
         for (float v : s.quat) w.F32(v);
@@ -160,6 +168,7 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
     if (s.flags & kInVehicle) {
         s.model = r.Str(48);
         s.seat = r.U8();
+        s.keyOwner = r.U8();
         s.vehId = r.U32();
         for (float& v : s.cpos) v = r.F32();
         for (float& v : s.quat) v = r.F32();
@@ -253,35 +262,81 @@ PlayerState Interpolate(const Remote& rem, double now) {
 
 void AppendTarget(std::string& out, net::PlayerId id, const PlayerState& s) {
     char buf[512];
-    const bool veh = (s.flags & kInVehicle) != 0;
+    char key[32] = "-";
+    const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
+    if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
     std::snprintf(buf, sizeof(buf),
-                  "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %u %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n",
+                  "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n",
                   id, ProfileFor(id).c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
-                  s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(),
-                  veh && !s.model.empty() ? s.model.c_str() : "-", s.vehId, s.seat, s.cpos[0], s.cpos[1], s.cpos[2],
-                  s.quat[0], s.quat[1], s.quat[2], s.quat[3]);
+                  s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
+                  s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3]);
     out += buf;
 }
 
+// "o:g" -> car key; false for "-" or garbage.
+bool ParseKey(const std::string& k, uint8_t& owner, uint32_t& guid) {
+    unsigned o = 0;
+    unsigned long g = 0;
+    if (std::sscanf(k.c_str(), "%u:%lu", &o, &g) != 2 || o > 255) return false;
+    owner = static_cast<uint8_t>(o);
+    guid = static_cast<uint32_t>(g);
+    return true;
+}
+
+// ---- CarParked (0x0101, reliable): the last driver's game tells where a car came to rest -------------------------
+// Lua event line: "CP o:g model x y z qx qy qz qw"
+bool WriteParked(net::ByteWriter& w, const std::string& line) {
+    std::istringstream in(line);
+    std::string tag, key, model;
+    float v[7] = {};
+    in >> tag >> key >> model;
+    for (float& f : v) in >> f;
+    uint8_t owner = 0;
+    uint32_t guid = 0;
+    if (!in || tag != "CP" || !ParseKey(key, owner, guid)) return false;
+    w.U8(owner);
+    w.U32(guid);
+    w.Str(model);
+    for (float f : v) w.F32(f);
+    return true;
+}
+
+void OnCarParked(net::PlayerId from, net::ByteReader& r) {
+    const uint8_t owner = r.U8();
+    const uint32_t guid = r.U32();
+    const std::string model = r.Str(48);
+    float v[7];
+    for (float& f : v) f = r.F32();
+    if (!r.Ok() || model.empty() || model.find_first_of(" \n\r\t") != std::string::npos) return;
+    for (float f : v)
+        if (!std::isfinite(f)) return;
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n", owner, guid, model.c_str(), v[0],
+                  v[1], v[2], v[3], v[4], v[5], v[6]);
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (!sh.active || from == sh.localId) return;
+    sh.inCmds += buf;
+    MC_LOG_INFO("sync: player %u parked car %u:%u (%s)", from, owner, guid, model.c_str());
+}
+
 // ---- local sample ---------------------------------------------------------------------------------------------------
-// "P x y z hx hy sprint crouch health weapon veh vehId seat cx cy cz qx qy qz qw cvx cvy cvz"
+// "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz"
 bool ParseSample(const std::string& line, PlayerState& s) {
     std::istringstream in(line);
-    std::string tag, weapon, model;
+    std::string tag, weapon, model, key;
     int sprint = 0, crouch = 0, health = 0, seat = 0;
-    unsigned long vehId = 0;
     in >> tag >> s.pos[0] >> s.pos[1] >> s.pos[2] >> s.head[0] >> s.head[1] >> sprint >> crouch >> health >> weapon >>
-        model >> vehId >> seat >> s.cpos[0] >> s.cpos[1] >> s.cpos[2] >> s.quat[0] >> s.quat[1] >> s.quat[2] >>
+        model >> key >> seat >> s.cpos[0] >> s.cpos[1] >> s.cpos[2] >> s.quat[0] >> s.quat[1] >> s.quat[2] >>
         s.quat[3] >> s.cvel[0] >> s.cvel[1] >> s.cvel[2];
     if (!in || tag != "P") return false;
     s.weapon = weapon == "-" ? "" : weapon;
     s.health = static_cast<uint8_t>(std::clamp(health, 0, 255));
     s.flags = 0;
-    if (model != "-") {
+    if (model != "-" && ParseKey(key, s.keyOwner, s.vehId)) {
         s.flags |= kInVehicle;
         s.model = model;
         s.seat = static_cast<uint8_t>(seat);
-        s.vehId = static_cast<uint32_t>(vehId);
     }
     if (crouch) s.flags |= kCrouch;
     if (sprint) s.flags |= kSprint;
@@ -364,6 +419,11 @@ void MainTick(lua_State* L, float dt) {
         sh.removed.clear();
         if (active) {
             const double now = Now();
+            cmds += "L " + std::to_string(sh.localId) + "\n";
+            cmds += sh.inCmds;
+            sh.inCmds.clear();
+            if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
+            sh.enterPressed = false;
             for (auto& [id, rem] : sh.remotes) {
                 if (!rem.snaps.empty()) AppendTarget(cmds, id, Interpolate(rem, now));
             }
@@ -391,13 +451,14 @@ void MainTick(lua_State* L, float dt) {
     lua::PushNumber(L, dt);
     lua::PushString(L, cmds);
     std::string err;
-    if (!lua::PCall(L, 2, 2, &err)) {
+    if (!lua::PCall(L, 2, 3, &err)) {
         LuaError(err);
         lua::SetTop(L, top);
         return;
     }
-    const char* sample = lua::ToString(L, -2);
-    const char* status = lua::ToString(L, -1);
+    const char* sample = lua::ToString(L, -3);
+    const char* status = lua::ToString(L, -2);
+    const char* events = lua::ToString(L, -1);
     PlayerState local;
     const bool ok = sample && *sample && ParseSample(sample, local);
     const double now = Now();
@@ -405,6 +466,12 @@ void MainTick(lua_State* L, float dt) {
     {
         std::lock_guard lock(sh.mu);
         sh.luaStatus = status ? status : "";
+        if (sh.active && events && *events) {
+            std::istringstream in(events);
+            std::string line;
+            while (std::getline(in, line))
+                if (line.rfind("CP ", 0) == 0) sh.outParked.push_back(line);
+        }
         if (ok) {
             sh.local = std::move(local);
             sh.localValid = true;
@@ -426,6 +493,7 @@ void PlayerSync::Install() {
 void PlayerSync::Attach(net::Session& session) {
     _session = &session;
     session.On(kMsgPlayerState, &OnState);
+    session.On(kMsgCarParked, &OnCarParked);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
@@ -434,7 +502,10 @@ void PlayerSync::Attach(net::Session& session) {
 }
 
 void PlayerSync::Detach() {
-    if (_session) _session->Off(kMsgPlayerState);
+    if (_session) {
+        _session->Off(kMsgPlayerState);
+        _session->Off(kMsgCarParked);
+    }
     _session = nullptr;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
@@ -445,6 +516,8 @@ void PlayerSync::Detach() {
     sh.active = false;
     sh.remotes.clear();
     sh.names.clear();
+    sh.inCmds.clear();
+    sh.outParked.clear();
 }
 
 void PlayerSync::OnPlayerLeft(net::PlayerId id) {
@@ -456,14 +529,22 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
 }
 
-void PlayerSync::Tick(float dt) {
+void PlayerSync::Tick(float dt, bool enterDown) {
     if (!_session) return;
     Shared& sh = S();
     const bool active = _session->IsActive();
     PlayerState local;
     bool send = false;
+    std::vector<std::string> parked;
+    const bool enterEdge = enterDown && !_enterWasDown;
+    _enterWasDown = enterDown;
     {
         std::lock_guard lock(sh.mu);
+        if (enterEdge && active) {
+            sh.enterPressed = true;
+            sh.enterAt = Now();
+        }
+        parked.swap(sh.outParked);
         if (active != sh.active) {
             sh.active = active;
             sh.localId = _session->LocalId();
@@ -495,6 +576,13 @@ void PlayerSync::Tick(float dt) {
             }
         }
     }
+    for (const std::string& line : parked) {
+        net::ByteWriter pw(96);
+        if (active && WriteParked(pw, line)) {
+            _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
+            MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
+        }
+    }
     if (!send) return;
     net::ByteWriter w(128);
     Write(w, local, NowMs());
@@ -507,12 +595,14 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
     std::lock_guard lock(sh.mu);
     if (!sh.active) return;
     // luaStatus: "<factory>|id:state:dist;..."
-    const std::string& ls = sh.luaStatus;
+    const std::string& ls = sh.luaStatus;  // "<factory>|id:state:dist;...|<cars>"
     const size_t bar = ls.find('|');
+    const size_t bar2 = bar == std::string::npos ? std::string::npos : ls.find('|', bar + 1);
     const std::string factory = bar == std::string::npos ? "?" : ls.substr(0, bar);
+    const std::string cars = bar2 == std::string::npos ? "0" : ls.substr(bar2 + 1);
     std::map<std::string, std::string> pupState;
     if (bar != std::string::npos) {
-        std::istringstream in(ls.substr(bar + 1));
+        std::istringstream in(ls.substr(bar + 1, bar2 == std::string::npos ? std::string::npos : bar2 - bar - 1));
         std::string item;
         while (std::getline(in, item, ';')) {
             const size_t c = item.find(':');
@@ -520,8 +610,9 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
         }
     }
     char buf[160];
-    std::snprintf(buf, sizeof(buf), "Sync: %s, puppet factory %s",
-                  sh.localValid && Now() - sh.localAt < 1.0 ? "in world" : "no local player", factory.c_str());
+    std::snprintf(buf, sizeof(buf), "Sync: %s, puppet factory %s, %s shared car(s)",
+                  sh.localValid && Now() - sh.localAt < 1.0 ? "in world" : "no local player", factory.c_str(),
+                  cars.c_str());
     out.push_back({buf, 0xFFC8C8C8});
     const double now = Now();
     for (const auto& [id, rem] : sh.remotes) {

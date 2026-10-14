@@ -473,6 +473,18 @@ Populate 0x26807D0, and more.
 - Player teleport: `C_WrapperPlayer::Teleport` 0x23BBB80.
 - Position: `C_WrapperEntityPos::GetPos` 0x23B4710 and `SetPos` 0x23B5B10.
 
+**C_WrapperHuman::GetOnVehicle** (two `luaL_Reg` entries in table 0x5AD2560, both 0x23BBBD0) [confirmed from code]:
+- 0x23BBBD0 dispatches on the argument count after `self`: 3 -> 0x23D18F0, 4 -> 0x23D1B00, 5 -> 0x23D1D40; anything
+  else raises an argument error.
+- 0x23D1D40 (5 args) reads: #2 vehicle wrapper (0x1ABD980), #3 number = seat (`cvttss2si`), #4 bool, #5 string
+  looked up as a move-style name (0x6BF820, -1 = unknown), #6 bool. It checks the human wrapper (vfunc +0x28), the
+  vehicle wrapper (vfunc +0x30, entity at +0x10, `[entity+0xA8]` non-null, `[entity+0x1C] & 1`), else returns a
+  failed sync object; then calls 0x2B97A40(human AI at `[[human+0x10]+0x130]`, &syncObj, vehicle, seat, ...).
+- 0x2B97A40 passes **`seat - 1`** to the command constructor 0x2B9BF30 (`lea edx, [rbp-1]`), with command type 1 for
+  entity type 0x0A (car), 0x1D for 0x1B (boat). So the script seat index is 1-based (1 = driver); script seat 0
+  becomes -1 and the command never completes. The bool #4 is passed inverted (`sete cl`).
+- Practical use and the traps around it (fixed cars, cars the player drove): docs/game-api.md 7.
+
 **Simplest robust route for co-op:** drive all of these by **executing Lua text** in the main state. These are
 exactly the calls the mission scripts make. For example:
 `local p = game.game:GetActivePlayer(); local v = p:GetPos()`.

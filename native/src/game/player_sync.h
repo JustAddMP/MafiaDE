@@ -21,7 +21,9 @@ public:
     static void Attach(net::Session& session);  // session created: registers the message handler
     static void Detach();                        // session gone: all puppets are removed
     static void OnPlayerLeft(net::PlayerId id);
-    static void Tick(float dt);                  // sends the local state at 20 Hz while the session is active
+    // Sends the local state at 20 Hz while the session is active. enterDown: the enter-vehicle key/button is held
+    // in our focused window (E / pad Y; a press next to a car another player drives rides along as passenger).
+    static void Tick(float dt, bool enterDown);
     static void GetStatus(std::vector<render::OverlayLine>& out);
 };
 
