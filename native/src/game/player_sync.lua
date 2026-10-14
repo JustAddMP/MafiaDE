@@ -29,13 +29,16 @@ local function try(what, f, ...)
   return a, b
 end
 
--- The active player exists from boot (also in the main menu, at the origin); only count it while in the world.
+-- The active player exists from boot: at the origin before the menu, at (-20, -20, 0) and invisible in the main
+-- menu (whose 3D scene runs scripts). Only count it while a save is loaded and we are not in the menu.
 function M.Player()
   local p = game.game:GetActivePlayer()
   if not p then return nil end
   local pos = p:GetPos()
   if pos.x * pos.x + pos.y * pos.y < 1 then return nil end
   if game.hud:IsLoadingScreenUp() then return nil end
+  local good, menu = pcall(game.game.GetIs3DMenu, game.game)
+  if good and menu then return nil end
   return p
 end
 
@@ -313,7 +316,7 @@ function M.Update(dt, cmds)
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
     local op = f[1]
-    if op == "T" then
+    if op == "T" and player then  -- no puppets until we are in the world ourselves
       local id = f[2]
       local pp = M.pup[id]
       if not pp then

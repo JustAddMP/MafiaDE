@@ -43,7 +43,7 @@ game's own Lua uses. Lua is Havok Script, Lua 5.1 syntax, **numbers are 32-bit f
 
 | what | call | notes |
 |---|---|---|
-| player | `game.game:GetActivePlayer()` | non-nil already in the main menu (at the origin): treat "x²+y² < 1" or `game.hud:IsLoadingScreenUp()` as "not in world" |
+| player | `game.game:GetActivePlayer()` | non-nil from boot: at the origin before the menu, at (-20, -20, 0) and invisible (`IsModelVisible()` false) in the main menu, whose 3D scene ticks scripts. "In world" = not at the origin, `not game.hud:IsLoadingScreenUp()` and `not game.game:GetIs3DMenu()` (true in the main menu, false in the world). `game.game:GetLoadedSaveId()` is `"!none!"` in the menu and e.g. `checkpoint_mm_110_omerta_cp_020` in the world |
 | position / heading | `p:GetPos()`, `p:GetDir()` | dir is a unit vector (z ~ 0 on foot) |
 | set position / heading | `p:SetPos(v)`, `p:SetDir(v)` | instant (teleport). Works for the player, humans and cars |
 | velocity | not exposed for humans | `p:GetMoveDir()` is zero when not driven by input; we differentiate positions |

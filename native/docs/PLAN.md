@@ -58,7 +58,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
    Thompson needs a model that accepts it.
 - [ ] **Faster first spawn**: puppet factory currently takes ~20 s if the other game is still loading; retry
    sooner / prepare the factory at world load.
-- [ ] Bug: at the main menu player-sync claims "in world" and queues puppets before a save is loaded.
+- [x] Bug: at the main menu player-sync claims "in world" and queues puppets before a save is loaded.
 
 ### B. Phase 4 — shared world (the campaign in co-op)
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.
