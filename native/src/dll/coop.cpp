@@ -209,8 +209,9 @@ void LogPlayers() {
     State& s = S();
     if (!s.session) return;
     for (const auto& p : s.session->Players()) {
-        MC_LOG_INFO("coop:   player %u '%s'%s%s", p.id, p.name.c_str(), p.id == net::kHostPlayer ? " (host)" : "",
-                    p.id == s.session->LocalId() ? " (you)" : "");
+        MC_LOG_INFO("coop:   player %u '%s'%s%s, model '%s'", p.id, p.name.c_str(),
+                    p.id == net::kHostPlayer ? " (host)" : "", p.id == s.session->LocalId() ? " (you)" : "",
+                    p.model.c_str());
     }
 }
 
@@ -219,6 +220,7 @@ void MakeSession(std::unique_ptr<net::Transport> transport) {
     net::SessionConfig cfg;
     cfg.modBuild = BuildNumber();
     cfg.playerName = PlayerName();
+    cfg.playerModel = core::Config::Get().GetString("model");  // character we appear as (alias or spawn profile)
     s.net = std::move(transport);
     s.session = std::make_unique<net::Session>(*s.net, cfg);
     net::Session& session = *s.session;

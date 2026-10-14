@@ -1,6 +1,7 @@
 #include "net/session.h"
 
 #include <algorithm>
+#include <cctype>
 
 #include "net/net_internal.h"
 
@@ -46,6 +47,16 @@ std::string CleanName(std::string s) {
     return s.empty() ? std::string("Player") : s;
 }
 
+// A spawn profile name ("visuals/hero/game_main_tommy_casual") or a short alias ("paulie"): letters, digits, '_',
+// '/', '.', '-' only (it ends up in a Lua command line), at most kMaxModelLen bytes; anything else gives "".
+constexpr size_t kMaxModelLen = 96;
+std::string CleanModel(std::string s) {
+    if (s.size() > kMaxModelLen) return {};
+    for (char c : s)
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '/' || c == '.' || c == '-')) return {};
+    return s;
+}
+
 uint32_t NowMs() { return static_cast<uint32_t>(Now() * 1000.0); }
 
 }  // namespace
@@ -81,7 +92,7 @@ bool Session::Host(uint16_t port) {
     }
     state_ = SessionState::Hosting;
     localId_ = kHostPlayer;
-    players_.push_back({kHostPlayer, cfg_.playerName, kInvalidPeer, 0});
+    players_.push_back({kHostPlayer, cfg_.playerName, CleanModel(cfg_.playerModel), kInvalidPeer, 0});
     Log(kInfo, "session: hosting (%s), protocol %u build %u", transport_.Name(), cfg_.protocolVersion, cfg_.modBuild);
     return true;
 }
@@ -207,6 +218,7 @@ void Session::OnEvent(const Event& e) {
             w.U32(cfg_.protocolVersion);
             w.U32(cfg_.modBuild);
             w.Str(cfg_.playerName);
+            w.Str(CleanModel(cfg_.playerModel));
             SendRaw(hostPeer_, w, Reliability::Reliable);
             helloSentAt_ = Now();
             break;
@@ -249,6 +261,7 @@ void Session::HostOnHello(PeerId peer, ByteReader& r) {
     uint32_t proto = r.U32();
     uint32_t build = r.U32();
     std::string name = r.Str(256);
+    std::string model = r.Str(kMaxModelLen);
     if (!r.Ok() || magic != kHelloMagic) {
         Reject(peer, kRejectBadHello, "invalid handshake");
         return;
@@ -275,7 +288,7 @@ void Session::HostOnHello(PeerId peer, ByteReader& r) {
         return;
     }
     pending_.erase(peer);
-    PlayerInfo info{id, CleanName(name), peer, 0};
+    PlayerInfo info{id, CleanName(name), CleanModel(model), peer, 0};
     players_.push_back(info);
     std::sort(players_.begin(), players_.end(), [](const PlayerInfo& a, const PlayerInfo& b) { return a.id < b.id; });
 
@@ -287,6 +300,7 @@ void Session::HostOnHello(PeerId peer, ByteReader& r) {
     for (auto& p : players_) {
         w.U8(p.id);
         w.Str(p.name);
+        w.Str(p.model);
     }
     SendRaw(peer, w, Reliability::Reliable);
 
@@ -294,6 +308,7 @@ void Session::HostOnHello(PeerId peer, ByteReader& r) {
     j.U8(kPeerJoined);
     j.U8(id);
     j.Str(info.name);
+    j.Str(info.model);
     BroadcastRaw(j, Reliability::Reliable, id);
     Log(kInfo, "session: player %u '%s' joined (peer %llu)", id, info.name.c_str(), static_cast<unsigned long long>(peer));
     if (onPlayerJoined) onPlayerJoined(info);
@@ -400,6 +415,7 @@ void Session::GuestOnMessage(ByteReader& r) {
                 PlayerInfo p;
                 p.id = r.U8();
                 p.name = r.Str(kMaxNameLen * 4);
+                p.model = CleanModel(r.Str(kMaxModelLen));
                 p.peer = p.id == kHostPlayer ? hostPeer_ : kInvalidPeer;
                 list.push_back(std::move(p));
             }
@@ -425,6 +441,7 @@ void Session::GuestOnMessage(ByteReader& r) {
             PlayerInfo p;
             p.id = r.U8();
             p.name = r.Str(kMaxNameLen * 4);
+            p.model = CleanModel(r.Str(kMaxModelLen));
             if (!r.Ok() || FindPlayer(p.id)) return;
             players_.push_back(p);
             std::sort(players_.begin(), players_.end(),

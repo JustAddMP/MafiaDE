@@ -15,7 +15,7 @@
 namespace mc::net {
 
 // Bump when the session or any app message format changes incompatibly.
-constexpr uint32_t kProtocolVersion = 3;
+constexpr uint32_t kProtocolVersion = 4;
 
 using PlayerId = uint8_t;
 constexpr PlayerId kHostPlayer = 0;
@@ -26,6 +26,7 @@ constexpr int kMaxPlayers = 4;
 struct PlayerInfo {
     PlayerId id = kNoPlayer;
     std::string name;
+    std::string model;           // character the player appears as (spawn profile; "" = default for his id)
     PeerId peer = kInvalidPeer;  // host: transport peer of that guest; guest: host's peer for id 0, else 0
     float rttMs = 0;             // to the host (host's own entry: 0)
 };
@@ -34,6 +35,7 @@ struct SessionConfig {
     uint32_t protocolVersion = kProtocolVersion;
     uint32_t modBuild = 0;
     std::string playerName = "Player";
+    std::string playerModel;  // spawn profile we appear as, sent in Hello ("" = default by player id)
     int maxPlayers = kMaxPlayers;
     double pingIntervalS = 1.0;
     double helloTimeoutS = 5.0;   // host: drop a connection that has not sent Hello

@@ -56,7 +56,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
    ownership" (car keys, CarParked 0x0101).
 - [x] **Crouch, aim direction, firing, reload** shown on puppets; health synced. Done: debug AI commands
    (game-api.md 10); aim input read from RMB/left trigger; panel health column not checked in a capture.
-- [ ] **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
+- [ ] (in progress, untested code on main) **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
    owner), deaths/respawn; ramming.
 - [ ] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it.

@@ -5,12 +5,15 @@
 -- Input (cmds, one line per command):
 --   L id host                                                                    our own player id, 1 = we host
 --                                                                                (sent every tick while a session runs)
---   Q id profile                                                                 a remote player is in the session
+--   Q id model                                                                   a remote player is in the session
 --                                                                                (load his model before he shows up)
---   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az
---                                                                                remote player target
+--   T id model x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
+--                                                                                remote player target (model: spawn
+--                                                                                profile or alias, M.Profile)
 --   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
 --   W time flow weather                                                          the host's time of day and weather
+--   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
+--   M model                                                                      our own model (alias/profile, "" = keep)
 --   E                                                                            enter key pressed (ride along)
 --   A                                                                            aim input held (RMB / left trigger)
 --   R id                                                                         remove that puppet
@@ -20,7 +23,8 @@
 --             aim reload shots ax ay az" or ""
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
---            "WE time flow weather" (host: time of day and weather, every few seconds and on change)
+--            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
+--            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit)
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -37,11 +41,30 @@ M.localId = M.localId or "0"
 M.events = {}
 M.shots = M.shots or 0  -- shots the local player fired (mod 256), counted from his ammo
 M.env = M.env or {}
+M.hitq = M.hitq or {}   -- hits on puppets by the local player, filled by the DAMAGE event callbacks
 
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 local MODES = { [0] = "WALK", [1] = "WALK", [2] = "RUN", [3] = "SPRINT" }
 local MAX_CARS = 12  -- shared car copies kept on this machine (the oldest unused parked copy goes first)
+-- Damage (docs/game-api.md 11). Puppets are NOT demigods: a demigod human gets no DAMAGE events. They take damage
+-- like any NPC, so their own hit reactions play, and their health is topped up so they never die from it.
+local PUP_HEALTH = 5000
+local DOWN_HEALTH = 12     -- guest: at or below this the player is "downed" instead of dying (respawned near the host)
+local DOWN_TIME = 5        -- s on the ground before the respawn
+local SHIELD_TIME = 0.6    -- s the local player ignores damage after a puppet fired at him (that shot is only a picture)
+-- Characters by alias. Player models are spawn profiles (C_String for the spawner, tohashname() for the player);
+-- "tommy" = the outfit of the loaded checkpoint (mm_spawn_profiles), like the story would dress him.
+M.MODELS = {
+  salieri = "visuals/temp/young_salieri",
+  morello = "visuals/temp/young_morello",
+  thug = "visuals/temp/trailer_thug",
+  tommy_suit = "visuals/hero/game_main_tommy_gangster_suit_2_hat",
+  tommy_casual = "visuals/hero/game_main_tommy_casual",
+  tommy_cab = "visuals/hero/game_main_tommy_cab_driver_flatcap",
+  tommy_racing = "visuals/hero/game_main_tommy_racing_outfit",
+  tommy_sailor = "visuals/hero/game_main_tommy_sailor",
+}
 
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -64,6 +87,17 @@ function M.Player()
   local good, menu = pcall(game.game.GetIs3DMenu, game.game)
   if good and menu then return nil end
   return p
+end
+
+-- The spawn profile for a model alias or profile name. "tommy" (or "") = what the loaded checkpoint dresses Tommy in.
+function M.Profile(model)
+  if model and model:find("/") then return model end
+  local p = model and M.MODELS[model]
+  if p then return p end
+  local save = game.game:GetLoadedSaveId() or ""
+  local mission, cp = save:match("checkpoint_(mm_[%w_]-)_(cp_%d+)")
+  local t = mission and mm_spawn_profiles and mm_spawn_profiles[mission]
+  return (t and t[cp]) or FACTORY_PROFILE
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -152,10 +186,13 @@ function M.SpawnTick()
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
     so:SetDir(V(pp.hx, pp.hy, 0))
     so:Activate()
-    try("SetDemigod", so.SetDemigod, so, true)
+    try("SetDemigod", so.SetDemigod, so, false)
     try("EnableInjury", so.EnableInjury, so, false)
-    pcall(function() so.invulnerability = true end)
+    pcall(function() so.invulnerability = false end)
+    pcall(function() so.health = PUP_HEALTH end)
     try("DespawnImmunity", so.DespawnImmunity, so, true)
+    M.WatchPuppet(pp, so)
+    pp.deadShown = nil
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
     pp.seatTries, pp.exitSo = 0, nil
     pp.cb = nil
@@ -428,6 +465,11 @@ function M.Weapon(pp)
     return
   end
   if not so:InventoryHaveWeapon(w) then try("InventoryAddWeapon", so.InventoryAddWeapon, so, w, 60) end
+  -- A civilian archetype has no slot for big weapons (Tommy gun, shotgun, rifle): InventoryAddWeapon ignores them,
+  -- the debug inventory helper puts them in anyway (docs/game-api.md 6).
+  if not so:InventoryHaveWeapon(w) then
+    try("HelperInventory_AddWeapon", so.DbgTesting_HelperInventory_AddWeapon, so, w, 60)
+  end
   try("InventorySelect", so.InventorySelect, so, w, false, true)
 end
 
@@ -548,7 +590,13 @@ function M.Combat(pp)
   if c.op then return end
   if pending > 0 and armed and c.aim and M.now - c.aimT > 0.15 then
     local ammo = so:DbgTesting_HelperFire_GetAmmoCountInEquipedWeapon() or 0
-    if ammo < 2 then try("InventoryAddWeapon", so.InventoryAddWeapon, so, pp.weapon, 60) end  -- refills the clip
+    if ammo < 2 then  -- refill the clip
+      try("InventoryAddWeapon", so.InventoryAddWeapon, so, pp.weapon, 60)
+      if (so:DbgTesting_HelperFire_GetAmmoCountInEquipedWeapon() or 0) < 2 then
+        try("HelperInventory_AddWeapon", so.DbgTesting_HelperInventory_AddWeapon, so, pp.weapon, 60)
+      end
+    end
+    M.ShieldFromShot(so, dx, dy, dz)
     try("ShootReload", so.DbgTesting_ShootReload, so, true, false, 0)
     c.so, c.t, c.op = so:DbgTesting_SemaphoreNextFrame(), M.now, "press"
     c.shots = (c.shots + 1) % 256
@@ -568,6 +616,7 @@ end
 function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
+  if M.PuppetLife(pp) then return end
   if pp.veh then
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
@@ -668,6 +717,174 @@ function M.RemoveAll()
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
+-- Damage between players (docs/protocol.md "Phase 6"). Puppets are only pictures: when the local player shoots,
+-- punches or rams one, its DAMAGE event (RegisterEvent(ctx, fn, EventType.HUMAN, HumanMessages.DAMAGE), called as
+-- fn(ctx, C_DamageMessage)) becomes a Hit for that player, whose own game applies it to the real player
+-- (DoDamage). The puppet's health is topped up; it only dies when its player is dead or downed.
+-- ---------------------------------------------------------------------------------------------------------------
+local function guidStr(o)
+  if not valid(o) then return nil end
+  local good, g = pcall(o.GetGUID, o)
+  return good and tostring(g) or nil
+end
+
+-- Is the entity with this GUID (tostring of a C_EntityGuid) the local player, or the car he sits in (rams)?
+function M.IsLocalAttacker(g)
+  local p = game.game:GetActivePlayer()
+  if not g or not p then return false end
+  if g == guidStr(p) then return true end
+  local car = p:GetOwner()
+  if car and g == guidStr(car) then return true end
+  if M.testAttacker and g == guidStr(M.testAttacker) then return true end  -- tests: an NPC stands in for us
+  return false
+end
+
+function M.OnPuppetDamage(ctx, m)
+  local pp = M.pup[ctx.id]
+  if not pp or not valid(pp.so) or not m then return end
+  local enemy = tostring(m:GetEnemyGUID())
+  local amount = tonumber(m:GetDamageAmount()) or 0
+  local dtype, zone = tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0
+  local weapon = tonumber(m:GetWeaponID()) or 0
+  if not M.IsLocalAttacker(enemy) then
+    pp.otherHits = (pp.otherHits or 0) + 1
+    if pp.otherHits <= 3 then
+      log(string.format("puppet %s hit by %s (not us): %.1f type %d, ignored", pp.id, enemy, amount, dtype))
+    end
+    return
+  end
+  if not M.friendlyFire then return end
+  local p = game.game:GetActivePlayer()
+  local a, b = p:GetPos(), pp.so:GetPos()
+  local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+  local l = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if l > 1e-3 then dx, dy, dz = dx / l, dy / l, dz / l else dx, dy, dz = 0, 1, 0 end
+  M.hitq[#M.hitq + 1] = string.format("HT %s %.2f %d %d %.0f %.3f %.3f %.3f", pp.id, amount, dtype, zone, weapon,
+    dx, dy, dz)
+  M.hitsSent = (M.hitsSent or 0) + 1
+  if M.hitsSent <= 30 or M.hitsSent % 50 == 0 then
+    log(string.format("we hit puppet %s: %.1f type %d zone %d weapon %.0f (hit #%d)", pp.id, amount, dtype, zone,
+      weapon, M.hitsSent))
+  end
+end
+
+function M.WatchPuppet(pp, so)
+  local good, id = pcall(so.RegisterEvent, so, { id = pp.id }, function(ctx, m)
+    local ok, err = pcall(M.OnPuppetDamage, ctx, m)
+    if not ok then log("damage event error: " .. tostring(err)) end
+  end, enums.EventType.HUMAN, enums.HumanMessages.DAMAGE)
+  if not good or not tonumber(id) or tonumber(id) < 0 then
+    log("puppet " .. pp.id .. ": could not watch its damage (" .. tostring(id) .. ")")
+  end
+end
+
+-- Puppet health and death, every tick before driving it. True while the puppet is (being made) dead.
+function M.PuppetLife(pp)
+  local so = pp.so
+  local dead = so:IsDeath()
+  if (pp.health or 100) <= 0 then  -- its player is dead or downed: so is the puppet
+    if not dead and not pp.deadShown then
+      pcall(so.DoDamage, so, PUP_HEALTH * 100)
+      log("puppet " .. pp.id .. ": its player is down, the puppet dies")
+    end
+    pp.deadShown = true
+    return true
+  end
+  if dead then  -- its player is back (respawned, checkpoint), or something killed it here: a fresh puppet
+    log("puppet " .. pp.id .. ": " .. (pp.deadShown and "its player is back, respawning it" or "died here, respawning it"))
+    local f = M.fac
+    if f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, so) end
+    pp.so, pp.st, pp.deadShown = nil, "queued", nil
+    return true
+  end
+  if (tonumber(so.health) or 0) < PUP_HEALTH * 0.75 then pcall(function() so.health = PUP_HEALTH end) end
+  return false
+end
+
+-- A puppet fired: when the shot passes near the local player, he ignores damage for a moment. That bullet is only
+-- the picture of the remote player's shot; if it hit us on his screen, his game sends the Hit.
+function M.ShieldFromShot(so, dx, dy, dz)
+  local p = M.Player()
+  if not p then return end
+  local a, b = so:GetPos(), p:GetPos()
+  local rx, ry, rz = b.x - a.x, b.y - a.y, (b.z + 1.2) - (a.z + 1.4)
+  local l = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if l < 1e-3 then return end
+  dx, dy, dz = dx / l, dy / l, dz / l
+  local t = rx * dx + ry * dy + rz * dz
+  if t < -1 or t > 200 then return end
+  local ex, ey, ez = rx - t * dx, ry - t * dy, rz - t * dz
+  if ex * ex + ey * ey + ez * ez < 2.5 * 2.5 then M.shieldUntil = M.now + SHIELD_TIME end
+end
+
+-- A Hit from another player: the game's own damage call on the real player. A guest is never killed by it (he is
+-- downed instead, M.DownTick); the host dies like in single player (YOU DIED, load the last checkpoint).
+function M.ApplyHit(p, from, amount, dtype, zone, weapon)
+  if M.down or p:IsDeath() then return end
+  local h0 = tonumber(p.health) or 0
+  local raw = amount
+  if not M.isHost then raw = math.min(raw, math.max(0, (h0 - 1) / (M.dmgScale or 2))) end
+  if raw <= 0 then return end
+  pcall(p.DoDamage, p, raw)
+  local h1 = tonumber(p.health) or h0
+  if raw > 0.5 and h0 - h1 > 0 then M.dmgScale = (h0 - h1) / raw end  -- the game scales damage (difficulty)
+  M.hitsTaken = (M.hitsTaken or 0) + 1
+  if M.hitsTaken <= 30 or M.hitsTaken % 50 == 0 then
+    log(string.format("hit by player %s: %.1f type %d zone %d weapon %s, health %.1f -> %.1f", from, amount, dtype,
+      zone, tostring(weapon), h0, h1))
+  end
+end
+
+-- Guest only: instead of dying (the YOU DIED screen would reload his own game) the player is downed at low health:
+-- invulnerable, controls locked, reported with health 0 (his puppets die), and after DOWN_TIME respawned behind the
+-- host's puppet with full health (HealByMedkit).
+function M.DownTick(p)
+  if M.isHost or not M.inSession then M.down = nil; return end
+  local h = tonumber(p.health) or 100
+  if not M.down then
+    if h <= DOWN_HEALTH and not p:IsDeath() then
+      M.down = { t = M.now }
+      try("LockControls", p.LockControls, p, true)
+      log(string.format("we are down (health %.1f), respawning in %d s", h, DOWN_TIME))
+    end
+    return
+  end
+  if M.now - M.down.t < DOWN_TIME then return end
+  local host = M.pup["0"]
+  local near = host and host.tx and not p:GetOwner()
+  if near then
+    p:SetPos(V(host.tx - (host.hx or 0) * 1.5, host.ty - (host.hy or 1) * 1.5, host.tz + 0.2))
+    p:SetDir(V(host.hx or 0, host.hy or 1, 0))
+  end
+  try("HealByMedkit", p.HealByMedkit, p)
+  try("LockControls", p.LockControls, p, false)
+  M.down = nil
+  M.shieldUntil = M.now + 2  -- a moment to get up
+  log("respawned " .. (near and "next to the host" or "in place"))
+end
+
+-- Our demigod flag: on while shielded or downed, off otherwise (only switched off again if we switched it on).
+function M.DemigodTick(p)
+  local want = M.down ~= nil or M.now < (M.shieldUntil or 0)
+  if want ~= (M.demi or false) then
+    try("SetDemigod", p.SetDemigod, p, want)
+    M.demi = want
+  end
+end
+
+-- Our own character: the player's spawn profile is switched once per loaded save when a model is set ("tommy" or
+-- "" = leave him as the story dresses him).
+function M.ModelTick(p)
+  if not M.myModel or M.myModel == "" or M.myModel == "tommy" then return end
+  local key = (game.game:GetLoadedSaveId() or "") .. "|" .. M.myModel
+  if M.modelKey == key then return end
+  M.modelKey = key
+  local prof = M.Profile(M.myModel)
+  local good, err = pcall(p.SwitchPlayerSpawnProfile, p, tohashname(prof))
+  log("our model: " .. prof .. (good and "" or (" failed: " .. tostring(err))))
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
 -- Local player sample
 -- ---------------------------------------------------------------------------------------------------------------
 -- Shots are counted from the ammo in the weapon in hand: a drop while the same weapon stays selected is a shot
@@ -693,7 +910,7 @@ function M.Sample(aimInput)
   local pos, d = p:GetPos(), p:GetDir()
   local sprint = p:IsSprinting() and 1 or 0
   local crouch = (p:IsStalkMove() or p:IsCoverCrouch()) and 1 or 0
-  local health = tonumber(p.health) or 0
+  local health = M.down and 0 or tonumber(p.health) or 0
   local weapon = p:InventoryGetSelected() or ""
   if weapon == "" or weapon == "empty" then weapon = "-" end
   local my = M.my
@@ -778,6 +995,7 @@ function M.Update(dt, cmds)
     M.inWorldAt = nil
   end
   local enter, aimInput, active, host, env = false, false, false, false, nil
+  local hits = {}
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -785,11 +1003,11 @@ function M.Update(dt, cmds)
     if op == "T" and player then  -- no puppets until we are in the world ourselves
       local id = f[2]
       local pp = M.pup[id]
-      if pp and pp.profile ~= f[3] then M.Remove(id); pp = nil end
+      if pp and pp.model ~= f[3] then M.Remove(id); pp = nil end
       if not pp then
-        pp = { id = id, st = "queued", profile = f[3] }
+        pp = { id = id, st = "queued", model = f[3], profile = M.Profile(f[3]) }
         M.pup[id] = pp
-        log("puppet " .. id .. " queued (" .. f[3] .. ")")
+        log("puppet " .. id .. " queued (" .. f[3] .. ": " .. pp.profile .. ")")
       end
       pp.tx, pp.ty, pp.tz = tonumber(f[4]), tonumber(f[5]), tonumber(f[6])
       pp.hx, pp.hy = tonumber(f[7]), tonumber(f[8])
@@ -804,11 +1022,12 @@ function M.Update(dt, cmds)
       pp.crouch, pp.aim, pp.reload = f[24] == "1", f[25] == "1", f[26] == "1"
       pp.shots = tonumber(f[27]) or 0
       pp.ax, pp.ay, pp.az = tonumber(f[28]), tonumber(f[29]), tonumber(f[30])
+      pp.health = tonumber(f[31]) or 100
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
       if not M.pup[f[2]] then
-        M.pup[f[2]] = { id = f[2], st = "queued", profile = f[3] }
+        M.pup[f[2]] = { id = f[2], st = "queued", model = f[3], profile = M.Profile(f[3]) }
         log("puppet " .. f[2] .. " queued ahead (" .. f[3] .. ")")
       end
     elseif op == "K" then
@@ -818,6 +1037,11 @@ function M.Update(dt, cmds)
     elseif op == "L" then
       M.localId = f[2] or M.localId
       active, host = true, f[3] == "1"
+      M.friendlyFire = f[4] ~= "0"
+    elseif op == "H" then
+      hits[#hits + 1] = f
+    elseif op == "M" then
+      M.myModel = f[2] or ""
     elseif op == "W" then
       env = { tonumber(f[2]), tonumber(f[3]), f[4] }
     elseif op == "E" then
@@ -843,6 +1067,22 @@ function M.Update(dt, cmds)
       local good, err = pcall(M.EnvGuest, env[1], env[2], env[3])
       if not good then log("env error: " .. tostring(err)) end
     end
+  end
+  M.isHost, M.inSession = host, active
+  if player then
+    for _, h in ipairs(hits) do
+      local good, err = pcall(M.ApplyHit, player, h[2], tonumber(h[3]) or 0, tonumber(h[4]) or 0, tonumber(h[5]) or 0, h[6])
+      if not good then log("hit error: " .. tostring(err)) end
+    end
+    local good, err = pcall(M.DownTick, player)
+    if not good then log("down error: " .. tostring(err)) end
+    pcall(M.DemigodTick, player)
+    if active then
+      good, err = pcall(M.ModelTick, player)
+      if not good then log("model error: " .. tostring(err)) end
+    end
+  elseif M.down then
+    M.down, M.demi = nil, nil  -- world unloaded (checkpoint, menu): our flags went with the old player
   end
   if player then
     M.FactoryTick(dt, need)
@@ -878,6 +1118,8 @@ function M.Update(dt, cmds)
     local good, s = pcall(M.Sample, aimInput)
     if good then sample = s else log("sample error: " .. tostring(s)) end
   end
+  for _, h in ipairs(M.hitq) do M.events[#M.events + 1] = h end
+  M.hitq = {}
   return sample, M.fac.st .. "|" .. table.concat(st, ";") .. "|" .. nc, table.concat(M.events, "\n")
 end
 

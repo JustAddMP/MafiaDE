@@ -25,6 +25,7 @@ namespace {
 constexpr uint16_t kMsgPlayerState = 0x0100;
 constexpr uint16_t kMsgCarParked = 0x0101;
 constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
+constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
 constexpr uint8_t kStateVersion = 3;
 constexpr double kSendInterval = 0.05;      // 20 Hz
 constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
@@ -33,12 +34,10 @@ constexpr size_t kMaxSnaps = 64;
 
 enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16 };
 
-const char* const kProfiles[] = {
-    "visuals/hero/game_main_tommy_gangster_trenchcoat",
-    "visuals/hero/game_main_tommy_gangster_suit_2_hat",
-    "visuals/hero/game_main_tommy_cab_driver_flatcap",
-    "visuals/hero/game_main_tommy_racing_outfit",
-};
+// Default character per player id (aliases resolved by the Lua glue, M.MODELS / M.Profile): the host stays Tommy as
+// the story dresses him, guests are other story characters. `model = <alias or spawn profile>` in the ini (or
+// --model) overrides it for that player; it is sent in Hello so everyone shows the same character.
+const char* const kDefaultModels[] = {"tommy", "salieri", "morello", "thug"};
 
 struct PlayerState {
     float pos[3] = {};
@@ -82,6 +81,7 @@ struct Shared {
     net::PlayerId localId = net::kNoPlayer;
     std::map<net::PlayerId, Remote> remotes;
     std::map<net::PlayerId, std::string> names;
+    std::map<net::PlayerId, std::string> models;  // from the session (Hello); "" = default by id
     std::vector<net::PlayerId> removed;
     bool removeAll = false;
     PlayerState local;
@@ -91,6 +91,7 @@ struct Shared {
     std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
     std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
     std::vector<std::string> outEnv;     // Lua -> network ("WE ..." lines, host only)
+    std::vector<std::string> outHits;    // Lua -> network ("HT ..." lines: we hit someone's puppet)
     bool isHost = false;
     bool aimDown = false;
     std::string lastWeather;  // last WorldEnv weather (for the log)
@@ -133,11 +134,20 @@ double Now() {
 
 uint32_t NowMs() { return static_cast<uint32_t>(static_cast<uint64_t>(Now() * 1000.0)); }
 
-std::string ProfileFor(net::PlayerId id) {
+std::string DefaultModel(net::PlayerId id) {
+    return kDefaultModels[id % (sizeof(kDefaultModels) / sizeof(kDefaultModels[0]))];
+}
+
+// Model shown for a remote player (under the lock): puppet_model (this machine, tests) > his Hello model > default.
+std::string ProfileFor(const Shared& sh, net::PlayerId id) {
     const std::string cfg = core::Config::Get().GetString("puppet_model");
     if (!cfg.empty()) return cfg;
-    return kProfiles[id % (sizeof(kProfiles) / sizeof(kProfiles[0]))];
+    auto it = sh.models.find(id);
+    if (it != sh.models.end() && !it->second.empty()) return it->second;
+    return DefaultModel(id);
 }
+
+bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
 
 // ---- wire ----------------------------------------------------------------------------------------------------------
 void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
@@ -273,19 +283,19 @@ PlayerState Interpolate(const Remote& rem, double now) {
     return s;
 }
 
-void AppendTarget(std::string& out, net::PlayerId id, const PlayerState& s) {
+void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s) {
     char buf[512];
     char key[32] = "-";
     const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
     if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
     std::snprintf(buf, sizeof(buf),
                   "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
-                  "%d %d %d %u %.3f %.3f %.3f\n",
-                  id, ProfileFor(id).c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
+                  "%d %d %d %u %.3f %.3f %.3f %u\n",
+                  id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
                   (s.flags & kCrouch) ? 1 : 0, (s.flags & kAim) ? 1 : 0, (s.flags & kReload) ? 1 : 0, s.shots, s.aim[0],
-                  s.aim[1], s.aim[2]);
+                  s.aim[1], s.aim[2], s.health);
     out += buf;
 }
 
@@ -367,6 +377,48 @@ void OnWorldEnv(net::PlayerId from, net::ByteReader& r) {
         MC_LOG_INFO("sync: host weather %s, time %.2f h, flow %.2f", weather.c_str(), t, flow);
         sh.lastWeather = weather;
     }
+}
+
+// ---- Hit (0x0400, reliable, attacker -> victim): the attacker's player hit the victim's puppet -----------------------
+// Lua event line: "HT victim amount dtype zone weapon dx dy dz"
+bool WriteHit(net::ByteWriter& w, const std::string& line, net::PlayerId& victim) {
+    std::istringstream in(line);
+    std::string tag;
+    unsigned v = 0;
+    float amount = 0, dir[3] = {};
+    int dtype = 0, zone = 0;
+    double weapon = 0;
+    in >> tag >> v >> amount >> dtype >> zone >> weapon >> dir[0] >> dir[1] >> dir[2];
+    if (!in || tag != "HT" || v >= net::kMaxPlayers || !std::isfinite(amount) || amount <= 0) return false;
+    victim = static_cast<net::PlayerId>(v);
+    w.U8(victim);
+    w.F32(std::min(amount, 1000.0f));
+    w.U8(static_cast<uint8_t>(std::clamp(dtype, 0, 255)));
+    w.U8(static_cast<uint8_t>(std::clamp(zone, 0, 255)));
+    w.U32(weapon >= 0 && weapon < 4294967295.0 ? static_cast<uint32_t>(weapon) : 0xFFFFFFFFu);
+    for (float f : dir) w.F32(std::isfinite(f) ? f : 0.0f);
+    return true;
+}
+
+void OnHit(net::PlayerId from, net::ByteReader& r) {
+    const net::PlayerId victim = r.U8();
+    const float amount = r.F32();
+    const uint8_t dtype = r.U8();
+    const uint8_t zone = r.U8();
+    const uint32_t weapon = r.U32();
+    float dir[3];
+    for (float& f : dir) f = r.F32();
+    if (!r.Ok() || !std::isfinite(amount) || amount <= 0 || amount > 1000) return;
+    for (float f : dir)
+        if (!std::isfinite(f)) return;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "H %u %.2f %u %u %lu %.3f %.3f %.3f\n", from, amount, dtype, zone,
+                  static_cast<unsigned long>(weapon), dir[0], dir[1], dir[2]);
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (!sh.active || victim != sh.localId || from == sh.localId) return;
+    sh.inCmds += buf;
+    MC_LOG_INFO("sync: hit by player %u: %.1f (type %u, zone %u)", from, amount, dtype, zone);
 }
 
 // ---- local sample ---------------------------------------------------------------------------------------------------
@@ -474,7 +526,13 @@ void MainTick(lua_State* L, float dt) {
         sh.removed.clear();
         if (active) {
             const double now = Now();
-            cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1\n" : " 0\n");
+            cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
+            {
+                auto mine = sh.models.find(sh.localId);
+                const std::string model =
+                    mine != sh.models.end() && !mine->second.empty() ? mine->second : DefaultModel(sh.localId);
+                cmds += "M " + model + "\n";
+            }
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
@@ -483,10 +541,10 @@ void MainTick(lua_State* L, float dt) {
             for (const auto& [id, name] : sh.names) {  // in the session but nothing received yet: preload the model
                 auto it = sh.remotes.find(id);
                 if (id != sh.localId && (it == sh.remotes.end() || it->second.snaps.empty()))
-                    cmds += "Q " + std::to_string(id) + " " + ProfileFor(id) + "\n";
+                    cmds += "Q " + std::to_string(id) + " " + ProfileFor(sh, id) + "\n";
             }
             for (auto& [id, rem] : sh.remotes) {
-                if (!rem.snaps.empty()) AppendTarget(cmds, id, Interpolate(rem, now));
+                if (!rem.snaps.empty()) AppendTarget(cmds, ProfileFor(sh, id), id, Interpolate(rem, now));
             }
         }
     }
@@ -535,6 +593,8 @@ void MainTick(lua_State* L, float dt) {
                     sh.outParked.push_back(line);
                 else if (line.rfind("WE ", 0) == 0 && sh.isHost)
                     sh.outEnv.push_back(line);
+                else if (line.rfind("HT ", 0) == 0)
+                    sh.outHits.push_back(line);
             }
         }
         if (ok) {
@@ -560,6 +620,7 @@ void PlayerSync::Attach(net::Session& session) {
     session.On(kMsgPlayerState, &OnState);
     session.On(kMsgCarParked, &OnCarParked);
     session.On(kMsgWorldEnv, &OnWorldEnv);
+    session.On(kMsgHit, &OnHit);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
@@ -572,6 +633,7 @@ void PlayerSync::Detach() {
         _session->Off(kMsgPlayerState);
         _session->Off(kMsgCarParked);
         _session->Off(kMsgWorldEnv);
+        _session->Off(kMsgHit);
     }
     _session = nullptr;
     Shared& sh = S();
@@ -586,6 +648,8 @@ void PlayerSync::Detach() {
     sh.inCmds.clear();
     sh.outParked.clear();
     sh.outEnv.clear();
+    sh.outHits.clear();
+    sh.models.clear();
     sh.lastWeather.clear();
 }
 
@@ -594,6 +658,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     std::lock_guard lock(sh.mu);
     sh.remotes.erase(id);
     sh.names.erase(id);
+    sh.models.erase(id);
     sh.removed.push_back(id);
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
 }
@@ -604,7 +669,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     const bool active = _session->IsActive();
     PlayerState local;
     bool send = false;
-    std::vector<std::string> parked, env;
+    std::vector<std::string> parked, env, hits;
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -615,6 +680,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         }
         parked.swap(sh.outParked);
         env.swap(sh.outEnv);
+        hits.swap(sh.outHits);
         sh.aimDown = aimDown && active;
         if (active != sh.active) {
             sh.active = active;
@@ -629,7 +695,11 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             sh.localId = _session->LocalId();
             sh.isHost = sh.localId == net::kHostPlayer;
             sh.names.clear();
-            for (const auto& p : _session->Players()) sh.names[p.id] = p.name;
+            sh.models.clear();
+            for (const auto& p : _session->Players()) {
+                sh.names[p.id] = p.name;
+                sh.models[p.id] = p.model;
+            }
             for (auto it = sh.remotes.begin(); it != sh.remotes.end();) {
                 if (!sh.names.count(it->first)) {  // left without an event we saw
                     sh.removed.push_back(it->first);
@@ -661,6 +731,14 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             _session->Broadcast(kMsgWorldEnv, ew.Span(), net::Reliability::Reliable);
             if (++_envSent <= 3 || _envSent % 100 == 0)
                 MC_LOG_INFO("sync: sent WorldEnv #%u (%s)", _envSent, line.c_str() + 3);
+        }
+    }
+    for (const std::string& line : hits) {
+        net::ByteWriter hw(32);
+        net::PlayerId victim = net::kNoPlayer;
+        if (active && WriteHit(hw, line, victim) && _session->FindPlayer(victim)) {
+            _session->SendTo(victim, kMsgHit, hw.Span(), net::Reliability::Reliable);
+            MC_LOG_INFO("sync: sent Hit to player %u (%s)", victim, line.c_str() + 3);
         }
     }
     if (!send) return;
