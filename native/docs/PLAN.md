@@ -21,6 +21,9 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
   capture only game windows.
 - Two instances on one PC: `out\MafiaCoop.exe --host --name Host --log host` and
   `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest`. Live Lua: F8 / `tools\devlua.ps1`.
+- When a feature lands, also update the website (C:\AI\Claude\Projects\JS\justaddmp.com): tick the matching task
+  in `app/lib/repos.ts` (Mafia entry, `progress.areas[].tasks`), add new tasks there when they're added here, refresh
+  highlights / not-synced / known issues if they changed, run `npx tsc --noEmit` and `npm run build`, commit.
 - Build with `build.cmd` (warning-free /W4); `out\net_loopback.exe` must pass. Commit on main after each tested
   step; no Claude attribution lines; push when the user asks.
 
