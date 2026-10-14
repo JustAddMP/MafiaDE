@@ -19,8 +19,8 @@ Read with `ARCHITECTURE.md` (design + clean-room rule), `protocol.md`, `re-notes
 - The game folder is read-only. Back up the save folder before in-world tests
   (`%TEMP%\claude\G--MafiaCoop\save-backup`), never start New Game, kill all game instances after a test,
   capture only game windows.
-- Two instances on one PC: `out\MafiaCoop.exe --host --name Host --log host` and
-  `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest`. Live Lua: F8 / `tools\devlua.ps1`.
+- Two instances on one PC: `out\MafiaCoop.exe --host --name Host --log host --debug-overlay` and
+  `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --debug-overlay` (the status text is hidden without it). Live Lua: F8 / `tools\devlua.ps1`.
 - When a feature lands, also update the website (C:\AI\Claude\Projects\JS\justaddmp.com): tick the matching task
   in `app/lib/repos.ts` (Mafia entry, `progress.areas[].tasks`), add new tasks there when they're added here, refresh
   highlights / not-synced / known issues if they changed, run `npx tsc --noEmit` and `npm run build`, commit.
@@ -99,7 +99,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Interest management: only stream within ~300 m of any player; bandwidth budget.
 
 ### C. Phase 5 polish (native UI)
-- [ ] Hide the debug status text by default (F7 shows it); keep banners.
+- [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.
 - [ ] Gamepad + mouse in our panels; test JOIN FRIEND and a real Steam invite with two accounts/PCs.
 - [ ] CO-OP page refreshes when a background join completes.
 - [ ] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible.

@@ -25,7 +25,7 @@ struct State {
     double sinceHeartbeat = 0.0;
     unsigned long long frames = 0;
     unsigned framesSinceHeartbeat = 0;
-    bool overlayVisible = true;
+    bool overlayVisible = false;  // the debug status text (top-left); banners and panels are drawn regardless
     bool toggleKeyDown = false;
     std::vector<render::OverlayLine> status;
     float minDt = 1e9f;
@@ -34,7 +34,7 @@ struct State {
 
 State _state;
 
-// F7 toggles the status overlay; only while one of our windows is in the foreground.
+// F7 toggles the debug status text; only while one of our windows is in the foreground.
 void PollToggleKey() {
     const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
     const bool wasDown = _state.toggleKeyDown;
@@ -46,7 +46,7 @@ void PollToggleKey() {
     GetWindowThreadProcessId(fg, &pid);
     if (pid != GetCurrentProcessId()) return;
     _state.overlayVisible = !_state.overlayVisible;
-    MC_LOG_INFO("mod: status overlay %s (F7)", _state.overlayVisible ? "shown" : "hidden");
+    MC_LOG_INFO("mod: debug status text %s (F7)", _state.overlayVisible ? "shown" : "hidden");
 }
 
 } // namespace
@@ -58,7 +58,11 @@ void Mod::Init() {
     if (_state.crashTest) {
         MC_LOG_WARN("mod: crash_test=1 -> will raise an access violation in Tick after %.0f s", _state.crashTestDelay);
     }
-    _state.overlayVisible = cfg.GetBool("overlay", true);
+    // Hidden by default for players; debug_overlay = 1 / --debug-overlay shows it from the start ("overlay" is the
+    // older name of the same key).
+    _state.overlayVisible = cfg.GetBool("debug_overlay", cfg.GetBool("overlay", false));
+    MC_LOG_INFO("mod: debug status text %s at start (F7 toggles; debug_overlay = 1 shows it)",
+                _state.overlayVisible ? "shown" : "hidden");
     Coop::Init();
     CoopUi::Init();
     MC_LOG_INFO("mod: initialized");

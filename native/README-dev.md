@@ -107,10 +107,11 @@ the launcher arguments still work.
 | `--transport udp\|steam` | Host only on that transport. With `steam`, `--join <id>` is read as a lobby id. |
 | `--name <n>` | Player name. Default: Steam persona name, else the Windows user name. |
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
+| `--debug-overlay` | Show the debug status text (top-left) from the start; F7 toggles it. Pass it in test flows whose captures are read for the status lines. |
 | `--window left\|right` | Keep the game window on the left/right half of its monitor's work area (full height, title bar kept), for watching two test instances side by side. Unset = the window is left alone. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
-`window = left|right`, `steam = 0` (no Steam at all), `overlay = 0` (start with the status panel hidden), `native_menu = 0` (no CO-OP
+`window = left|right`, `steam = 0` (no Steam at all), `debug_overlay = 1` (show the debug status text from the start; hidden by default), `native_menu = 0` (no CO-OP
 entries in the game's menus), `menu_dump = 1` (write the original and patched menu movies to `out\dev\gfx\`),
 `menu_debug = 1` (log every request from the patched menus).
 
@@ -125,20 +126,21 @@ the dll `LoadLibrary`s the game folder's `steam_api64.dll` (read-only) itself, c
 pipe to the same Steam client, the game's own Steam keeps working) and calls its `SteamAPI_RunCallbacks` every
 frame. If that fails, Steam features are off and UDP still works.
 
-**Disconnects:** no automatic reconnect. The reason is logged (`coop: disconnected: ...`), shown on the overlay
-for 20 s, and the mod goes back to idle.
+**Disconnects:** no automatic reconnect. The reason is logged (`coop: disconnected: ...`), shown in a banner (and
+for 20 s in the debug status text), and the mod goes back to idle.
 
-**Status overlay:** top-left of the game window, drawn by the dll's own D3D11 renderer (`src/render/overlay.cpp`,
+**Debug status text:** hidden by default for players; **F7** shows/hides it, `--debug-overlay` / `debug_overlay = 1`
+shows it from the start. Banners and the co-op panels are drawn either way. Top-left of the game window, drawn by the dll's own D3D11 renderer (`src/render/overlay.cpp`,
 glyphs rasterised at startup from the Windows font Bahnschrift, `src/render/ui_font.cpp`; the same renderer draws
 the co-op panels and banners): `Co-op: hosting (2 players)` or `Co-op: connected to Host - 8 ms`, then one line per player with their ping
-to the host. **F7** toggles it (only when a game window has focus). The same lines are written to the log with every
+to the host. F7 works only when a game window has focus. The same lines are written to the log with every
 10 s heartbeat (`status: ...`).
 
 ### Two instances on one PC through the menus
 
 ```
-out\MafiaCoop.exe --log host
-out\MafiaCoop.exe --log guest      (after the first window is up)
+out\MafiaCoop.exe --log host --debug-overlay
+out\MafiaCoop.exe --log guest --debug-overlay      (after the first window is up)
 ```
 
 Host window: Enter at the title, CO-OP > HOST CO-OP GAME. Guest window: Enter at the title, CO-OP > JOIN BY IP,
@@ -149,8 +151,8 @@ LEAVE CO-OP ends it (the other side gets a "Disconnected" banner).
 ### Two instances on one PC (gate test, launcher arguments)
 
 ```
-out\MafiaCoop.exe --host --name Host --log host --window left
-out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right      (after the first window is up)
+out\MafiaCoop.exe --host --name Host --log host --window left --debug-overlay
+out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right --debug-overlay      (after the first window is up)
 ```
 
 `--window left|right` puts the two windows side by side (each on half of the monitor's work area; the dll moves the
@@ -196,7 +198,7 @@ the session ends.
 
 On foot, puppets also crouch, aim (right mouse button / pad left trigger with a gun in hand, in the camera's
 direction) and fire a real shot (flash and sound, no damage yet) for every shot the player fires, and play a reload.
-Health is synced: shown on the overlay line (verified) and in the pause menu's CO-OP panel (`HEALTH n` next to each
+Health is synced: shown on the debug status line (verified) and in the pause menu's CO-OP panel (`HEALTH n` next to each
 player; not checked in a capture yet).
 The puppet factory is prepared as soon as the local player is in the world with a session running, and the model of
 a player who is still loading is loaded ahead, so his puppet appears with his first state.
@@ -204,7 +206,7 @@ a player who is still loading is loaded ahead, so his puppet appears with his fi
 **Weather and time of day:** the host's game is the clock. The host sends its time of day, time flow speed and weather
 set (WorldEnv, docs/protocol.md) every 4 s and at once on a change; guests apply them.
 
-The overlay shows `Sync: in world, puppet factory ready, 1 shared car(s)` and one line per remote player
+The debug status text (`--debug-overlay` or F7) shows `Sync: in world, puppet factory ready, 1 shared car(s)` and one line per remote player
 (`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago, health 100, crouch, aim` = state, metres off the target, receive
 rate, age of the newest snapshot, his health and stance; `alive/seat0` = sitting in seat 0 of a car,
 `alive/veh-hidden` = in a car but not seated). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
@@ -217,9 +219,9 @@ one PC). Set `background_run = 0` to get the original pause-on-alt-tab.
 
 1. Back up the save folder first (`%USERPROFILE%\Documents\My Games\Mafia Definitive Edition`, OneDrive-redirected
    on some PCs) and never pick "New Game".
-2. `out\MafiaCoop.exe --host --name Host --log host --window left`; at the title press Enter, then Enter on **Continue**, then Enter
+2. `out\MafiaCoop.exe --host --name Host --log host --window left --debug-overlay`; at the title press Enter, then Enter on **Continue**, then Enter
    when the loading screen says "Continue".
-3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right`, same three Enters.
+3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right --debug-overlay`, same three Enters.
 4. Both stand at the save's spawn point; each sees the other's puppet next to them. Move one player and watch the
    other window (`tools\devlua.ps1` can teleport/step the player: see the test snippets below).
 5. `taskkill /IM mafiadefinitiveedition.exe /F`.
