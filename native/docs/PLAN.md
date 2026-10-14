@@ -105,6 +105,14 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible.
 - [ ] Settings page (name, show tags, debug overlay).
 
+- [ ] **Session password**: the host can set an optional password (CO-OP page: "Set password", reusing the text box
+  from Join by IP; ini `password=`). Joining a passworded game prompts for it. Never sent in plain text: the host
+  sends a random challenge after Hello and the guest answers with HMAC-SHA256(password, challenge) via Windows
+  BCrypt (no extra libraries); wrong answers get Reject "wrong password", with a short delay and a per-address attempt
+  limit. Steam invites from the host skip the password by default (option to require it anyway). The pause-menu
+  panel shows a lock icon when a password is set. Protocol version bump; loopback tests for right/wrong/missing
+  password and the attempt limit.
+
 ### D. Release / distribution
 - [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
    a version constant, not the build hash.
