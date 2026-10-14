@@ -31,6 +31,7 @@ constexpr double kSendInterval = 0.05;      // 20 Hz
 constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
 constexpr double kMaxExtrapolate = 0.25;    // then hold
 constexpr size_t kMaxSnaps = 64;
+constexpr size_t kMaxInCmds = 64 * 1024;  // network -> Lua lines kept while the script tick does not run (paused)
 
 enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16 };
 
@@ -66,6 +67,9 @@ struct Snap {
 
 struct Remote {
     std::deque<Snap> snaps;
+    int64_t clockMs = 0;  // sender clock unwrapped from its 32-bit wire value (wraps every 49.7 days of uptime)
+    uint32_t lastRawMs = 0;
+    bool haveClock = false;
     double offset = 0;  // local clock - sender clock (smoothed toward the minimum)
     bool haveOffset = false;
     double lastRecv = 0;
@@ -174,6 +178,33 @@ void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
     }
 }
 
+// A remote string that becomes one whitespace-separated field of a Lua command line: printable ASCII, no spaces.
+// Anything else could split the field or start a new command line (a weapon "x\nH ..." would forge a hit).
+bool Token(const std::string& s) {
+    for (unsigned char c : s)
+        if (c <= 0x20 || c >= 0x7F) return false;
+    return true;
+}
+
+constexpr float kMaxCoord = 1e6f;  // metres; the map is a few km across
+constexpr float kMaxSpeed = 1e3f;  // m/s
+
+bool InRange(const float* v, int n, float lim) {
+    for (int i = 0; i < n; ++i)
+        if (!(std::fabs(v[i]) <= lim)) return false;
+    return true;
+}
+
+// Appends a formatted command line, or nothing if it did not fit (a cut line would lose its '\n' and merge with the
+// next command) or out would grow past cap.
+template <class... A>
+void AppendLine(std::string& out, size_t cap, const char* fmt, A... args) {
+    char buf[512];
+    const int n = std::snprintf(buf, sizeof(buf), fmt, args...);
+    if (n <= 0 || static_cast<size_t>(n) >= sizeof(buf) || out.size() + static_cast<size_t>(n) > cap) return;
+    out.append(buf, static_cast<size_t>(n));
+}
+
 bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
     if (r.U8() != kStateVersion) return false;
     timeMs = r.U32();
@@ -196,9 +227,16 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
         for (float& v : s.quat) v = r.F32();
         for (float& v : s.cvel) v = r.F32();
     }
-    for (float v : s.pos) if (!std::isfinite(v)) return false;
-    for (float v : s.aim) if (!std::isfinite(v) || std::fabs(v) > 1.5f) return false;
-    return r.Ok();
+    if (!r.Ok()) return false;
+    // Everything below ends up in a Lua command line ("T ..."): one %S+ field per string, and numbers small enough
+    // that the line fits its buffer. NaN fails every !(|v| <= lim) check.
+    if (!Token(s.weapon) || !InRange(s.pos, 3, kMaxCoord) || !InRange(s.head, 2, 2) || !InRange(s.vel, 3, kMaxSpeed) ||
+        !InRange(s.aim, 3, 1.5f))
+        return false;
+    if ((s.flags & kInVehicle) && (!Token(s.model) || !InRange(s.cpos, 3, kMaxCoord) || !InRange(s.quat, 4, 2) ||
+                                   !InRange(s.cvel, 3, kMaxSpeed)))
+        return false;
+    return true;
 }
 
 void OnState(net::PlayerId from, net::ByteReader& r) {
@@ -210,7 +248,10 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     if (!sh.active || from == sh.localId) return;
     Remote& rem = sh.remotes[from];
     const double now = Now();
-    const double t = timeMs / 1000.0;
+    rem.clockMs = rem.haveClock ? rem.clockMs + static_cast<int32_t>(timeMs - rem.lastRawMs) : timeMs;
+    rem.lastRawMs = timeMs;
+    rem.haveClock = true;
+    const double t = static_cast<double>(rem.clockMs) / 1000.0;
     const double off = now - t;
     if (!rem.haveOffset || off < rem.offset) {
         rem.offset = off;
@@ -284,11 +325,10 @@ PlayerState Interpolate(const Remote& rem, double now) {
 }
 
 void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s) {
-    char buf[512];
     char key[32] = "-";
     const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
     if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
-    std::snprintf(buf, sizeof(buf),
+    AppendLine(out, SIZE_MAX,
                   "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
                   "%d %d %d %u %.3f %.3f %.3f %u\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
@@ -296,7 +336,6 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
                   (s.flags & kCrouch) ? 1 : 0, (s.flags & kAim) ? 1 : 0, (s.flags & kReload) ? 1 : 0, s.shots, s.aim[0],
                   s.aim[1], s.aim[2], s.health);
-    out += buf;
 }
 
 // "o:g" -> car key; false for "-" or garbage.
@@ -333,16 +372,12 @@ void OnCarParked(net::PlayerId from, net::ByteReader& r) {
     const std::string model = r.Str(48);
     float v[7];
     for (float& f : v) f = r.F32();
-    if (!r.Ok() || model.empty() || model.find_first_of(" \n\r\t") != std::string::npos) return;
-    for (float f : v)
-        if (!std::isfinite(f)) return;
-    char buf[256];
-    std::snprintf(buf, sizeof(buf), "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n", owner, guid, model.c_str(), v[0],
-                  v[1], v[2], v[3], v[4], v[5], v[6]);
+    if (!r.Ok() || model.empty() || !Token(model) || !InRange(v, 3, kMaxCoord) || !InRange(v + 3, 4, 2)) return;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || from == sh.localId) return;
-    sh.inCmds += buf;
+    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n", owner, guid, model.c_str(),
+               v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
     MC_LOG_INFO("sync: player %u parked car %u:%u (%s)", from, owner, guid, model.c_str());
 }
 
@@ -364,15 +399,13 @@ void OnWorldEnv(net::PlayerId from, net::ByteReader& r) {
     const float t = r.F32();
     const float flow = r.F32();
     const std::string weather = r.Str(96);
-    if (!r.Ok() || from != net::kHostPlayer || !std::isfinite(t) || !std::isfinite(flow) || t < 0 || t > 24.5f ||
-        weather.empty() || weather.find_first_of(" \n\r\t") != std::string::npos)
+    if (!r.Ok() || from != net::kHostPlayer || !std::isfinite(t) || !(std::fabs(flow) <= 1e4f) || t < 0 ||
+        t > 24.5f || weather.empty() || !Token(weather))
         return;
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "W %.4f %.4f %s\n", t, flow, weather.c_str());
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || sh.isHost) return;
-    sh.inCmds += buf;
+    AppendLine(sh.inCmds, kMaxInCmds, "W %.4f %.4f %s\n", t, flow, weather.c_str());
     if (weather != sh.lastWeather) {
         MC_LOG_INFO("sync: host weather %s, time %.2f h, flow %.2f", weather.c_str(), t, flow);
         sh.lastWeather = weather;
@@ -408,16 +441,12 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     const uint32_t weapon = r.U32();
     float dir[3];
     for (float& f : dir) f = r.F32();
-    if (!r.Ok() || !std::isfinite(amount) || amount <= 0 || amount > 1000) return;
-    for (float f : dir)
-        if (!std::isfinite(f)) return;
-    char buf[160];
-    std::snprintf(buf, sizeof(buf), "H %u %.2f %u %u %lu %.3f %.3f %.3f\n", from, amount, dtype, zone,
-                  static_cast<unsigned long>(weapon), dir[0], dir[1], dir[2]);
+    if (!r.Ok() || !std::isfinite(amount) || amount <= 0 || amount > 1000 || !InRange(dir, 3, kMaxCoord)) return;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || victim != sh.localId || from == sh.localId) return;
-    sh.inCmds += buf;
+    AppendLine(sh.inCmds, kMaxInCmds, "H %u %.2f %u %u %lu %.3f %.3f %.3f\n", from, amount, dtype, zone,
+               static_cast<unsigned long>(weapon), dir[0], dir[1], dir[2]);
     MC_LOG_INFO("sync: hit by player %u: %.1f (type %u, zone %u)", from, amount, dtype, zone);
 }
 
