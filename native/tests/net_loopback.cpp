@@ -248,6 +248,13 @@ int main(int argc, char** argv) {
     }
 
     // ---- RTT measured under 20 ms simulated one-way latency ----
+    // Ping faster for this check so the loss estimate has enough samples: with ~36% round-trip loss and only a
+    // handful of settled pings, "no ping lost" happened in about 1 run in 16.
+    for (Node* n : all) {
+        UdpOptions o = n->transport.Options();
+        o.pingIntervalS = 0.05;
+        n->transport.SetOptions(o);
+    }
     Pump(all, 2.5, nullptr);
     {
         const PlayerInfo* p = host.session.FindPlayer(id1);
@@ -257,6 +264,11 @@ int main(int argc, char** argv) {
         std::snprintf(d, sizeof(d), "session rtt %.1f ms, transport rtt %.1f ms, loss %.0f%%", p->rttMs, st.rttMs,
                       st.loss * 100);
         Check(p->rttMs > 20 && st.rttMs > 20 && st.loss > 0.05f && st.loss < 0.6f, "stats: rtt + loss reported", d);
+    }
+    for (Node* n : all) {
+        UdpOptions o = n->transport.Options();
+        o.pingIntervalS = UdpOptions{}.pingIntervalS;
+        n->transport.SetOptions(o);
     }
 
     // ---- 4. unreliable delivery (sim off) ----
