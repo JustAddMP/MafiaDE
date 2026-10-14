@@ -125,6 +125,12 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] GitHub release v0.2.0 with the new zip when the user asks.
 
 ### E. Robustness (ongoing)
+- [ ] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
+- [ ] Overlay: release the backbuffer reference after each draw; log Present/ResizeBuffers thread ids in game to confirm assumptions.
+- [ ] Steam join request: only record the lobby id in the callback and act after polling (no session reset mid-use).
+- [ ] Crash handler: don't let a first-chance stack overflow use up the one-shot dump flag.
+- [ ] Host relay rate limits for guest chat/app messages; evict oldest un-handshaken UDP connections when slots are full.
+- [ ] Launcher: require a value for keys like --password (reject "--password --x").
 - Every pattern/Lua call fails soft (log + disable feature); keep it that way.
 - Crash triage: `out\logs\crash-*.dmp` + log stack (module+offset) → symbolize with the PDBs in out\.
 - Long-session test (1 h, two instances, driving + shooting) before each release.
