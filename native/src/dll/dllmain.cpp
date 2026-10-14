@@ -39,6 +39,9 @@ LRESULT CALLBACK ModWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void SubclassWindow(HWND hwnd, bool backgroundRun) {
     _backgroundRun = backgroundRun;
     ui_input::SetWindow(hwnd);
+    // Messages can arrive on the window's thread between SetWindowLongPtr and the assignment below; ModWndProc must
+    // already have somewhere to forward them.
+    _gameWndProc = reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
     SetLastError(0);
     auto prev = reinterpret_cast<WNDPROC>(
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&ModWndProc)));
