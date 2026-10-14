@@ -30,8 +30,9 @@ interest.md).
   bridge, player sync, menus); everything game-agnostic is JustAddMP/core in the submodule `external/core`
   (`git submodule update --init` after cloning).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
-  its README.md), then bump the submodule here (`git -C external\core pull` or checkout the new commit, then commit
-  `external/core`). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
+  `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
+  tags (currently v0.1.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.

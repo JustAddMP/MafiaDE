@@ -14,7 +14,9 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
 - `src\game\lua.*`, `player_sync.*` (+ `player_sync.lua`), `menu.*`: the Lua bridge, player sync and the CO-OP
   menu entries.
 
-Generic fixes go to core first (commit there, its tests pass), then bump the submodule here (docs/PLAN.md).
+Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
+one tag (currently core v0.1.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+(docs/PLAN.md).
 
 ## Build
 
