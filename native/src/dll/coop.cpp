@@ -47,13 +47,16 @@ const char* ModeName(Mode m) {
     return "?";
 }
 
-// Hello carries this; both sides must match exactly. Derived from the build time of this file (build.cmd recompiles
-// everything on every build), so only identical builds can play together.
+// Hello carries this; both sides must match exactly. Derived from kModVersion ("1.2.3" -> 10203), so players
+// can connect whenever they run the same release. Bump kModVersion when the wire format or sync changes.
 uint32_t BuildNumber() {
-    const char* s = __DATE__ " " __TIME__;
-    uint32_t h = 2166136261u;
-    for (; *s; ++s) h = (h ^ static_cast<uint8_t>(*s)) * 16777619u;
-    return h;
+    uint32_t parts[3] = {0, 0, 0};
+    int i = 0;
+    for (const char* s = kModVersion; *s && i < 3; ++s) {
+        if (*s == '.') ++i;
+        else if (*s >= '0' && *s <= '9') parts[i] = parts[i] * 10 + static_cast<uint32_t>(*s - '0');
+    }
+    return parts[0] * 10000 + parts[1] * 100 + parts[2];
 }
 
 struct State {
@@ -327,7 +330,7 @@ void InitSteam() {
     MC_LOG_INFO("coop: Steam ready: SteamID %llu, persona '%s', app %u", static_cast<unsigned long long>(s.steamId),
                 s.persona.c_str(), api.Utils_GetAppID(api.utils));
 
-    std::string version = std::string(kModVersion) + "-" + std::to_string(BuildNumber());
+    std::string version = kModVersion;
     if (!s.lobby.Init(version, net::kProtocolVersion)) {
         s.steam = SteamState::Failed;
         return;
