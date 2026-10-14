@@ -84,7 +84,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Settings page (name, show tags, debug overlay).
 
 ### D. Release / distribution
-- [ ] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
+- [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
    a version constant, not the build hash.
 - [ ] Package: `MafiaCoop.exe` + `mafiacoop.dll` (+ README) in a zip, a few MB; `tools\make_release.cmd`.
 - [ ] Optional proxy-DLL install mode (drop-in so the game can be started from Steam) — must be opt-in because it
