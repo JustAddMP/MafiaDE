@@ -31,6 +31,7 @@ bool BuildGdi(Atlas& a) {
     HDC dc = CreateCompatibleDC(nullptr);
     if (!dc) return false;
     HFONT font = nullptr;
+    HGDIOBJ oldFont = nullptr;
     wchar_t got[LF_FACESIZE] = {};
     for (const wchar_t* face : faces) {
         HFONT f = CreateFontW(-kPx, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
@@ -40,6 +41,7 @@ bool BuildGdi(Atlas& a) {
         GetTextFaceW(dc, LF_FACESIZE, got);
         if (_wcsnicmp(got, face, wcslen(got) < wcslen(face) ? wcslen(got) : wcslen(face)) == 0 && got[0]) {
             font = f;
+            oldFont = old;
             break;
         }
         SelectObject(dc, old);
@@ -81,6 +83,7 @@ bool BuildGdi(Atlas& a) {
     void* bits = nullptr;
     HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!bmp || !bits) {
+        SelectObject(dc, oldFont);  // a font still selected into a DC cannot be deleted
         DeleteObject(font);
         DeleteDC(dc);
         return false;
@@ -122,6 +125,7 @@ bool BuildGdi(Atlas& a) {
 
     SelectObject(dc, oldBmp);
     DeleteObject(bmp);
+    SelectObject(dc, oldFont);
     DeleteObject(font);
     DeleteDC(dc);
     a.valid = true;

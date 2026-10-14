@@ -89,6 +89,7 @@ struct State {
 
     std::deque<Coop::Notice> notices;
     std::string localAddress;  // computed once
+    ULONGLONG localAddressTried = 0;  // GetTickCount64 of the last failed lookup (retried every 30 s, not per frame)
     std::string lastAddress;   // last JoinAddress target
 
     // session password (never logged)
@@ -167,6 +168,11 @@ void Notify(std::string title, std::string text, bool error = false) {
 std::string LocalAddress() {
     State& s = S();
     if (!s.localAddress.empty()) return s.localAddress;
+    // Called every frame (Coop::GetInfo): on a PC without a usable IPv4 address, getaddrinfo (which can wait on
+    // DNS/LLMNR) must not run on the render thread each frame.
+    const ULONGLONG nowMs = GetTickCount64();
+    if (s.localAddressTried && nowMs - s.localAddressTried < 30000) return {};
+    s.localAddressTried = nowMs;
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return {};
     char host[256] = {};
@@ -483,7 +489,9 @@ void Coop::Init() {
         MC_LOG_WARN("coop: unknown transport '%s' (udp|steam); using both", s.transport.c_str());
         s.transport.clear();
     }
-    s.port = static_cast<uint16_t>(cfg.GetInt("port", net::kDefaultPort));
+    const int port = cfg.GetInt("port", net::kDefaultPort);
+    if (port < 0 || port > 65535) MC_LOG_WARN("coop: port %d out of range; using %u", port, net::kDefaultPort);
+    s.port = port < 0 || port > 65535 ? net::kDefaultPort : static_cast<uint16_t>(port);
     if (!cfg.GetBool("steam", true)) s.steam = SteamState::Disabled;
     s.password = cfg.GetString("password");  // host: required; guest: used to join
     s.joinPassword = s.password;
