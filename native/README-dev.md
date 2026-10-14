@@ -94,9 +94,10 @@ the launcher arguments still work.
 | `--transport udp\|steam` | Host only on that transport. With `steam`, `--join <id>` is read as a lobby id. |
 | `--name <n>` | Player name. Default: Steam persona name, else the Windows user name. |
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
+| `--window left\|right` | Keep the game window on the left/right half of its monitor's work area (full height, title bar kept), for watching two test instances side by side. Unset = the window is left alone. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
-`steam = 0` (no Steam at all), `overlay = 0` (start with the status panel hidden), `native_menu = 0` (no CO-OP
+`window = left|right`, `steam = 0` (no Steam at all), `overlay = 0` (start with the status panel hidden), `native_menu = 0` (no CO-OP
 entries in the game's menus), `menu_dump = 1` (write the original and patched menu movies to `out\dev\gfx\`),
 `menu_debug = 1` (log every request from the patched menus).
 
@@ -135,11 +136,13 @@ LEAVE CO-OP ends it (the other side gets a "Disconnected" banner).
 ### Two instances on one PC (gate test, launcher arguments)
 
 ```
-out\MafiaCoop.exe --host --name Host --log host
-out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest      (after the first window is up)
+out\MafiaCoop.exe --host --name Host --log host --window left
+out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right      (after the first window is up)
 ```
 
-Both windows open; the games sit at the title screen. Check `out\logs\mafiacoop-host.log` for
+`--window left|right` puts the two windows side by side (each on half of the monitor's work area; the dll moves the
+window as soon as it exists and puts it back whenever the game resets its size, checked twice a second; the swap chain
+follows through the ResizeBuffers hook). Both windows open; the games sit at the title screen. Check `out\logs\mafiacoop-host.log` for
 `coop: player 1 'Guest' joined` and `out\logs\mafiacoop-guest.log` for `coop: handshake complete`, and the
 `status:` lines for pings. Both instances share one SteamID, so they can only connect over UDP; Steam P2P needs
 two accounts on two PCs. Stop with `taskkill /IM mafiadefinitiveedition.exe /F`.
@@ -190,9 +193,9 @@ one PC). Set `background_run = 0` to get the original pause-on-alt-tab.
 
 1. Back up the save folder first (`%USERPROFILE%\Documents\My Games\Mafia Definitive Edition`, OneDrive-redirected
    on some PCs) and never pick "New Game".
-2. `out\MafiaCoop.exe --host --name Host --log host`; at the title press Enter, then Enter on **Continue**, then Enter
+2. `out\MafiaCoop.exe --host --name Host --log host --window left`; at the title press Enter, then Enter on **Continue**, then Enter
    when the loading screen says "Continue".
-3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest`, same three Enters.
+3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right`, same three Enters.
 4. Both stand at the save's spawn point; each sees the other's puppet next to them. Move one player and watch the
    other window (`tools\devlua.ps1` can teleport/step the player: see the test snippets below).
 5. `taskkill /IM mafiadefinitiveedition.exe /F`.
@@ -231,6 +234,7 @@ crash_test = 0             ; 1 = raise an access violation in Tick after crash_t
 crash_test_delay = 20
 background_run = 1         ; 0 = the game pauses when its window loses focus (original behaviour)
 puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (default: by player id)
+window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```
 
 ## Logs and crashes

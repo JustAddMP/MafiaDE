@@ -5,6 +5,7 @@
 #include "core/log.h"
 #include "dll/coop.h"
 #include "dll/coop_ui.h"
+#include "dll/window_place.h"
 #include "game/lua.h"
 #include "render/overlay.h"
 #include "render/present_hook.h"
@@ -68,6 +69,7 @@ void Mod::Tick(float dt) {
     ++_state.frames;
     ++_state.framesSinceHeartbeat;
     _state.uptime += dt;
+    window_place::Tick(dt);
     _state.sinceHeartbeat += dt;
     if (_state.frames > 1) {
         if (dt < _state.minDt) _state.minDt = dt;
@@ -113,6 +115,7 @@ void Mod::Tick(float dt) {
 void Mod::OnBeforeResize() { render::Overlay::ReleaseTargets(); }
 
 void Mod::OnResize(unsigned width, unsigned height) {
+    window_place::OnResize();
     MC_LOG_INFO("mod: resized to %ux%u", width, height);
 }
 

@@ -44,7 +44,7 @@ native/
                          (host-authoritative star; host relays), wire.{h,cpp} (byte writer/reader)
     dll/                 dllmain.cpp: init thread -> wait for game ready -> install hooks; mod.cpp (per-frame tick);
                          coop.{h,cpp} (sessions, startable from config or at runtime); coop_ui.{h,cpp} (menu commands,
-                         pause co-op panel, join-by-IP box, banners); ui_input.{h,cpp} (panel input, blocks the
+                         pause co-op panel, join-by-IP box, banners); window_place.{h,cpp} (--window left|right); ui_input.{h,cpp} (panel input, blocks the
                          game's DirectInput/XInput/window input while a panel is open)
   tests/                 net_loopback.cpp (two sessions over UDP in one process), steam_smoke.cpp
   tools/                 fontgen.cpp, embed_lua.ps1 (build step), devlua.ps1 (run Lua in a running game)

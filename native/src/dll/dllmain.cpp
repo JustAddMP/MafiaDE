@@ -6,6 +6,7 @@
 #include "core/mem.h"
 #include "dll/mod.h"
 #include "dll/ui_input.h"
+#include "dll/window_place.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/player_sync.h"
@@ -134,7 +135,7 @@ DWORD WINAPI InitThread(LPVOID) {
     } else {
         MC_LOG_INFO("config: %s not found, using defaults", Narrow(cfg.Path()).c_str());
     }
-    for (const char* key : {"host", "join", "join_lobby", "transport", "name", "port", "log", "steam"}) {
+    for (const char* key : {"host", "join", "join_lobby", "transport", "name", "port", "log", "steam", "window"}) {
         if (cfg.Has(key)) MC_LOG_INFO("config: %s = %s", key, cfg.GetString(key).c_str());
     }
 
@@ -157,6 +158,7 @@ DWORD WINAPI InitThread(LPVOID) {
     MC_LOG_INFO("init: game window %p class '%s' title '%s'", hwnd, cls, title);
 
     SubclassWindow(hwnd, cfg.GetBool("background_run", true));
+    window_place::Init(hwnd);
     ui_input::Install();
     Mod::Init();
     if (!render::InstallPresentHook(&Mod::Tick, &Mod::OnResize, &Mod::OnBeforeResize)) {
