@@ -55,11 +55,21 @@ bool Config::Lookup(const std::string& key, std::string& out) const {
     for (char c : key) {
         envName += (c == '.' || c == '-') ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     }
-    char buf[1024];
-    DWORD n = GetEnvironmentVariableA(envName.c_str(), buf, sizeof(buf));
-    if (n > 0 && n < sizeof(buf)) {
-        out.assign(buf, n);
-        return true;
+    // Wide API + UTF-8: the launcher passes its UTF-16 command line through, and the ini is UTF-8. The ANSI API would
+    // turn a non-ASCII --name or --password into codepage bytes (or '?') that match nothing else.
+    const std::wstring wname(envName.begin(), envName.end());  // key: ASCII
+    const DWORD need = GetEnvironmentVariableW(wname.c_str(), nullptr, 0);
+    if (need > 1) {
+        std::wstring w(need, L'\0');
+        const DWORD n = GetEnvironmentVariableW(wname.c_str(), w.data(), need);
+        if (n > 0 && n < need) {
+            const int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(n), nullptr, 0, nullptr, nullptr);
+            if (len > 0) {
+                out.assign(static_cast<size_t>(len), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(n), out.data(), len, nullptr, nullptr);
+                return true;
+            }
+        }
     }
     auto it = _values.find(Lower(key));
     if (it == _values.end()) return false;
