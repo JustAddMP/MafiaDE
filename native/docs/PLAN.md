@@ -65,6 +65,20 @@ Tick an item (`- [x]`) in the same commit that lands it.
    the other player's first state.
 - [x] Bug: at the main menu player-sync claims "in world" and queues puppets before a save is loaded.
 
+### F. Customisable characters
+Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
+- [ ] **Research**: find the game's model/outfit APIs: spawn profiles for story characters and civilians, outfit/clothing
+  variants, the ModelParts enum (hats, accessories), and whether the local player's model can be swapped at runtime.
+  Record what works in game-api.md, including which models can hold every weapon, drive and animate correctly.
+- [ ] **Character list**: a curated list of playable characters (story cast, gangsters, civilians) with their outfit
+  variants; only models that pass the weapon/vehicle/animation check above.
+- [ ] **Character picker**: a "Character" page in the CO-OP menu with the list, outfit and accessory choices and a live
+  preview (the player's own character changes while browsing, or a preview character in front of the camera).
+- [ ] **Sync**: the choice (character, outfit, parts) is saved in MafiaCoop.ini, sent in Hello, and can be changed
+  mid-session; everyone's puppet updates live. The local player sees themselves as the chosen character.
+- [ ] **Fallbacks**: an unknown or unsupported choice (e.g. from a newer version) falls back to a default model instead
+  of failing; the host's story character can be kept as Tommy for cutscenes if swapping breaks them.
+
 ### B. Phase 4 — shared world (the campaign in co-op)
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.
 - [x] **Weather + time of day**: host sends `game.gfx` GetTime/weather set every few seconds; guests apply
