@@ -181,9 +181,20 @@ where it was left on every game, and anyone can get in and drive it (owner = las
 docs/protocol.md "Shared cars, seats and ownership". Puppets are removed when their player leaves and all at once when
 the session ends.
 
+On foot, puppets also crouch, aim (right mouse button / pad left trigger with a gun in hand, in the camera's
+direction) and fire a real shot (flash and sound, no damage yet) for every shot the player fires, and play a reload.
+Health is synced: shown on the overlay line (verified) and in the pause menu's CO-OP panel (`HEALTH n` next to each
+player; not checked in a capture yet).
+The puppet factory is prepared as soon as the local player is in the world with a session running, and the model of
+a player who is still loading is loaded ahead, so his puppet appears with his first state.
+
+**Weather and time of day:** the host's game is the clock. The host sends its time of day, time flow speed and weather
+set (WorldEnv, docs/protocol.md) every 4 s and at once on a change; guests apply them.
+
 The overlay shows `Sync: in world, puppet factory ready, 1 shared car(s)` and one line per remote player
-(`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago` = state, metres off the target, receive rate, age of the newest
-snapshot; `alive/seat0` = sitting in seat 0 of a car, `alive/veh-hidden` = in a car but not seated). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
+(`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago, health 100, crouch, aim` = state, metres off the target, receive
+rate, age of the newest snapshot, his health and stance; `alive/seat0` = sitting in seat 0 of a car,
+`alive/veh-hidden` = in a car but not seated). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
 
 **background_run** (default on): the game pauses its simulation when its window loses focus (`WM_ACTIVATEAPP`). The
 dll swallows that message so an unfocused game keeps running and sending (needed for co-op and for two instances on
@@ -215,6 +226,12 @@ StartThread(function() Wait(so); local s = game.traffic:SpawnCar(id, Math:newVec
 -- shared cars on this machine
 local r = {} for k, c in pairs(MafiaCoop.cars) do r[#r+1] = k .. " " .. c.st .. " driver=" .. tostring(c.driver) end return table.concat(r, "
 ")
+-- weather/time on the host (guests follow within 4 s)
+game.gfx:SetWeatherSet("_default_game_rainy", 0, 0); game.gfx:SetTime(21, 0)
+-- aim (instead of holding the right mouse button), fire once (about 1 s later), crouch
+MafiaCoop.testAim = true   -- or {x, y, z}: a fixed aim direction; nil = off
+local p = game.game:GetActivePlayer(); p:ShootWeapon(true)
+local p = game.game:GetActivePlayer(); p:SetStalkMove(true)
 -- give the player a pistol (the puppet draws one too)
 local p = game.game:GetActivePlayer(); p:InventoryAddWeapon("p_mast_a_v1", 50); p:InventorySelect("p_mast_a_v1", true)
 -- puppet state on this machine

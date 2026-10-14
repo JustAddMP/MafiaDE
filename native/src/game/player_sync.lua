@@ -3,16 +3,24 @@
 -- a copy at <dll dir>\player_sync.lua overrides it for development.
 --
 -- Input (cmds, one line per command):
---   L id                                                                         our own player id
---   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw   remote player target
+--   L id host                                                                    our own player id, 1 = we host
+--                                                                                (sent every tick while a session runs)
+--   Q id profile                                                                 a remote player is in the session
+--                                                                                (load his model before he shows up)
+--   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az
+--                                                                                remote player target
 --   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
+--   W time flow weather                                                          the host's time of day and weather
 --   E                                                                            enter key pressed (ride along)
+--   A                                                                            aim input held (RMB / left trigger)
 --   R id                                                                         remove that puppet
 --   X                                                                            remove everything
 -- Output: sample, status, events
---   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz" or ""
+--   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
+--             aim reload shots ax ay az" or ""
 --   status = "factory|id:state:dist;...|cars" for the overlay
---   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove)
+--   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
+--            "WE time flow weather" (host: time of day and weather, every few seconds and on change)
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -20,13 +28,15 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 2
+M.version = 3
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
 M.cars = M.cars or {}
 M.localId = M.localId or "0"
 M.events = {}
+M.shots = M.shots or 0  -- shots the local player fired (mod 256), counted from his ammo
+M.env = M.env or {}
 
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
@@ -65,7 +75,7 @@ function M.FactoryReset(why)
   local f = M.fac
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
-  M.fac = { st = "none", t = -3 }
+  M.fac = { st = "none", t = -1 }
   for _, pp in pairs(M.pup) do pp.so = nil; pp.st = "queued" end
 end
 
@@ -79,7 +89,7 @@ function M.FactoryTick(dt, need)
       f.st, f.so, f.id, f.t = "obtain", so, id, 0
       log("factory: obtaining crewed car (query " .. tostring(id) .. ")")
     else
-      f.t = -5
+      f.t = -2
     end
   elseif f.st == "obtain" then
     if f.so:IsDone() then
@@ -88,7 +98,7 @@ function M.FactoryTick(dt, need)
       local pp = p:GetPos()
       f.sp = game.traffic:SpawnCar(f.id, V(pp.x, pp.y, pp.z - 40), V(1, 0, 0))
       f.st, f.t = "spawn", 0
-    elseif f.t > 10 then
+    elseif f.t > 6 then
       M.FactoryReset("obtain timeout")
     end
   elseif f.st == "spawn" then
@@ -103,8 +113,8 @@ function M.FactoryTick(dt, need)
       if not comp then M.FactoryReset("no spawner component"); return end
       try("factory demigod", drv.SetDemigod, drv, true)
       f.car, f.drv, f.comp, f.st, f.t, f.busy = car, drv, comp, "ready", 0, nil
-      log("factory ready (" .. tostring(drv) .. ")")
-    elseif f.t > 20 then
+      log(string.format("factory ready (%s) %.1f s after the world loaded", tostring(drv), M.now - (M.inWorldAt or M.now)))
+    elseif f.t > 8 then
       M.FactoryReset("spawn timeout")
     end
   elseif f.st == "ready" then
@@ -120,7 +130,8 @@ function M.FactoryTick(dt, need)
   end
 end
 
--- One puppet at a time: the component holds one spawn profile.
+-- One puppet at a time: the component holds one spawn profile. A player who is in the session but has not sent a
+-- position yet (still loading) gets his profile loaded ahead ("Q" lines), so his puppet appears at once when he does.
 function M.SpawnTick()
   local f = M.fac
   if f.st ~= "ready" then return end
@@ -128,6 +139,13 @@ function M.SpawnTick()
     local pp = M.pup[f.busy]
     if not pp then f.busy = nil; return end
     if not f.load:IsDone() then return end
+    if not pp.tx then  -- preloaded, no position yet: wait, unless another player needs the component now
+      pp.st = "preloaded"
+      for _, o in pairs(M.pup) do
+        if o.st == "queued" and o.tx then pp.st, f.busy = "queued", nil; return end
+      end
+      return
+    end
     f.busy = nil
     local so = try("CreateObject", f.comp.CreateObject, f.comp)
     if not valid(so) then pp.st = "queued"; pp.fails = (pp.fails or 0) + 1; return end
@@ -140,16 +158,22 @@ function M.SpawnTick()
     try("DespawnImmunity", so.DespawnImmunity, so, true)
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
     pp.seatTries, pp.exitSo = 0, nil
-    log("puppet " .. pp.id .. " spawned: " .. tostring(so) .. " profile " .. pp.profile)
+    pp.cb = nil
+    log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
+      pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
     return
   end
+  local pick
   for id, pp in pairs(M.pup) do
-    if pp.st == "queued" and pp.tx and (pp.fails or 0) < 5 then
-      f.comp:SetSpawnProfile(pp.profile)
-      f.load = f.comp:GetSpawnProfileLoadSyncObject()
-      f.busy, pp.st = id, "loading"
-      return
+    if pp.st == "queued" and (pp.fails or 0) < 5 and (pp.tx or not pick) then
+      pick = pp
+      if pp.tx then break end
     end
+  end
+  if pick then
+    f.comp:SetSpawnProfile(pick.profile)
+    f.load = f.comp:GetSpawnProfileLoadSyncObject()
+    f.busy, pick.st = pick.id, "loading"
   end
 end
 
@@ -461,10 +485,91 @@ function M.Seat(pp, c)
   return true
 end
 
+-- Crouch, aim, shots and reload on a puppet (on foot only). The puppet is an AI civilian; these are the human
+-- debug commands the game's own test scripts use (docs/game-api.md 10):
+--   SetStalkMove(bool)                 crouch (aiming stands it up again)
+--   DbgTesting_AimAtDir(dir) / _AimAtStop()      aim the weapon along a world direction (body turns with it)
+--   DbgTesting_ShootReload(trigger, reload, 0)   press/release the trigger or the reload button; the AI reads it on
+--   DbgTesting_SemaphoreNextFrame()             its next update, so each press waits for this sync object
+-- Shots are real (bullets, muzzle flash, sound) but the puppet is not hostile to anyone; damage is phase A5.
+local AIM_HOLD = 1.0  -- keep aiming this long after a shot without aim input (hip fire)
+
+local function cmdTick(pp)
+  local c = pp.cb
+  if not c.op then return end
+  if c.so and not c.so:IsDone() and M.now - c.t < 0.5 then return end
+  local so = pp.so
+  if c.op == "press" or c.op == "reload" then
+    try("ShootReload", so.DbgTesting_ShootReload, so, false, false, 0)
+    c.so, c.t, c.op = so:DbgTesting_SemaphoreNextFrame(), M.now, "release"
+  else
+    c.op, c.so = nil, nil
+  end
+end
+
+function M.Combat(pp)
+  local so = pp.so
+  pp.cb = pp.cb or { shots = pp.shots, crouch = false, aim = false }
+  local c = pp.cb
+  if pp.veh then  -- in a car: drop the stance
+    if c.aim then try("AimAtStop", so.DbgTesting_AimAtStop, so); c.aim = false end
+    if c.crouch then try("SetStalkMove", so.SetStalkMove, so, false); c.crouch = false end
+    c.shots, c.op = pp.shots, nil
+    return
+  end
+  -- shots counted since the last tick (the counter wraps at 256; at most a few per tick are shown)
+  local pending = ((pp.shots or 0) - (c.shots or 0)) % 256
+  if pending > 0 and pp.weapon ~= "" and pp.weapon == pp.wantWeapon then
+    c.lastShot = M.now
+  elseif pending > 0 and (pp.wantWeapon or "") == "" then
+    c.shots = pp.shots  -- no gun: nothing to show
+    pending = 0
+  end
+  local armed = (pp.weapon or "") ~= ""
+  local wantAim = armed and (pp.aim or (c.lastShot and M.now - c.lastShot < AIM_HOLD))
+  local dx, dy, dz = pp.ax or pp.hx, pp.ay or pp.hy, pp.az or 0
+  if wantAim then
+    local dot = c.aim and (c.dx * dx + c.dy * dy + c.dz * dz) or -2
+    if dot < 0.995 or M.now - c.aimT > 2 then
+      try("AimAtDir", so.DbgTesting_AimAtDir, so, V(dx, dy, dz))
+      if not c.aim then log("puppet " .. pp.id .. " aims") end
+      c.aim, c.dx, c.dy, c.dz, c.aimT = true, dx, dy, dz, M.now
+    end
+  elseif c.aim then
+    try("AimAtStop", so.DbgTesting_AimAtStop, so)
+    c.aim = false
+  end
+  local crouch = pp.crouch and not c.aim
+  if crouch ~= c.crouch then
+    try("SetStalkMove", so.SetStalkMove, so, crouch)
+    c.crouch = crouch
+  end
+  cmdTick(pp)
+  if c.op then return end
+  if pending > 0 and armed and c.aim and M.now - c.aimT > 0.15 then
+    local ammo = so:DbgTesting_HelperFire_GetAmmoCountInEquipedWeapon() or 0
+    if ammo < 2 then try("InventoryAddWeapon", so.InventoryAddWeapon, so, pp.weapon, 60) end  -- refills the clip
+    try("ShootReload", so.DbgTesting_ShootReload, so, true, false, 0)
+    c.so, c.t, c.op = so:DbgTesting_SemaphoreNextFrame(), M.now, "press"
+    c.shots = (c.shots + 1) % 256
+    if pending > 4 then c.shots = pp.shots end  -- far behind (e.g. after a hitch): skip the backlog
+    c.fired = (c.fired or 0) + 1
+    if c.fired <= 20 or c.fired % 50 == 0 then
+      log(string.format("puppet %s fired (shot %d, dir %.2f %.2f %.2f)", pp.id, c.fired, dx, dy, dz))
+    end
+  elseif pp.reload and not c.reload and armed then
+    try("ShootReload", so.DbgTesting_ShootReload, so, false, true, 0)
+    c.so, c.t, c.op = so:DbgTesting_SemaphoreNextFrame(), M.now, "reload"
+    log("puppet " .. pp.id .. " reloads")
+  end
+  c.reload = pp.reload
+end
+
 function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if pp.veh then
+    if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
     if pp.seatKey ~= sk then pp.seatKey, pp.seatTries, pp.ejects, pp.seated = sk, 0, 0, false end
     local c = pp.vkey and M.cars[pp.vkey]
@@ -502,6 +607,18 @@ function M.Drive(pp)
     return
   end
   local spd2 = pp.vx * pp.vx + pp.vy * pp.vy
+  -- The remote player stands still but the puppet cannot reach the spot (blocked; MoveVec keeps failing): after
+  -- 2 s put it there. A puppet that keeps walking on the spot also cannot crouch or settle.
+  if spd2 <= 0.16 and d2 > 1.0 then
+    pp.stuckT = pp.stuckT or M.now
+    if M.now - pp.stuckT > 2 then
+      so:SetPos(V(pp.tx, pp.ty, pp.tz))
+      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
+      pp.stuckT, pp.moving, d2 = nil, false, 0
+    end
+  else
+    pp.stuckT = nil
+  end
   if spd2 > 0.16 or d2 > 1.0 then
     if M.now - pp.lastMove > 0.3 or pp.lastMode ~= pp.mode then
       local mode = MODES[pp.mode] or "RUN"
@@ -518,9 +635,10 @@ function M.Drive(pp)
       pp.moving = false
     end
     local d = so:GetDir()
-    if d.x * pp.hx + d.y * pp.hy < 0.97 then so:SetDir(V(pp.hx, pp.hy, 0)) end
+    if not (pp.cb and pp.cb.aim) and d.x * pp.hx + d.y * pp.hy < 0.97 then so:SetDir(V(pp.hx, pp.hy, 0)) end
   end
   M.Weapon(pp)
+  M.Combat(pp)
 end
 
 function M.Remove(id)
@@ -544,6 +662,7 @@ function M.RemoveAll()
     end
   end
   M.cars = {}
+  M.env = {}
   if M.fac.st ~= "none" then M.FactoryReset("session ended") end
   M.fac.t = 0
 end
@@ -551,25 +670,98 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Local player sample
 -- ---------------------------------------------------------------------------------------------------------------
-function M.Sample()
+-- Shots are counted from the ammo in the weapon in hand: a drop while the same weapon stays selected is a shot
+-- (a reload raises the count, a weapon switch resets the baseline).
+local function countShots(p, weapon)
+  local good, ammo = pcall(p.DbgTesting_HelperFire_GetAmmoCountInEquipedWeapon, p)
+  ammo = good and tonumber(ammo) or nil
+  if ammo and weapon == M.shotWeapon and M.shotAmmo and ammo < M.shotAmmo then
+    local n = math.min(M.shotAmmo - ammo, 10)
+    M.shots = (M.shots + n) % 256
+    M.fired = (M.fired or 0) + n
+    if M.fired <= 20 or M.fired % 50 == 0 then log("we fired (" .. weapon .. ", shot " .. M.fired .. ")") end
+  elseif ammo and weapon == M.shotWeapon and M.shotAmmo and ammo > M.shotAmmo then
+    M.reloadUntil = M.now + 1.0  -- the clip was refilled: show a reload even if IsReloading() missed it
+    log("we reloaded (" .. weapon .. ")")
+  end
+  M.shotWeapon, M.shotAmmo = weapon, ammo
+end
+
+function M.Sample(aimInput)
   local p = M.Player()
   if not p then return "" end
   local pos, d = p:GetPos(), p:GetDir()
   local sprint = p:IsSprinting() and 1 or 0
-  local crouch = p:IsCoverCrouch() and 1 or 0
+  local crouch = (p:IsStalkMove() or p:IsCoverCrouch()) and 1 or 0
   local health = tonumber(p.health) or 0
   local weapon = p:InventoryGetSelected() or ""
   if weapon == "" or weapon == "empty" then weapon = "-" end
   local my = M.my
-  if my and valid(my.c.ent) then
+  local inCar = my and valid(my.c.ent)
+  countShots(p, weapon)
+  -- M.testAim (set from the dev console) stands in for the aim input in tests
+  local aim = ((aimInput or M.testAim) and not inCar and weapon ~= "-" and p:HaveFireWeaponInHand()) and 1 or 0
+  local reload = (not inCar and (p:IsReloading() or M.now < (M.reloadUntil or 0))) and 1 or 0
+  local cam = game.cameramanager:GetPlayerCamera()
+  local ad = cam and cam:GetDir() or d
+  if type(M.testAim) == "table" then ad = V(M.testAim[1], M.testAim[2], M.testAim[3]) end  -- test: fixed direction
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f", aim, reload, M.shots, ad.x, ad.y, ad.z)
+  if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
+  if aim == 0 then M.aimLogged = nil end
+  if inCar then
     local car = my.c.ent
     local cp, q, cv = car:GetPos(), car:GetRot(), car:GetSpeed()
     return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s %s %s %d %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f %.3f",
       pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon, my.c.model, my.key, my.seat,
-      cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, cv.x, cv.y, cv.z)
+      cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, cv.x, cv.y, cv.z) .. tail
   end
   return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s - - 0 0 0 0 0 0 0 1 0 0 0",
-    pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon)
+    pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon) .. tail
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Weather and time of day: the host's game is the clock. The host reports its time (hours, 0..24), time flow speed
+-- and weather set every few seconds and at once when the weather or flow changes; guests apply them and correct
+-- their clock when it drifts (game.gfx, docs/game-api.md 8).
+-- ---------------------------------------------------------------------------------------------------------------
+local ENV_PERIOD = 4      -- s between host reports
+local ENV_MAX_DRIFT = 0.05  -- hours (3 game minutes) before a guest's clock is set
+
+function M.EnvHost()
+  local g = game.gfx
+  local t, flow, w = g:GetTime(), g:GetTimeFlowSpeed(), g:GetCurrentWeatherSetName()
+  if not t or not w then return end
+  local e = M.env
+  local changed = w ~= e.w or flow ~= e.flow
+  if changed or not e.at or M.now - e.at >= ENV_PERIOD then
+    if changed then log(string.format("env: weather %s, time %.2f h, flow %.2f", tostring(w), t, flow or 0)) end
+    e.w, e.flow, e.at = w, flow, M.now
+    M.events[#M.events + 1] = string.format("WE %.4f %.4f %s", t, flow or 0, tostring(w))
+  end
+end
+
+local function hourDiff(a, b)
+  local d = (a - b) % 24
+  if d > 12 then d = d - 24 end
+  return d
+end
+
+function M.EnvGuest(t, flow, w)
+  local g = game.gfx
+  local e = M.env
+  if w and w ~= "" and g:GetCurrentWeatherSetName() ~= w then
+    try("SetWeatherSet", g.SetWeatherSet, g, w, 0, 0)
+    log("env: weather set to " .. w .. " (host)")
+  end
+  if flow and g:GetTimeFlowSpeed() ~= flow then try("SetTimeFlowSpeed", g.SetTimeFlowSpeed, g, flow) end
+  local cur = g:GetTime()
+  if t and cur and math.abs(hourDiff(cur, t)) > ENV_MAX_DRIFT then
+    try("SetTime", g.SetTime, g, t, 0)
+    if not e.synced or math.abs(hourDiff(cur, t)) > 0.5 then
+      log(string.format("env: time %.2f h -> %.2f h (host)", cur, t))
+    end
+  end
+  e.synced = true
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -579,7 +771,13 @@ function M.Update(dt, cmds)
   M.now = M.now + dt
   M.events = {}
   local player = M.Player()
-  local enter = false
+  if player and not M.inWorldAt then
+    M.inWorldAt = M.now
+    log("local player in world")
+  elseif not player then
+    M.inWorldAt = nil
+  end
+  local enter, aimInput, active, host, env = false, false, false, false, nil
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -587,6 +785,7 @@ function M.Update(dt, cmds)
     if op == "T" and player then  -- no puppets until we are in the world ourselves
       local id = f[2]
       local pp = M.pup[id]
+      if pp and pp.profile ~= f[3] then M.Remove(id); pp = nil end
       if not pp then
         pp = { id = id, st = "queued", profile = f[3] }
         M.pup[id] = pp
@@ -602,15 +801,29 @@ function M.Update(dt, cmds)
       pp.seat = tonumber(f[16]) or 0
       pp.cx, pp.cy, pp.cz = tonumber(f[17]), tonumber(f[18]), tonumber(f[19])
       pp.qx, pp.qy, pp.qz, pp.qw = tonumber(f[20]), tonumber(f[21]), tonumber(f[22]), tonumber(f[23])
+      pp.crouch, pp.aim, pp.reload = f[24] == "1", f[25] == "1", f[26] == "1"
+      pp.shots = tonumber(f[27]) or 0
+      pp.ax, pp.ay, pp.az = tonumber(f[28]), tonumber(f[29]), tonumber(f[30])
+      pp.firstT = pp.firstT or M.now
       pp.fresh = true
+    elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
+      if not M.pup[f[2]] then
+        M.pup[f[2]] = { id = f[2], st = "queued", profile = f[3] }
+        log("puppet " .. f[2] .. " queued ahead (" .. f[3] .. ")")
+      end
     elseif op == "K" then
       local n = {}
       for i = 4, 10 do n[#n + 1] = tonumber(f[i]) end
       if #n == 7 then M.Parked(f[2], f[3], n[1], n[2], n[3], n[4], n[5], n[6], n[7]) end
     elseif op == "L" then
       M.localId = f[2] or M.localId
+      active, host = true, f[3] == "1"
+    elseif op == "W" then
+      env = { tonumber(f[2]), tonumber(f[3]), f[4] }
     elseif op == "E" then
       enter = true
+    elseif op == "A" then
+      aimInput = true
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
@@ -618,8 +831,19 @@ function M.Update(dt, cmds)
     end
   end
 
-  local need = false
+  -- the factory is prepared as soon as we are in the world with a session running, not when the first remote
+  -- player shows up (he may still be loading; then his puppet appears the moment his first state arrives)
+  local need = active
   for _, _ in pairs(M.pup) do need = true break end
+  if player and active then
+    if host then
+      local good, err = pcall(M.EnvHost)
+      if not good then log("env error: " .. tostring(err)) end
+    elseif env then
+      local good, err = pcall(M.EnvGuest, env[1], env[2], env[3])
+      if not good then log("env error: " .. tostring(err)) end
+    end
+  end
   if player then
     M.FactoryTick(dt, need)
     M.SpawnTick()
@@ -651,7 +875,7 @@ function M.Update(dt, cmds)
   for _, _ in pairs(M.cars) do nc = nc + 1 end
   local sample = ""
   if player then
-    local good, s = pcall(M.Sample)
+    local good, s = pcall(M.Sample, aimInput)
     if good then sample = s else log("sample error: " .. tostring(s)) end
   end
   return sample, M.fac.st .. "|" .. table.concat(st, ";") .. "|" .. nc, table.concat(M.events, "\n")

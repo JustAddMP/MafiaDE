@@ -391,6 +391,11 @@ void DrawPausePanel(render::DrawList& d, float W, float H, float s) {
                 const uint32_t col = p.pingMs < 80 ? 0xFF8CCB7E : p.pingMs < 160 ? 0xFFE0C060 : kRed;
                 d.Text(x + w - pad - render::DrawList::TextWidth(ping, 25 * s), y, ping, 25 * s, col);
             }
+            if (p.health >= 0) {  // health column left of the ping
+                const std::string hp = "HEALTH " + std::to_string(p.health);
+                const uint32_t col = p.health > 60 ? kTextDim : p.health > 25 ? 0xFFE0C060 : kRed;
+                d.Text(x + w - pad - 120 * s - render::DrawList::TextWidth(hp, 25 * s), y, hp, 25 * s, col);
+            }
             y += 36 * s;
         }
         d.Rect(x + pad, y + 4 * s, w - pad * 2, 1 * s, 0x60D1AC62);

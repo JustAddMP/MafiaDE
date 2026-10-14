@@ -30,5 +30,7 @@ bool PopEvent(Event* out);  // render thread
 // First gamepad (XInput user 0), buttons as XINPUT_GAMEPAD_* bits (left stick up/down reported as d-pad); 0 if
 // none. Render thread.
 uint16_t PadButtons();
+// First gamepad's left trigger (0..255), 0 if none. Render thread.
+uint8_t PadLeftTrigger();
 
 }  // namespace mc::ui_input

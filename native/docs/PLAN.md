@@ -54,19 +54,21 @@ Tick an item (`- [x]`) in the same commit that lands it.
 - [x] **Car ownership hand-off**: when the driver leaves, the car copy should stay where it was left (not vanish)
    and become drivable by others; decide owner = last driver. Flow in protocol.md "Shared cars, seats and
    ownership" (car keys, CarParked 0x0101).
-- [ ] **Crouch, aim direction, firing, reload** shown on puppets; health synced.
+- [x] **Crouch, aim direction, firing, reload** shown on puppets; health synced. Done: debug AI commands
+   (game-api.md 10); aim input read from RMB/left trigger; panel health column not checked in a capture.
 - [ ] **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
    owner), deaths/respawn; ramming.
 - [ ] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it.
-- [ ] **Faster first spawn**: puppet factory currently takes ~20 s if the other game is still loading; retry
-   sooner / prepare the factory at world load.
+- [x] **Faster first spawn**: puppet factory currently takes ~20 s if the other game is still loading; retry
+   sooner / prepare the factory at world load. Done: factory at world load, model preloaded, puppet 0.0-0.1 s after
+   the other player's first state.
 - [x] Bug: at the main menu player-sync claims "in world" and queues puppets before a save is loaded.
 
 ### B. Phase 4 — shared world (the campaign in co-op)
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.
-- [ ] **Weather + time of day**: host sends `game.gfx` GetTime/weather set every few seconds; guests apply
-   (SetTime/SetWeatherSet, re-notes §4). Smallest, do first.
+- [x] **Weather + time of day**: host sends `game.gfx` GetTime/weather set every few seconds; guests apply
+   (SetTime/SetWeatherSet, re-notes §4). Done: WorldEnv 0x0200 (protocol.md), time flow speed included.
 - [ ] **Mission state**: find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
    tables). Guests load the same chapter as the host on join; follow host's checkpoint/chapter changes;
    objective text mirrored. Decide: guests run the mission scripts disabled and mirror the host's world.

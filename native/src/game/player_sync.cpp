@@ -24,13 +24,14 @@ namespace {
 // ---- protocol (docs/protocol.md "Phase 3") ---------------------------------------------------------------------
 constexpr uint16_t kMsgPlayerState = 0x0100;
 constexpr uint16_t kMsgCarParked = 0x0101;
-constexpr uint8_t kStateVersion = 2;
+constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
+constexpr uint8_t kStateVersion = 3;
 constexpr double kSendInterval = 0.05;      // 20 Hz
 constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
 constexpr double kMaxExtrapolate = 0.25;    // then hold
 constexpr size_t kMaxSnaps = 64;
 
-enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4 };
+enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16 };
 
 const char* const kProfiles[] = {
     "visuals/hero/game_main_tommy_gangster_trenchcoat",
@@ -47,6 +48,8 @@ struct PlayerState {
     uint8_t flags = 0;
     uint8_t health = 0;
     std::string weapon;  // "" = none
+    uint8_t shots = 0;         // shots fired so far (wraps at 256); a change = new shots
+    float aim[3] = {0, 1, 0};  // aim direction (camera), unit vector
     // vehicle (flags & kInVehicle)
     std::string model;
     uint8_t seat = 0;
@@ -87,6 +90,10 @@ struct Shared {
     std::string luaStatus;
     std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
     std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
+    std::vector<std::string> outEnv;     // Lua -> network ("WE ..." lines, host only)
+    bool isHost = false;
+    bool aimDown = false;
+    std::string lastWeather;  // last WorldEnv weather (for the log)
     bool enterPressed = false;
     double enterAt = 0;
 };
@@ -101,6 +108,7 @@ net::Session* _session = nullptr;
 bool _enterWasDown = false;
 double _sendAccum = 0;
 uint32_t _sent = 0;
+uint32_t _envSent = 0;
 
 // main-thread only
 bool _moduleLoaded = false;
@@ -143,6 +151,8 @@ void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
     w.U8(s.flags);
     w.U8(s.health);
     w.Str(s.weapon);
+    w.U8(s.shots);
+    for (float v : s.aim) w.F32(v);
     if (s.flags & kInVehicle) {
         w.Str(s.model);
         w.U8(s.seat);
@@ -165,6 +175,8 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
     s.flags = r.U8();
     s.health = r.U8();
     s.weapon = r.Str(32);
+    s.shots = r.U8();
+    for (float& v : s.aim) v = r.F32();
     if (s.flags & kInVehicle) {
         s.model = r.Str(48);
         s.seat = r.U8();
@@ -175,6 +187,7 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
         for (float& v : s.cvel) v = r.F32();
     }
     for (float v : s.pos) if (!std::isfinite(v)) return false;
+    for (float v : s.aim) if (!std::isfinite(v) || std::fabs(v) > 1.5f) return false;
     return r.Ok();
 }
 
@@ -266,10 +279,13 @@ void AppendTarget(std::string& out, net::PlayerId id, const PlayerState& s) {
     const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
     if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
     std::snprintf(buf, sizeof(buf),
-                  "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n",
+                  "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
+                  "%d %d %d %u %.3f %.3f %.3f\n",
                   id, ProfileFor(id).c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
-                  s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3]);
+                  s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
+                  (s.flags & kCrouch) ? 1 : 0, (s.flags & kAim) ? 1 : 0, (s.flags & kReload) ? 1 : 0, s.shots, s.aim[0],
+                  s.aim[1], s.aim[2]);
     out += buf;
 }
 
@@ -320,16 +336,53 @@ void OnCarParked(net::PlayerId from, net::ByteReader& r) {
     MC_LOG_INFO("sync: player %u parked car %u:%u (%s)", from, owner, guid, model.c_str());
 }
 
+// ---- WorldEnv (0x0200, reliable, host -> guests): time of day, time flow speed, weather set -------------------------
+// Lua event line (host): "WE time flow weather"
+bool WriteEnv(net::ByteWriter& w, const std::string& line) {
+    std::istringstream in(line);
+    std::string tag, weather;
+    float t = 0, flow = 0;
+    in >> tag >> t >> flow >> weather;
+    if (!in || tag != "WE" || !std::isfinite(t) || !std::isfinite(flow)) return false;
+    w.F32(t);
+    w.F32(flow);
+    w.Str(weather);
+    return true;
+}
+
+void OnWorldEnv(net::PlayerId from, net::ByteReader& r) {
+    const float t = r.F32();
+    const float flow = r.F32();
+    const std::string weather = r.Str(96);
+    if (!r.Ok() || from != net::kHostPlayer || !std::isfinite(t) || !std::isfinite(flow) || t < 0 || t > 24.5f ||
+        weather.empty() || weather.find_first_of(" \n\r\t") != std::string::npos)
+        return;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "W %.4f %.4f %s\n", t, flow, weather.c_str());
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (!sh.active || sh.isHost) return;
+    sh.inCmds += buf;
+    if (weather != sh.lastWeather) {
+        MC_LOG_INFO("sync: host weather %s, time %.2f h, flow %.2f", weather.c_str(), t, flow);
+        sh.lastWeather = weather;
+    }
+}
+
 // ---- local sample ---------------------------------------------------------------------------------------------------
-// "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz"
+// "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz aim reload shots ax ay az"
 bool ParseSample(const std::string& line, PlayerState& s) {
     std::istringstream in(line);
     std::string tag, weapon, model, key;
-    int sprint = 0, crouch = 0, health = 0, seat = 0;
+    int sprint = 0, crouch = 0, health = 0, seat = 0, aim = 0, reload = 0, shots = 0;
     in >> tag >> s.pos[0] >> s.pos[1] >> s.pos[2] >> s.head[0] >> s.head[1] >> sprint >> crouch >> health >> weapon >>
         model >> key >> seat >> s.cpos[0] >> s.cpos[1] >> s.cpos[2] >> s.quat[0] >> s.quat[1] >> s.quat[2] >>
-        s.quat[3] >> s.cvel[0] >> s.cvel[1] >> s.cvel[2];
+        s.quat[3] >> s.cvel[0] >> s.cvel[1] >> s.cvel[2] >> aim >> reload >> shots >> s.aim[0] >> s.aim[1] >> s.aim[2];
     if (!in || tag != "P") return false;
+    const float al = std::sqrt(s.aim[0] * s.aim[0] + s.aim[1] * s.aim[1] + s.aim[2] * s.aim[2]);
+    if (!(al > 1e-3f)) return false;
+    for (float& v : s.aim) v /= al;
+    s.shots = static_cast<uint8_t>(shots & 0xFF);
     s.weapon = weapon == "-" ? "" : weapon;
     s.health = static_cast<uint8_t>(std::clamp(health, 0, 255));
     s.flags = 0;
@@ -340,6 +393,8 @@ bool ParseSample(const std::string& line, PlayerState& s) {
     }
     if (crouch) s.flags |= kCrouch;
     if (sprint) s.flags |= kSprint;
+    if (aim) s.flags |= kAim;
+    if (reload) s.flags |= kReload;
     return true;
 }
 
@@ -419,11 +474,17 @@ void MainTick(lua_State* L, float dt) {
         sh.removed.clear();
         if (active) {
             const double now = Now();
-            cmds += "L " + std::to_string(sh.localId) + "\n";
+            cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1\n" : " 0\n");
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
             sh.enterPressed = false;
+            if (sh.aimDown) cmds += "A\n";
+            for (const auto& [id, name] : sh.names) {  // in the session but nothing received yet: preload the model
+                auto it = sh.remotes.find(id);
+                if (id != sh.localId && (it == sh.remotes.end() || it->second.snaps.empty()))
+                    cmds += "Q " + std::to_string(id) + " " + ProfileFor(id) + "\n";
+            }
             for (auto& [id, rem] : sh.remotes) {
                 if (!rem.snaps.empty()) AppendTarget(cmds, id, Interpolate(rem, now));
             }
@@ -469,8 +530,12 @@ void MainTick(lua_State* L, float dt) {
         if (sh.active && events && *events) {
             std::istringstream in(events);
             std::string line;
-            while (std::getline(in, line))
-                if (line.rfind("CP ", 0) == 0) sh.outParked.push_back(line);
+            while (std::getline(in, line)) {
+                if (line.rfind("CP ", 0) == 0)
+                    sh.outParked.push_back(line);
+                else if (line.rfind("WE ", 0) == 0 && sh.isHost)
+                    sh.outEnv.push_back(line);
+            }
         }
         if (ok) {
             sh.local = std::move(local);
@@ -494,6 +559,7 @@ void PlayerSync::Attach(net::Session& session) {
     _session = &session;
     session.On(kMsgPlayerState, &OnState);
     session.On(kMsgCarParked, &OnCarParked);
+    session.On(kMsgWorldEnv, &OnWorldEnv);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
@@ -505,6 +571,7 @@ void PlayerSync::Detach() {
     if (_session) {
         _session->Off(kMsgPlayerState);
         _session->Off(kMsgCarParked);
+        _session->Off(kMsgWorldEnv);
     }
     _session = nullptr;
     Shared& sh = S();
@@ -518,6 +585,8 @@ void PlayerSync::Detach() {
     sh.names.clear();
     sh.inCmds.clear();
     sh.outParked.clear();
+    sh.outEnv.clear();
+    sh.lastWeather.clear();
 }
 
 void PlayerSync::OnPlayerLeft(net::PlayerId id) {
@@ -529,13 +598,13 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
 }
 
-void PlayerSync::Tick(float dt, bool enterDown) {
+void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     if (!_session) return;
     Shared& sh = S();
     const bool active = _session->IsActive();
     PlayerState local;
     bool send = false;
-    std::vector<std::string> parked;
+    std::vector<std::string> parked, env;
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -545,6 +614,8 @@ void PlayerSync::Tick(float dt, bool enterDown) {
             sh.enterAt = Now();
         }
         parked.swap(sh.outParked);
+        env.swap(sh.outEnv);
+        sh.aimDown = aimDown && active;
         if (active != sh.active) {
             sh.active = active;
             sh.localId = _session->LocalId();
@@ -556,6 +627,7 @@ void PlayerSync::Tick(float dt, bool enterDown) {
         }
         if (active) {
             sh.localId = _session->LocalId();
+            sh.isHost = sh.localId == net::kHostPlayer;
             sh.names.clear();
             for (const auto& p : _session->Players()) sh.names[p.id] = p.name;
             for (auto it = sh.remotes.begin(); it != sh.remotes.end();) {
@@ -583,11 +655,29 @@ void PlayerSync::Tick(float dt, bool enterDown) {
             MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
         }
     }
+    for (const std::string& line : env) {
+        net::ByteWriter ew(128);
+        if (active && WriteEnv(ew, line)) {
+            _session->Broadcast(kMsgWorldEnv, ew.Span(), net::Reliability::Reliable);
+            if (++_envSent <= 3 || _envSent % 100 == 0)
+                MC_LOG_INFO("sync: sent WorldEnv #%u (%s)", _envSent, line.c_str() + 3);
+        }
+    }
     if (!send) return;
     net::ByteWriter w(128);
     Write(w, local, NowMs());
     _session->Broadcast(kMsgPlayerState, w.Span(), net::Reliability::Unreliable);
     if (++_sent == 1) MC_LOG_INFO("sync: sending local state (%zu bytes)", w.Size());
+}
+
+int PlayerSync::Health(net::PlayerId id) {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (!sh.active) return -1;
+    if (id == sh.localId) return sh.localValid && Now() - sh.localAt < 2.0 ? sh.local.health : -1;
+    auto it = sh.remotes.find(id);
+    if (it == sh.remotes.end() || it->second.snaps.empty() || Now() - it->second.lastRecv > 3.0) return -1;
+    return it->second.snaps.back().s.health;
 }
 
 void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
@@ -618,9 +708,12 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
     for (const auto& [id, rem] : sh.remotes) {
         auto nameIt = sh.names.find(id);
         auto st = pupState.find(std::to_string(id));
-        std::snprintf(buf, sizeof(buf), "  %s: puppet %s, %.0f Hz, last %.1f s ago",
+        const PlayerState* last = rem.snaps.empty() ? nullptr : &rem.snaps.back().s;
+        std::snprintf(buf, sizeof(buf), "  %s: puppet %s, %.0f Hz, last %.1f s ago, health %d%s%s",
                       nameIt != sh.names.end() ? nameIt->second.c_str() : "?",
-                      st != pupState.end() ? st->second.c_str() : "pending", rem.rateHz, now - rem.lastRecv);
+                      st != pupState.end() ? st->second.c_str() : "pending", rem.rateHz, now - rem.lastRecv,
+                      last ? static_cast<int>(last->health) : -1, last && (last->flags & kCrouch) ? ", crouch" : "",
+                      last && (last->flags & kAim) ? ", aim" : "");
         out.push_back({buf, 0xFFC8C8C8});
     }
 }

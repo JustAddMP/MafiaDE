@@ -168,7 +168,15 @@ of police for a long time.
 
 ## 8. Misc
 
-- `game.hud:IsLoadingScreenUp()`, `game.police:Enable()/Disable()`, `game.gfx:SetWeatherSet(name, 0, 0)`.
+- `game.hud:IsLoadingScreenUp()`, `game.police:Enable()/Disable()`.
+- **Weather and time (verified 2026-10-14, used by WorldEnv):** `game.gfx:GetCurrentWeatherSetName()` returns the active
+  weather set (`mm_110_omerta_cp_010_cs_cs_park` in the Omerta park save; `_default_game_rainy` after setting it);
+  `game.gfx:SetWeatherSet(name, 0, 0)` switches at once (names: `WeatherIDs.lua` of the ScriptHook scripts, e.g.
+  `_default_game`, `_default_game_rainy`, `_default_game_foggy`, `day_cycle_01`). `game.gfx:GetTime()` is the time of
+  day in hours (11 in that save), `game.gfx:SetTime(hours, 0)` (2 args; 1 arg = "Missing adaptor arguments"; returns a
+  sync object) sets it. `GetTimeFlowSpeed()` / `SetTimeFlowSpeed(n)` (1 arg): 0 in missions (time stands still), the
+  game's day cycle runs when it is > 0 (flow 20 = 1 game hour per ~3 s). The game's own node scripts
+  (`Game.Weather.SetTime`, `Game.Game.SetMissionWeatherAndTime`) make the same calls.
 - Globals useful for exploring: `scripts`, `mm_spawn_profiles`, `enums`, `Game.*` / `Human.*` / `Vehicle.*` (viscript
   node tables: their functions show, via `string.dump`, which wrapper methods a node calls).
 - `package.loaded.traffic.GetSpawnProfiles(...)`, `Game.Traffic.SpawnProfileHuman`, `Testscenes.SpawnEnemies`
@@ -215,3 +223,32 @@ the expected classes/methods the patch is skipped (logged) and the menu loads un
 - Steam: `ISteamFriends::ActivateGameOverlayInviteDialog(lobby)` (INVITE FRIENDS) and `ActivateGameOverlay("Friends")`
   (JOIN FRIEND) open over the game (gameoverlayrenderer64.dll is loaded in game processes started by MafiaCoop.exe;
   with two instances on one account the dialog showed in both windows).
+
+## 10. Combat on a human: aim, shoot, crouch, reload — verified 2026-10-14
+
+What the puppets use (src/game/player_sync.lua `M.Combat`). The puppet is a civilian-archetype AI human with a pistol.
+
+| call | notes |
+|---|---|
+| `h:DbgTesting_AimAtDir(dir)` | aims the weapon in hand along a world direction (C_Vector, any length; z tilts it); the body turns with it. Holds until `h:DbgTesting_AimAtStop()`. Used by the game's `Human.NPC.DBG.DebugAimAtDir` node. Re-issue to change direction |
+| `h:DbgTesting_ShootReload(trigger, reload, 0)` | presses (true) or releases the trigger / reload button of an AI human. The AI reads it on its next update, so a press must stay until `Wait(h:DbgTesting_SemaphoreNextFrame())` (a sync object; poll `IsDone()` outside a script thread) before the release; pressing and releasing within 1-4 frames often does nothing. One press = one real shot (bullet, muzzle flash, sound), also while not aiming. `human.ShootWithParams(h, maxShots, shotsPerSecond)` (game Lua, needs a script thread) does the same in a loop |
+| `h:DbgTesting_HelperFire_GetAmmoCountInEquipedWeapon()` | rounds in the clip of the weapon in hand (player too). The player's shots are counted from drops of this value |
+| `h:SetStalkMove(bool)` / `IsStalkMove()` | crouch (head bone ~0.94 m above the feet instead of ~1.6 m); a puppet that is still walking (MoveVec pending) stays up until it stops. Aiming stands it up |
+| `h:IsReloading()` | true during the reload animation (AI: right after a reload press). `p:InventoryReload()` on the player refills the clip instantly without animation |
+| `h:GetBonePos("Head")` | world position of the head bone (other names, numbers: the entity position) |
+| `h:DoDamage(n)` | hurts the human (player: `p.health` 100 -> 37 after `DoDamage(35)`, armour/difficulty scaling); `p.health = x` is ignored |
+| `h:AimAt(target, offset, bool)` / `h:ShootAt(target, offset, n)` / `h:Aim(bool)` | AI combat commands (3 args each; target = a human, offset a C_Vector). `AimAt(self, worldPos, true)` aimed the puppet in the wrong direction (offset is not a world position) and the command reports `IsFail()`; `AimAt(otherHuman, (0,0,0), true)` aims at that human. Not used |
+| `h:ShootEffect(from, to, dir, n, n)` | 5 args, returned a done sync object, no visible effect. Not used |
+| `h:PanicCrouch(seconds)` | a civilian panic crouch (hands over the head); `DbgTesting_SetPose(n)` did nothing visible |
+
+Local player: there is no script getter for "aiming" (`GetAimDiff()` stayed (0,0,0) and `IsButtonDown(n)` takes gamepad
+button enums only: `enums.E_Script_GamepadButtons.BUTT_A/B/X/Y` = 6..9), so the dll reads the aim input itself (right
+mouse button / pad left trigger in the focused game window) and only reports it while `HaveFireWeaponInHand()`. The
+aim direction is the player camera's `GetDir()`. `p:ShootWeapon(true)` makes the player fire, about 1 s later and not
+every time (unreliable; used only by tests). `DbgTesting_ShootReload` has no effect on the player.
+
+Test notes: synthetic mouse **button** events (`mouse_event`/SendInput) are ignored by the game (mouse movement and
+keyboard with scan codes work), so in tests the guest sets `MafiaCoop.testAim = true` (or `{x, y, z}` for a fixed
+direction) from the dev console instead of holding the right button, and fires with `p:ShootWeapon(true)`. The default
+crouch key (C) did nothing in the Omerta park save (crouch may be mission-gated); `SetStalkMove(true)` on the player
+crouches him and is reported.

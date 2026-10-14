@@ -40,6 +40,7 @@ public:
     struct PlayerRow {
         std::string name;
         int pingMs = -1;  // -1 = none (the host's own row)
+        int health = -1;  // 0..100, -1 = unknown (not in the world yet)
         bool host = false, you = false;
     };
     struct Info {

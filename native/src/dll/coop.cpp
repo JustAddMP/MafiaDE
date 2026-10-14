@@ -474,6 +474,16 @@ bool EnterVehicleHeld() {
     constexpr uint16_t kPadY = 0x8000;  // XINPUT_GAMEPAD_Y
     return (GetAsyncKeyState('E') & 0x8000) != 0 || (ui_input::PadButtons() & kPadY) != 0;
 }
+
+// The aim control (right mouse button, pad left trigger) held in our focused window while no panel takes input.
+// The game itself does not tell scripts whether the player aims (docs/game-api.md 10), so this is read from the input.
+bool AimHeld() {
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (!fg || (GetWindowThreadProcessId(fg, &pid), pid != GetCurrentProcessId())) return false;
+    if (ui_input::Blocking()) return false;
+    return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 || ui_input::PadLeftTrigger() > 60;
+}
 }  // namespace
 
 void Coop::Tick(float dt) {
@@ -482,7 +492,7 @@ void Coop::Tick(float dt) {
     PollSteam();
     if (!s.started) TryStart();
     if (s.session) s.session->Poll();
-    if (s.session) game::PlayerSync::Tick(dt, EnterVehicleHeld());
+    if (s.session) game::PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
     if (s.teardown) Teardown();
 }
 
@@ -587,6 +597,7 @@ Coop::Info Coop::GetInfo() {
             row.host = p.id == net::kHostPlayer;
             row.you = p.id == session.LocalId();
             row.pingMs = row.host ? -1 : static_cast<int>(p.rttMs + 0.5f);
+            row.health = game::PlayerSync::Health(p.id);
             info.players.push_back(row);
         }
     } else if (s.mode == Mode::JoinLobby) {

@@ -15,7 +15,7 @@
 namespace mc::net {
 
 // Bump when the session or any app message format changes incompatibly.
-constexpr uint32_t kProtocolVersion = 2;
+constexpr uint32_t kProtocolVersion = 3;
 
 using PlayerId = uint8_t;
 constexpr PlayerId kHostPlayer = 0;

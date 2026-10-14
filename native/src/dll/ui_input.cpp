@@ -288,6 +288,13 @@ bool PopEvent(Event* out) {
     return true;
 }
 
+uint8_t PadLeftTrigger() {
+    if (!_origXInput) return 0;
+    XINPUT_STATE st{};
+    if (_origXInput(0, &st) != ERROR_SUCCESS) return 0;
+    return st.Gamepad.bLeftTrigger;
+}
+
 uint16_t PadButtons() {
     if (!_origXInput) return 0;
     XINPUT_STATE st{};
