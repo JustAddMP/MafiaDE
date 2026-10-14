@@ -59,7 +59,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
    ownership" (car keys, CarParked 0x0101).
 - [x] **Crouch, aim direction, firing, reload** shown on puppets; health synced. Done: debug AI commands
    (game-api.md 10); aim input read from RMB/left trigger; panel health column not checked in a capture.
-- [ ] (in progress, untested code on main) **Damage**: shooting/punching the other player hurts them on their own game (send hit events to the victim's
+- [ ] (in progress, untested code on main) **Damage** (research: docs/research-world-sync.md): shooting/punching the other player hurts them on their own game (send hit events to the victim's
    owner), deaths/respawn; ramming.
 - [ ] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it.
@@ -89,13 +89,13 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] **Mission state** (static research in docs/research-characters-missions.md): find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
    tables). Guests load the same chapter as the host on join; follow host's checkpoint/chapter changes;
    objective text mirrored. Decide: guests run the mission scripts disabled and mirror the host's world.
-- [ ] **NPC mirroring**: host enumerates relevant humans (mission NPCs, enemies near players), streams
+- [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
    invisible proxy for each guest so its AI targets them. Prototype both, measure.
-- [ ] **Vehicles + traffic**: host's mission cars mirrored; ambient traffic either disabled on guests
+- [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
-- [ ] **Cutscenes**: guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
+- [ ] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
 - [x] Interest management: only stream within ~300 m of any player; bandwidth budget. (Module + tests in
   src/net/interest.*, docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
 
