@@ -1,4 +1,4 @@
-native/out/
+out/
 *.log
 *.dmp
 Thumbs.db
