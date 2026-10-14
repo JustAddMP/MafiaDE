@@ -82,11 +82,11 @@ bool Abc::Parse(const uint8_t* data, size_t size, std::string* err) {
     // ints / uints / doubles: kept raw (counts included)
     size_t s = r.i;
     uint32_t c = r.U30();
-    for (uint32_t k = 1; k < c; ++k) r.U30();
+    for (uint32_t k = 1; k < c && r.ok; ++k) r.U30();
     _ints.assign(data + s, data + r.i);
     s = r.i;
     c = r.U30();
-    for (uint32_t k = 1; k < c; ++k) r.U30();
+    for (uint32_t k = 1; k < c && r.ok; ++k) r.U30();
     _uints.assign(data + s, data + r.i);
     s = r.i;
     c = r.U30();
@@ -158,7 +158,7 @@ bool Abc::Parse(const uint8_t* data, size_t size, std::string* err) {
             }
             if ((kind >> 4) & 0x04) {
                 const uint32_t m = r.U30();
-                for (uint32_t j = 0; j < m; ++j) r.U30();
+                for (uint32_t j = 0; j < m && r.ok; ++j) r.U30();
             }
             if (out) out->push_back(t);
         }
@@ -167,24 +167,24 @@ bool Abc::Parse(const uint8_t* data, size_t size, std::string* err) {
     for (uint32_t k = 0; k < c && r.ok; ++k) {
         const uint32_t pc = r.U30();
         r.U30();  // return type
-        for (uint32_t j = 0; j < pc; ++j) r.U30();
+        for (uint32_t j = 0; j < pc && r.ok; ++j) r.U30();
         r.U30();  // name
         const uint8_t flags = r.U8();
         if (flags & 0x08) {
             const uint32_t oc = r.U30();
-            for (uint32_t j = 0; j < oc; ++j) {
+            for (uint32_t j = 0; j < oc && r.ok; ++j) {
                 r.U30();
                 r.U8();
             }
         }
         if (flags & 0x80)
-            for (uint32_t j = 0; j < pc; ++j) r.U30();
+            for (uint32_t j = 0; j < pc && r.ok; ++j) r.U30();
     }
     c = r.U30();  // metadata
     for (uint32_t k = 0; k < c && r.ok; ++k) {
         r.U30();
         const uint32_t n = r.U30();
-        for (uint32_t j = 0; j < n; ++j) {
+        for (uint32_t j = 0; j < n && r.ok; ++j) {
             r.U30();
             r.U30();
         }
@@ -199,7 +199,7 @@ bool Abc::Parse(const uint8_t* data, size_t size, std::string* err) {
         const uint8_t flags = r.U8();
         if (flags & 0x08) r.U30();
         const uint32_t ni = r.U30();
-        for (uint32_t j = 0; j < ni; ++j) r.U30();
+        for (uint32_t j = 0; j < ni && r.ok; ++j) r.U30();
         r.U30();  // iinit
         readTraits(&_instTraits[k]);
     }
@@ -539,6 +539,7 @@ bool PatchMovie(std::vector<uint8_t>& movie, const std::function<bool(Abc&, std:
                 abcStart += 4;
                 while (abcStart < pos + len && movie[abcStart] != 0) ++abcStart;
                 ++abcStart;  // name terminator
+                if (abcStart > pos + len) return fail("bad DoABC tag");  // flags/name run past the tag
             }
             Abc abc;
             std::string why;
