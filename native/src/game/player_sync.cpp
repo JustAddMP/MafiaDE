@@ -744,6 +744,10 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     if (!send) return;
     net::ByteWriter w(128);
     Write(w, local, NowMs());
+    // TODO(interest): players and their cars are always relevant (Kind::Player/PlayerCar, Critical), so PlayerState
+    // stays a plain 20 Hz Broadcast. Phase-4 host-mirrored NPCs/vehicles go through net/interest.h instead: register
+    // them with an InterestManager, Tick it here at the send rate, spawn/despawn on Enter/Leave and send each peer
+    // its SendList with SendTo (docs/interest.md "Integration").
     _session->Broadcast(kMsgPlayerState, w.Span(), net::Reliability::Unreliable);
     if (++_sent == 1) MC_LOG_INFO("sync: sending local state (%zu bytes)", w.Size());
 }
