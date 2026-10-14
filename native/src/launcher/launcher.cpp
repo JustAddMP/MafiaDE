@@ -382,7 +382,13 @@ std::vector<wchar_t> BuildEnvironment(const std::vector<std::pair<std::wstring, 
         entries.push_back(e);
     }
     if (env) FreeEnvironmentStringsW(env);
-    for (auto& [k, v] : extra) entries.push_back(k + L"=" + v);
+    // A name given twice (e.g. "--name a --name b") must not end up twice in the block: which copy the game sees
+    // would depend on the sort. The last one wins, as for the dll's own argument handling.
+    for (size_t i = 0; i < extra.size(); ++i) {
+        bool later = false;
+        for (size_t j = i + 1; j < extra.size() && !later; ++j) later = _wcsicmp(extra[i].first.c_str(), extra[j].first.c_str()) == 0;
+        if (!later) entries.push_back(extra[i].first + L"=" + extra[i].second);
+    }
     std::sort(entries.begin(), entries.end(), [](const std::wstring& a, const std::wstring& b) {
         return _wcsicmp(a.substr(0, a.find(L'=', 1)).c_str(), b.substr(0, b.find(L'=', 1)).c_str()) < 0;
     });
@@ -393,6 +399,26 @@ std::vector<wchar_t> BuildEnvironment(const std::vector<std::pair<std::wstring, 
     }
     block.push_back(L'\0');
     return block;
+}
+
+// One command-line argument, quoted for CommandLineToArgvW / the CRT if it needs it (spaces, tabs, quotes).
+std::wstring QuoteArg(const std::wstring& a) {
+    if (!a.empty() && a.find_first_of(L" \t\"") == std::wstring::npos) return a;
+    std::wstring q = L"\"";
+    size_t slashes = 0;
+    for (wchar_t c : a) {
+        if (c == L'\\') {
+            ++slashes;
+            continue;
+        }
+        if (c == L'"') q.append(slashes * 2 + 1, L'\\');  // escape the backslashes before a quote, and the quote
+        else q.append(slashes, L'\\');
+        slashes = 0;
+        q += c;
+    }
+    q.append(slashes * 2, L'\\');  // backslashes before the closing quote
+    q += L'"';
+    return q;
 }
 
 // Loads dllPath into a process via LoadLibraryW on a new remote thread. Returns true if LoadLibraryW succeeded.
@@ -415,9 +441,16 @@ bool InjectRemoteThread(HANDLE process, void* remotePath, DWORD& err) {
 } // namespace
 
 int Run() {
-    wchar_t selfPath[MAX_PATH];
-    GetModuleFileNameW(nullptr, selfPath, MAX_PATH);
-    std::wstring selfDir = selfPath;
+    std::wstring selfDir(MAX_PATH, L'\0');
+    for (;;) {  // long paths: MAX_PATH would silently truncate and point at a missing dll
+        const DWORD n = GetModuleFileNameW(nullptr, selfDir.data(), static_cast<DWORD>(selfDir.size()));
+        if (n == 0) return Fail(L"GetModuleFileName failed: " + LastErrorText());
+        if (n < selfDir.size()) {
+            selfDir.resize(n);
+            break;
+        }
+        selfDir.resize(selfDir.size() * 2);
+    }
     selfDir = selfDir.substr(0, selfDir.find_last_of(L'\\'));
     const std::wstring iniPath = selfDir + L"\\MafiaCoop.ini";
     const std::wstring dllPath = selfDir + L"\\" + kDllName;
@@ -433,8 +466,9 @@ int Run() {
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a.size() > 1 && a[0] == L'+') {
-            gameArgs += L" " + a;
-            if (i + 1 < argc && argv[i + 1][0] != L'-' && argv[i + 1][0] != L'+') gameArgs += L" " + std::wstring(argv[++i]);
+            gameArgs += L" " + QuoteArg(a);
+            if (i + 1 < argc && argv[i + 1][0] != L'-' && argv[i + 1][0] != L'+')
+                gameArgs += L" " + QuoteArg(argv[++i]);
             continue;
         }
         if (a.rfind(L"--", 0) != 0 || a.size() < 3) {
@@ -611,10 +645,13 @@ int Run() {
     if (method.empty()) method = L"apc";
     Log(L"inject: method %s, dll %s", method.c_str(), dllPath.c_str());
     auto loadLibrary = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW");
+    bool apcQueued = false;
     if (method == L"apc") {
         if (!QueueUserAPC(reinterpret_cast<PAPCFUNC>(loadLibrary), pi.hThread, reinterpret_cast<ULONG_PTR>(remotePath))) {
             Log(L"inject: QueueUserAPC failed (%s), will use remote thread", LastErrorText().c_str());
             method = L"thread";
+        } else {
+            apcQueued = true;
         }
     }
     if (ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) return abortGame(L"ResumeThread failed: " + LastErrorText());
@@ -633,9 +670,12 @@ int Run() {
         DWORD err = 0;
         if (!InjectRemoteThread(pi.hProcess, remotePath, err) ||
             WaitForSingleObject(loaded, 5000) != WAIT_OBJECT_0) {
+            CloseHandle(loaded);
             return abortGame(L"Could not load mafiacoop.dll into the game: " + LastErrorText(err));
         }
         method = L"thread";
+    } else {
+        apcQueued = false;  // the APC ran (it signalled): the path buffer is no longer needed
     }
     Log(L"inject: dll loaded (via %s)", method.c_str());
     CloseHandle(loaded);
@@ -657,7 +697,9 @@ int Run() {
                                      L"). See logs\\mafiacoop.log.");
     }
     Log(L"game running (pid %lu); launcher done", pi.dwProcessId);
-    VirtualFreeEx(pi.hProcess, remotePath, 0, MEM_RELEASE);
+    // An APC that has not run yet (remote-thread fallback) still points at the path: freeing it would make that
+    // late LoadLibraryW read freed memory, so it stays (a few hundred bytes).
+    if (!apcQueued) VirtualFreeEx(pi.hProcess, remotePath, 0, MEM_RELEASE);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return 0;
