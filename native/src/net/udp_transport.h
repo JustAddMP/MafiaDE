@@ -15,6 +15,7 @@ struct UdpOptions {
     double connectTimeoutS = 10.0;  // give up connecting after this long
     double pingIntervalS = 0.5;     // keepalive / RTT probe
     int maxPeers = 8;               // incoming connection limit when hosting
+    int maxPeersPerAddress = 4;     // incoming connections from one IPv4 address (any port)
     // Test-only network simulation, applied to datagrams this transport SENDS.
     float simLoss = 0.0f;           // 0..1 drop probability
     float simLatencyMs = 0.0f;      // base one-way delay

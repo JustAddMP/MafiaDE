@@ -42,6 +42,10 @@ constexpr size_t kMaxQueuedUnits = 8192;
 constexpr double kConnectResend = 0.25;
 constexpr double kCookieBucketS = 5.0;
 constexpr size_t kConnectPacketSize = 64;  // padded so a CHALLENGE is never larger than its CONNECT
+// Events (messages) queued per Poll before Receive stops reading the socket until the next Poll. A 1200-byte DATA
+// datagram can carry ~590 empty units, so without a cap one connected peer could make a single Poll queue millions of
+// events; the rest stays in the socket buffer.
+constexpr size_t kMaxEventsPerPoll = 8192;
 
 enum PacketType : uint8_t {
     kConnect = 1,
@@ -352,7 +356,7 @@ struct UdpTransport::Impl {
     // ---- receive ----
     void Receive() {
         if (sock == INVALID_SOCKET) return;
-        for (int guard = 0; guard < 4096; ++guard) {
+        for (int guard = 0; guard < 4096 && events.size() < kMaxEventsPerPoll; ++guard) {
             sockaddr_in from{};
             int fl = sizeof(from);
             int n = recvfrom(sock, reinterpret_cast<char*>(rxbuf), sizeof(rxbuf), 0, reinterpret_cast<sockaddr*>(&from),
@@ -473,10 +477,15 @@ struct UdpTransport::Impl {
             }
             Drop(*existing, DisconnectReason::Remote);  // same address reconnected with a new session
         }
-        size_t incoming = 0;
-        for (auto& kv : peers)
-            if (!kv.second.outgoing) ++incoming;
-        if (static_cast<int>(incoming) >= opt.maxPeers) {
+        size_t incoming = 0, fromAddr = 0;
+        for (auto& kv : peers) {
+            if (kv.second.outgoing) continue;
+            ++incoming;
+            if (kv.second.addr.sin_addr.s_addr == from.sin_addr.s_addr) ++fromAddr;
+        }
+        // Per-address cap: otherwise one machine (any source port completes the cookie handshake) could hold every
+        // slot with connections that never get past the session handshake, and nobody else could join.
+        if (static_cast<int>(incoming) >= opt.maxPeers || static_cast<int>(fromAddr) >= opt.maxPeersPerAddress) {
             refuse(kRefuseFull);
             return;
         }
