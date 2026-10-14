@@ -1,6 +1,8 @@
 #include "dll/coop_ui.h"
 
+#include "core/compat.h"
 #include "core/log.h"
+#include "core/version.h"
 #include "dll/coop.h"
 #include "dll/ui_input.h"
 #include "game/menu.h"
@@ -28,11 +30,13 @@ constexpr uint32_t kPanelBg = 0xE60D0C0B;
 constexpr uint32_t kToastBg = 0xE0100E0C;
 
 constexpr float kToastSeconds = 5.0f;
+constexpr float kCompatToastSeconds = 45.0f;
 constexpr float kFade = 0.25f;
 
 struct Toast {
     std::string title, text;
     bool error;
+    float seconds = kToastSeconds;  // how long it stays up
     float age = 0;
 };
 
@@ -57,6 +61,7 @@ struct UiState {
     render::DrawList list;
     Coop::Info info;
     float mouseX = -1, mouseY = -1;
+    bool compatChecked = false;
 };
 
 UiState& U() {
@@ -69,11 +74,35 @@ std::string Upper(std::string s) {
     return s;
 }
 
-void AddToast(std::string title, std::string text, bool error) {
+void AddToast(std::string title, std::string text, bool error, float seconds = kToastSeconds) {
     UiState& u = U();
     MC_LOG_INFO("ui: notice: %s: %s", title.c_str(), text.c_str());
     if (u.toasts.size() >= 3) u.toasts.erase(u.toasts.begin());
-    u.toasts.push_back({std::move(title), std::move(text), error});
+    u.toasts.push_back({std::move(title), std::move(text), error, seconds});
+}
+
+// Once, on the first frame: tell the player when this game build is not (fully) supported (core/compat.h) instead
+// of letting features fail silently. Stays up longer than other banners so it is seen past the intro videos.
+void ShowCompatBanner() {
+    const std::string crc = core::compat::UnsupportedBuildCrc();
+    const std::string missing = core::compat::FailedList();
+    const std::string found = crc.empty() ? std::string() : " (exe CRC " + crc + ")";
+    if (core::compat::CoopDisabled()) {
+        AddToast("Co-op disabled: unsupported game version",
+                 "This game version" + found + " is not supported by MafiaCoop " + kModVersion + " (missing: " +
+                     missing + "). Check for a newer MafiaCoop.",
+                 true, kCompatToastSeconds);
+    } else if (!missing.empty()) {
+        AddToast("Unsupported game version",
+                 "Co-op " + missing + " are not available on this game version" + found +
+                     ". Check for a newer MafiaCoop.",
+                 true, kCompatToastSeconds);
+    } else if (!crc.empty()) {
+        AddToast("Unsupported game version",
+                 "MafiaCoop " + std::string(kModVersion) + " was not made for this game version" + found +
+                     ". Co-op may not work correctly.",
+                 true, kCompatToastSeconds);
+    }
 }
 
 // ---- panels -------------------------------------------------------------------------------------------------------
@@ -311,7 +340,7 @@ void DrawToasts(render::DrawList& d, float W, float s) {
     float y = 70 * s;
     const float titlePx = 24 * s, textPx = 21 * s, pad = 14 * s;
     for (const Toast& t : u.toasts) {
-        const float a = std::min({1.0f, t.age / kFade, (kToastSeconds - t.age) / kFade});
+        const float a = std::min({1.0f, t.age / kFade, (t.seconds - t.age) / kFade});
         if (a <= 0) continue;
         const auto lines = Wrap(t.text, textPx, w - pad * 2 - 6 * s);
         const float h = pad * 2 + titlePx * 1.1f + textPx * 1.15f * static_cast<float>(lines.size());
@@ -443,6 +472,10 @@ bool CoopUi::PanelOpen() { return U().panel != Panel::None; }
 
 void CoopUi::Tick(float dt) {
     UiState& u = U();
+    if (!u.compatChecked) {
+        u.compatChecked = true;
+        ShowCompatBanner();
+    }
     u.info = Coop::GetInfo();
 
     // native menu entries: publish state, run their commands
@@ -471,7 +504,7 @@ void CoopUi::Tick(float dt) {
     Coop::Notice n;
     while (Coop::PopNotice(&n)) AddToast(n.title, n.text, n.error);
     for (Toast& t : u.toasts) t.age += dt;
-    u.toasts.erase(std::remove_if(u.toasts.begin(), u.toasts.end(), [](const Toast& t) { return t.age >= kToastSeconds; }),
+    u.toasts.erase(std::remove_if(u.toasts.begin(), u.toasts.end(), [](const Toast& t) { return t.age >= t.seconds; }),
                    u.toasts.end());
 
     HandleInput(dt);

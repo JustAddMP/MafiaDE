@@ -32,6 +32,7 @@ enderont8x16.h` is generated once and checked in (8x16 cells, 8-bit coverage, A
 ```
 out\MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <name>] [--transport udp|steam]
                   [--port <n>] [--log <tag>] [--<key> [value]] [--game <path to exe>] [+connect_lobby <id>]
+                  [--skip-version-check] [--check-only]
 ```
 
 1. The launcher finds the game in this order: `--game`, then the Steam registry (`HKCU\Software\Valve\Steam\SteamPath`,
@@ -41,15 +42,27 @@ out\MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <nam
    testing). The game is started with `/multiinst` on its command line, which skips its leftover Mafia II
    launcher mutex (the exe has no working single-instance check, see `docs/re-notes.md` 3.2). `+word` arguments
    (e.g. `+connect_lobby <id>`) are appended to the game's command line.
-3. It starts `mafiadefinitiveedition.exe` with `CREATE_SUSPENDED`. The working directory is the game folder, and
+3. **Game version check:** it computes the CRC32 of the exe (slicing-by-8, ~55 ms for the 111 MB exe when it is in
+   the OS file cache) and compares it with `kSupportedGameBuilds` in `src\coreersion.h` (today only Steam build
+   16502642, CRC `BCE2C8EF` = 3168979183). The result is cached in `outersion-cache.txt` keyed by exe path, size
+   and last-write time, so later launches take under 1 ms. Unknown build: a message box names the supported builds
+   and the CRC found; **Yes** starts anyway (the dll then gets `MAFIACOOP_UNSUPPORTED_BUILD=<crc>` and shows an
+   "Unsupported game version" banner), **No** quits with exit code 2. `--skip-version-check` or
+   `skip_version_check = 1` in the ini skips the check. `--check-only` only does the check (never starts the game,
+   no message boxes): it prints the result to the console / redirected stdout, logs to `logs\launcher-check.log` and
+   exits with 0 = supported, 2 = unsupported, 1 = error. Example:
+   `out\MafiaCoop.exe --check-only` or `out\MafiaCoop.exe --check-only --game D:\other\mafiadefinitiveedition.exe`.
+   In the dll, a feature whose patterns are missing reports to `core/compat.h`; if the Lua bridge is missing, co-op
+   is disabled (sessions refuse to start) and a banner says "Co-op disabled: unsupported game version".
+4. It starts `mafiadefinitiveedition.exe` with `CREATE_SUSPENDED`. The working directory is the game folder, and
    `SteamAppId=1030840` and `SteamGameId=1030840` are added to the environment. With these set, steam_api does
    not restart the game through Steam (tested: the same PID keeps running). Steam must be running. Nothing is
    written to the game folder.
-4. It injects `out\mafiacoop.dll`: `QueueUserAPC(LoadLibraryW)` on the suspended main thread, then resumes. The APC
+5. It injects `out\mafiacoop.dll`: `QueueUserAPC(LoadLibraryW)` on the suspended main thread, then resumes. The APC
    runs when the loader finishes process initialization, before the game's entry point. If the dll has not
    signalled `Local\MafiaCoopInjected-<pid>` within 15 s, the launcher falls back to `CreateRemoteThread(LoadLibraryW)`.
    Set `inject_method = thread` in the ini to force the fallback.
-5. It watches the game for 20 s and then exits. Failures show a message box and are written to
+6. It watches the game for 20 s and then exits. Failures show a message box and are written to
    `out\logs\launcher.log`.
 
 **Passing arguments to the dll:** each `--key value` becomes the environment variable `MAFIACOOP_KEY=value` in the
@@ -246,6 +259,7 @@ it, restart the game, no rebuild needed.
 ```
 game_path = G:\SteamLibrary\steamapps\common\Mafia Definitive Edition
 inject_method = apc        ; or thread
+skip_version_check = 0     ; 1 = start even if the game exe's CRC is not a supported build (launcher)
 window_timeout_s = 300     ; how long the dll waits for the game window
 crash_test = 0             ; 1 = raise an access violation in Tick after crash_test_delay seconds (debug only)
 crash_test_delay = 20

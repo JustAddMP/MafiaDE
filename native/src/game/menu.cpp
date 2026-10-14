@@ -1,6 +1,7 @@
 #include "game/menu.h"
 
 #include "core/config.h"
+#include "core/compat.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
@@ -596,13 +597,16 @@ void Install(const std::wstring& dllDir) {
         !Resolve(_valueCtorString, "FlashValue_CtorString", kPatValueCtorString) ||
         !Resolve(_valueGetString, "FlashValue_GetString", kPatValueGetString) ||
         !Resolve(_valueAssign, "FlashValue_Assign", kPatValueAssign) ||
-        !Resolve(_valueDtor, "FlashValue_Dtor", kPatValueDtor))
+        !Resolve(_valueDtor, "FlashValue_Dtor", kPatValueDtor)) {
+        core::compat::Failed(core::compat::Feature::NativeMenu);
         return;
+    }
     if (!core::hook::Install("Flash::AttachIface", reinterpret_cast<void*>(attach),
                              reinterpret_cast<void*>(&AttachDetour), reinterpret_cast<void**>(&_origAttach)) ||
         !core::hook::Install("GFx::LoadProcess::BeginSWF", reinterpret_cast<void*>(beginLoad),
                              reinterpret_cast<void*>(&BeginLoadDetour), reinterpret_cast<void**>(&_origBeginLoad))) {
         MC_LOG_ERROR("menu: hooks failed; native menu entries disabled");
+        core::compat::Failed(core::compat::Feature::NativeMenu);
         return;
     }
     _active = true;

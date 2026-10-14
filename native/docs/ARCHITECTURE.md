@@ -27,11 +27,13 @@ native/
   docs/                  ARCHITECTURE.md (this), re-notes.md (game reverse engineering), protocol.md
   third_party/minhook/
   src/
-    launcher/            MafiaCoop.exe: finds the game (Steam registry + libraryfolders.vdf), starts it
+    launcher/            MafiaCoop.exe: finds the game (Steam registry + libraryfolders.vdf), checks its exe CRC32
+                         against core/version.h, starts it
                          suspended with SteamAppId=1030840 in the environment, injects mafiacoop.dll, resumes
     core/                log.{h,cpp}, crash.{h,cpp} (minidump + log on unhandled exception), hook.{h,cpp}
                          (thin MinHook wrapper), config.{h,cpp} (MafiaCoop.ini next to the dll), mem.{h,cpp}
-                         (module info, pattern scan with ?? wildcards, RIP-relative resolve)
+                         (module info, pattern scan with ?? wildcards, RIP-relative resolve), version.h (mod version,
+                         supported game builds), compat.{h,cpp} (features missing on this game build -> banner)
     render/              present_hook.{h,cpp}: hooks IDXGISwapChain::Present -> per-frame Tick on the game's
                          render thread; overlay.{h,cpp} + overlay.hlsl (status panel, co-op panels, banners);
                          ui_font.{h,cpp} (glyph atlas rasterised with GDI from Bahnschrift)

@@ -1,7 +1,9 @@
 #include "dll/coop.h"
 
+#include "core/compat.h"
 #include "core/config.h"
 #include "core/log.h"
+#include "core/version.h"
 #include "dll/ui_input.h"
 #include "game/player_sync.h"
 #include "net/multi_transport.h"
@@ -25,7 +27,6 @@
 namespace mc {
 namespace {
 
-constexpr const char* kModVersion = "0.2.0";
 constexpr double kSteamInitDelayS = 3.0;  // after the first frame: the game's own Steam init is long done by then
 constexpr double kErrorShowS = 20.0;      // how long a disconnect reason stays on screen
 
@@ -268,8 +269,17 @@ void JoinSteamHost(uint64_t host) {
     if (!s.session->Join(std::to_string(host))) return Fail("could not connect: " + s.session->LastError());
 }
 
+// The game build lacks something co-op needs (core/compat.h): refuse with a banner instead of failing silently.
+bool Blocked() {
+    if (!core::compat::CoopDisabled()) return false;
+    S().started = true;
+    Fail("Co-op disabled: unsupported game version");
+    return true;
+}
+
 void StartLobbyJoin(uint64_t lobbyId) {
     State& s = S();
+    if (Blocked()) return;
     s.mode = Mode::JoinLobby;
     s.lobbyId = lobbyId;
     s.started = true;
@@ -370,6 +380,7 @@ void PollSteam() {
 void TryStart() {
     State& s = S();
     const bool steamPending = s.steam == SteamState::Pending;
+    if (s.mode != Mode::None && Blocked()) return;
     switch (s.mode) {
     case Mode::None:
         break;

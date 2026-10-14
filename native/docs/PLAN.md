@@ -111,7 +111,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Package: `MafiaCoop.exe` + `mafiacoop.dll` (+ README) in a zip, a few MB; `tools\make_release.cmd`.
 - [ ] Optional proxy-DLL install mode (drop-in so the game can be started from Steam) — must be opt-in because it
    writes into the game folder.
-- [ ] Detect unsupported game builds (exe CRC) and show a clear message.
+- [x] Detect unsupported game builds (exe CRC) and show a clear message. Done: launcher CRC32 check against
+   `core/version.h` (cached, `--check-only`, `--skip-version-check`); dll banner when patterns are missing.
 - [ ] GitHub release v0.2.0 with the new zip when the user asks.
 
 ### E. Robustness (ongoing)

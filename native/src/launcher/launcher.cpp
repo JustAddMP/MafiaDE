@@ -3,15 +3,23 @@
 //
 // Usage: MafiaCoop.exe [--host] [--join <ip[:port]>] [--join-lobby <id>] [--name <name>] [--log <tag>]
 //                      [--<key> [value]] [--game <exe path>] [+connect_lobby <id>]
-// Every --<key> [value] (except --game) is passed to the dll as environment variable MAFIACOOP_<KEY>=<value>
-// ("1" for a bare flag); core::Config gives these precedence over MafiaCoop.ini.
+//                      [--skip-version-check] [--check-only]
+// Every --<key> [value] (except --game and the two launcher-only flags) is passed to the dll as environment variable
+// MAFIACOOP_<KEY>=<value> ("1" for a bare flag); core::Config gives these precedence over MafiaCoop.ini.
+// Before starting the game the CRC32 of its exe is checked against core/version.h (cached in version-cache.txt);
+// --check-only does only that, prints the result and exits with 0 (supported), 2 (unsupported) or 1 (error).
+#include "core/version.h"
+
 #include <windows.h>
 #include <tlhelp32.h>
 #include <shellapi.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <fstream>
 #include <sstream>
@@ -28,6 +36,29 @@ constexpr const wchar_t* kAppId = L"1030840";
 constexpr const wchar_t* kDllName = L"mafiacoop.dll";
 
 FILE* _log = nullptr;
+bool _console = false;  // --check-only: print instead of showing message boxes
+
+// Writes a line to redirected stdout or the parent's console (--check-only; the launcher is a GUI exe).
+void Print(const std::wstring& line) {
+    static HANDLE out = [] {
+        HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (h && h != INVALID_HANDLE_VALUE && GetFileType(h) != FILE_TYPE_UNKNOWN) return h;
+        if (!AttachConsole(ATTACH_PARENT_PROCESS)) return INVALID_HANDLE_VALUE;
+        return CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
+    }();
+    if (out == INVALID_HANDLE_VALUE) return;
+    const std::wstring w = line + L"\r\n";
+    DWORD mode = 0, written = 0;
+    if (GetConsoleMode(out, &mode)) {
+        WriteConsoleW(out, w.c_str(), static_cast<DWORD>(w.size()), &written, nullptr);
+        return;
+    }
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), nullptr, 0, nullptr, nullptr);
+    std::string u(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), u.data(), n, nullptr, nullptr);
+    WriteFile(out, u.data(), static_cast<DWORD>(u.size()), &written, nullptr);
+}
 
 void Log(const wchar_t* fmt, ...) {
     if (!_log) return;
@@ -44,7 +75,10 @@ void Log(const wchar_t* fmt, ...) {
 
 int Fail(const std::wstring& msg) {
     Log(L"ERROR: %s", msg.c_str());
-    MessageBoxW(nullptr, msg.c_str(), L"MafiaCoop", MB_ICONERROR | MB_OK);
+    if (_console)
+        Print(L"ERROR: " + msg);
+    else
+        MessageBoxW(nullptr, msg.c_str(), L"MafiaCoop", MB_ICONERROR | MB_OK);
     return 1;
 }
 
@@ -180,6 +214,149 @@ std::wstring FindGameViaSteam() {
     return {};
 }
 
+// --- game version check (CRC32 of the exe) ------------------------------------------------------
+
+// Standard CRC-32 (reflected polynomial 0xEDB88320, init and final xor 0xFFFFFFFF; the same value as zlib's
+// crc32), slicing-by-8: eight input bytes per step through eight 256-entry tables.
+struct Crc32Tables {
+    uint32_t t[8][256];
+    Crc32Tables() {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+            t[0][i] = c;
+        }
+        for (uint32_t i = 0; i < 256; ++i)
+            for (int s = 1; s < 8; ++s) t[s][i] = (t[s - 1][i] >> 8) ^ t[0][t[s - 1][i] & 0xFF];
+    }
+};
+
+uint32_t Crc32Update(uint32_t crc, const uint8_t* p, size_t n) {
+    static const Crc32Tables tables;
+    const auto& t = tables.t;
+    crc = ~crc;
+    while (n >= 8) {
+        uint32_t lo, hi;
+        std::memcpy(&lo, p, 4);
+        std::memcpy(&hi, p + 4, 4);
+        lo ^= crc;
+        crc = t[7][lo & 0xFF] ^ t[6][(lo >> 8) & 0xFF] ^ t[5][(lo >> 16) & 0xFF] ^ t[4][lo >> 24] ^
+              t[3][hi & 0xFF] ^ t[2][(hi >> 8) & 0xFF] ^ t[1][(hi >> 16) & 0xFF] ^ t[0][hi >> 24];
+        p += 8;
+        n -= 8;
+    }
+    while (n--) crc = (crc >> 8) ^ t[0][(crc ^ *p++) & 0xFF];
+    return ~crc;
+}
+
+// CRC32 of a whole file, streamed in 4 MB blocks. False on any open/read error (GetLastError is kept).
+bool FileCrc32(const std::wstring& path, uint32_t& crc) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    std::vector<uint8_t> buf(4u << 20);
+    crc = 0;
+    bool ok = true;
+    for (;;) {
+        DWORD got = 0;
+        if (!ReadFile(f, buf.data(), static_cast<DWORD>(buf.size()), &got, nullptr)) {
+            ok = false;
+            break;
+        }
+        if (got == 0) break;
+        crc = Crc32Update(crc, buf.data(), got);
+    }
+    const DWORD err = GetLastError();
+    CloseHandle(f);
+    SetLastError(err);
+    return ok;
+}
+
+struct FileStamp {
+    unsigned long long size = 0, writeTime = 0;
+};
+
+bool GetFileStamp(const std::wstring& path, FileStamp& st) {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &a)) return false;
+    st.size = (static_cast<unsigned long long>(a.nFileSizeHigh) << 32) | a.nFileSizeLow;
+    st.writeTime = (static_cast<unsigned long long>(a.ftLastWriteTime.dwHighDateTime) << 32) |
+                   a.ftLastWriteTime.dwLowDateTime;
+    return true;
+}
+
+// version-cache.txt next to the launcher: one "<size> <last write time> <crc32 hex> <exe path>" line per exe, so
+// a repeat launch does not read the ~110 MB exe again. A different size or write time recomputes.
+struct CacheLine {
+    FileStamp stamp;
+    uint32_t crc = 0;
+    std::wstring path, text;
+};
+
+std::vector<CacheLine> ReadCache(const std::wstring& cachePath) {
+    std::vector<CacheLine> lines;
+    std::wistringstream in(ReadTextFile(cachePath));
+    std::wstring line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line[0] == 0xFEFF) line.erase(0, 1);  // BOM written by ccs=UTF-8
+        line = Trim(line);
+        CacheLine c;
+        unsigned crc = 0;
+        int pathAt = 0;
+        if (swscanf_s(line.c_str(), L"%llu %llu %x %n", &c.stamp.size, &c.stamp.writeTime, &crc, &pathAt) != 3 ||
+            pathAt <= 0 || static_cast<size_t>(pathAt) >= line.size())
+            continue;
+        c.crc = crc;
+        c.path = line.substr(static_cast<size_t>(pathAt));
+        c.text = line;
+        lines.push_back(std::move(c));
+    }
+    return lines;
+}
+
+bool CachedCrc(const std::wstring& cachePath, const std::wstring& exe, const FileStamp& st, uint32_t& crc) {
+    for (const auto& c : ReadCache(cachePath)) {
+        if (_wcsicmp(c.path.c_str(), exe.c_str()) != 0) continue;
+        if (c.stamp.size != st.size || c.stamp.writeTime != st.writeTime) return false;
+        crc = c.crc;
+        return true;
+    }
+    return false;
+}
+
+void StoreCrc(const std::wstring& cachePath, const std::wstring& exe, const FileStamp& st, uint32_t crc) {
+    std::vector<std::wstring> keep;
+    for (const auto& c : ReadCache(cachePath))
+        if (_wcsicmp(c.path.c_str(), exe.c_str()) != 0) keep.push_back(c.text);
+    if (keep.size() > 7) keep.erase(keep.begin(), keep.end() - 7);
+    wchar_t head[80];
+    swprintf_s(head, L"%llu %llu %08X ", st.size, st.writeTime, crc);
+    keep.push_back(head + exe);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, cachePath.c_str(), L"w, ccs=UTF-8") != 0 || !f) {
+        Log(L"version: cannot write %s", cachePath.c_str());
+        return;
+    }
+    for (const auto& l : keep) fwprintf(f, L"%s\n", l.c_str());
+    fclose(f);
+}
+
+const GameBuild* FindSupportedBuild(uint32_t crc) {
+    for (const auto& b : kSupportedGameBuilds)
+        if (b.crc32 == crc) return &b;
+    return nullptr;
+}
+
+std::wstring SupportedBuildsText() {
+    std::wstring s;
+    for (const auto& b : kSupportedGameBuilds) {
+        wchar_t line[160];
+        swprintf_s(line, L"    %s (CRC %08X)\n", Widen(b.label).c_str(), b.crc32);
+        s += line;
+    }
+    return s;
+}
+
 // --- process helpers ---------------------------------------------------------------------------
 
 std::vector<DWORD> FindProcesses(const wchar_t* exeName) {
@@ -250,6 +427,7 @@ int Run() {
     // passes for "Join Game") go to the game's command line unchanged.
     std::vector<std::pair<std::wstring, std::wstring>> passEnv;
     std::wstring gameOverride, logTag, gameArgs;
+    bool checkOnly = false, skipVersionCheck = false;
     int argc = 0;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; ++i) {
@@ -265,6 +443,15 @@ int Run() {
                         L"[--<key> [value]] [--game <exe>]");
         }
         std::wstring key = a.substr(2);
+        // launcher-only flags (not passed to the dll)
+        if (Lower(key) == L"check-only") {
+            checkOnly = true;
+            continue;
+        }
+        if (Lower(key) == L"skip-version-check") {
+            skipVersionCheck = true;
+            continue;
+        }
         std::wstring value = L"1";
         if (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) value = argv[++i];
         if (Lower(key) == L"game") {
@@ -277,12 +464,15 @@ int Run() {
         passEnv.emplace_back(envName, value);
     }
     if (argv) LocalFree(argv);
+    _console = checkOnly;
 
     // ---- log: one per launch when several games run (launcher-<tag>.log / launcher-<pid>.log) ----
     const std::vector<DWORD> running = FindProcesses(kGameExe);
     std::wstring logName = L"launcher.log";
     if (!logTag.empty())
         logName = L"launcher-" + logTag + L".log";
+    else if (checkOnly)
+        logName = L"launcher-check.log";
     else if (!running.empty())
         logName = L"launcher-" + std::to_wstring(GetCurrentProcessId()) + L".log";
     CreateDirectoryW((selfDir + L"\\logs").c_str(), nullptr);
@@ -294,7 +484,7 @@ int Run() {
     // ---- find the game ----
     std::wstring gameExe;
     if (!gameOverride.empty()) {
-        gameExe = gameOverride;
+        gameExe = NormalizePath(gameOverride);
         Log(L"game: from --game: %s", gameExe.c_str());
     } else {
         gameExe = FindGameViaSteam();
@@ -312,6 +502,64 @@ int Run() {
                     L"    game_path = <folder containing mafiadefinitiveedition.exe>\nto " + iniPath);
     }
     if (!FileExists(gameExe)) return Fail(L"Game executable not found:\n" + gameExe);
+
+    // ---- game version: CRC32 of the exe against the builds we support (core/version.h) ----
+    if (!skipVersionCheck) {
+        const std::wstring v = Lower(IniValue(iniPath, L"skip_version_check"));
+        skipVersionCheck = v == L"1" || v == L"true" || v == L"yes" || v == L"on";
+    }
+    if (skipVersionCheck && !checkOnly) {  // --check-only always checks
+        Log(L"version: check skipped (--skip-version-check / skip_version_check = 1)");
+    } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::wstring cachePath = selfDir + L"\\version-cache.txt";
+        FileStamp st;
+        uint32_t crc = 0;
+        bool cached = false;
+        if (!GetFileStamp(gameExe, st))
+            return Fail(L"Cannot read the game executable:\n" + gameExe + L"\n\n" + LastErrorText());
+        if (CachedCrc(cachePath, gameExe, st, crc)) {
+            cached = true;
+        } else {
+            if (!FileCrc32(gameExe, crc))
+                return Fail(L"Cannot read the game executable:\n" + gameExe + L"\n\n" + LastErrorText());
+            StoreCrc(cachePath, gameExe, st, crc);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const GameBuild* build = FindSupportedBuild(crc);
+        wchar_t crcText[16];
+        swprintf_s(crcText, L"%08X", crc);
+        const std::wstring verdict = build ? L"supported: " + Widen(build->label) : L"NOT SUPPORTED";
+        Log(L"version: exe CRC32 %s (%u), %llu bytes, %s in %.1f ms -> %s", crcText, crc, st.size,
+            cached ? L"cached" : L"computed", ms, verdict.c_str());
+        const std::wstring ver = Widen(kModVersion);
+        if (checkOnly) {
+            wchar_t line[200];
+            swprintf_s(line, L"CRC32 %s (%u), %llu bytes, %s in %.1f ms", crcText, crc, st.size,
+                       cached ? L"cached" : L"computed", ms);
+            Print(L"MafiaCoop " + ver + L" version check: " + gameExe);
+            Print(line);
+            if (build) {
+                Print(verdict);
+                return 0;
+            }
+            Print(L"NOT SUPPORTED. Supported builds:\n" + SupportedBuildsText());
+            return 2;
+        }
+        if (!build) {
+            const std::wstring msg = L"This version of Mafia: Definitive Edition isn't supported yet by MafiaCoop " +
+                                     ver + L".\n\nSupported:\n" + SupportedBuildsText() + L"Found: CRC " + crcText +
+                                     L"\n" + gameExe +
+                                     L"\n\nCheck for a newer MafiaCoop, or start anyway (may crash).\n\n"
+                                     L"Yes = start anyway, No = quit";
+            if (MessageBoxW(nullptr, msg.c_str(), L"MafiaCoop", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+                Log(L"version: unsupported game build; quit");
+                return 2;
+            }
+            Log(L"version: unsupported game build; starting anyway");
+            passEnv.emplace_back(L"MAFIACOOP_UNSUPPORTED_BUILD", crcText);  // the dll shows a banner
+        }
+    }
     if (!FileExists(dllPath)) return Fail(L"mafiacoop.dll not found next to MafiaCoop.exe:\n" + dllPath);
     const std::wstring gameDir = gameExe.substr(0, gameExe.find_last_of(L'\\'));
     Log(L"game: %s", gameExe.c_str());
