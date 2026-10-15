@@ -15,7 +15,7 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
   menu entries.
 
 Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
-one tag (currently core v0.1.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+one tag (currently core v0.1.1) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
 (docs/PLAN.md).
 
 ## Build
