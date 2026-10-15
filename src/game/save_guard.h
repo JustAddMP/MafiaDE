@@ -15,5 +15,9 @@ void Install();
 void Block(bool on);    // keep the game's save writes out of the real slots (a guest following the host's story)
 bool Blocking();
 uint32_t Redirected();  // save writes sent to the scratch tree since start
+// Loads of "freeroam_before_quest_activated" the game requested since start: in a chapter loaded through the
+// menu's chapter loader (replay flags) that is how the game answers a failed mission (it goes back to the free
+// roam state from before the quest, a different world); the story sync then reloads the checkpoint instead.
+uint32_t MissionAborts();
 
 }  // namespace mc::game::save_guard

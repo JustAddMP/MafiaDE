@@ -33,6 +33,7 @@ constexpr const char* kPatFind =
 FindFn _origFind = nullptr;
 std::atomic<bool> _block{false};
 std::atomic<uint32_t> _redirected{0};
+std::atomic<uint32_t> _aborts{0};
 uintptr_t _exe = 0;
 std::mutex _mu;
 std::string _scratch;  // ...\MafiaCoop\coop-saves\<pid> (no trailing slash)
@@ -71,6 +72,10 @@ uint32_t _dbgSlot = 0;
 void* LoadDetour(void* self, void* out, uint32_t slot, void* id, void* name) {
     const std::string saveId = Str(id), storage = Str(name);
     MC_LOG_INFO("savesys: load of '%s' (slot %u, %s) from%s", saveId.c_str(), slot, storage.c_str(), Callers().c_str());
+    if (saveId == "freeroam_before_quest_activated") {
+        ++_aborts;
+        MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)");
+    }
     if (storage == "debugloadchapter") {
         std::lock_guard lock(_dbgMu);
         _dbgId = saveId;
@@ -278,5 +283,6 @@ void Block(bool on) {
 
 bool Blocking() { return _block.load(); }
 uint32_t Redirected() { return _redirected.load(); }
+uint32_t MissionAborts() { return _aborts.load(); }
 
 }  // namespace mc::game::save_guard

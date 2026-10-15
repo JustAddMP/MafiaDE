@@ -9,6 +9,7 @@
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
+#include "game/npc_sync.h"
 #include "game/player_sync.h"
 #include "game/save_guard.h"
 
@@ -166,6 +167,7 @@ public:
         if (lua::Install(dllDir, logTag)) {
             PlayerSync::Install();
             MissionSync::Install();
+            NpcSync::Install();
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -175,21 +177,25 @@ public:
     void OnSessionStart(net::Session& session) override {
         PlayerSync::Attach(session);
         MissionSync::Attach(session);
+        NpcSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
         MissionSync::Detach();
+        NpcSync::Detach();
     }
     void OnPlayerLeft(net::PlayerId id) override { PlayerSync::OnPlayerLeft(id); }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
         MissionSync::Tick(dt);
+        NpcSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
     void AppendStatus(std::vector<render::OverlayLine>& out) override {
         PlayerSync::GetStatus(out);
         MissionSync::GetStatus(out);
+        NpcSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }

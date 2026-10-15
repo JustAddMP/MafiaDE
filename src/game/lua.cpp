@@ -325,6 +325,100 @@ int McPad(lua_State* L) {
     return 1;
 }
 
+// mc_entity(id) -> the entity wrapper with that entity id (the number inside a C_EntityGuid: tostring(guid) ends in
+// it), or nil. game.entitywrapper:GetEntityByGUID only takes a C_EntityGuid object; this is the same lookup
+// (thunk exe+0x239E510: entity manager -> entity -> its script wrapper) for an id that came over the network.
+constexpr const char* kPatGetEntityByGuid =
+    "48 89 5C 24 08 48 89 74 24 20 57 48 83 EC 20 BA 01 00 00 00 48 8B F1 44 8B C2 E8 ?? ?? ?? ?? 33 FF 4C 8D 44 24 "
+    "38 48 8B CE 89 7C 24 38 8D 57 02 E8 ?? ?? ?? ?? 8B 5C 24 38 E8";
+using EntMgrFn = void* (*)();
+using EntFindFn = uint8_t* (*)(void* mgr, uint32_t id, uint64_t zero);
+using RefFn = void** (*)(void* tmp, void* p);
+using DerefFn = uint8_t* (*)(void* p);
+using PushWrapperFn = void (*)(lua_State* L, void* wrapper);
+struct EntityApi {
+    EntMgrFn mgr = nullptr;
+    EntFindFn find = nullptr;
+    RefFn ref = nullptr;
+    DerefFn deref = nullptr;
+    PushWrapperFn push = nullptr;
+} _ent;
+
+uintptr_t CallTarget(uintptr_t site) {
+    int32_t rel = 0;
+    std::memcpy(&rel, reinterpret_cast<const void*>(site + 1), 4);
+    return site + 5 + rel;
+}
+
+void* WrapperById(uint32_t id) {
+    uint8_t* e = _ent.find(_ent.mgr(), id, 0);
+    // the table is indexed by id >> 8: a slot reused by another entity has another id
+    if (!e || *reinterpret_cast<uint32_t*>(e + 0x18) != id || !*reinterpret_cast<void**>(e + 0xA8)) return nullptr;
+    uint8_t tmp[16] = {};
+    void** r = _ent.ref(tmp, *reinterpret_cast<void**>(e + 0xA8));
+    uint8_t* o = _ent.deref(*r);
+    if (!o || !*reinterpret_cast<uint8_t**>(o + 0x10)) return nullptr;
+    return *reinterpret_cast<void**>(*reinterpret_cast<uint8_t**>(o + 0x10) + 0xA8);
+}
+
+void* WrapperByIdGuarded(uint32_t id) {
+    __try {
+        return WrapperById(id);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// The entity ids (GUID numbers) of every entity of one type (low byte of the id: 8 human, 9 player, 10 car, ...),
+// space separated. Entities sit in a table indexed by id >> 8; the scan stops after 8192 empty slots in a row.
+// There is no "entities in a radius" call for scripts; this is it (the caller filters by position).
+size_t EntityIdsGuarded(uint8_t type, uint32_t* out, size_t cap) {
+    size_t n = 0;
+    __try {
+        void* mgr = _ent.mgr();
+        uint32_t misses = 0;
+        for (uint32_t idx = 1; idx < 0x100000 && misses < 8192 && n < cap; ++idx) {
+            uint8_t* e = _ent.find(mgr, (idx << 8) | type, 0);
+            if (!e) {
+                ++misses;
+                continue;
+            }
+            misses = 0;
+            const uint32_t guid = *reinterpret_cast<uint32_t*>(e + 0x18);
+            if ((guid & 0xFF) == type && (guid >> 8) == idx) out[n++] = guid;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+int McEntityIds(lua_State* L) {
+    const double t = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    std::string out;
+    if (_ent.find && t >= 0 && t < 256) {
+        static uint32_t ids[8192];
+        const size_t n = EntityIdsGuarded(static_cast<uint8_t>(t), ids, std::size(ids));
+        out.reserve(n * 9);
+        for (size_t i = 0; i < n; ++i) {
+            if (i) out += ' ';
+            out += std::to_string(ids[i]);
+        }
+    }
+    PushString(L, out);
+    return 1;
+}
+
+int McEntity(lua_State* L) {
+    const double id = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    void* w = (_ent.push && id > 0) ? WrapperByIdGuarded(static_cast<uint32_t>(id)) : nullptr;
+    if (!w) {
+        PushNil(L);
+        return 1;
+    }
+    _ent.push(L, w);
+    return 1;
+}
+
 }  // namespace
 
 // ---- setup ----------------------------------------------------------------------------------------------------
@@ -384,6 +478,15 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         core::hook::Install("C_ScriptMachine::TickPaused", reinterpret_cast<void*>(tickPaused),
                             reinterpret_cast<void*>(&TickPausedDetour), reinterpret_cast<void**>(&_origTickPaused));
     }
+    if (const uintptr_t t = core::mem::FindPattern(kPatGetEntityByGuid)) {
+        _ent.mgr = reinterpret_cast<EntMgrFn>(CallTarget(t + 0x39));
+        _ent.find = reinterpret_cast<EntFindFn>(CallTarget(t + 0x46));
+        _ent.ref = reinterpret_cast<RefFn>(CallTarget(t + 0x61));
+        _ent.deref = reinterpret_cast<DerefFn>(CallTarget(t + 0x69));
+        _ent.push = reinterpret_cast<PushWrapperFn>(CallTarget(t + 0x89));
+    } else {
+        MC_LOG_WARN("lua: GetEntityByGUID not found: mc_entity unavailable (NPCs and mission cars are not matched by id)");
+    }
     _available = true;
     // Our helpers for scripts; registered on the first tick.
     Post([](lua_State* L) {
@@ -391,7 +494,12 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         RegisterGlobal(L, "mc_u64", &McU64);
         RegisterGlobal(L, "mc_u64str", &McU64Str);
         RegisterGlobal(L, "mc_pad", &McPad);
-        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad");
+        if (_ent.push) {
+            RegisterGlobal(L, "mc_entity", &McEntity);
+            RegisterGlobal(L, "mc_entity_ids", &McEntityIds);
+        }
+        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s",
+                    _ent.push ? ", mc_entity, mc_entity_ids" : "");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
                 Narrow(_dllDir).c_str(), Narrow(_dllDir).c_str(), _tag.c_str());

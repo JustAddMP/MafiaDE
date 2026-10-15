@@ -135,10 +135,18 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 function M.FactoryReset(why)
   local f = M.fac
+  for _, pp in pairs(M.pup) do
+    if M.Burning(pp) and why ~= "session ended" then  -- the factory's despawn would release the burning puppet
+      if not f.burnWait then log("factory reset (" .. tostring(why) .. ") waits: a puppet burns") end
+      f.burnWait = true
+      return
+    end
+  end
+  for _, pp in pairs(M.pup) do M.Unmark(pp) end  -- before the puppets go with the factory (see M.PuppetLife)
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
   M.fac = { st = "none", t = -1 }
-  for _, pp in pairs(M.pup) do pp.so = nil; pp.st = "queued" end
+  for _, pp in pairs(M.pup) do M.Unmark(pp); pp.so = nil; pp.st = "queued" end
 end
 
 function M.FactoryTick(dt, need)
@@ -174,13 +182,28 @@ function M.FactoryTick(dt, need)
       local comp = drv:GetComponent("C_RuntimeSpawnerComponent")
       if not comp then M.FactoryReset("no spawner component"); return end
       try("factory demigod", drv.SetDemigod, drv, true)
+      -- A civilian driver panics at gunfire (a shootout, an NPC fight next to the players), leaves and is despawned
+      -- like any traffic driver: the factory was lost every few seconds in fights, its puppets with it, and the
+      -- releases crashed the game (exe+0x243a915). It stays put, hears nothing, and is never despawned.
+      try("factory immunity", drv.DespawnImmunity, drv, true)
+      pcall(drv.SetReactionOnSound, drv, false)
+      pcall(drv.InterruptCivilWander, drv)
+      pcall(drv.LockControls, drv, true)
       f.car, f.drv, f.comp, f.st, f.t, f.busy = car, drv, comp, "ready", 0, nil
       log(string.format("factory ready (%s) %.1f s after the world loaded", tostring(drv), M.now - (M.inWorldAt or M.now)))
     elseif f.t > 8 then
       M.FactoryReset("spawn timeout")
     end
   elseif f.st == "ready" then
-    if not valid(f.drv) or not valid(f.car) then M.FactoryReset("factory lost"); return end
+    if not valid(f.drv) or not valid(f.car) then
+      M.FactoryReset("factory lost (" .. (valid(f.drv) and "car" or "driver") .. " gone)")
+      return
+    end
+    if f.drv:IsDeath() then M.FactoryReset("factory driver died"); return end
+    if not f.drv:GetOwner() and not f.leftLogged then
+      f.leftLogged = true
+      log("factory driver left his car")
+    end
     if f.t > 3 then
       f.t = 0
       local p = M.Player()
@@ -340,8 +363,55 @@ local function setLock(c, closed)
   end
 end
 
+-- A car of this model already standing where the other player's car is (within ADOPT_DIST): the same mission car
+-- (every game runs the same mission scripts, so a chapter's cars stand at the same spots, docs/game-api.md 15).
+-- Driving that one instead of spawning a copy on top of it keeps the mission's own car in this game (a copy on top
+-- of it shoved it away, and the guest's mission flow failed when its car was gone).
+local ADOPT_DIST = 3
+-- Returns: a free car of the same model standing there (adopt it), or nil and a car that stands in the way (ours, or
+-- another model): a copy spawned into it shoved it away, and a mission car shoved like that failed the mission (the
+-- game then loaded the free roam state before the quest).
+function M.FindLocalCar(c)
+  if not mc_entity_ids then return nil end
+  local p = game.game:GetActivePlayer()
+  local mine = p and p:GetOwner()
+  local best, bestD, block
+  for s in string.gmatch(mc_entity_ids(10), "%d+") do
+    local e = mc_entity(tonumber(s))
+    if e and e.GetVehicleModelName then
+      local q = e:GetPos()
+      local d = (q.x - c.tx) ^ 2 + (q.y - c.ty) ^ 2 + (q.z - c.tz) ^ 2
+      if d <= ADOPT_DIST * ADOPT_DIST then
+        local good, model = pcall(e.GetVehicleModelName, e)
+        if good and model == c.model and not (mine and same(mine, e)) and not M.KeyOf(e) then
+          if not bestD or d < bestD then best, bestD = e, d end
+        else
+          block = e
+        end
+      end
+    end
+  end
+  return best, bestD and math.sqrt(bestD), block
+end
+
 function M.CarTick(c)
   if c.st == "new" then
+    if M.now - (c.lookT or -10) < 0.5 then return end
+    c.lookT = M.now
+    local own, dist, block = M.FindLocalCar(c)
+    if own then
+      c.ent, c.st, c.adopted = own, "ready", true
+      try("SetDespawnImmunity", own.SetDespawnImmunity, own, true)
+      log(string.format("car %s: our own %s stands there (%.1f m): it is this car here", c.key, c.model, dist))
+      return
+    end
+    if block then  -- wait until the other player's car has moved off it (his puppet stays hidden meanwhile)
+      if not c.blockLogged then
+        c.blockLogged = true
+        log("car " .. c.key .. ": another car stands where it is (ours?): no copy until it moved away")
+      end
+      return
+    end
     local so, id = try("ObtainSpecificCar", game.traffic.ObtainSpecificCar, game.traffic, c.model)
     if not so then c.st = "failed"; return end
     c.so, c.qid, c.st = so, id, "obtain"
@@ -730,13 +800,25 @@ function M.Drive(pp)
   M.Combat(pp)
 end
 
+-- A puppet that burns (FIRE damage in the last 8 s) is not released: the game's fire update keeps a list of burning
+-- humans and read a released one (crash in exe+0x243a915, docs/game-api.md 15). It is hidden and released later
+-- (or goes with the world).
+function M.Burning(pp)
+  return pp.burnT ~= nil and M.now - pp.burnT < 8
+end
+
 function M.Remove(id)
   local pp = M.pup[id]
   if not pp then return end
   M.Unmark(pp)
   local f = M.fac
   if f.busy == id then f.busy = nil end
-  if valid(pp.so) and f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, pp.so) end
+  if valid(pp.so) and M.Burning(pp) then
+    pcall(pp.so.ShowModel, pp.so, false)
+    log("puppet " .. id .. " burns: hidden, not released")
+  elseif valid(pp.so) and f.comp then
+    pcall(f.comp.ReleaseObjectRaw, f.comp, pp.so)
+  end
   M.pup[id] = nil
   log("puppet " .. id .. " removed")
 end
@@ -797,6 +879,7 @@ function M.OnPuppetDamage(pp, m)
   local enemy = tostring(m:GetEnemyGUID())
   local amount = tonumber(m:GetDamageAmount()) or 0
   local dtype, zone = tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0
+  if dtype == 8 then pp.burnT = M.now end  -- FIRE: see M.Burning
   local weapon = tonumber(m:GetWeaponID()) or 0
   if not M.IsLocalAttacker(enemy) then
     pp.otherHits = (pp.otherHits or 0) + 1
@@ -855,6 +938,8 @@ end
 function M.OnDamageEvent(m)
   local g = tostring(m:GetReceiverGUID())
   if g == M.localGuid then return M.OnLocalDamage(m) end
+  -- mission NPCs (npc_sync.lua): our hits on copies of the host's NPCs, replayed guest shots landing on the host's
+  if M.Npc and M.Npc.OnDamage and M.Npc.OnDamage(m, tonumber(g:match("(%d+)%s*$"))) then return end
   for _, pp in pairs(M.pup) do
     if pp.guid == g and pp.st == "alive" then return M.OnPuppetDamage(pp, m) end
   end
@@ -901,17 +986,26 @@ end
 function M.PuppetLife(pp)
   local so = pp.so
   local dead = so:IsDeath()
-  if (pp.health or 100) <= 0 then  -- its player is dead or downed: so is the puppet
+  -- its player is dead or downed: so is the puppet. Back only from 10 health on and not within 3 s of its death:
+  -- a player hovering at 0-1 health (a demigod, a heal tick) made the puppet die and respawn several times a second,
+  -- churning the puppet factory (and the guest's game crashed in the entity message dispatch during such a churn)
+  local hp = pp.health or 100
+  if hp <= 0 or (pp.deadShown and (hp < 10 or M.now - (pp.deadAt or 0) < 3)) then
     if not dead and not pp.deadShown then
       pcall(so.DoDamage, so, PUP_HEALTH * 100)
       log("puppet " .. pp.id .. ": its player is down, the puppet dies")
     end
+    if not pp.deadShown then pp.deadAt = M.now end
     pp.deadShown = true
     return true
   end
   if dead then  -- its player is back (respawned, checkpoint), or something killed it here: a fresh puppet
     log("puppet " .. pp.id .. ": " .. (pp.deadShown and "its player is back, respawning it" or "died here, respawning it"))
     local f = M.fac
+    -- its map marker goes first: the navigation module updates its markers once a second and read the released
+    -- puppet through a stale marker (crash in exe+0x243a915, docs/game-api.md 15)
+    if M.Burning(pp) then return true end  -- released once the fire is out
+    M.Unmark(pp)
     if f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, so) end
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
@@ -1073,28 +1167,59 @@ function M.ApplyHit(p, from, amount, dtype, zone)
   M.HurtScript(p, from, amount, dtype, zone)
 end
 
--- Next to the host's puppet (behind it), on foot.
+-- Beside the host's puppet, on foot, facing his way: guest 1 on his right, guest 2 on his left, guest 3 further right
+-- (1.5 m steps).
 function M.NearHost(p)
   local host = M.pup["0"]
   if not (host and host.tx) or p:GetOwner() then return false end
-  p:SetPos(V(host.tx - (host.hx or 0) * 1.5, host.ty - (host.hy or 1) * 1.5, host.tz + 0.2))
-  p:SetDir(V(host.hx or 0, host.hy or 1, 0))
+  local hx, hy = host.hx or 0, host.hy or 1
+  local l = math.sqrt(hx * hx + hy * hy)
+  if l < 1e-3 then hx, hy, l = 0, 1, 1 end
+  hx, hy = hx / l, hy / l
+  local idx = math.max(1, tonumber(M.localId) or 1)
+  local side = (idx % 2 == 1) and 1 or -1      -- right of the heading (hy, -hx) for odd ids
+  local d = 1.5 * math.ceil(idx / 2) * side
+  p:SetPos(V(host.tx + hy * d, host.ty - hx * d, host.tz + 0.2))
+  p:SetDir(V(hx, hy, 0))
   return true
 end
 
 -- Guest only: instead of dying (the YOU DIED screen would reload his own game) the player is downed at low health:
--- invulnerable, controls locked, reported with health 0 (his puppets die), and after DOWN_TIME respawned behind the
+-- invulnerable, controls locked, reported with health 0 (his puppets die), and after DOWN_TIME respawned beside the
 -- host's puppet with full health (HealByMedkit). If he dies anyway (an NPC, a fall, a car), his last checkpoint is
 -- loaded during the death camera (game.savesystem:Retry(), skipping the YOU DIED menu, where scripts do not run) and
 -- he is put next to the host once he is back in the world.
 function M.DownTick(p)
-  if M.isHost or not M.inSession then M.down, M.died = nil, nil; return end
+  if not M.inSession then M.down, M.died = nil, nil; return end
+  if M.isHost then
+    -- In a chapter loaded through our chapter loader (replay flags) the game answers a death by loading the free
+    -- roam state from before the quest (another world, sometimes another chapter): the host's own last checkpoint is
+    -- loaded instead, through the same loader (mc_story_reload, mission_sync.cpp). In a normal story load the game's
+    -- own YOU DIED / load checkpoint flow stays.
+    M.down = nil
+    if M.died and p:IsDeath() and not M.diedRetry and M.now - (M.diedAt or M.now) > 1.5 then
+      M.diedRetry = true
+      local good, replay = pcall(game.savesystem.IsInReplayOrTestDrive, game.savesystem)
+      if good and replay and mc_story_reload and mc_story_reload() then
+        log("dead in a co-op chapter: reloading our last checkpoint")
+      end
+    elseif M.died and not p:IsDeath() then
+      M.died = nil
+    end
+    return
+  end
   if M.died then
     if p:IsDeath() then
       if not M.diedRetry and M.now - (M.diedAt or M.now) > 1.5 then
         M.diedRetry = true
-        local good, err = pcall(game.savesystem.Retry, game.savesystem)
-        log("dead: loading our last checkpoint" .. (good and "" or (" failed: " .. tostring(err))))
+        if mc_story_reload and mc_story_reload() then
+          -- following the host's story: his checkpoint, not ours (in a replay-style load the game's Retry goes back
+          -- to the free roam state before the quest)
+          log("dead: loading the host's checkpoint")
+        else
+          local good, err = pcall(game.savesystem.Retry, game.savesystem)
+          log("dead: loading our last checkpoint" .. (good and "" or (" failed: " .. tostring(err))))
+        end
       end
     elseif M.now - (M.inWorldAt or M.now) > 3 and M.NearHost(p) then
       -- not on the first ticks after the load: the HUD is not ready yet, and a car next to the new spot makes it show

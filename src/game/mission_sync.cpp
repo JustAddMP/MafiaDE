@@ -247,10 +247,20 @@ double _menuSince = -1;       // guest: since when the main menu is up with no s
 double _mismatchSince = -1;   // guest in the world: since when the host is at another point
 double _cutsceneAt = -100;    // guest: last time a cutscene played (here or on the host)
 double _now = 0;
-std::atomic<bool> _forceReload{false};
-bool _forceLeaving = false;  // a forced reload is leaving the world: our (stale) point must not count as reached
+std::atomic<bool> _forceReload{false};  // guest: quit and load the host's point although we are there (mc_follow_force,
+                                        // mc_story_reload after a death)
+bool _forceLeaving = false;             // a forced reload is leaving the world: our (stale) point must not count as reached
+std::atomic<bool> _selfReload{false};   // host: reload our own newest checkpoint (we died in a replay-style load)
+Point _selfPoint;                       // host: the point being reloaded
+std::vector<uint8_t> _selfBytes;        // host: its save
+double _selfMenuSince = -1;
+Point _lastHostPoint;                   // host: the story point we were last at (with a checkpoint save of it)
+std::vector<uint8_t> _lastHostBytes;
+uint32_t _abortsSeen = 0;               // save_guard::MissionAborts() handled
+bool _selfQuitWanted = false;           // host: leave the free roam world the game loaded after a failed mission
+double _selfQuitAt = 0;
 std::mutex _testMu;
-std::string _testStart;  // tests (mc_start): "story" or a quest id, started on the render thread like a lobby START  // tests (mc_follow_force): quit and load the host's point although we are there
+std::string _testStart;                 // tests (mc_start): "story", a quest id or "quest@cp", started like a lobby START
 
 // main thread only
 bool _moduleLoaded = false, _moduleFailed = false;
@@ -501,7 +511,7 @@ void GuestFollow() {
     if (!following || !hostStory) return;
     const Point host = HostPoint();
     if (inWorld && _forceReload.exchange(false) && !host.quest.empty()) {
-        MC_LOG_INFO("mission: test: reloading the host's point %s %s from the main menu", host.quest.c_str(),
+        MC_LOG_INFO("mission: reloading the host's point %s %s from the main menu (death or test)", host.quest.c_str(),
                     host.cp.c_str());
         _followPoint = {};
         _forceLeaving = true;
@@ -523,7 +533,9 @@ void GuestFollow() {
             _mismatchSince = -1;
             return;
         }
-        if (cutscene) _cutsceneAt = _now;
+        // a cutscene holds the reload only when it belongs to the host's chapter (a guest thrown into another chapter,
+        // e.g. by his game's own mission-failed load, goes back at once)
+        if (cutscene && local.quest == host.quest) _cutsceneAt = _now;
         if (_mismatchSince < 0) _mismatchSince = _now;
         if (_now - _cutsceneAt < 5) return;  // not during or right after a cutscene
         // our own mission flow usually gets there a moment later (it runs the same chapter): give it time
@@ -553,6 +565,86 @@ void GuestFollow() {
     }
 }
 
+// Host died in a replay-style load (chapter mode): back to the main menu, then our own newest checkpoint save of the
+// point we were at is loaded through the chapter loader and its quest started there; guests follow as usual.
+void HostSelfReload() {
+    Shared& sh = S();
+    const bool inWorld = PlayerSync::InWorld();
+    {
+        Point at;
+        {
+            std::lock_guard lock(sh.mu);
+            at = sh.local;
+        }
+        if (inWorld && !at.quest.empty() && !_hostSave.empty() && ParseSaveId(_hostSaveId) == at &&
+            !(_lastHostPoint == at && _lastHostBytes == _hostSave)) {
+            _lastHostPoint = at;
+            _lastHostBytes = _hostSave;
+        }
+    }
+    // A failed mission in a replay-style load: the game loads the free roam state from before the quest (another
+    // world). Back to our last checkpoint instead, once that world is up.
+    const uint32_t aborts = save_guard::MissionAborts();
+    if (aborts != _abortsSeen) {
+        _abortsSeen = aborts;
+        if (!_lastHostPoint.quest.empty() && _selfPoint.quest.empty()) {
+            MC_LOG_INFO("mission: our mission failed at %s %s: reloading that checkpoint", _lastHostPoint.quest.c_str(),
+                        _lastHostPoint.cp.c_str());
+            _selfPoint = _lastHostPoint;
+            _selfBytes = _lastHostBytes;
+            _selfMenuSince = -1;
+            _selfQuitWanted = true;
+            _selfQuitAt = _now;
+        }
+    }
+    if (_selfQuitWanted && inWorld && PlayerSync::SaveId().rfind("freeroam", 0) == 0 && _now - _selfQuitAt > 3) {
+        // the free roam world the game loaded is up: leave it
+        _selfQuitWanted = false;
+        std::lock_guard lock(sh.mu);
+        sh.quitPending = true;
+    }
+    if (_selfReload.exchange(false)) {
+        Point at;
+        {
+            std::lock_guard lock(sh.mu);
+            at = sh.local;
+        }
+        if (!at.quest.empty() && !_hostSave.empty() && ParseSaveId(_hostSaveId) == at) {
+            _selfPoint = at;
+            _selfBytes = _hostSave;
+            _selfMenuSince = -1;
+            MC_LOG_INFO("mission: we died at %s %s: reloading our checkpoint save (%s)", at.quest.c_str(), at.cp.c_str(),
+                        _hostSaveId.c_str());
+            std::lock_guard lock(sh.mu);
+            sh.quitPending = true;
+        } else {
+            MC_LOG_WARN("mission: we died at %s %s but have no checkpoint save of it: the game's own flow runs",
+                        at.quest.c_str(), at.cp.c_str());
+        }
+    }
+    if (_selfPoint.quest.empty() || inWorld) {
+        _selfMenuSince = -1;
+        return;
+    }
+    const std::string saveId = PlayerSync::SaveId();
+    if (!menu::MainMenuShown() || !(saveId.empty() || saveId == "!none!")) {
+        _selfMenuSince = -1;
+        return;
+    }
+    if (_selfMenuSince < 0) _selfMenuSince = _now;
+    if (_now - _selfMenuSince < 8) return;
+    const Point p = _selfPoint;
+    _selfPoint = {};
+    if (ArmAndLoad(std::move(_selfBytes))) {
+        std::lock_guard lock(sh.mu);
+        sh.target = p;
+        MC_LOG_INFO("mission: loading our checkpoint %s %s again", p.quest.c_str(), p.cp.c_str());
+    } else {
+        MC_LOG_WARN("mission: could not load our checkpoint %s %s", p.quest.c_str(), p.cp.c_str());
+    }
+    _selfBytes.clear();
+}
+
 // ---- Lua ------------------------------------------------------------------------------------------------------------
 std::wstring DllDir() {
     HMODULE mod = nullptr;
@@ -579,6 +671,25 @@ int McFollowReset(lua_State* L) {
 int McFollowForce(lua_State* L) {
     _forceReload = true;
     lua::PushBool(L, true);
+    return 1;
+}
+
+// mc_story_reload() -> true when the story sync takes over a death: a following guest reloads the host's checkpoint,
+// the host (in a story point with a checkpoint save) his own; player_sync.lua calls it instead of the game's Retry.
+int McStoryReload(lua_State* L) {
+    bool ok = false;
+    {
+        Shared& sh = S();
+        std::lock_guard lock(sh.mu);
+        if (sh.active && !sh.isHost && sh.following) {
+            _forceReload = true;
+            ok = true;
+        } else if (sh.active && sh.isHost && !sh.local.quest.empty()) {
+            _selfReload = true;
+            ok = true;
+        }
+    }
+    lua::PushBool(L, ok);
     return 1;
 }
 
@@ -635,6 +746,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_follow_reset", &McFollowReset);
     lua::RegisterGlobal(L, "mc_follow_force", &McFollowForce);
     lua::RegisterGlobal(L, "mc_start", &McStart);
+    lua::RegisterGlobal(L, "mc_story_reload", &McStoryReload);
     lua::RegisterGlobal(L, "mc_load_file", &McLoadFile);
     return true;
 }
@@ -785,6 +897,20 @@ void MissionSync::Tick(float dt) {
         std::lock_guard lock(_testMu);
         start.swap(_testStart);
     }
+    if (!start.empty() && start.find('@') != std::string::npos && _session->IsHost()) {
+        // tests: "quest@cp_040" = the chapter's start save, its quest started at that checkpoint (host only; a later
+        // checkpoint from the start save can crash, docs/re-notes.md 6; guests follow the host's save of it)
+        const Point p{start.substr(0, start.find('@')), start.substr(start.find('@') + 1)};
+        std::vector<uint8_t> bytes;
+        const bool ok = ReadReplaySave(ReplayFile(p.quest), bytes) && ArmAndLoad(std::move(bytes));
+        if (ok) {
+            Shared& sh = S();
+            std::lock_guard lock(sh.mu);
+            sh.target = p;
+        }
+        MC_LOG_INFO("mission: test start of %s at %s: %s", p.quest.c_str(), p.cp.c_str(), ok ? "loading" : "failed");
+        start.clear();
+    }
     if (!start.empty()) {
         const bool ok = start == "story" ? StartStory() : StartChapter(start);
         MC_LOG_INFO("mission: test start of %s: %s", start.c_str(), ok ? "loading" : "cannot start now");
@@ -837,6 +963,7 @@ void MissionSync::Tick(float dt) {
             SendMissionState(id, ms);
             SendCutscene(id, cs);
         }
+        HostSelfReload();
         return;
     }
     GuestFollow();
