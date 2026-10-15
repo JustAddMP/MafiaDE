@@ -24,14 +24,15 @@ src/game/
   game_info.cpp          GetGameInfo(): MafiaCoop names, Steam app 1030840, mafiadefinitiveedition.exe, /multiinst,
                          supported builds (CRC32), default port 27960, proxy names/marker
   module.cpp             GetGameModule(): wires the pieces below to core's calls (Init, render tick, session
-                         start/end/tick, player left, health/status, menu state/commands); reads the enter-vehicle
-                         and aim controls
+                         start/end/tick, player left, health/status, menu state/commands, lobby modes and start,
+                         CO-OP SETTINGS rows, name tags via DrawHud); reads the enter-vehicle and aim controls
   lua.{h,cpp}            bridge into the game's Havok Script VM (C_ScriptMachine::Tick hook), dev console (F8)
   characters.{h,cpp}     the character list (aliases -> spawn profiles), defaults by player id, fallbacks
   player_sync.{h,cpp}    phase 3: local player sampling, puppets, copy cars, weather/time (C++ side; wire format in
   player_sync.lua        docs/protocol.md); the .lua is embedded at build time. Also the CHARACTER/OUTFIT
                          rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel
-  menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch
+  menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch;
+                         the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
                          research-*.md, re-tools/, screenshots/
 tools/                   devlua.ps1 (run Lua in a running game), make_release.cmd + release-readme.txt

@@ -7,7 +7,9 @@ Steam transports and lobbies are core's: `external/core/docs/protocol.md`. All i
 
 Version rules: any incompatible change to these messages needs a bump of `modVersion` in `src/game/game_info.cpp`
 (the session build number is derived from it, so mismatched builds are rejected in the handshake). 0.3.0: Hit (0x0400)
-and the character per player. 0.4.0: PlayerModel (0x0102), character choice in the CO-OP panel, punch detection.
+and the character per player. 0.4.0: PlayerModel (0x0102), character choice in the CO-OP panel, punch detection. 0.5.0:
+core 0.5 (protocol 7: the pre-game lobby, core docs/protocol.md "Lobby"); lobby mode indexes: 0 FREE RIDE, 1 STORY (not
+startable yet).
 
 App id allocation (core reserves 0x0000-0x00FF):
 

@@ -15,7 +15,7 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
   menu entries.
 
 Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
-one tag (currently core v0.4.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+one tag (currently core v0.5.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
 (docs/PLAN.md).
 
 ## Build
@@ -142,8 +142,12 @@ scripts and still work.
 
 - **Main menu:** a **CO-OP** entry after FREE RIDE (it reads `CO-OP (HOSTING)` / `CO-OP (CONNECTED)` while a
   session runs). It opens a CO-OP page in the same style, with mouse, keyboard and gamepad like every other entry:
-  - **HOST CO-OP GAME** starts hosting (UDP 27960 + a friends-only Steam lobby) and goes back to HOME, where the player
-    starts the game the usual way (CONTINUE, STORY > chapter, ...) with hosting on.
+  - **HOST CO-OP GAME** starts hosting (UDP 27960 + a friends-only Steam lobby) and opens the **LOBBY** over the menu
+    (below). BACK there returns to the CO-OP page with hosting on, so the old way still works too: start the game
+    yourself (CONTINUE, STORY > chapter, ...) and the others drop in.
+  - **LOBBY (n PLAYERS)** (while hosting or connected) opens the lobby again; **SETTINGS** opens CO-OP SETTINGS.
+  - The page updates by itself when the co-op state changes (a join completes, players come and go): the patched
+    menu polls the dll every frame (docs/game-api.md 13).
   - **JOIN FRIEND** opens the Steam overlay's friends list: right-click a friend who hosts and pick *Join Game*, or
     accept their invite.
   - **JOIN BY IP** opens a text box (type `ip` or `ip:port`, Ctrl+V pastes; Enter connects, Esc cancels).
@@ -152,6 +156,21 @@ scripts and still work.
     **CLEAR PASSWORD**. The password lives until the game exits (the ini/launcher one is the starting value). The
     pause panel shows a padlock next to its CO-OP title while a password is set. A join refused with "password
     required" / "wrong password" opens a PASSWORD box; Enter repeats the join with it.
+- **Lobby** (core's panel over the main menu): the players with their character (CHARACTER column) and status
+  (HOST / READY / NOT READY), your CHARACTER and OUTFIT rows, then for a guest **READY** (Left/Right/Enter toggle) and
+  for the host **MODE** (FREE RIDE; STORY is listed as "NEXT VERSION") and **START** (waits until every guest is
+  ready), INVITE FRIENDS, SETTINGS, LEAVE CO-OP / STOP HOSTING, BACK. A guest who joins (JOIN BY IP, JOIN FRIEND, a
+  Steam invite, `--join`) gets the lobby by itself as soon as he is at the main menu (not over the title screen).
+  START closes everybody's lobby and every game loads Free Ride the way the menu's own FREE RIDE does (each player
+  presses Enter on his loading screen); everyone starts at the Free Ride start. If the host is already playing, the
+  lobby says "HOST IS PLAYING FREE RIDE" and **JOIN GAME** loads it. The host's host-menu flow and the lobby messages
+  are core's (core docs/protocol.md "Lobby").
+- **CO-OP SETTINGS** (main menu CO-OP page, lobby, pause CO-OP panel): NAME (text box; empty = Steam name; used from
+  the next session), DEBUG OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE; saved in MafiaCoop.ini.
+- **In the world:** every other player's name floats over his character (fades with distance, no occlusion: it shows
+  through walls) and he is an orange marker on the minimap and map (docs/game-api.md 13).
+- **Quitting:** when a game closes (window X, the game's quit) the others are told at once: guests see **HOST LEFT**,
+  the host sees "<name> left the game". Killing the process from outside still makes them wait for the 10 s timeout.
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
@@ -375,6 +394,9 @@ model = paulie             ; your character (alias from src/game/characters.cpp,
                            ; the CO-OP panel's CHARACTER/OUTFIT rows; empty = default by player id (host tommy)
 puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (tests)
 friendly_fire = 1          ; 0 = shooting/punching/ramming other players does not hurt them (and they cannot hurt you)
+name_tags = 1              ; 0 = no names over the other players (CO-OP SETTINGS > SHOW NAME TAGS)
+map_markers = 1            ; 0 = the other players are not on the minimap/map (CO-OP SETTINGS > MAP MARKERS)
+debug_overlay = 0          ; 1 = debug status text at start (CO-OP SETTINGS > DEBUG OVERLAY, F7)
 test_pad = 0               ; 1 = a virtual gamepad for automated tests (mc_pad from the dev console)
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```

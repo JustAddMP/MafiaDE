@@ -325,3 +325,42 @@ Learned the hard way:
 | `enums.ModelParts` | HEAD 0 .. BODY 9, LAST 10, as in the static research. `C_ModelComponent` (SetSubdivType, SetDynamic, reflections, resource id) and `C_ClothComponent` exist on the player, neither switches parts; `C_SpawnedObjectComponent` is nil |
 | Free Ride | `GetLoadedSaveId()` = `freeroam_test`; `mm_spawn_profiles` has no entry for it. Resolving "tommy" locally therefore gives the trench coat; since 0.4.0 the host's own game sends its model-manager profile instead (row above) |
 | `game.outfits:GetCurrentOutfit()` in Free Ride | `tostring` gives a number like 140737180990744 that matches no `ToHashName(<outfit id>)` (23 ids tried); not usable |
+
+## 13. Screen projection, minimap markers, starting a mode — verified 2026-10-15
+
+Two instances on one PC, Omerta park story checkpoint and Free Ride. Used by the name tags, the map markers and the
+lobby (src/game/player_sync.lua "Name tags and map markers", src/game/module.cpp, src/game/menu.cpp).
+
+| call | notes |
+|---|---|
+| `game.game:ProjectPointToScreen(v)` | returns **three values** `x, y, onScreen`: x and y in -1..1 from the screen centre, **y up** (a point 10 m above the head gave y 10.3), `onScreen` false for points behind the camera or outside the view. Pixel = ((x + 1) / 2 * w, (1 - y) / 2 * h). A point 20 m along the camera's direction gave (0, 0) |
+| `game.cameramanager:GetPlayerCamera():GetPos()` / `GetDir()` | camera position and direction (distance for the tag fade) |
+| `game.hud:GetScreenResolution()` / `GetScreenAspectRatio()` | 1280 800 / 1.6 (the game's render resolution; the dll draws in backbuffer pixels instead) |
+| `h:IsVisibleFromCamera()` | true for humans far off screen and behind the camera too: **not** a visibility or occlusion test |
+| `game.physics:StartCollisionQuery(from, to, x)` | 3 arguments (2 or 4 = wrong number), returns a sync object whose user data is a `C_WrapperCollisionResult` (`HasHit`, `GetHitEntity`, `GetHitPos`, `GetHitNormal`, `GetHitFraction`). With the third argument 0, 1, -1, 65535, 2, 4, 8 or 16 a ray from the camera 20 m straight down never hit anything; `MakeCollLayers(...)` returns a `C_EntityGuid: 0` for every argument tried. **No working ray cast found, so name tags have no occlusion** (they fade with distance and hide off screen) |
+| `game.navigation:RegisterHumanEntityDirect(human, 1, 1)` | **minimap/map marker on a human**: returns an id (11, 12, ...); an orange marker appeared on the minimap at the human's position and followed it (also on the guest's map for the host's puppet in Free Ride). `RegisterHumanEntity(name, type, state)` wants the entity **name** (string) as 2nd argument. Types 0, 2-6 (state 1) and states 0, 2, 3 (type 1) showed nothing, but they were tried on a human that had had an icon before: after `UnregisterId(id)` the **same entity never gets a second icon** (every later register returns a new id and shows nothing; a fresh human gets one at once). The game's own node `Game.Hud.CreateHumanIcon` uses this call (`inEntity`, `inHumanNavType`, `inHumanNavState`); other icons: `RegisterIconEntityDirect(entity, icon, textId, desc, showText, showIcon, picture[, color])` (`Game.Hud.CreateMapIconOnEntity`), not used |
+| `game.navigation:UnregisterId(id)` | removes the marker |
+
+**Starting Free Ride / Continue from the main menu.** The main menu's AS3 (`pages::main_menu_page_main`) starts a
+game with `menu_parent.LoadGame(name)` (`main_menu` class): `"free_ride"` (the FREE RIDE entry, and the Free Ride
+info page's START), `"free_ride_extreme"`, `"continue_game"` (CONTINUE), `"new_game"`. `LoadGame` fades to black and
+after a short timer calls the C++ menu object: `game.MainMenu.OpenDebugLoadChapter2(["02_lost_heaven",
+"lh_freeride_extreme.sav"])` for Free Ride, `game.MainMenu.ContinueGame()` for CONTINUE, `StartNewGame()` for a new
+game. The co-op lobby calls `menu_parent.LoadGame("free_ride")` from our patched page (src/game/menu.cpp,
+"poll"): both games went to the Free Ride loading screen (sailor Tommy) at once and, after Enter on each loading
+screen ("Enter CONTINUE"; the game waits for it, the dll does not press it), both players were in Free Ride at the
+Free Ride start (`GetLoadedSaveId()` = `freeroam_test`) and saw each other. While the loading screen waits for that
+key, scripts run and `game.hud:IsLoadingScreenUp()` is true. Not tried: a guest whose Free Ride is still locked.
+
+**Main menu live refresh.** The patched `BuildMenu` registers `this.QuitGameResponse` as an `enterFrame` listener
+(Flash keeps one registration per listener, so every rebuild adds it once). `QuitGameResponse(answer:String)` is the
+quit dialog's callback ("a" / "b"); called as a listener it gets the Event (coerced to a string) and asks C++
+(`"poll"`, menuLocation) every frame: `refresh` -> `UpdateMenu()`, `free_ride` / `continue_game` ->
+`menu_parent.LoadGame(...)`. Checked: the host's CO-OP page switched to LOBBY (1 PLAYER) when hosting started and to
+LOBBY (2 PLAYERS) when the guest joined, without a key press. The main menu page is loaded and polls behind the title
+screen too ("PRESS ENTER TO START"); it builds HOME once there and again when the title is passed, so "the menu is
+really on screen" = at least two HOME builds and a poll within the last second (`menu::MainMenuShown`).
+
+**Quitting.** Closing the game window (WM_CLOSE, the X button) ends the process through `ExitProcess` on the game's
+main thread right away (no dialog); the dll's hook leaves the co-op session first (core docs/protocol.md "Leaving
+cleanly").

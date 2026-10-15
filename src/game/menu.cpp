@@ -73,6 +73,16 @@ std::deque<Command> _commands;
 // acted on the command; SetState must not undo that for a moment.
 Mode _optimistic = Mode::Idle;
 ULONGLONG _optimisticUntil = 0;
+// Live refresh (the main menu polls us every frame, see PatchMainMenu): the spec last handed to BuildMenu per menu
+// location, a load the menu should start ("free_ride" / "continue_game", from the lobby's START), and when the main
+// menu last polled (it only polls while it exists, i.e. at the main menu).
+std::unordered_map<int, std::string> _lastBuilt;
+std::string _pendingLoad;
+ULONGLONG _lastPoll = 0;
+// HOME (location 0) builds seen. The main menu page is loaded, builds HOME once and polls behind the title screen
+// ("PRESS ENTER TO START"); it builds HOME again when the player passes the title. So from the second build on the
+// menu is really on screen (the title never comes back while the game runs).
+int _homeBuilds = 0;
 
 void SetOptimistic(Mode m) {  // _mutex held
     _state.mode = m;
@@ -93,6 +103,8 @@ enum ItemId : int {
     kItemInvite = 106,
     kItemSetPassword = 107,
     kItemClearPassword = 108,
+    kItemLobby = 109,
+    kItemSettings = 110,
 };
 
 // ---- a Scaleform File backed by memory (same virtual layout as the engine's file class, vtable exe+0x4F6EAA8:
@@ -211,6 +223,9 @@ bool PatchMainMenu(swf::Abc& abc, std::string* err) {
         !Need(updateMenu, "UpdateMenu", err) || !Need(back, "Back", err) || !Need(setPageTitle, "setPageTitle", err) ||
         !Need(infoBarBack, "setupInfoBarBack", err))
         return false;
+    const uint32_t quitResponse = abc.TraitName(cls, "QuitGameResponse");
+    const int pollMethod = abc.TraitMethod(cls, "QuitGameResponse");
+    if (!Need(quitResponse, "QuitGameResponse", err) || pollMethod < 0) return false;
     const uint32_t buttonData = abc.QName(swf::ns::kPackage, "components", "ButtonData");
     const uint32_t idx = abc.RuntimeIndexName(), length = abc.Name("length"), split = abc.Name("split"),
                    push = abc.Name("push"), splice = abc.Name("splice"), id = abc.Name("id"),
@@ -234,6 +249,11 @@ bool PatchMainMenu(swf::Abc& abc, std::string* err) {
             a.ConstructProp(buttonData, 2);
         };
         a.Op(swf::op::kGetLocal0).Op(swf::op::kPushScope);
+        // this.addEventListener("enterFrame", this.QuitGameResponse): our per-frame poll (below). Flash keeps one
+        // registration per (type, listener), and a method closure of the same object is the same listener, so
+        // calling this on every build adds it once.
+        a.Op(swf::op::kGetLocal0).PushString("enterFrame").Op(swf::op::kGetLocal0).GetProperty(quitResponse);
+        a.CallPropVoid(abc.Name("addEventListener"), 2);
         EiCall ei(a, abc, "build");
         a.Op(swf::op::kGetLocal0).GetProperty(menuLocation);
         ei.Finish(1);
@@ -299,6 +319,34 @@ bool PatchMainMenu(swf::Abc& abc, std::string* err) {
         a.Bind(skip).Op(swf::op::kPopScope);
         const auto code = a.Finish();
         if (code.empty() || !abc.Prepend(activate, code, 8, 1)) return *err = "ActivateButton patch failed", false;
+    }
+
+    // QuitGameResponse(answer:String) is the quit dialog's callback ("a" = quit, "b" = cancel). As our enterFrame
+    // listener it gets an Event (coerced to "[Event type=...]"): then it asks C++ ("poll", menuLocation) and follows
+    // the answer: "refresh" -> UpdateMenu() (the co-op state changed: a background join completed, players came or
+    // went), "free_ride" / "continue_game" -> menu_parent.LoadGame(that) (the lobby's START, the same call as the
+    // menu's own FREE RIDE / CONTINUE). The dialog's own "a"/"b" calls run the original code.
+    {
+        swf::Asm a(abc);
+        const uint32_t rRes = abc.LocalCount(pollMethod);
+        const int orig = a.Label(), n1 = a.Label(), n2 = a.Label(), done = a.Label();
+        const uint32_t loadGame = abc.Name("LoadGame");
+        a.Op(swf::op::kGetLocal0).Op(swf::op::kPushScope);
+        a.Op(swf::op::kGetLocal1).PushString("a").Jump(swf::op::kIfEq, orig);
+        a.Op(swf::op::kGetLocal1).PushString("b").Jump(swf::op::kIfEq, orig);
+        EiCall ei(a, abc, "poll");
+        a.Op(swf::op::kGetLocal0).GetProperty(menuLocation);
+        ei.Finish(1);
+        a.Op(swf::op::kConvertS).SetLocal(rRes);
+        a.GetLocal(rRes).PushString("refresh").Jump(swf::op::kIfNe, n1);
+        a.Op(swf::op::kGetLocal0).CallPropVoid(updateMenu, 0).Jump(swf::op::kJump, done);
+        a.Bind(n1).GetLocal(rRes).PushString("free_ride").Jump(swf::op::kIfEq, n2);
+        a.GetLocal(rRes).PushString("continue_game").Jump(swf::op::kIfNe, done);
+        a.Bind(n2).Op(swf::op::kGetLocal0).GetProperty(menuParent).GetLocal(rRes).CallPropVoid(loadGame, 1);
+        a.Bind(done).Op(swf::op::kReturnVoid);
+        a.Bind(orig).Op(swf::op::kPopScope);
+        const auto code = a.Finish();
+        if (code.empty() || !abc.Prepend(pollMethod, code, 6, 1)) return *err = "QuitGameResponse patch failed", false;
     }
     return true;
 }
@@ -495,18 +543,50 @@ std::string BuildSpec(int location) {
         item(kItemJoinIp, "JOIN BY IP");
         passwordItems();
         break;
-    case Mode::Hosting:
+    case Mode::Hosting: {
+        const std::string lobby = "LOBBY (" + std::to_string(st.players < 1 ? 1 : st.players) + " PLAYER" +
+                                  (st.players == 1 ? ")" : "S)");
+        item(kItemLobby, lobby.c_str());
         item(kItemInvite, "INVITE FRIENDS");
         passwordItems();
         item(kItemLeave, "STOP HOSTING");
         break;
+    }
     case Mode::Joining:
-    case Mode::Connected:
+        item(kItemLeave, "LEAVE CO-OP");
+        break;
+    case Mode::Connected: {
+        const std::string lobby = "LOBBY (" + std::to_string(st.players) + " PLAYERS)";
+        item(kItemLobby, lobby.c_str());
         item(kItemLeave, "LEAVE CO-OP");
         break;
     }
+    }
+    item(kItemSettings, "SETTINGS");
     item(kItemBack, "BACK");
     return s;
+}
+
+// The main menu's per-frame poll: start a requested load, or rebuild the page when what it would show changed.
+std::string Poll(int location) {
+    {
+        std::lock_guard lock(_mutex);
+        _lastPoll = GetTickCount64();
+        if (!_pendingLoad.empty()) {
+            std::string what;
+            what.swap(_pendingLoad);
+            MC_LOG_INFO("menu: starting '%s' from the main menu (lobby start)", what.c_str());
+            return what;
+        }
+    }
+    if (location != 0 && location != kCoopMenuLocation) return {};
+    const std::string spec = BuildSpec(location);
+    std::lock_guard lock(_mutex);
+    auto it = _lastBuilt.find(location);
+    if (it == _lastBuilt.end() || it->second == spec) return {};
+    it->second = spec;  // the rebuild that follows asks "build" and gets the same
+    if (_verbose) MC_LOG_INFO("menu: page %d changed, refreshing", location);
+    return "refresh";
 }
 
 std::string Select(int id) {
@@ -518,8 +598,11 @@ std::string Select(int id) {
             SetOptimistic(Mode::Hosting);  // the root entry shows it right away
         }
         Post(Command::Host);
-        return "back";  // the player now picks CONTINUE / STORY as usual, with hosting on
+        Post(Command::Lobby);  // the lobby opens over the menu; BACK there returns to this page (still hosting)
+        return "refresh";
     }
+    case kItemLobby: Post(Command::Lobby); return "";
+    case kItemSettings: Post(Command::Settings); return "";
     case kItemJoinFriend: Post(Command::JoinFriend); return "";
     case kItemJoinIp: Post(Command::JoinByIp); return "";
     case kItemInvite: Post(Command::Invite); return "";
@@ -554,10 +637,19 @@ uint64_t AttachDetour(void* self, void* args, uint32_t argc, void* ret, void* a5
     if (request == "build") {
         const int location = argc >= 3 ? static_cast<int>(ArgNumber(args, 2)) : -1;
         reply = BuildSpec(location);
+        std::lock_guard lock(_mutex);
+        _lastBuilt[location] = reply;
+        if (location == 0) ++_homeBuilds;
     } else if (request == "select") {
         const int id = argc >= 3 ? static_cast<int>(ArgNumber(args, 2)) : -1;
         reply = Select(id);
         MC_LOG_INFO("menu: main menu item %d -> '%s'", id, reply.c_str());
+    } else if (request == "poll") {
+        const int location = argc >= 3 ? static_cast<int>(ArgNumber(args, 2)) : -1;
+        reply = Poll(location);
+        if (_verbose && !reply.empty()) MC_LOG_INFO("menu: poll %d -> '%s'", location, reply.c_str());
+        if (ret) ReturnString(ret, reply);
+        return 1;  // every frame: not logged by menu_debug unless it did something
     } else if (request == "pause_label") {
         reply = "CO-OP";
     } else if (request == "pause") {
@@ -594,6 +686,8 @@ const char* CommandName(Command c) {
     case Command::PausePanel: return "pause co-op panel";
     case Command::SetPassword: return "set password";
     case Command::ClearPassword: return "clear password";
+    case Command::Lobby: return "lobby";
+    case Command::Settings: return "settings";
     }
     return "?";
 }
@@ -635,6 +729,24 @@ void Install(const std::wstring& dllDir) {
 }
 
 bool Active() { return _active.load(); }
+
+bool AtMainMenu() {
+    std::lock_guard lock(_mutex);
+    return _lastPoll && GetTickCount64() - _lastPoll < 1000;
+}
+
+bool MainMenuShown() {
+    std::lock_guard lock(_mutex);
+    return _homeBuilds >= 2 && _lastPoll && GetTickCount64() - _lastPoll < 1000;
+}
+
+bool RequestLoad(const std::string& what) {
+    if (!AtMainMenu()) return false;
+    std::lock_guard lock(_mutex);
+    _pendingLoad = what;
+    MC_LOG_INFO("menu: load '%s' requested", what.c_str());
+    return true;
+}
 
 void SetState(const State& s) {
     std::lock_guard lock(_mutex);

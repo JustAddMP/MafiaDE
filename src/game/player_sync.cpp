@@ -109,6 +109,16 @@ struct Shared {
     std::string lastWeather;  // last WorldEnv weather (for the log)
     bool enterPressed = false;
     double enterAt = 0;
+    // name tags: the head of each remote player's puppet on screen (Lua "NT" events, every script tick)
+    struct Tag {
+        float x = 0, y = 0, dist = 0;  // x, y: -1..1, y up
+        double at = 0;
+    };
+    std::map<net::PlayerId, Tag> tags;
+    // world state (Lua "WS" events, twice a second, also without a session)
+    bool inWorld = false;
+    std::string saveId;
+    double worldAt = 0;
 };
 
 Shared& S() {
@@ -210,6 +220,8 @@ int McPlayerProfile(lua_State* L) {
 }
 
 bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
+bool NameTagsOn() { return core::Config::Get().GetInt("name_tags", 1) != 0; }
+bool MapMarkersOn() { return core::Config::Get().GetInt("map_markers", 1) != 0; }
 
 // ---- wire ----------------------------------------------------------------------------------------------------------
 void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
@@ -647,6 +659,7 @@ void MainTick(lua_State* L, float dt) {
             const double now = Now();
             cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
             cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
+            cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1\n" : "0\n");
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
@@ -662,7 +675,13 @@ void MainTick(lua_State* L, float dt) {
             }
         }
     }
-    if (!active && cmds.empty() && !_wasActive) return;  // nothing to do offline
+    // Offline the glue only reports the world state (lobby: in the world or not, which save), four times a second.
+    static double lastIdle = 0;
+    if (!active && cmds.empty() && !_wasActive) {
+        const double t = Now();
+        if (t - lastIdle < 0.25) return;
+        lastIdle = t;
+    }
     _wasActive = active;
     if (_moduleFailed) return;
     if (!_moduleLoaded) {
@@ -699,11 +718,23 @@ void MainTick(lua_State* L, float dt) {
     {
         std::lock_guard lock(sh.mu);
         sh.luaStatus = status ? status : "";
-        if (sh.active && events && *events) {
+        if (events && *events) {
             std::istringstream in(events);
             std::string line;
             while (std::getline(in, line)) {
-                if (line.rfind("CP ", 0) == 0)
+                if (line.rfind("WS ", 0) == 0) {  // world state, also offline
+                    sh.inWorld = line.size() > 3 && line[3] == '1';
+                    sh.saveId = line.size() > 5 ? line.substr(5) : std::string();
+                    sh.worldAt = now;
+                    continue;
+                }
+                if (!sh.active) continue;
+                if (line.rfind("NT ", 0) == 0) {  // name tag of a puppet
+                    unsigned id = 0;
+                    float x = 0, y = 0, d = 0;
+                    if (std::sscanf(line.c_str() + 3, "%u %f %f %f", &id, &x, &y, &d) == 4 && id < net::kMaxPlayers)
+                        sh.tags[static_cast<net::PlayerId>(id)] = {x, y, d, now};
+                } else if (line.rfind("CP ", 0) == 0)
                     sh.outParked.push_back(line);
                 else if (line.rfind("WE ", 0) == 0 && sh.isHost)
                     sh.outEnv.push_back(line);
@@ -779,6 +810,7 @@ void PlayerSync::Detach() {
     sh.models.clear();
     sh.live.clear();
     sh.lastWeather.clear();
+    sh.tags.clear();
 }
 
 void PlayerSync::OnPlayerLeft(net::PlayerId id) {
@@ -788,6 +820,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.names.erase(id);
     sh.models.erase(id);
     sh.live.erase(id);
+    sh.tags.erase(id);
     sh.removed.push_back(id);
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
 }
@@ -901,6 +934,47 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
 }
 
 std::string PlayerSync::Model() { return LocalModelSetting(); }
+
+bool PlayerSync::InWorld() {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    return sh.inWorld && Now() - sh.worldAt < 2.0;
+}
+
+std::string PlayerSync::SaveId() {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    return Now() - sh.worldAt < 2.0 ? sh.saveId : std::string();
+}
+
+std::string PlayerSync::CharacterName(net::PlayerId id) {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    std::string picked;
+    if (id == sh.localId || !sh.active) {
+        picked = LocalModelSetting();
+    } else {
+        auto live = sh.live.find(id);
+        auto hello = sh.models.find(id);
+        picked = live != sh.live.end() ? live->second.model : hello != sh.models.end() ? hello->second : std::string();
+    }
+    if (picked.empty() || (!characters::Find(picked, nullptr, nullptr) && characters::Resolve(picked, id) != picked))
+        picked = characters::DefaultModel(id);
+    return characters::DisplayName(picked);
+}
+
+void PlayerSync::GetTags(std::vector<NameTag>& out) {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (!sh.active) return;
+    const double now = Now();
+    for (const auto& [id, t] : sh.tags) {
+        if (now - t.at > 0.25) continue;  // not seen this tick (off screen, hidden, paused, loading)
+        auto name = sh.names.find(id);
+        if (name == sh.names.end()) continue;
+        out.push_back({name->second, t.x, t.y, t.dist});
+    }
+}
 
 void PlayerSync::SetModel(const std::string& model) {
     if (!core::Config::Get().Set("model", model))

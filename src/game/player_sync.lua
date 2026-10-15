@@ -18,6 +18,9 @@
 --                                                                                story dresses him)
 --   E                                                                            enter key pressed (ride along)
 --   A                                                                            aim input held (RMB / left trigger)
+--   G tags markers                                                               settings: 1/0 name tags (send NT
+--                                                                                events), 1/0 map markers (minimap
+--                                                                                icons on puppets)
 --   R id                                                                         remove that puppet
 --   X                                                                            remove everything
 -- Output: sample, status, events
@@ -27,7 +30,9 @@
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
---            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel)
+--            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
+--            not for the network: "NT id x y dist" (name tag: the puppet's head on screen, x/y -1..1 with y up, dist
+--            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -35,7 +40,7 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 5
+M.version = 6
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
@@ -723,6 +728,7 @@ end
 function M.Remove(id)
   local pp = M.pup[id]
   if not pp then return end
+  M.Unmark(pp)
   local f = M.fac
   if f.busy == id then f.busy = nil end
   if valid(pp.so) and f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, pp.so) end
@@ -1287,6 +1293,63 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------------------------------------------
+-- Name tags and map markers (docs/game-api.md 13). Tags: the dll draws each player's name over his puppet with our
+-- overlay; it gets the head's screen position from game.game:ProjectPointToScreen (x, y in -1..1 with y up, and
+-- whether the point is in front of the camera). Markers: the game's own minimap icon for a human
+-- (game.navigation:RegisterHumanEntityDirect(human, 1, 1), an orange marker), removed with UnregisterId. The game does
+-- not give the same entity a second icon after UnregisterId, so a puppet keeps its icon until it is replaced.
+-- ---------------------------------------------------------------------------------------------------------------
+local TAG_HEAD = 0.45  -- m above the head bone
+
+function M.Unmark(pp)
+  if pp.blip then pcall(game.navigation.UnregisterId, game.navigation, pp.blip) end
+  pp.blip, pp.blipSo = nil, nil
+end
+
+function M.MarkersTick()
+  for _, pp in pairs(M.pup) do
+    local so = pp.so
+    local want = M.markers and pp.st == "alive" and valid(so)
+    if pp.blip and (not want or pp.blipSo ~= so) then M.Unmark(pp) end
+    if want and not pp.blip and pp.blipFailed ~= so then
+      local good, id = pcall(game.navigation.RegisterHumanEntityDirect, game.navigation, so, 1, 1)
+      if good and id then
+        pp.blip, pp.blipSo = id, so
+        log("puppet " .. pp.id .. ": map marker " .. tostring(id))
+      else
+        pp.blipFailed = so
+        log("puppet " .. pp.id .. ": no map marker (" .. tostring(id) .. ")")
+      end
+    end
+  end
+end
+
+function M.TagsTick()
+  local cam = game.cameramanager:GetPlayerCamera()
+  local c = cam and cam:GetPos()
+  for id, pp in pairs(M.pup) do
+    local so = pp.so
+    if pp.st == "alive" and valid(so) and not pp.hidden and not pp.deadShown then
+      local good, h = pcall(so.GetBonePos, so, "Head")
+      if not good or not h then h = so:GetPos(); h = V(h.x, h.y, h.z + 1.6) end
+      local x, y, on = game.game:ProjectPointToScreen(V(h.x, h.y, h.z + TAG_HEAD))
+      if on and x and y then
+        local dx, dy, dz = h.x - c.x, h.y - c.y, h.z - c.z
+        M.events[#M.events + 1] = string.format("NT %s %.4f %.4f %.1f", id, x, y, math.sqrt(dx * dx + dy * dy + dz * dz))
+      end
+    end
+  end
+end
+
+-- Twice a second: are we in a loaded world, and which save (the lobby's "playing" state and mode).
+function M.WorldState()
+  if M.now - (M.wsT or -10) < 0.5 then return end
+  M.wsT = M.now
+  local p = M.Player()
+  M.events[#M.events + 1] = "WS " .. (p and "1 " or "0 ") .. tostring(game.game:GetLoadedSaveId() or "-")
+end
+
 function M.Update(dt, cmds)
   M.now = M.now + dt
   M.events = {}
@@ -1351,6 +1414,8 @@ function M.Update(dt, cmds)
       enter = true
     elseif op == "A" then
       aimInput = true
+    elseif op == "G" then
+      M.tags, M.markers = f[2] == "1", f[3] == "1"
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
@@ -1433,6 +1498,15 @@ function M.Update(dt, cmds)
   end
   for _, h in ipairs(M.hitq) do M.events[#M.events + 1] = h end
   M.hitq = {}
+  if player and active then
+    local good, err = pcall(M.MarkersTick)
+    if not good then logErr("markers", err) end
+    if M.tags then
+      good, err = pcall(M.TagsTick)
+      if not good then logErr("tags", err) end
+    end
+  end
+  pcall(M.WorldState)
   return sample, M.fac.st .. "|" .. table.concat(st, ";") .. "|" .. nc, table.concat(M.events, "\n")
 end
 

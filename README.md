@@ -12,11 +12,15 @@ missions are not shared yet.
 ## Play
 
 1. Run `MafiaCoop.exe`. It starts the game with co-op built in.
-2. Host: choose **CO-OP → Host Co-op Game** in the main menu, then invite friends from the pause menu or the
-   Steam overlay (Shift+Tab).
-3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**.
+2. Host: choose **CO-OP → Host Co-op Game** in the main menu. The co-op lobby opens: invite friends (or let them join
+   by IP), wait until everyone is ready, pick the mode and press **START**. Free Ride works today; story mode in the
+   lobby comes next (until then the host can start the story the usual way and friends drop in).
+3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**. You land in the lobby: pick your character and
+   set **READY**.
 4. Your character: pause menu → **CO-OP** → **CHARACTER** / **OUTFIT** (Left/Right). Tommy, Paulie, Sam, Salieri,
    Frank and more of the story cast; everyone sees the change at once, and your pick is remembered.
+5. In the world the other players' names float over them and they show on your minimap. Name, name tags, map
+   markers and friendly fire: **CO-OP → SETTINGS**.
 
 ## Start from Steam (optional)
 
@@ -45,3 +49,5 @@ overlay, co-op UI) is [JustAddMP/core](https://github.com/JustAddMP/core), a git
 | Guest's view after joining mid-game | Picking a character and outfit in the co-op panel |
 | ![The guest as Sam](docs/screenshots/character-sam-puppet.png) | ![A punch](docs/screenshots/punch.png) |
 | Host's view: the guest picked Sam in a suit | Punching the other player hurts him on his own game |
+| ![The co-op lobby](docs/screenshots/lobby.png) | ![Name tag and map marker](docs/screenshots/name-tag-map-marker.png) |
+| The lobby: characters, ready, mode, start | Free Ride together: the guest's name and his marker on the minimap |

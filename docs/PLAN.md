@@ -12,7 +12,7 @@ interest.md).
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
-| 5 Native UI (CO-OP in main/pause menus, banners) | Done for keyboard; gamepad/mouse/Steam invite untested |
+| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done for keyboard; gamepad/mouse/Steam invite untested; lobby: Free Ride works, Story next |
 | 4 Shared world, 6 polish | Not started |
 
 ## Working rules
@@ -32,7 +32,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.4.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.5.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -144,9 +144,37 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 ### C. Phase 5 polish (native UI)
 - [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.
 - [ ] Gamepad + mouse in our panels; test JOIN FRIEND and a real Steam invite with two accounts/PCs.
-- [ ] CO-OP page refreshes when a background join completes.
-- [ ] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible.
-- [ ] Settings page (name, show tags, debug overlay).
+- [x] CO-OP page refreshes when a background join completes. Done 2026-10-15 (game-api.md 13 "Main menu live
+  refresh"): the patched main menu polls us every frame (an enterFrame listener) and rebuilds the page when what it
+  shows changed; checked in game: the host's page went to LOBBY (1 PLAYER) when hosting started and to LOBBY (2
+  PLAYERS) the moment the guest joined, the guest's page to its connected entries, no key pressed.
+- [x] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible. Done
+  2026-10-15 (game-api.md 13): each player's name over his puppet (the head projected with
+  `game.game:ProjectPointToScreen`, drawn by our overlay through core's `GameModule::DrawHud`), size and fade by
+  distance (full to 35 m, gone at 90 m), hidden off screen, while the puppet is hidden or dead, and in menus/loading;
+  SHOW NAME TAGS in CO-OP SETTINGS turns them off (checked both ways in Free Ride). **No occlusion**: no working ray
+  cast was found from script (`StartCollisionQuery` never hits) and `IsVisibleFromCamera` is not a visibility test,
+  so a tag also shows through walls. Minimap: the game's own marker on every puppet
+  (`navigation:RegisterHumanEntityDirect(puppet, 1, 1)`, an orange marker on the minimap and map), MAP MARKERS in
+  settings; checked on both screens in Free Ride (the marker followed the other player into a building). Markers off
+  was not checked in a capture.
+- [x] Settings page (name, show tags, debug overlay). Done 2026-10-15: CO-OP SETTINGS (core v0.5.0 panel; main menu
+  CO-OP > SETTINGS, the lobby, pause menu CO-OP > SETTINGS): NAME (text box; used from the next session), DEBUG
+  OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE, all saved in MafiaCoop.ini with `Config::Set`. Checked in game:
+  debug overlay off/on, name saved, name tags off in the world (pause panel > SETTINGS).
+- [ ] **Pre-game lobby** (user agreed 2026-10-15): main menu CO-OP > HOST CO-OP GAME opens a lobby screen listing the
+  joined players with their character and ready state; guests reach it via JOIN BY IP / JOIN FRIEND / a Steam invite
+  (it opens by itself once they are at the main menu) and pick their character (the batch-3 rows) and toggle READY;
+  the host picks the MODE and presses START; the host's game loads that mode, every guest's loads the same, and
+  everyone spawns together. Generic parts in core v0.5.0 (`net/lobby.h`: ready, mode, start broadcast, in-game state
+  for late joiners, Steam lobby data `mc_state`/`mc_mode`; the LOBBY panel); UDP and Steam joins use the same
+  messages. Done includes tests: core `net_lobby` (ready, start waits for everyone, reaches every guest once, guests
+  cannot start, late joiner). **Free Ride works; Story next.** Checked in game 2026-10-15 (two instances, UDP): lobby
+  over the main menu, the guest's character change (Sam -> Salieri) seen on the host's lobby, READY, MODE (STORY shows
+  "NEXT VERSION" and cannot start), START: both games loaded Free Ride at once and both players stood at the Free Ride
+  start seeing each other (Enter on each loading screen, as in single player); a guest joining while the host already
+  plays sees "HOST IS PLAYING FREE RIDE" and JOIN GAME loads it. Story mode (continue the host's save / pick a chapter)
+  comes with mission/chapter sync (B2). A real Steam invite into the lobby between two accounts is not checked.
 
 - [x] **Session password** (network side + tests done in 65c562f; menus checked in game 2026-10-15: SET PASSWORD on
   the host, guest gets the PASSWORD box on JOIN BY IP, joins with it): the host can set an optional password (CO-OP page: "Set password", reusing the text box
@@ -176,8 +204,15 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] GitHub release v0.2.0 with the new zip when the user asks.
 
 ### E. Robustness (ongoing)
-- [ ] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
-- [ ] Overlay: release the backbuffer reference after each draw; log Present/ResizeBuffers thread ids in game to confirm assumptions.
+- [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
+  Done 2026-10-15 (core v0.5.0, its docs/protocol.md "Leaving cleanly"): `ExitProcess` / `TerminateProcess(self)`
+  hooks leave the session before the process ends. Checked in game: closing the host's window -> the guest's banner
+  "HOST LEFT: Host left the game" 4 ms later; closing the guest's window -> "Guest left the game" on the host 3 ms
+  later; STOP HOSTING -> HOST LEFT at once. A kill from outside (taskkill /F) still times out after 10 s.
+- [x] Overlay: release the backbuffer reference after each draw; log Present/ResizeBuffers thread ids in game to confirm assumptions.
+  Done 2026-10-15 (core v0.5.0): a backbuffer view per frame, released after drawing; everything released on device
+  removed/reset and at exit. In game: ResizeBuffers ran on the Present thread (logged) and succeeded right after the
+  overlay had drawn; the exit release logged. Device loss itself was not provoked.
 - [x] Steam join request: only record the lobby id in the callback and act after polling (no session reset mid-use).
 - [x] Crash handler: don't let a first-chance stack overflow use up the one-shot dump flag.
 - [x] Host relay rate limits for guest chat/app messages; evict oldest un-handshaken UDP connections when slots are full.

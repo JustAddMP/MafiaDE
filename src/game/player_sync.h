@@ -35,6 +35,22 @@ public:
     // (live preview while browsing), and everyone else's puppet of us follows (PlayerModel message).
     static void SetModel(const std::string& model);
     static void GetStatus(std::vector<render::OverlayLine>& out);
+
+    // The local player is in a loaded world (not the main menu or a loading screen), and the loaded save id
+    // ("freeroam_test" in Free Ride, "checkpoint_..." in the story; "" when unknown). Any thread; updated twice a
+    // second by the Lua glue, with or without a session.
+    static bool InWorld();
+    static std::string SaveId();
+    // "PAULIE / SUIT" for the lobby: the character player `id` picked (ours for the local player).
+    static std::string CharacterName(net::PlayerId id);
+
+    // Name tags (docs/game-api.md 13): every remote player whose puppet's head is in front of the camera this tick.
+    struct NameTag {
+        std::string name;
+        float x, y;  // -1..1, y up
+        float dist;  // metres from the camera
+    };
+    static void GetTags(std::vector<NameTag>& out);
 };
 
 }  // namespace mc::game
