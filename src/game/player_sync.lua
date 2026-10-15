@@ -1204,7 +1204,35 @@ function M.NearHost(p)
   local idx = math.max(1, tonumber(M.localId) or 1)
   local side = (idx % 2 == 1) and 1 or -1      -- right of the heading (hy, -hx) for odd ids
   local d = 1.5 * math.ceil(idx / 2) * side
-  p:SetPos(V(host.tx + hy * d, host.ty - hx * d, host.tz + 0.2))
+  -- The spot beside the host, unless a car stands there (a guest once landed on the roof of a parked car: the host
+  -- stands on the ground, a car beside him does not): then the other side, behind him, further out.
+  local spots = { { d, 0 }, { -d, 0 }, { 0, -1.5 * math.ceil(idx / 2) }, { 2 * d, 0 }, { -2 * d, 0 },
+                  { 0, -3 * math.ceil(idx / 2) } }
+  local cars = {}
+  if mc_entity_ids then
+    for s in string.gmatch(mc_entity_ids(10), "%d+") do
+      local e = mc_entity(tonumber(s))
+      if e and e.GetVehicleModelName then
+        local good, q = pcall(e.GetPos, e)
+        if good and q and (q.x - host.tx) ^ 2 + (q.y - host.ty) ^ 2 < 100 then cars[#cars + 1] = q end
+      end
+    end
+  end
+  local x, y = host.tx + hy * d, host.ty - hx * d
+  for i, o in ipairs(spots) do
+    local sx = host.tx + hy * o[1] + hx * o[2]
+    local sy = host.ty - hx * o[1] + hy * o[2]
+    local free = true
+    for _, q in ipairs(cars) do
+      if (q.x - sx) ^ 2 + (q.y - sy) ^ 2 < 3.0 * 3.0 and math.abs(q.z - host.tz) < 3 then free = false; break end
+    end
+    if free then
+      x, y = sx, sy
+      if i > 1 then log("a car stands beside the host: placed at spot " .. i .. " instead") end
+      break
+    end
+  end
+  p:SetPos(V(x, y, host.tz + 0.2))
   p:SetDir(V(hx, hy, 0))
   return true
 end

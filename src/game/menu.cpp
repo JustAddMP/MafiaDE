@@ -1,5 +1,7 @@
 #include "game/menu.h"
 
+#include "game/lua.h"
+
 #include "core/config.h"
 #include "core/compat.h"
 #include "core/hook.h"
@@ -79,10 +81,7 @@ ULONGLONG _optimisticUntil = 0;
 std::unordered_map<int, std::string> _lastBuilt;
 std::string _pendingLoad;
 ULONGLONG _lastPoll = 0;
-// HOME (location 0) builds seen. The main menu page is loaded, builds HOME once and polls behind the title screen
-// ("PRESS ENTER TO START"); it builds HOME again when the player passes the title. So from the second build on the
-// menu is really on screen (the title never comes back while the game runs).
-int _homeBuilds = 0;
+ULONGLONG _loadStartedAt = 0;  // when the menu last took a requested load (it polls a few more frames after that)
 
 void SetOptimistic(Mode m) {  // _mutex held
     _state.mode = m;
@@ -575,6 +574,7 @@ std::string Poll(int location) {
         if (!_pendingLoad.empty()) {
             std::string what;
             what.swap(_pendingLoad);
+            _loadStartedAt = GetTickCount64();
             MC_LOG_INFO("menu: starting '%s' from the main menu (lobby start)", what.c_str());
             return what;
         }
@@ -639,7 +639,6 @@ uint64_t AttachDetour(void* self, void* args, uint32_t argc, void* ret, void* a5
         reply = BuildSpec(location);
         std::lock_guard lock(_mutex);
         _lastBuilt[location] = reply;
-        if (location == 0) ++_homeBuilds;
     } else if (request == "select") {
         const int id = argc >= 3 ? static_cast<int>(ArgNumber(args, 2)) : -1;
         reply = Select(id);
@@ -730,14 +729,21 @@ void Install(const std::wstring& dllDir) {
 
 bool Active() { return _active.load(); }
 
+// The main menu page exists, and polls, behind the title screen ("PRESS ENTER TO START") too, and it rebuilds HOME
+// there whenever the window is resized, so neither tells the title from the menu. The game's scripts tick from the
+// moment the player passes the title (never on it), and the title never comes back while the game runs: the first
+// script tick is the sign. A load started from behind the title hangs on a black screen.
 bool AtMainMenu() {
+    if (!lua::MainThreadId()) return false;
     std::lock_guard lock(_mutex);
     return _lastPoll && GetTickCount64() - _lastPoll < 1000;
 }
 
 bool MainMenuShown() {
+    if (!AtMainMenu()) return false;
     std::lock_guard lock(_mutex);
-    return _homeBuilds >= 2 && _lastPoll && GetTickCount64() - _lastPoll < 1000;
+    // not while a requested load waits for the menu or has just started (the loading screen follows)
+    return _pendingLoad.empty() && (!_loadStartedAt || GetTickCount64() - _loadStartedAt > 3000);
 }
 
 bool RequestLoad(const std::string& what) {

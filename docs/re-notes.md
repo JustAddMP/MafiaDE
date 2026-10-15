@@ -641,8 +641,11 @@ Used by src/game/save_guard.cpp.
   `gamesaves` to `%TEMP%\MafiaCoop\coop-saves\<pid>\gamesaves\...` while a guest is in a co-op session (writes always,
   reads when the scratch file exists, so a Retry reads this session's checkpoint). Checked: a STORY session with 3
   forced reloads and a guest death: 10 save writes redirected, every file in the save folder byte-identical
-  afterwards (only `Savesideoconfig.cfg`, the window size, changed; `gamesettings.pf` was rewritten with the same
-  bytes).
+  afterwards (only `Saves\videoconfig.cfg`, the window size, changed; `gamesettings.pf` was rewritten with the same
+  bytes). The host of a lobby CHAPTER session is redirected too (mod 0.8.0; before that the chapter's `bslot` saves
+  overwrote his Free Ride): checked with a CHAPTER 10: OMERTA session through the intro to cp_020 (4 host writes and 4
+  guest writes redirected, the host's cp_010 and cp_020 checkpoints still found in his scratch tree and sent to the
+  guest): all 18 save and profile files byte-identical afterwards (only `videoconfig.cfg` changed).
 - **Death or a failed mission in a replay-style load**: the game loads `freeroam_before_quest_activated` (slot 2,
   storage `aslot`): the free roam state from before the quest. In our sessions that put players into another world
   (once the user's own Omerta story). The story sync reloads the checkpoint instead (docs/protocol.md "Story").

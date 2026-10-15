@@ -37,7 +37,8 @@ src/game/
   npc_sync.{h,cpp,lua}   phase 4 NPCs: host-authoritative mission NPCs (states, deaths), guests pair them with
                          their own copies, guests' hits replayed on the host from their puppets
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
-                         following guest's save files redirected to %TEMP% (his slots stay untouched)
+                         following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
+                         stay untouched)
   menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch;
                          the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,

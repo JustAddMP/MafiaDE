@@ -216,6 +216,7 @@ struct Shared {
     // guest
     HostView host;
     bool following = false;
+    bool hostChapter = false;     // host: a lobby CHAPTER runs (his saves go to the scratch tree, save_guard)
     Point target;                 // the chapter and checkpoint our last follow load should start (Lua "T")
     bool quitPending = false;     // Lua: quit to the main menu
     std::string notice;
@@ -277,24 +278,30 @@ bool ReadFile(const std::filesystem::path& p, std::vector<uint8_t>& out) {
 // Newest *.sav under Documents\...\Data\<id>\gamesaves whose save id is a story checkpoint (of point `at` when
 // given). Files are only read when their time or size changed.
 const SaveFile* NewestCheckpoint(const Point& at) {
-    static const std::filesystem::path root = SaveRoot();
-    if (root.empty()) return nullptr;
-    std::error_code ec;
+    static const std::filesystem::path real = SaveRoot();
+    // the real save folder, and while saves are redirected (a CHAPTER session) the scratch tree they go to
+    std::vector<std::filesystem::path> roots;
+    if (!real.empty()) roots.push_back(real);
+    if (const std::string scratch = save_guard::ScratchDir(); !scratch.empty()) roots.emplace_back(scratch);
+    if (roots.empty()) return nullptr;
     std::set<std::wstring> present;
-    for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
-         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
-        if (!it->is_regular_file(ec) || it->path().extension() != L".sav") continue;
-        const std::wstring key = it->path().wstring();
-        present.insert(key);
-        const auto stamp = static_cast<uint64_t>(it->last_write_time(ec).time_since_epoch().count());
-        const uint64_t size = it->file_size(ec);
-        SaveFile& f = _files[key];
-        if (f.stamp == stamp && f.size == size && !f.path.empty()) continue;
-        f.path = it->path();
-        f.stamp = stamp;
-        f.size = size;
-        std::vector<uint8_t> bytes;
-        f.id = ReadFile(f.path, bytes) ? SaveIdIn(bytes) : std::string();
+    for (const auto& root : roots) {
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+            if (!it->is_regular_file(ec) || it->path().extension() != L".sav") continue;
+            const std::wstring key = it->path().wstring();
+            present.insert(key);
+            const auto stamp = static_cast<uint64_t>(it->last_write_time(ec).time_since_epoch().count());
+            const uint64_t size = it->file_size(ec);
+            SaveFile& f = _files[key];
+            if (f.stamp == stamp && f.size == size && !f.path.empty()) continue;
+            f.path = it->path();
+            f.stamp = stamp;
+            f.size = size;
+            std::vector<uint8_t> bytes;
+            f.id = ReadFile(f.path, bytes) ? SaveIdIn(bytes) : std::string();
+        }
     }
     for (auto it = _files.begin(); it != _files.end();) it = present.count(it->first) ? std::next(it) : _files.erase(it);
     const SaveFile* best = nullptr;
@@ -873,6 +880,7 @@ void MissionSync::Detach() {
     std::lock_guard lock(sh.mu);
     sh.active = false;
     sh.following = false;
+    sh.hostChapter = false;
     sh.host = {};
     sh.quitPending = false;
 }
@@ -885,11 +893,15 @@ void MissionSync::Tick(float dt) {
         // menu) after the session ended (save_guard).
         Shared& sh = S();
         bool following;
+        // The host of a lobby CHAPTER session too: that chapter is not his story, and the game would save it into
+        // his Free Ride slot. A host who continues his story (STORY) keeps saving it as in single player.
+        bool hostChapter;
         {
             std::lock_guard lock(sh.mu);
             following = _session && _session->IsActive() && !_session->IsHost();
+            hostChapter = _session && _session->IsActive() && _session->IsHost() && sh.hostChapter;
         }
-        if (following) save_guard::Block(true);
+        if (following || hostChapter) save_guard::Block(true);
         else if (save_guard::Blocking() && !PlayerSync::InWorld()) save_guard::Block(false);
     }
     if (!_session) return;
@@ -979,7 +991,14 @@ void MissionSync::Tick(float dt) {
 
 bool MissionSync::StartStory() {
     if (!_session || !_session->IsActive()) return false;
-    if (_session->IsHost()) return menu::RequestLoad("continue_game");  // the host plays his own story
+    if (_session->IsHost()) {
+        {
+            Shared& sh = S();
+            std::lock_guard lock(sh.mu);
+            sh.hostChapter = false;
+        }
+        return menu::RequestLoad("continue_game");  // the host plays his own story (and saves it)
+    }
     if (!LoadPoint(HostPoint())) {
         MC_LOG_WARN("mission: story start: nothing to load yet (no host save or chapter received)");
         return false;
@@ -993,10 +1012,13 @@ bool MissionSync::StartStory() {
 bool MissionSync::StartChapter(const std::string& quest) {
     if (!_session || !_session->IsActive() || ReplayFile(quest).empty()) return false;
     const Point start{quest, "cp_010"};
+    const bool host = _session->IsHost();
+    if (host) save_guard::Block(true);  // before the load: nothing of this chapter goes into the host's slots
     if (!LoadPoint(start)) return false;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    sh.following = !_session->IsHost();
+    sh.following = !host;
+    sh.hostChapter = host;
     return true;
 }
 
@@ -1015,6 +1037,7 @@ void MissionSync::StopFollowing() {
     std::lock_guard lock(sh.mu);
     if (sh.following) MC_LOG_INFO("mission: no longer following the host's story");
     sh.following = false;
+    sh.hostChapter = false;
 }
 
 std::string MissionSync::HudNotice() {

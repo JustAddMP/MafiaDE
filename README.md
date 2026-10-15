@@ -7,9 +7,15 @@ checkpoint, objectives, cutscenes); mission NPCs are kept in step with the host'
 mission cars are not doubled. Enemies on the host's screen do not aim at the other players yet, and ambient traffic
 is each player's own.
 
+## Download
+
+The current version is the **0.8.0 pre-release**: download `MafiaCoop-0.8.0.zip` from
+[Releases](https://github.com/JustAddMP/MafiaDE/releases), extract it anywhere and read its `README.txt` (requirements,
+how to play, known issues, uninstall). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+
 ## What you need
 
-- Windows 10/11 (64-bit) and Mafia: Definitive Edition on Steam, with Steam running
+- Windows 10/11 (64-bit) and Mafia: Definitive Edition on Steam (build 16502642, the current one), with Steam running
 
 ## Play
 
@@ -18,7 +24,8 @@ is each player's own.
    by IP), wait until everyone is ready, pick the mode and press **START**: **FREE RIDE**, **STORY** (the host
    continues his story; everyone else joins him at his checkpoint) or a **CHAPTER** from its start. In the story the
    friends follow the host: his checkpoints, objectives and cutscenes. A friend's game saves nothing into his own
-   save slots while he is in a co-op game (story or Free Ride). (The host in CHAPTER mode saves into his Free Ride slot, never his story.)
+   save slots while he is in a co-op game (story or Free Ride), and neither does the host's in a CHAPTER (that chapter
+   is not his story); the host of a STORY game saves his own story as in single player.
 3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**. You land in the lobby: pick your character and
    set **READY**.
 4. Your character: pause menu → **CO-OP** → **CHARACTER** / **OUTFIT** (Left/Right). Tommy, Paulie, Sam, Salieri,
@@ -34,6 +41,15 @@ MafiaCoop when the game starts) and `mafiacoop_path.txt` (where your MafiaCoop f
 where it is; settings come from `MafiaCoop.ini` next to `mafiacoop.dll`. If another mod already uses a
 `version.dll`, MafiaCoop changes nothing and tells you. To remove it, run `MafiaCoop.exe --uninstall` (or delete
 those two files); it only ever deletes its own files.
+
+## Known issues
+
+- The host's enemies do not aim at the other players yet (mission NPCs are matched up and their deaths and your hits
+  on them are shared); some passers-by take no damage on a friend's game.
+- Mission cars are only partly shared; ambient traffic, pedestrians and police are each player's own.
+- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) only.
+- Name tags show through walls. A killed game (not closed) makes the others wait for a 10 s timeout.
+- Co-op panels are keyboard-first (gamepad and mouse not finished); Steam invites between two PCs not fully tested.
 
 ## For developers
 

@@ -276,12 +276,17 @@ void Block(bool on) {
         ClearScratch(dir);
         RemoveDirectoryA(dir.c_str());
     }
-    MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (a guest in a co-op session: his real save slots are "
-                                     "not touched)").c_str()
+    MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (co-op session: the real save slots are not "
+                                     "touched)").c_str()
                                   : "saves go to the real save slots again");
 }
 
 bool Blocking() { return _block.load(); }
+std::string ScratchDir() {
+    if (!_block.load()) return {};
+    std::lock_guard lock(_mu);
+    return _scratch;
+}
 uint32_t Redirected() { return _redirected.load(); }
 uint32_t MissionAborts() { return _aborts.load(); }
 

@@ -151,7 +151,15 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    autosaves were redirected too (0 real writes). Deaths
    and failed missions in a chapter loaded through the chapter loader (the game would load the free roam state from
    before the quest) reload the checkpoint instead: guest death -> the host's checkpoint, host death -> his own
-   (checked in Taxi). The guest is placed beside the host (1.5 m to his right) after loads and cutscenes.
+   (checked in Taxi). The guest is placed beside the host (1.5 m to his right) after loads and cutscenes; when a car
+   stands on that spot he goes to the other side or behind the host (0.8.0; checked: a car spawned on the spot, the
+   guest landed on the ground 3 m from it). The host of a lobby CHAPTER session is redirected too (0.8.0; before, the
+   chapter overwrote his Free Ride slot): checked with CHAPTER 10: OMERTA through the intro to cp_020, the host's
+   checkpoints still reached the guest from his scratch tree, every save and profile file byte-identical afterwards.
+   A STORY host keeps saving his own story (his campaign). Fixed in 0.8.0: a guest who joined at start-up
+   (`--join`, an invite) got the lobby over the title screen, and a START then loaded from behind the title and hung
+   on a black screen; "at the main menu" now needs the first script tick (game-api.md 13). Checked: no lobby over the
+   title or the loading screen, lobby STORY and CHAPTER starts with a `--join` guest loaded both games.
 - [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
@@ -241,12 +249,21 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 ### D. Release / distribution
 - [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
    a version constant, not the build hash.
-- [ ] Package: `MafiaCoop.exe` + `mafiacoop.dll` (+ README) in a zip, a few MB; `tools\make_release.cmd`.
-- [ ] Optional proxy-DLL install mode (built and tested on a fake game folder in afa56cd: `MafiaCoop.exe --install`; tick after a real start from Steam) (drop-in so the game can be started from Steam) — must be opt-in because it
-   writes into the game folder.
+- [x] Package: `MafiaCoop.exe` + `mafiacoop.dll` (+ README) in a zip, a few MB; `tools\make_release.cmd`.
+   Done 2026-10-15 (0.8.0): `tools\make_release.cmd <version>` builds, runs every core test and proxy_test, and writes
+   `MafiaCoop-<v>.zip` (exe, dll, proxy dll, player README with known issues, MinHook licence; 844 KB) and
+   `MafiaCoop-<v>-symbols.zip` (PDBs). Checked: unzipped into an empty folder, `MafiaCoop.exe --check-only` found the
+   game through Steam and reported the supported build.
+- [x] Optional proxy-DLL install mode (built and tested on a fake game folder in afa56cd: `MafiaCoop.exe --install`; tick after a real start from Steam) (drop-in so the game can be started from Steam) — must be opt-in because it
+   writes into the game folder. Real start from Steam checked 2026-10-15 with the unzipped 0.8.0 release: `--install`
+   wrote `version.dll` (= `mafiacoop_proxy.dll`, same SHA-256) and `mafiacoop_path.txt`; `steam://rungameid/1030840`
+   started the game, the log said `loaded by the version.dll proxy ... (game started without MafiaCoop.exe)`, the main
+   menu showed CO-OP; after quitting, `--uninstall` removed both files. Game folder before/after (5215 entries: names,
+   sizes, times; SHA-256 of every top-level file): identical except `BootCount` and one `cache\...\*.md`, which the
+   game itself rewrites on every start.
 - [x] Detect unsupported game builds (exe CRC) and show a clear message. Done: launcher CRC32 check against
    `core/version.h` (cached, `--check-only`, `--skip-version-check`); dll banner when patterns are missing.
-- [ ] GitHub release v0.2.0 with the new zip when the user asks.
+- [ ] GitHub pre-release v0.8.0 with the new zip (and a symbols zip).
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

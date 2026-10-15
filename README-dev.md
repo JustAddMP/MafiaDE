@@ -22,6 +22,9 @@ one tag (currently core v0.5.0) and moves with `tools\update_core.cmd vX.Y.Z`, w
 
 ```
 build.cmd
+tools\make_release.cmd 0.8.0      build, run every core test and proxy_test, write out\release\MafiaCoop-0.8.0.zip
+                                 (player files, tools\release-readme.txt as README.txt, MinHook licence) and
+                                 MafiaCoop-0.8.0-symbols.zip (PDBs); the version must equal modVersion
 ```
 
 - Works from any directory. Needs Visual Studio 2022 or newer with the x64 C++ toolset (found through vswhere by
@@ -357,7 +360,11 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
   while a cutscene plays.
 - A guest's game writes no saves into his own slots while he is in a co-op session: every save file goes to
   `%TEMP%\MafiaCoop\coop-saves\<pid>` (read back from there in the session, folders of ended games removed at the next
-  start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`.
+  start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`. The host of a lobby
+  CHAPTER session is redirected the same way from START on (the game would otherwise save that chapter into his Free
+  Ride slot); his checkpoint scan reads the scratch tree too, so his new checkpoints still reach the guests. The host
+  of a STORY session continues his own story and keeps saving it (that is his campaign, as in single player); in Free
+  Ride the host's game saves his Free Ride as usual.
 - Dying in a co-op chapter (or failing its mission) reloads the checkpoint: a guest the host's, the host his own (the
   game itself would load the free roam state from before the quest in these loads). After a load or cutscene the
   guest stands 1.5 m to the host's right.

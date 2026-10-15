@@ -358,8 +358,12 @@ quit dialog's callback ("a" / "b"); called as a listener it gets the Event (coer
 (`"poll"`, menuLocation) every frame: `refresh` -> `UpdateMenu()`, `free_ride` / `continue_game` ->
 `menu_parent.LoadGame(...)`. Checked: the host's CO-OP page switched to LOBBY (1 PLAYER) when hosting started and to
 LOBBY (2 PLAYERS) when the guest joined, without a key press. The main menu page is loaded and polls behind the title
-screen too ("PRESS ENTER TO START"); it builds HOME once there and again when the title is passed, so "the menu is
-really on screen" = at least two HOME builds and a poll within the last second (`menu::MainMenuShown`).
+screen too ("PRESS ENTER TO START"); it builds HOME there, and again whenever the window is resized (`--window`), so
+HOME builds do not tell the title from the menu (a guest who joined with `--join` got the lobby over the title, and a
+lobby START then loaded from behind the title and hung on a black screen). The game's scripts tick only from the
+moment the title is passed (first `C_ScriptMachine::Tick`, never on the title), so "at the main menu" = a script tick
+seen and a poll within the last second (`menu::AtMainMenu`, which `RequestLoad` needs), and "the menu is really on
+screen" (`menu::MainMenuShown`, the lobby may open) also needs no requested load pending or started in the last 3 s.
 
 **Quitting.** Closing the game window (WM_CLOSE, the X button) ends the process through `ExitProcess` on the game's
 main thread right away (no dialog); the dll's hook leaves the co-op session first (core docs/protocol.md "Leaving

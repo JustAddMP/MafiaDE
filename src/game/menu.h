@@ -28,9 +28,10 @@ using State = MenuState;
 void Install(const std::wstring& dllDir);
 bool Active();
 
-// The patched main menu polled us within the last second (it polls every frame while it exists).
+// Past the title screen (the game's scripts tick) and the patched main menu polled us within the last second (it
+// polls every frame while it exists, behind the title too).
 bool AtMainMenu();
-// AtMainMenu and past the title screen (the menu page also exists, and polls, behind the title).
+// AtMainMenu and no requested load pending or just started: the menu is really on screen (the lobby may open).
 bool MainMenuShown();
 // Asks the main menu to start a game the way its own entries do: "free_ride" (FREE RIDE: its chapter loader on
 // /saves/02_lost_heaven/lh_freeride_extreme.sav, whose contents MissionSync can swap for another save) or
