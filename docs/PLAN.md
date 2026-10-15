@@ -32,7 +32,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.1.1). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.2.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
