@@ -119,6 +119,12 @@ Scratch tooling (not checked in) is in `%TEMP%\claude\G--MafiaCoop\re3`. It reus
 
 ## A5. Damage, death, invulnerability, hits
 
+**Live-tested 2026-10-15** (A5-0 to A5-6): results in game-api.md 11. Confirmed: the enum values, RegisterBlanketEvent,
+the DAMAGE getters, `DoDamage` = SCRIPT damage with a flinch, `CreateShots` from an NPC hurting the player with a real
+hit reaction (but unreliable per game instance), car rams as COLLISION damage with the driver as enemy. Refuted: the
+globals `relationships` and `wingmanmanager` (nil), `ApplyRagdollRadialSpeed` on the player (no effect), `AttackMelee`
+from a puppet, melee DAMAGE messages (a punch sends none).
+
 ### Summary
 
 - **Observe**: per human with `h:RegisterEvent(ctx, fn, enums.EventType.HUMAN, enums.HumanMessages.DAMAGE | DEATH)`
@@ -306,6 +312,10 @@ return "car event id " .. tostring(MafiaCoop.a5car)
 ---------------------------------------------------------------------------------------------------------------
 
 ## A6. Weapons: why puppets refuse the Thompson; how enemies are armed
+
+**Live-tested 2026-10-15** (A6-1, A6-2): confirmed. `InventoryAddWeapon` adds nothing to an NPC, the helper adds the
+pistol, revolver, Tommy gun and shotgun, and a civilian-archetype puppet draws, aims and fires the Tommy gun without an
+archetype switch (game-api.md 6).
 
 ### Summary
 

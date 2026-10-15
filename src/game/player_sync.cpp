@@ -31,6 +31,8 @@ constexpr double kSendInterval = 0.05;      // 20 Hz
 constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
 constexpr double kMaxExtrapolate = 0.25;    // then hold
 constexpr size_t kMaxSnaps = 64;
+constexpr float kTeleport = 20.0f;          // metres between two snapshots: a teleport, not lerped (a car copy swept
+                                            // through the line would run over whoever stands on it)
 constexpr size_t kMaxInCmds = 64 * 1024;  // network -> Lua lines kept while the script tick does not run (paused)
 
 enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16 };
@@ -38,7 +40,7 @@ enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kRelo
 // Default character per player id (aliases resolved by the Lua glue, M.MODELS / M.Profile): the host stays Tommy as
 // the story dresses him, guests are other story characters. `model = <alias or spawn profile>` in the ini (or
 // --model) overrides it for that player; it is sent in Hello so everyone shows the same character.
-const char* const kDefaultModels[] = {"tommy", "salieri", "morello", "thug"};
+const char* const kDefaultModels[] = {"tommy", "paulie", "sam", "salieri"};
 
 struct PlayerState {
     float pos[3] = {};
@@ -294,6 +296,11 @@ PlayerState Interpolate(const Remote& rem, double now) {
     const Snap& b = sn[i + 1];
     const float t = static_cast<float>((rt - a.t) / std::max(1e-6, b.t - a.t));
     PlayerState s = t < 0.5f ? a.s : b.s;  // discrete fields from the nearer snapshot
+    auto jumped = [](const float* p, const float* q) {
+        const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+        return dx * dx + dy * dy + dz * dz > kTeleport * kTeleport;
+    };
+    if (jumped(a.s.pos, b.s.pos)) return s;
     for (int k = 0; k < 3; ++k) {
         s.pos[k] = Lerp(a.s.pos[k], b.s.pos[k], t);
         s.vel[k] = Lerp(a.s.vel[k], b.s.vel[k], t);
@@ -304,7 +311,8 @@ PlayerState Interpolate(const Remote& rem, double now) {
         s.head[0] = hx / hl;
         s.head[1] = hy / hl;
     }
-    if ((a.s.flags & kInVehicle) && (b.s.flags & kInVehicle) && a.s.vehId == b.s.vehId) {
+    if ((a.s.flags & kInVehicle) && (b.s.flags & kInVehicle) && a.s.vehId == b.s.vehId &&
+        !jumped(a.s.cpos, b.s.cpos)) {
         for (int k = 0; k < 3; ++k) {
             s.cpos[k] = Lerp(a.s.cpos[k], b.s.cpos[k], t);
             s.cvel[k] = Lerp(a.s.cvel[k], b.s.cvel[k], t);

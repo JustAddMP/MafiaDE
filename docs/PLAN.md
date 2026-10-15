@@ -11,7 +11,7 @@ interest.md).
 |---|---|
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
-| 3 Second player (Lua bridge, puppets) | On foot, weapons, shared cars (seated drivers, passengers, hand-off) done; gaps below |
+| 3 Second player (Lua bridge, puppets) | On foot, weapons, shared cars, characters, shooting/ramming damage and respawns done; punches below |
 | 5 Native UI (CO-OP in main/pause menus, banners) | Done for keyboard; gamepad/mouse/Steam invite untested |
 | 4 Shared world, 6 polish | Not started |
 
@@ -69,10 +69,20 @@ Tick an item (`- [x]`) in the same commit that lands it.
    ownership" (car keys, CarParked 0x0101).
 - [x] **Crouch, aim direction, firing, reload** shown on puppets; health synced. Done: debug AI commands
    (game-api.md 10); aim input read from RMB/left trigger; panel health column not checked in a capture.
-- [ ] (in progress, untested code on main) **Damage** (research: docs/research-world-sync.md): shooting/punching the other player hurts them on their own game (send hit events to the victim's
-   owner), deaths/respawn; ramming.
-- [ ] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
-   Thompson needs a model that accepts it.
+- [ ] **Damage** (research: docs/research-world-sync.md): shooting/punching the other player hurts them on their own game (send hit events to the victim's
+   owner), deaths/respawn; ramming. Checked in game 2026-10-15 (docs/protocol.md "Phase 6", game-api.md 11): bullets
+   (pistol and real Tommy gun fire), rams, puppets never dying on the attacker's screen, guest downed -> respawn next to
+   the host, guest death -> checkpoint loaded at once -> next to the host, host death -> YOU DIED flow, `friendly_fire = 0`.
+   **Not done: punches.** A punch (key Q) sends no DAMAGE message; the glue now reads an unexplained puppet health drop as
+   a punch, but no punch landed with damage in the tests (Free Ride: the puppet raised its guard; the story checkpoint
+   locks melee). The bullet replay (CreateShots from the attacker's puppet) only works in some game instances; the
+   DoDamage fallback covers the rest.
+- [x] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
+   Thompson needs a model that accepts it. Done 2026-10-15: default by player id (Tommy, Paulie, Sam, Salieri),
+   `model =` / `--model` sent in Hello, the local player switched with the override slot (re-applied after loads,
+   cleared at session end); Paulie and Sam seen on both screens; puppets armed through the debug inventory helper draw,
+   aim and fire the Tommy gun. Sam's puppet variant wears a coat and hat his player model does not; Salieri (player 3)
+   not checked.
 - [x] **Faster first spawn**: puppet factory currently takes ~20 s if the other game is still loading; retry
    sooner / prepare the factory at world load. Done: factory at world load, model preloaded, puppet 0.0-0.1 s after
    the other player's first state.
@@ -80,11 +90,16 @@ Tick an item (`- [x]`) in the same commit that lands it.
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
-- [ ] **Research** (static part done: docs/research-characters-missions.md; confirm in game with its test snippets): find the game's model/outfit APIs: spawn profiles for story characters and civilians, outfit/clothing
+- [x] **Research** (static part done: docs/research-characters-missions.md; confirm in game with its test snippets): find the game's model/outfit APIs: spawn profiles for story characters and civilians, outfit/clothing
   variants, the ModelParts enum (hats, accessories), and whether the local player's model can be swapped at runtime.
   Record what works in game-api.md, including which models can hold every weapon, drive and animate correctly.
+  Done 2026-10-15 (game-api.md 12): override switch confirmed, the player wrapper survives it, the override is saved
+  into the save file but the checkpoint setup clears it on load; Paulie holds and fires every weapon; no per-part
+  switch (ShowHat/SetDirtBlend show nothing on the player). Driving as Paulie/Sam not checked.
 - [ ] **Character list**: a curated list of playable characters (story cast, gangsters, civilians) with their outfit
-  variants; only models that pass the weapon/vehicle/animation check above.
+  variants; only models that pass the weapon/vehicle/animation check above. Prefer profiles that look the same as the
+  player and as a puppet (Sam does not); the host's "tommy" puppet in Free Ride falls back to the trench coat (no
+  `mm_spawn_profiles` entry for `freeroam_test`).
 - [ ] **Character picker**: a "Character" page in the CO-OP menu with the list, outfit and accessory choices and a live
   preview (the player's own character changes while browsing, or a preview character in front of the camera).
 - [ ] **Sync**: the choice (character, outfit, parts) is saved in MafiaCoop.ini, sent in Hello, and can be changed

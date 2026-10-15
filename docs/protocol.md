@@ -6,7 +6,8 @@ Steam transports and lobbies are core's: `external/core/docs/protocol.md`. All i
 `varint` = unsigned LEB128, `str` = varint byte length + UTF-8 bytes.
 
 Version rules: any incompatible change to these messages needs a bump of `modVersion` in `src/game/game_info.cpp`
-(the session build number is derived from it, so mismatched builds are rejected in the handshake).
+(the session build number is derived from it, so mismatched builds are rejected in the handshake). 0.3.0: Hit (0x0400)
+and the character per player.
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -102,14 +103,59 @@ Puppets that cannot be seated (seat taken, the game keeps throwing them out) are
 4 s.
 
 Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
-session end (the whole set, including the hidden "factory" car, is removed when the session ends). Model per player:
-`visuals/hero/game_main_tommy_{gangster_trenchcoat, gangster_suit_2_hat, cab_driver_flatcap, racing_outfit}` by
-player id (0..3), overridable per machine with `puppet_model = <spawn profile>`.
+session end (the whole set, including the hidden "factory" car, is removed when the session ends).
 
-Fire, aim, crouch, reload (no damage yet): a receiver turns `aim` (or a new shot, kept for 1 s as hip fire) into
+Character per player: the `model` string of his Hello (core's handshake; `model = <alias or spawn profile>` in
+MafiaCoop.ini or `--model`), else the default for his player id: 0 `tommy` (the host, dressed as the loaded checkpoint
+dresses him), 1 `paulie`, 2 `sam`, 3 `salieri` (aliases in `M.MODELS`, player_sync.lua). Every game shows that player's
+puppet with that spawn profile, and the player's own game switches its local player to it with the model manager's
+override slot (`SwitchOverridePlayerSpawnProfile`, docs/game-api.md 12; re-applied every 3 s and after every load,
+cleared when the session ends). `puppet_model = <spawn profile>` forces one profile for every puppet on that machine
+(tests).
+
+Fire, aim, crouch, reload: a receiver turns `aim` (or a new shot, kept for 1 s as hip fire) into
 `DbgTesting_AimAtDir(ax, ay, az)` on the puppet, fires one real shot per new `shots` count (trigger press/release, at
 most a few per tick; a far backlog is skipped), `crouch` into `SetStalkMove`, and a rising `reload` into a reload
 press. Shots are not separate messages: they ride on the 20 Hz state, so a lost packet only delays them by 50 ms.
+
+## Phase 6: damage between players (app ids 0x0400-0x04FF)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0400 | Hit | attacker -> victim (`SendTo`, relayed by the host) | R | u8 victim, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, f32 dx, dy, dz |
+
+The attacker's game decides what hit. Puppets are AI humans that take damage like any NPC (their own hit reaction plays
+on the attacker's screen) and never die from it there (health kept at 5000). When the local player's bullet, punch or
+car hurts the puppet of player V, the attacker's game sends **Hit** to V:
+
+- bullets and anything else with a DAMAGE event: amount, `enums.DamageType` (0 shot, 3 melee, 10/11 car), `enums.Hitzone`
+  and the weapon id from the puppet's DAMAGE message (one blanket DAMAGE subscription per game, the receiver GUID says
+  which puppet and the enemy GUID must be the local player or the car he drives);
+- car contact sends one DAMAGE per frame: these are summed for 0.25 s into one Hit;
+- punches send no message at all (docs/game-api.md 11): a puppet's health drop without a DAMAGE event while the local
+  player stands within 2.5 m without a gun in hand is sent as melee (type 3);
+- `dx dy dz`: unit vector from the attacker to the puppet (unused by receivers so far).
+
+The victim's game applies it to its real player:
+- a bullet (type 0) is replayed as one real shot from the attacker's puppet at the hit body part
+  (`game.shotmgr:CreateShots`), so the game's own bullet reaction and damage happen; the victim's "picture shot" shield
+  (the demigod moment after a puppet fires near him) is opened for it. If it has not landed after 0.3 s (seen in the
+  victim's own DAMAGE event, enemy = that puppet) the hit is applied with `DoDamage(amount)` instead;
+- everything else: `DoDamage(amount)` (the game's flinch and damage vignette).
+
+Deaths: a player's health in PlayerState is 0 while he is dead or downed; every puppet of his then dies (a big
+`DoDamage` on it) and is spawned again when his health comes back.
+- Guests are never killed by a Hit: hits are capped, at 12 health or less the guest is **downed** (demigod, controls
+  locked, reported as health 0) and after 5 s put behind the host's puppet with full health. A replayed bullet is only
+  used while the guest would stay above that line.
+- A guest who dies anyway (an NPC, a fall, a car) has his last checkpoint loaded during the death camera
+  (`game.savesystem:Retry()`, so the YOU DIED menu, where scripts do not run, is skipped); 3 s after he is back in the
+  world he is put next to the host.
+- The host dies like in single player: YOU DIED, his choice in the menu, his checkpoint loads; guests see his puppet
+  die and come back.
+
+`friendly_fire = 0` (MafiaCoop.ini or `--friendly_fire 0`) on a machine: its player sends no Hits and ignores the ones
+he gets.
 
 ## Phase 4: world (app ids 0x0200-0x02FF)
 

@@ -109,17 +109,19 @@ which the remote side sees as walking/running.
 `npc:SetDemigod(true)`, `npc:EnableInjury(false)`, `npc.invulnerability = true` (the ScriptHook trainer uses the same
 three for god mode), `npc:DespawnImmunity(true)` (returns a sync object). All calls succeed; the puppets are
 civilian-archetype humans and in the tests nobody reacted to them (police and the mission NPC ignored them, they did
-not flee or attack). Not tested: damage (shooting/ramming a puppet), wanted levels, puppets holding a gun in front
-of police for a long time.
+not flee or attack). A demigod human gets no DAMAGE events, so puppets are NOT demigods: they take damage like any NPC
+and their health is topped up instead (section 11). Not tested: wanted levels, puppets holding a gun in front of police
+for a long time.
 
 ## 6. Weapons — verified
 
 | call | notes |
 |---|---|
-| `h:InventoryAddWeapon(name, ammo)` | names as in `WeaponIDs` of the ScriptHook scripts (`p_mast_a_v1`, `rev_alf_a_v1`, `smg_trench_a_v1`, ...). For the player any weapon works; **a civilian puppet accepts pistols (`p_mast_a_v1`) but not the Tommy gun** (no big-weapon slot) |
+| `h:InventoryAddWeapon(name, ammo)` | names as in `WeaponIDs` of the ScriptHook scripts (`p_mast_a_v1`, `rev_alf_a_v1`, `smg_trench_a_v1`, ...). **Player only** (the binding checks the entity type; verified 2026-10-15: on an NPC it adds nothing, pistol included; the pistol a civilian puppet shows is the one its archetype already carries) |
+| `h:DbgTesting_HelperInventory_AddWeapon(name, ammo)` | the same add without the player check (what the game's own `human.lua` uses to arm NPCs). Verified: an NPC took `rev_alf_a_v1`, `smg_trench_a_v1` and `sg_barker_a_v1`; a puppet armed this way draws, aims (`DbgTesting_AimAtDir`) and fires the Tommy gun (`DbgTesting_ShootReload`: its clip went 44 -> 42 per trigger press, a two-round burst). Used by `M.Weapon` |
 | `h:InventoryHaveWeapon(name)` | |
 | `h:InventorySelect(name, animate, forced)` | equips; `InventoryGetSelected()` reports it ~1 s later (draw animation) |
-| `game.game:GetItemIDFromName(name)` | numeric id (84 for the Tommy gun); the inventory calls want the name |
+| `game.game:GetItemIDFromName(name)` | numeric id (84 for the Tommy gun); the inventory calls want the name. DAMAGE messages carry the same ids (`GetWeaponID`: 2 = `p_mast_a_v1`, 84 = `smg_trench_a_v1`, 9 = `rev_alf_a_v1`, 1 = a car) |
 
 ## 7. Vehicles — verified
 
@@ -252,3 +254,57 @@ keyboard with scan codes work), so in tests the guest sets `MafiaCoop.testAim = 
 direction) from the dev console instead of holding the right button, and fires with `p:ShootWeapon(true)`. The default
 crouch key (C) did nothing in the Omerta park save (crouch may be mission-gated); `SetStalkMove(true)` on the player
 crouches him and is reported.
+
+## 11. Damage, death and health — verified 2026-10-15
+
+Two instances on one PC, story save (Omerta park, `mm_110_omerta_cp_010`) and Free Ride (`freeroam_test`). What the
+co-op damage uses (src/game/player_sync.lua "Damage between players"; message flow in docs/protocol.md "Hit").
+
+| call / event | notes |
+|---|---|
+| `game.game:RegisterBlanketEvent(ctx, fn, enums.EventType.HUMAN, enums.HumanMessages.DAMAGE)` | one subscription for every human; `fn(ctx, msg)`; returns an id (`UnregisterBlanketEvent(id)`). `msg:GetReceiverGUID()` is the victim: compare `tostring()` with `tostring(h:GetGUID())`. Also `DEATH` (`GetKillerGUID`, `GetDamageType`). A per-human `h:RegisterEvent(ctx, fn, et, msg)` works the same way. Enum values as in research-world-sync.md 0.1 (EventType.HUMAN 3, DAMAGE 458772, DEATH 458777, ON_BULLET_HIT 458756, DamageType.SHOT 0, Hitzone.HEAD 2) |
+| `C_DamageMessage` getters | `GetEnemyGUID` (the attacker: the player for his bullets, the player for rams with the car he drives, the shooting NPC for `CreateShots` from an NPC), `GetDamageType` (0 SHOT, 9 SCRIPT, 11 COLLISION, 12 FALL), `GetDamageAmount` (10 for a pistol or Tommy gun bullet on an NPC; 0.02-0.8 per frame of car contact), `GetHitZone`, `GetWeaponID`, `GetCanHeadShot` |
+| `ON_BULLET_HIT` | sent to the **shooter**; `GetHitObject()` is the human or object hit (a bench: `lh_bench_a_v1_bv01_13`) |
+| player GUID | the local player is `C_EntityGuid: 24585` in every instance (the same entity id in each game) |
+| player melee (key **Q**; Counter = Left Alt; the default keys also include Stalk = X, Cover = Left Ctrl, Interact = E) | in Free Ride a punch made the puppet (a friendly AI human) double over and took 55 health, but **no message was seen for it**: none of the 148 HUMAN (458753-458900) or 26 ACTOR (262145-262170) message ids fired on the puppet. After that the puppet raised its fists (guard) and further punches did no damage. The co-op glue therefore reads a puppet's unexplained health drop while the local player stands within 2.5 m without a gun as a punch (not yet seen working end to end). At the story checkpoint Q does nothing (mission input lock, below) |
+| `h:DoDamage(n)` | one number. SCRIPT damage (type 9, attacker GUID 0, amount 0 in the message), self as sender. On the player: a short flinch and the red damage vignette; the game scales it (`p.health` 100 -> 93.5 for `DoDamage(10)`: 0.65 on this difficulty). A big value kills (YOU DIED) |
+| `game.shotmgr:CreateShots(shooter, from, to, weaponName, scatter, timeout, particle, sound)` | real bullets owned by `shooter`. `timeout` 0 = one shot, 1 = two or three (the weapon's rate over 1 s). Player as shooter: the target NPC gets SHOT damage with `GetEnemyGUID` = player, the zone where it hit and its own hit reaction. **NPC (puppet) as shooter at the player works**: the player gets a SHOT DAMAGE with `GetEnemyGUID` = that NPC and his real hit reaction (health 100 -> 74 for 10 damage: NPC bullets are scaled about 2.6x on the player). **Unreliable**: in some game instances every `CreateShots` call (any shooter, any target) did nothing for the whole run, in others it worked every time; not explained (not window focus, not the model swap, not old sync objects). The glue replays bullets with it and falls back to `DoDamage` when the replay did not land within 0.3 s |
+| `h.health` | health of the player and of NPCs; **writable on NPCs** (`so.health = 5000` sticks; `healthmax` stays 105), not on the player. A puppet knocked down by a car came back with `healthmax` 100 and health 100 |
+| `h:HealByMedkit()` | refills the player's health (a frame later) |
+| `h:SetMaxHealth()` | no args, accepted; no visible change on a player at full health |
+| `h:ApplyRagdollRadialSpeed(center, speed, radius)` | accepted on the player, no visible effect |
+| `h:AttackMelee(target)` | on a puppet (FRIEND AI) aimed at the player: accepted, nothing happens |
+| `h:DbgTesting_HumanCombatAction(n, 0)` | on the player, n = 0..5: accepted, nothing visible |
+| `game.savesystem:Retry()` | during the death camera (before YOU DIED appears): loads the last checkpoint at once, like "Load Last Checkpoint". **Scripts do not run while the YOU DIED menu is up**, so it has to be called before. Used for guests |
+| `game.savesystem:RequestCheckpointSave()` | writes a checkpoint save at once (save0.sav of the active slot) |
+| `p:IsInputDisabled(enums.DisabledInput.X)` / `p:DisableInput(lockName, disable, input, ...)` | the Omerta park checkpoint locks AIM, MELEE, WEAPON, STALK, SPRINT, COVER and GRENADE (the player cannot punch or aim there). `DisableInput` takes (string lock name, bool, inputs...) and only lifts locks of that name; none of the input preset names lifted the mission's lock. Free Ride reported the same values, so the getter's meaning is unclear |
+
+Learned the hard way:
+- A player can be killed on his own screen by a remote player's **car copy** teleported through him: the copy follows
+  the driver's transform, a teleport of the real car was lerped across 30 m and ran the guest over (DEATH, type 12).
+  The interpolation now snaps instead of lerping when two snapshots are more than 20 m apart.
+- Teleporting the player next to a car on the first tick after a checkpoint load crashed the game in the HUD
+  (`ShowPrompt` on a null movie, exe+0x3024566). Wait a few seconds after the load before moving him.
+- `npc:SwitchBrain(2)` + `EnableCloseCombat(true)` + `AttackMelee(puppet)` on a spawned NPC crashed the game a second
+  later on GameMainThread (null read at exe+0x733e7d in the AI update). Do not script NPC fist fights this way.
+- Synthetic mouse clicks (SendInput, mouse_event, posted WM_LBUTTONDOWN) do nothing in game. The keyboard is the only
+  DirectInput device the game polls (logged by a test build); the mouse comes another way (GetCursorPos, messages).
+  Keyboard keys with the scan-code flag work. Tests fire with `p:ShootWeapon(true)` (along the camera's crosshair,
+  about one call in seven hit a puppet 7 m away) or with `CreateShots`.
+
+## 12. Player model (character) — verified 2026-10-15
+
+| call | notes |
+|---|---|
+| `p:SwitchOverridePlayerSpawnProfile(profile)` | profile = path string (`"characters/scotch/game/main/game_main_paulie"`) or a decimal-hash string (`"16922695808871587265"`, the same profile); a Lua number is rejected (`C_LuaHashName expected, got number`). Returns a sync object, done within a few ticks. **The player wrapper survives**: same `GetGUID()` (24585), still valid, inventory kept. Used by `M.ModelTick` |
+| `p:SwitchDefaultPlayerSpawnProfile(profile)` | what the checkpoint scripts call. While an override is set the model stays the override (default switched to `tommy_casual`: Paulie stayed) |
+| `p:ClearOverridePlayerSpawnProfile()` | back to the default slot (casual Tommy after the switch above) |
+| `p:SwitchPlayerSpawnProfile(tohashname(profile))` | the raw swap. Did not visibly change the guest at session start (the checkpoint setup applies the slots again); not used |
+| `p:IsPlayerUsingDefaultCostume()` | false with an override and also after clearing it; not useful |
+| save files | **the override is written into the save**: after `RequestCheckpointSave()` with Paulie as override, save0.sav holds the default (Tommy suit) and the Paulie hash next to each other in the player model block. A single-player Continue of that save still loaded Tommy (the checkpoint setup clears the override), so a guest's own story is not changed by it |
+| weapons | Paulie as the player took every weapon (`p_mast_a_v1`, `rev_alf_a_v1`, `sg_barker_a_v1`, `smg_trench_a_v1`, `sn_mayw_a_v1`) and drew and fired the Tommy gun |
+| puppets | `comp:SetSpawnProfile("characters/scotch/game/main/game_main_paulie" / "..._sam")` spawns the same characters with the civilian AI (`GetAIType()` 1). Paulie looks the same as player and as puppet; Sam's puppet wears a long coat and hat, his player model a suit without them |
+| `h:ShowHat(false)`, `h:SetDirtBlend(1)` | accepted on the player, no visible change |
+| `game.outfits:GetCurrentOutfit()` | a `C_HashName` that compared unequal to `ToHashName("casual")` and `("cab_driver_flatcap")` at the Omerta checkpoint; `IsLocked("vito")` and `IsLocked("casual")` both false |
+| `enums.ModelParts` | HEAD 0 .. BODY 9, LAST 10, as in the static research. `C_ModelComponent` (SetSubdivType, SetDynamic, reflections, resource id) and `C_ClothComponent` exist on the player, neither switches parts; `C_SpawnedObjectComponent` is nil |
+| Free Ride | `GetLoadedSaveId()` = `freeroam_test`; `mm_spawn_profiles` has no entry for it, so a "tommy" puppet falls back to the trench coat while the host wears his Free Ride outfit |

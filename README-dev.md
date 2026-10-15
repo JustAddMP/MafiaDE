@@ -258,8 +258,8 @@ Dev console, to explore the API live:
 ## Player sync (phase 3)
 
 Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x0100, docs/protocol.md) at 20 Hz and
-shows every other player as a **puppet**: an AI human with its own outfit (host = trench coat, guest 1 = suit and
-hat, ...) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (100 ms
+shows every other player as a **puppet**: an AI human in that player's character (host = Tommy as the story dresses
+him, guest 1 = Paulie, guest 2 = Sam, guest 3 = Salieri, or the `model` he set) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (100 ms
 buffer), snaps when more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
 Puppets only appear once the local player is in a loaded world (not in the main menu).
 
@@ -271,7 +271,18 @@ docs/protocol.md "Shared cars, seats and ownership". Puppets are removed when th
 the session ends.
 
 On foot, puppets also crouch, aim (right mouse button / pad left trigger with a gun in hand, in the camera's
-direction) and fire a real shot (flash and sound, no damage yet) for every shot the player fires, and play a reload.
+direction) and fire a real shot (flash and sound) for every shot the player fires, and play a reload.
+
+**Characters:** each player sees himself as his character too (the model manager's override slot; the host stays
+Tommy). `model = paulie|sam|salieri|frank|vincenzo|ralph|tommy|<spawn profile>` in MafiaCoop.ini or `--model` sets
+yours; it is sent in Hello. Puppets get any weapon (Tommy gun included) through the debug inventory helper.
+
+**Damage between players** (docs/protocol.md "Phase 6"): shooting, punching (key Q) or running over another player's
+puppet hurts that player on his own game: bullets are replayed as a real shot from your puppet there (else
+`DoDamage`), punches and rams are `DoDamage` (a flinch). Puppets never die on your screen; they die when their player
+dies or is downed. A guest at 12 health or less is downed for 5 s and comes back next to the host; a guest who dies
+anyway (NPCs, falls) has his checkpoint loaded at once and is put next to the host; the host dies like in single
+player (YOU DIED, load the checkpoint). `friendly_fire = 0` / `--friendly_fire 0` turns it off for that machine.
 Health is synced: shown on the debug status line (verified) and in the pause menu's CO-OP panel (`HEALTH n` next to each
 player; not checked in a capture yet).
 The puppet factory is prepared as soon as the local player is in the world with a session running, and the model of
@@ -321,8 +332,13 @@ game.gfx:SetWeatherSet("_default_game_rainy", 0, 0); game.gfx:SetTime(21, 0)
 MafiaCoop.testAim = true   -- or {x, y, z}: a fixed aim direction; nil = off
 local p = game.game:GetActivePlayer(); p:ShootWeapon(true)
 local p = game.game:GetActivePlayer(); p:SetStalkMove(true)
--- give the player a pistol (the puppet draws one too)
+-- give the player a pistol (the puppet draws one too); "smg_trench_a_v1" = Tommy gun
 local p = game.game:GetActivePlayer(); p:InventoryAddWeapon("p_mast_a_v1", 50); p:InventorySelect("p_mast_a_v1", true)
+-- shoot the puppet of player 1 (real bullets from the local player; his game gets a Hit)
+local p, n = game.game:GetActivePlayer(), MafiaCoop.pup["1"].so; local a, b = p:GetBonePos("Head"), n:GetPos()
+game.shotmgr:CreateShots(p, Math:newVector(a.x, a.y, a.z), Math:newVector(b.x, b.y, b.z + 1.2), "p_mast_a_v1", 0, 1, true, true)
+-- hurt yourself the way a punch from another player would (flinch; a guest is downed at <= 12 health)
+local p = game.game:GetActivePlayer(); p:DoDamage(10)
 -- puppet state on this machine
 local r = {} for id, pp in pairs(MafiaCoop.pup) do r[#r+1] = id .. " " .. pp.st .. " " .. tostring(pp.dist) end return table.concat(r, "\n")
 ```
@@ -340,7 +356,9 @@ window_timeout_s = 300     ; how long the dll waits for the game window
 crash_test = 0             ; 1 = raise an access violation in Tick after crash_test_delay seconds (debug only)
 crash_test_delay = 20
 background_run = 1         ; 0 = the game pauses when its window loses focus (original behaviour)
-puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (default: by player id)
+model = paulie             ; your character (alias or spawn profile), sent in Hello; default by player id (host tommy)
+puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (tests)
+friendly_fire = 1          ; 0 = shooting/punching/ramming other players does not hurt them (and they cannot hurt you)
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```
 

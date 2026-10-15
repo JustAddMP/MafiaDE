@@ -16,6 +16,12 @@ hashes). How to redo it is in "Method" at the end.
 
 ## F1. Customisable characters
 
+**Live-tested 2026-10-15** (F1-1 to F1-8): results in game-api.md 12. Confirmed: the override switch with path or
+decimal-hash strings (numbers rejected), the wrapper surviving the swap, the override beating the default slot,
+ClearOverride back to the default, Paulie/Sam as player and puppet, every weapon on a swapped player, ModelParts values.
+Open question 1 (wrapper survives): yes. Open question 3 (override saved): yes, it is written into the save, but the
+checkpoint setup clears it on load. Refuted: visible effect of ShowHat/SetDirtBlend on the player.
+
 ### Summary
 
 - **A character/outfit in this engine is a "spawn profile"**, a 64-bit name hash looked up in
