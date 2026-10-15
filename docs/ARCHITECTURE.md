@@ -27,8 +27,10 @@ src/game/
                          start/end/tick, player left, health/status, menu state/commands); reads the enter-vehicle
                          and aim controls
   lua.{h,cpp}            bridge into the game's Havok Script VM (C_ScriptMachine::Tick hook), dev console (F8)
+  characters.{h,cpp}     the character list (aliases -> spawn profiles), defaults by player id, fallbacks
   player_sync.{h,cpp}    phase 3: local player sampling, puppets, copy cars, weather/time (C++ side; wire format in
-  player_sync.lua        docs/protocol.md); the .lua is embedded at build time
+  player_sync.lua        docs/protocol.md); the .lua is embedded at build time. Also the CHARACTER/OUTFIT
+                         rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel
   menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
                          research-*.md, re-tools/, screenshots/

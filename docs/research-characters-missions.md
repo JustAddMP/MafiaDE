@@ -19,6 +19,9 @@ hashes). How to redo it is in "Method" at the end.
 **Live-tested 2026-10-15** (F1-1 to F1-8): results in game-api.md 12. Confirmed: the override switch with path or
 decimal-hash strings (numbers rejected), the wrapper surviving the swap, the override beating the default slot,
 ClearOverride back to the default, Paulie/Sam as player and puppet, every weapon on a swapped player, ModelParts values.
+2026-10-15 (second run): the curated list in src/game/characters.cpp (story cast `game_main_*`, Paulie/Sam outfits
+`ai_ally_*`, Tommy's wardrobe profiles) checked as player and puppet, story outfits follow the loaded story point,
+decimal hashes work for puppets, unknown profiles never finish loading; details in game-api.md 12.
 Open question 1 (wrapper survives): yes. Open question 3 (override saved): yes, it is written into the save, but the
 checkpoint setup clears it on load. Refuted: visible effect of ShowHat/SetDirtBlend on the player.
 

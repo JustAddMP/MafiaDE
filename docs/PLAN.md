@@ -11,7 +11,7 @@ interest.md).
 |---|---|
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
-| 3 Second player (Lua bridge, puppets) | On foot, weapons, shared cars, characters, shooting/ramming damage and respawns done; punches below |
+| 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
 | 5 Native UI (CO-OP in main/pause menus, banners) | Done for keyboard; gamepad/mouse/Steam invite untested |
 | 4 Shared world, 6 polish | Not started |
 
@@ -32,7 +32,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.3.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.4.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -69,14 +69,17 @@ Tick an item (`- [x]`) in the same commit that lands it.
    ownership" (car keys, CarParked 0x0101).
 - [x] **Crouch, aim direction, firing, reload** shown on puppets; health synced. Done: debug AI commands
    (game-api.md 10); aim input read from RMB/left trigger; panel health column not checked in a capture.
-- [ ] **Damage** (research: docs/research-world-sync.md): shooting/punching the other player hurts them on their own game (send hit events to the victim's
+- [x] **Damage** (research: docs/research-world-sync.md): shooting/punching the other player hurts them on their own game (send hit events to the victim's
    owner), deaths/respawn; ramming. Checked in game 2026-10-15 (docs/protocol.md "Phase 6", game-api.md 11): bullets
    (pistol and real Tommy gun fire), rams, puppets never dying on the attacker's screen, guest downed -> respawn next to
    the host, guest death -> checkpoint loaded at once -> next to the host, host death -> YOU DIED flow, `friendly_fire = 0`.
-   **Not done: punches.** A punch (key Q) sends no DAMAGE message; the glue now reads an unexplained puppet health drop as
-   a punch, but no punch landed with damage in the tests (Free Ride: the puppet raised its guard; the story checkpoint
-   locks melee). The bullet replay (CreateShots from the attacker's puppet) only works in some game instances; the
-   DoDamage fallback covers the rest.
+   Punches done 2026-10-15 (game-api.md 11): melee only works outside safehouse zones (the Free Ride start at Salieri's
+   bar locks it, which is why earlier tests saw nothing); puppets with a story profile take real punches (DAMAGE type 3,
+   10 / 36 charged), puppets the game will not target (ally/Tommy profiles) get a Hit from our swing event; host->guest
+   and guest->host landed, five punches in a row, charged punches downed the guest and he respawned next to the host.
+   Re-verified: ram damage summed over 0.25 s (puppets no longer dodge cars), the >20 m snap (host car teleported 40 m
+   through the guest: the copy jumped, no damage). The bullet replay (CreateShots from the attacker's puppet) only
+   works in some game instances; the DoDamage fallback covers the rest.
 - [x] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it. Done 2026-10-15: default by player id (Tommy, Paulie, Sam, Salieri),
    `model =` / `--model` sent in Hello, the local player switched with the override slot (re-applied after loads,
@@ -96,16 +99,30 @@ Builds on A6 (player models). Each player picks how they look; everyone sees the
   Done 2026-10-15 (game-api.md 12): override switch confirmed, the player wrapper survives it, the override is saved
   into the save file but the checkpoint setup clears it on load; Paulie holds and fires every weapon; no per-part
   switch (ShowHat/SetDirtBlend show nothing on the player). Driving as Paulie/Sam not checked.
-- [ ] **Character list**: a curated list of playable characters (story cast, gangsters, civilians) with their outfit
+- [x] **Character list**: a curated list of playable characters (story cast, gangsters, civilians) with their outfit
   variants; only models that pass the weapon/vehicle/animation check above. Prefer profiles that look the same as the
   player and as a puppet (Sam does not); the host's "tommy" puppet in Free Ride falls back to the trench coat (no
   `mm_spawn_profiles` entry for `freeroam_test`).
-- [ ] **Character picker**: a "Character" page in the CO-OP menu with the list, outfit and accessory choices and a live
+  Done 2026-10-15 (game-api.md 12, src/game/characters.cpp): 14 characters, 26 outfits, each checked as the player and
+  as a puppet; story outfits follow the loaded story point on both sides (that was the Sam mismatch); Tommy's outfits
+  are his wardrobe profiles; the host as story Tommy sends the profile his game uses, so in Free Ride he is seen in his
+  real outfit. Weapons: sailor Tommy fired the Tommy gun; driving: Sam drove.
+- [x] **Character picker**: a "Character" page in the CO-OP menu with the list, outfit and accessory choices and a live
   preview (the player's own character changes while browsing, or a preview character in front of the camera).
-- [ ] **Sync**: the choice (character, outfit, parts) is saved in MafiaCoop.ini, sent in Hello, and can be changed
+  Done 2026-10-15: CHARACTER and OUTFIT rows in the pause menu's CO-OP panel (core v0.4.0 PanelOptions), keyboard
+  Left/Right/Enter checked in game; every step applies at once (the others see it while you browse; your own model
+  switches when the pause menu closes, because the game is paused while it is open). Pad d-pad and mouse click on the
+  rows not checked in game.
+- [x] **Sync**: the choice (character, outfit, parts) is saved in MafiaCoop.ini, sent in Hello, and can be changed
   mid-session; everyone's puppet updates live. The local player sees themselves as the chosen character.
-- [ ] **Fallbacks**: an unknown or unsupported choice (e.g. from a newer version) falls back to a default model instead
+  Done 2026-10-15: `model =` saved by the panel, PlayerModel (0x0102) with the pick and its look, re-sent when a
+  player joins; guest switched to Sam / suit mid-session and the host's puppet followed at once; a rejoining guest saw
+  the host's sailor outfit straight away.
+- [x] **Fallbacks**: an unknown or unsupported choice (e.g. from a newer version) falls back to a default model instead
   of failing; the host's story character can be kept as Tommy for cutscenes if swapping breaks them.
+  Done 2026-10-15: unknown alias (`--model zorro`) -> the default for the player id on every game; a profile the game
+  does not know -> after 12 s marked bad, default used (player and puppet, the factory is rebuilt). The host's default
+  is story Tommy; a swapped character in a cutscene is not checked yet.
 
 ### B. Phase 4 — shared world (the campaign in co-op)
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.

@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 61 patterns below; prints OK/FAIL each)
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 62 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -485,6 +485,20 @@ Populate 0x26807D0, and more.
   becomes -1 and the command never completes. The bool #4 is passed inverted (`sete cl`).
 - Practical use and the traps around it (fixed cars, cars the player drove): docs/game-api.md 7.
 
+**C_PlayerModelManager** (the player's character) [confirmed in game 2026-10-15]: global pointer at exe+0x6353128.
+- The default-slot setter 0x21E0960 (`PlayerModelManager_SetDefault` below) stores the profile hash at +0x30 and
+  swaps the model only if it changed and the override slot (+0x38) is empty; +0x28 = player present, +0x48/+0x50 the
+  sync objects it returns. The override setter (0x21E09B0) and clear (0x21E0FF0) have the same shape.
+- The Lua thunks `C_WrapperPlayer::SwitchPlayerSpawnProfile` 0x2394BB0, `SwitchDefaultPlayerSpawnProfile`
+  0x2395340 and `SwitchOverridePlayerSpawnProfile` 0x2395A00 each contain
+  `4C 8B 44 24 40 48 8D 54 24 38 48 8B 0D <rel32> E8 <rel32> 48 8B 44 24 38 48 8D 54 24 48` (3 matches, so not in
+  the pattern table): `mov rcx,[rip+mgr]` at +0xA (disp +0xD, end +0x11) and the `call` at +0x11 (rel32 +0x12, end
+  +0x16). The dll takes the match whose call goes to the default setter and reads the global from it
+  (`player_sync.cpp` FindModelManager).
+- Read at runtime: in Free Ride the default slot held 335218123840277515 =
+  `visuals/hero/game_main_tommy_cab_driver_flatcap` (the Free Ride outfit), the override slot 0 until we set one.
+  That hash given to a puppet spawner (as a decimal string) shows the same clothes (docs/game-api.md 12).
+
 **Simplest robust route for co-op:** drive all of these by **executing Lua text** in the main state. These are
 exactly the calls the mission scripts make. For example:
 `local p = game.game:GetActivePlayer(); local v = p:GetPos()`.
@@ -626,6 +640,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | Lua_RegisterClass | 0x3812B70 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 81 EC 90 00 00 00 41 8B F9` |
 | Lua_EnvEff_SetWeatherSet | 0x2D4DBE0 | `48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 BA 03 00 00 00 0F 29 74 24` |
 | Lua_PushScriptWrapper | 0x1ABD8D0 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 48 85 D2 74 6F 48 8B 02` |
+| PlayerModelManager_SetDefault | 0x21E0960 | `40 53 48 83 EC 20 48 83 79 28 00 48 8B DA 75 06 48 8B 41 50 EB 26 48 8B 41 30 4C 89 41 30 4C 3B C0` |
 | WrapperFactory_GetByGuid | 0x23E8A10 | `40 53 48 83 EC 20 8B DA E8 ?? ?? ?? ?? 48 8B C8 45 33 C0 8B D3 E8 ?? ?? ?? ?? 48` |
 | GFx_LoadProcess_BeginSWF | 0x475BB20 | `48 89 5C 24 20 55 56 57 41 54 41 57 48 83 EC 40 48 8B 02 48 8B F1 48 8B CA 4D 8B F9 49 8B E8 48 8B DA FF 50 20` |
 | Flash_AttachIface_Call | 0x1842D60 | `48 89 54 24 10 48 89 4C 24 08 53 48 83 EC 60 48 8B 9C 24 98 00 00 00 4C 89 64 24 48 45 8B E0` |

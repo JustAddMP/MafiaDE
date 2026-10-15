@@ -15,7 +15,7 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
   menu entries.
 
 Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
-one tag (currently core v0.3.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+one tag (currently core v0.4.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
 (docs/PLAN.md).
 
 ## Build
@@ -182,6 +182,8 @@ the launcher arguments still work.
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
 | `--debug-overlay` | Show the debug status text (top-left) from the start; F7 toggles it. Pass it in test flows whose captures are read for the status lines. |
 | `--window left\|right` | Keep the game window on the left/right half of its monitor's work area (full height, title bar kept), for watching two test instances side by side. Unset = the window is left alone. |
+| `--model <alias>` | Your character (see "Characters" below), e.g. `--model sam_hat`; wins over the ini until you pick another in the CO-OP panel. |
+| `--test_pad 1` | Tests: a virtual gamepad the game and our panels read like a real one, pressed with `mc_pad(...)` from the dev console. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
 `password = ...`, `require_password_for_invites = 0|1`,
@@ -244,7 +246,10 @@ game's own scripts, runs queued jobs and the per-tick callbacks on **GameMainThr
 (not on the title screen, not while the game is paused). Missing patterns disable the bridge (logged), an access
 violation inside a job disables it for the rest of the session instead of crashing.
 
-Globals the dll adds: `mc_log(...)` (writes to our log), `mc_u64(str|num)` / `mc_u64str(v)` (HKS ui64 values).
+Globals the dll adds: `mc_log(...)` (writes to our log), `mc_u64(str|num)` / `mc_u64str(v)` (HKS ui64 values),
+`mc_pad(buttons, holdMs, lt, rt, lx, ly, rx, ry)` (tests: holds core's virtual gamepad, needs `--test_pad 1`; e.g.
+`mc_pad(0, 1500, 0, 0, 0, 30000)` walks forward), `mc_player_profile()` ("default override" profile hashes of the
+game's player model manager).
 
 Dev console, to explore the API live:
 
@@ -273,13 +278,23 @@ the session ends.
 On foot, puppets also crouch, aim (right mouse button / pad left trigger with a gun in hand, in the camera's
 direction) and fire a real shot (flash and sound) for every shot the player fires, and play a reload.
 
-**Characters:** each player sees himself as his character too (the model manager's override slot; the host stays
-Tommy). `model = paulie|sam|salieri|frank|vincenzo|ralph|tommy|<spawn profile>` in MafiaCoop.ini or `--model` sets
-yours; it is sent in Hello. Puppets get any weapon (Tommy gun included) through the debug inventory helper.
+**Characters:** pause menu > CO-OP has **CHARACTER** and **OUTFIT** rows (Left/Right or Enter step through them; pad
+d-pad left/right): DEFAULT (by player id: host Tommy as his story dresses him, then Paulie, Sam, Salieri) or Tommy,
+Paulie, Sam, Salieri, Frank, Vincenzo, Luigi, Ralph, Sarah, Morello, Sergio, Norman, Bertone, Billy, each with its
+outfits (STORY = as the loaded story point dresses him; Tommy: casual, cab driver, suit and hat, trench coat, racing,
+sailor; Paulie and Sam: suit, suit and hat, trench coat; Frank: suit, coat). A pick applies at once: you change in the
+world (when the pause menu closes; the game does not run while paused) and the others' puppet of you is replaced live
+(PlayerModel, docs/protocol.md). It is saved as `model = <alias>` in MafiaCoop.ini (`--model` and the ini line work
+too; a spawn profile path or decimal hash also works). An unknown alias, or a profile that does not load within 12 s,
+falls back to the default for your player id. The list and its aliases: `src/game/characters.cpp`. Two test
+instances on one PC share `out\MafiaCoop.ini`: give the guest `--model`, and delete the file after a test that used
+the panel. Puppets get any weapon (Tommy gun included) through the debug inventory helper.
 
-**Damage between players** (docs/protocol.md "Phase 6"): shooting, punching (key Q) or running over another player's
-puppet hurts that player on his own game: bullets are replayed as a real shot from your puppet there (else
-`DoDamage`), punches and rams are `DoDamage` (a flinch). Puppets never die on your screen; they die when their player
+**Damage between players** (docs/protocol.md "Phase 6"): shooting, punching (key Q: tap = punch, hold = charged
+punch) or running over another player's puppet hurts that player on his own game: bullets are replayed as a real shot
+from your puppet there (else `DoDamage`), punches and rams are `DoDamage` (a flinch). The game itself turns melee off
+in safehouse zones (around Salieri's bar, where Free Ride starts) and at some story checkpoints: Q does nothing there.
+Puppets do not dodge cars, so a ram lands like it would on the player. Puppets never die on your screen; they die when their player
 dies or is downed. A guest at 12 health or less is downed for 5 s and comes back next to the host; a guest who dies
 anyway (NPCs, falls) has his checkpoint loaded at once and is put next to the host; the host dies like in single
 player (YOU DIED, load the checkpoint). `friendly_fire = 0` / `--friendly_fire 0` turns it off for that machine.
@@ -356,9 +371,11 @@ window_timeout_s = 300     ; how long the dll waits for the game window
 crash_test = 0             ; 1 = raise an access violation in Tick after crash_test_delay seconds (debug only)
 crash_test_delay = 20
 background_run = 1         ; 0 = the game pauses when its window loses focus (original behaviour)
-model = paulie             ; your character (alias or spawn profile), sent in Hello; default by player id (host tommy)
+model = paulie             ; your character (alias from src/game/characters.cpp, spawn profile or decimal hash); set by
+                           ; the CO-OP panel's CHARACTER/OUTFIT rows; empty = default by player id (host tommy)
 puppet_model = visuals/hero/game_main_tommy_casual   ; spawn profile for every puppet on this machine (tests)
 friendly_fire = 1          ; 0 = shooting/punching/ramming other players does not hurt them (and they cannot hurt you)
+test_pad = 0               ; 1 = a virtual gamepad for automated tests (mc_pad from the dev console)
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```
 

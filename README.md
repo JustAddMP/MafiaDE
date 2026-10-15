@@ -1,8 +1,9 @@
 # Mafia: Definitive Edition — Co-op
 
 **Status: in development, playable but not optimal.** A from-scratch co-op mod: one small DLL, no separate
-server, Steam invites. Players see each other walking, running, armed and driving. The host's NPCs, traffic,
-weather and missions are not shared yet.
+server, Steam invites. Players see each other walking, running, armed and driving, can shoot, punch and run each
+other over, and each picks the character he plays as. Weather and time follow the host; the host's NPCs, traffic and
+missions are not shared yet.
 
 ## What you need
 
@@ -14,6 +15,8 @@ weather and missions are not shared yet.
 2. Host: choose **CO-OP → Host Co-op Game** in the main menu, then invite friends from the pause menu or the
    Steam overlay (Shift+Tab).
 3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**.
+4. Your character: pause menu → **CO-OP** → **CHARACTER** / **OUTFIT** (Left/Right). Tommy, Paulie, Sam, Salieri,
+   Frank and more of the story cast; everyone sees the change at once, and your pick is remembered.
 
 ## Start from Steam (optional)
 
@@ -38,5 +41,7 @@ overlay, co-op UI) is [JustAddMP/core](https://github.com/JustAddMP/core), a git
 | CO-OP entry in the game's own main menu | The co-op page while hosting |
 | ![Co-op panel in the pause menu](docs/screenshots/pause-menu-coop.png) | ![Two players in the world](docs/screenshots/in-game-two-players.png) |
 | Pause menu: players, ping, invite friends | Host's view: the guest standing next to them |
-| ![Guest's view](docs/screenshots/in-game-guest-view.png) | |
-| Guest's view after joining mid-game | |
+| ![Guest's view](docs/screenshots/in-game-guest-view.png) | ![Character choice](docs/screenshots/character-panel.png) |
+| Guest's view after joining mid-game | Picking a character and outfit in the co-op panel |
+| ![The guest as Sam](docs/screenshots/character-sam-puppet.png) | ![A punch](docs/screenshots/punch.png) |
+| Host's view: the guest picked Sam in a suit | Punching the other player hurts him on his own game |

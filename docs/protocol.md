@@ -7,7 +7,7 @@ Steam transports and lobbies are core's: `external/core/docs/protocol.md`. All i
 
 Version rules: any incompatible change to these messages needs a bump of `modVersion` in `src/game/game_info.cpp`
 (the session build number is derived from it, so mismatched builds are rejected in the handshake). 0.3.0: Hit (0x0400)
-and the character per player.
+and the character per player. 0.4.0: PlayerModel (0x0102), character choice in the CO-OP panel, punch detection.
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -27,7 +27,8 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 |---|---|---|---|---|
 | 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 20 Hz | see below |
 | 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw |
-| 0x0102-0x01FF | reserved (phase 3 events) | | | |
+| 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
+| 0x0103-0x01FF | reserved (phase 3 events) | | | |
 
 PlayerState body (54 bytes on foot + weapon name, ~130 bytes in a car):
 
@@ -105,13 +106,26 @@ Puppets that cannot be seated (seat taken, the game keeps throwing them out) are
 Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
 session end (the whole set, including the hidden "factory" car, is removed when the session ends).
 
-Character per player: the `model` string of his Hello (core's handshake; `model = <alias or spawn profile>` in
-MafiaCoop.ini or `--model`), else the default for his player id: 0 `tommy` (the host, dressed as the loaded checkpoint
-dresses him), 1 `paulie`, 2 `sam`, 3 `salieri` (aliases in `M.MODELS`, player_sync.lua). Every game shows that player's
-puppet with that spawn profile, and the player's own game switches its local player to it with the model manager's
-override slot (`SwitchOverridePlayerSpawnProfile`, docs/game-api.md 12; re-applied every 3 s and after every load,
-cleared when the session ends). `puppet_model = <spawn profile>` forces one profile for every puppet on that machine
-(tests).
+Character per player (code: `src/game/characters.cpp`, docs/game-api.md 12): every player picks a `model`: an alias
+from the character list (`paulie`, `paulie_suit`, `sam_hat`, `tommy_sailor`, ...; the CO-OP panel's CHARACTER and
+OUTFIT rows, `model =` in MafiaCoop.ini or `--model`), a spawn profile path or a decimal profile hash. Empty = the
+default for his player id: 0 `tommy` (the host, as his story dresses him), 1 `paulie`, 2 `sam`, 3 `salieri`. Unknown
+aliases (a newer version's, a typo) are shown as that default.
+
+- The pick at session start travels in core's Hello (`model`). **PlayerModel** (0x0102, reliable broadcast) carries
+  the current pick and its **look**: the spawn profile his own game uses for it. The look lets a build whose list
+  lacks that alias show the character anyway, and for story Tommy it is the profile his game's model manager holds
+  (a decimal hash, e.g. the Free Ride outfit; reported by the Lua glue as `ML <hash>`), so everyone sees his real
+  clothes. Both strings are `[A-Za-z0-9_/.-]`, at most 96 bytes, else ignored.
+- PlayerModel is sent when a session starts, when the player picks something else in the panel (at once: the others'
+  puppet of him is replaced live), when his story look changes, and whenever a new player appears in the session
+  (the Hello model is fixed for the session, so a late joiner would otherwise see the old pick).
+- Receivers show a remote player's puppet with: `puppet_model` (this machine, tests) > his PlayerModel look > his
+  PlayerModel / Hello model resolved locally. A profile that does not load within 12 s is marked bad on that machine
+  and the default character for his id is used instead.
+- His own game switches the local player with the model manager's override slot (`SwitchOverridePlayerSpawnProfile`,
+  docs/game-api.md 12; re-applied every 3 s and after every load, cleared when the session ends; `tommy` = no
+  override). A switch that has not finished after 12 s falls back to the default for his id the same way.
 
 Fire, aim, crouch, reload: a receiver turns `aim` (or a new shot, kept for 1 s as hip fire) into
 `DbgTesting_AimAtDir(ax, ay, az)` on the puppet, fires one real shot per new `shots` count (trigger press/release, at
@@ -132,8 +146,11 @@ car hurts the puppet of player V, the attacker's game sends **Hit** to V:
   and the weapon id from the puppet's DAMAGE message (one blanket DAMAGE subscription per game, the receiver GUID says
   which puppet and the enemy GUID must be the local player or the car he drives);
 - car contact sends one DAMAGE per frame: these are summed for 0.25 s into one Hit;
-- punches send no message at all (docs/game-api.md 11): a puppet's health drop without a DAMAGE event while the local
-  player stands within 2.5 m without a gun in hand is sent as melee (type 3);
+- punches (key Q, only outside safehouse zones, docs/game-api.md 11): a puppet with a story profile (AI type 0) is a
+  melee target like any NPC, so its DAMAGE event (type 3, 10 for a light and 36 for a charged punch) sends the Hit.
+  Puppets with an ally or Tommy profile are never targeted by the game's melee; for those, our swing
+  (`MELEE_LIGHT_ATTACK` / `MELEE_HEAVY_ATTACK` with no opponent) is a Hit of 10 / 36 when a puppet stands within 1.9 m
+  in front of us 0.25 s after it (the puppet gets a small `DoDamage` for its flinch);
 - `dx dy dz`: unit vector from the attacker to the puppet (unused by receivers so far).
 
 The victim's game applies it to its real player:
