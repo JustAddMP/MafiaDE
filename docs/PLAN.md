@@ -263,7 +263,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    game itself rewrites on every start.
 - [x] Detect unsupported game builds (exe CRC) and show a clear message. Done: launcher CRC32 check against
    `core/version.h` (cached, `--check-only`, `--skip-version-check`); dll banner when patterns are missing.
-- [ ] GitHub pre-release v0.8.0 with the new zip (and a symbols zip).
+- [x] GitHub pre-release v0.8.0 with the new zip (and a symbols zip). Done 2026-10-15:
+   https://github.com/JustAddMP/MafiaDE/releases/tag/v0.8.0 (pre-release; release notes list features and known issues).
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
