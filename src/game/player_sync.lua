@@ -40,7 +40,7 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 6
+M.version = 7
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
@@ -100,6 +100,11 @@ function M.Player()
   local pos = p:GetPos()
   if pos.x * pos.x + pos.y * pos.y < 1 then return nil end
   if game.hud:IsLoadingScreenUp() then return nil end
+  if game.game:GetLoadedSaveId() == "!none!" then  -- main menu, or a world being torn down
+    M.leaving = nil
+    return nil
+  end
+  if M.leaving then return nil end  -- mission_sync.lua is taking us out of this world
   local good, menu = pcall(game.game.GetIs3DMenu, game.game)
   if good and menu then return nil end
   return p
@@ -1468,7 +1473,11 @@ function M.Update(dt, cmds)
     local good, err = pcall(M.CarsUpdate, player)
     if not good then logErr("cars", err) end
     for _, pp in pairs(M.pup) do
-      if pp.st == "alive" then
+      if pp.st == "alive" and M.cutscene then
+        -- a cutscene plays here (or the host's holds us; mission_sync.lua): puppets must not stand in it. M.Drive
+        -- shows them again at their player's spot afterwards.
+        if valid(pp.so) and not pp.veh then pcall(M.Hide, pp, true) end
+      elseif pp.st == "alive" then
         good, err = pcall(M.Drive, pp)
         if not good then
           pp.errs = (pp.errs or 0) + 1

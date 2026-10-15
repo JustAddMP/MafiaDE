@@ -13,8 +13,10 @@ missions are not shared yet.
 
 1. Run `MafiaCoop.exe`. It starts the game with co-op built in.
 2. Host: choose **CO-OP → Host Co-op Game** in the main menu. The co-op lobby opens: invite friends (or let them join
-   by IP), wait until everyone is ready, pick the mode and press **START**. Free Ride works today; story mode in the
-   lobby comes next (until then the host can start the story the usual way and friends drop in).
+   by IP), wait until everyone is ready, pick the mode and press **START**: **FREE RIDE**, **STORY** (the host
+   continues his story; everyone else joins him at his checkpoint) or a **CHAPTER** from its start. In the story the
+   friends follow the host: his checkpoints, objectives and cutscenes. Your own story save is not touched (co-op
+   story checkpoints go to the Free Ride save slot).
 3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**. You land in the lobby: pick your character and
    set **READY**.
 4. Your character: pause menu → **CO-OP** → **CHARACTER** / **OUTFIT** (Left/Right). Tommy, Paulie, Sam, Salieri,

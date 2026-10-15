@@ -12,8 +12,9 @@ interest.md).
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
-| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done for keyboard; gamepad/mouse/Steam invite untested; lobby: Free Ride works, Story next |
-| 4 Shared world, 6 polish | Not started |
+| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done for keyboard; gamepad/mouse/Steam invite untested; lobby: Free Ride, Story and chapter select |
+| 4 Shared world | Weather/time, story (chapter, checkpoint, objectives) and cutscenes done; NPCs and traffic next |
+| 6 polish | Not started |
 
 ## Working rules
 
@@ -128,16 +129,35 @@ Builds on A6 (player models). Each player picks how they look; everyone sees the
 Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, mission progress.
 - [x] **Weather + time of day**: host sends `game.gfx` GetTime/weather set every few seconds; guests apply
    (SetTime/SetWeatherSet, re-notes §4). Done: WorldEnv 0x0200 (protocol.md), time flow speed included.
-- [ ] **Mission state** (static research in docs/research-characters-missions.md): find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
+- [x] **Mission state** (static research in docs/research-characters-missions.md): find the mission/chapter API (E_MissionAction, mission/objective enums in the Lua
    tables). Guests load the same chapter as the host on join; follow host's checkpoint/chapter changes;
    objective text mirrored. Decide: guests run the mission scripts disabled and mirror the host's world.
+   Done 2026-10-15 (src/game/mission_sync.*, game-api.md 14, re-notes 6, protocol.md "Story"). Decision: guests run
+   the chapter's own mission scripts at the host's checkpoint (the world stays the guest's; NPC mirroring is B3).
+   The host sends his chapter/checkpoint/objective (MissionState) and his newest checkpoint save (HostSave); a guest
+   loads that save from memory through the menu's chapter loader (bytes swapped, nothing written), starts the quest at
+   the host's checkpoint and is put next to him; objectives by id through the game's HUD helpers. Checked in game
+   (two instances): **Omerta** (lobby STORY from the cp_020 save: guest at cp_020 with the quest, objective and
+   markers; lobby CHAPTER 10: OMERTA: both at cp_010, both flows reached cp_020 together after the intro, the host's
+   cp_020 save reached the guest; late join with JOIN GAME at cp_020) and **Taxi** (lobby CHAPTER 2: TAXI, both in the
+   chapter with objective markers). Known issue: when the guest has to reload the host's checkpoint from the world
+   (quit to the main menu, load), the guest's game crashed in 2 of 5 runs (exe+0x2E81EF8, re-notes 6); a later
+   checkpoint is only ever loaded from the host's save of it (from the chapter start it crashed). Other chapters and
+   checkpoints than these were not played.
 - [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
    invisible proxy for each guest so its AI targets them. Prototype both, measure.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
-- [ ] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
+- [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
+  Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
+  guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the
+  host's ends or the host skips (then fades in and is put next to the host); a guest who skipped, or cannot play it,
+  is held (controls locked, "THE HOST IS WATCHING A CUTSCENE") until the host's ends; puppets are hidden while a
+  cutscene plays. Checked in Omerta with cine_1100_omerta (played from the console on the host, and the chapter's
+  real intro): played on both, host skip stopped the guest's, guest skip held him and released him at the host's
+  end. A cutscene that binds live entities (cars) was not checked.
 - [x] Interest management: only stream within ~300 m of any player; bandwidth budget. (Module + tests in
   core: external/core/src/net/interest.*, external/core/docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
 
@@ -162,7 +182,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   CO-OP > SETTINGS, the lobby, pause menu CO-OP > SETTINGS): NAME (text box; used from the next session), DEBUG
   OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE, all saved in MafiaCoop.ini with `Config::Set`. Checked in game:
   debug overlay off/on, name saved, name tags off in the world (pause panel > SETTINGS).
-- [ ] **Pre-game lobby** (user agreed 2026-10-15): main menu CO-OP > HOST CO-OP GAME opens a lobby screen listing the
+- [x] **Pre-game lobby** (user agreed 2026-10-15): main menu CO-OP > HOST CO-OP GAME opens a lobby screen listing the
   joined players with their character and ready state; guests reach it via JOIN BY IP / JOIN FRIEND / a Steam invite
   (it opens by itself once they are at the main menu) and pick their character (the batch-3 rows) and toggle READY;
   the host picks the MODE and presses START; the host's game loads that mode, every guest's loads the same, and
@@ -175,6 +195,9 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   start seeing each other (Enter on each loading screen, as in single player); a guest joining while the host already
   plays sees "HOST IS PLAYING FREE RIDE" and JOIN GAME loads it. Story mode (continue the host's save / pick a chapter)
   comes with mission/chapter sync (B2). A real Steam invite into the lobby between two accounts is not checked.
+  Story done 2026-10-15 (mod 0.6.0): MODE STORY (host CONTINUE, guests load the host's checkpoint save) and CHAPTER
+  1..20 (everyone loads that chapter's shipped start save; the host's own story slot is not touched). Checked in game:
+  STORY into Omerta cp_020, CHAPTER 10: OMERTA and CHAPTER 2: TAXI, JOIN GAME into the host's running story.
 
 - [x] **Session password** (network side + tests done in 65c562f; menus checked in game 2026-10-15: SET PASSWORD on
   the host, guest gets the PASSWORD box on JOIN BY IP, joins with it): the host can set an optional password (CO-OP page: "Set password", reusing the text box

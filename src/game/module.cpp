@@ -8,10 +8,12 @@
 #include "game/characters.h"
 #include "game/lua.h"
 #include "game/menu.h"
+#include "game/mission_sync.h"
 #include "game/player_sync.h"
 
 #include <windows.h>
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 
 namespace mc::game {
@@ -102,7 +104,16 @@ void SettingsStep(size_t index, int) {
 }
 
 // ---- lobby modes (the index travels on the wire: keep the order) ----
-enum LobbyModeId { kModeFreeRide = 0, kModeStory = 1 };
+// After STORY: one mode per chapter (MissionSync::Chapters, kModeFirstChapter + i).
+enum LobbyModeId { kModeFreeRide = 0, kModeStory = 1, kModeFirstChapter = 2 };
+
+// "mm_110_omerta" -> "CHAPTER 10: OMERTA" (number = position in the story; name from the quest id)
+std::string ChapterLabel(size_t index, const std::string& quest) {
+    size_t at = quest.find('_', 3);
+    std::string name = at == std::string::npos ? quest : quest.substr(at + 1);
+    for (char& c : name) c = c == '_' ? ' ' : static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return "CHAPTER " + std::to_string(index + 1) + ": " + name;
+}
 constexpr const char* kFreeRideSave = "freeroam_test";  // GetLoadedSaveId() in Free Ride (docs/game-api.md 11)
 
 // ---- name tags (docs/game-api.md 13): the other players' names over their puppets ----
@@ -134,22 +145,50 @@ void DrawTags(render::DrawList& d, float w, float h) {
     }
 }
 
+// A line over the game while the story sync needs a moment (guest: held during the host's cutscene, loading his
+// checkpoint).
+void DrawNotice(render::DrawList& d, float w, float h) {
+    std::string text = MissionSync::HudNotice();
+    if (text.empty()) return;
+    const float s = h / 1080.0f, px = 26.0f * s;
+    const float tw = render::DrawList::TextWidth(text, px);
+    const float x = (w - tw) * 0.5f, y = h * 0.82f;
+    d.Rect(x - px * 0.6f, y - px * 0.3f, tw + px * 1.2f, px * 1.6f, 0xB4000000);
+    d.Rect(x - px * 0.6f, y + px * 1.3f, tw + px * 1.2f, std::max(1.0f, px * 0.08f), 0xFFD1AC62);
+    d.Text(x, y, text, px, 0xFFE9E5DB);
+}
+
 class MafiaModule final : public GameModule {
 public:
     void Init(const std::wstring& dllDir, const std::string& logTag) override {
         // Lua bridge: hooks the script tick (GameMainThread); player sync runs on it. Failure only disables it.
-        if (lua::Install(dllDir, logTag)) PlayerSync::Install();
+        if (lua::Install(dllDir, logTag)) {
+            PlayerSync::Install();
+            MissionSync::Install();
+        }
         menu::Install(dllDir);
     }
     void RenderTick(float dt) override { lua::PollRender(dt); }
 
-    void OnSessionStart(net::Session& session) override { PlayerSync::Attach(session); }
-    void OnSessionEnd() override { PlayerSync::Detach(); }
+    void OnSessionStart(net::Session& session) override {
+        PlayerSync::Attach(session);
+        MissionSync::Attach(session);
+    }
+    void OnSessionEnd() override {
+        PlayerSync::Detach();
+        MissionSync::Detach();
+    }
     void OnPlayerLeft(net::PlayerId id) override { PlayerSync::OnPlayerLeft(id); }
-    void SessionTick(float dt) override { PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld()); }
+    void SessionTick(float dt) override {
+        PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
+        MissionSync::Tick(dt);
+    }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
-    void AppendStatus(std::vector<render::OverlayLine>& out) override { PlayerSync::GetStatus(out); }
+    void AppendStatus(std::vector<render::OverlayLine>& out) override {
+        PlayerSync::GetStatus(out);
+        MissionSync::GetStatus(out);
+    }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
     void PanelOptions(std::vector<PanelOption>& out) override { CharacterOptions(out); }
@@ -160,14 +199,23 @@ public:
 
     void LobbyModes(std::vector<LobbyMode>& out) override {
         out.push_back({"FREE RIDE", true, ""});
-        out.push_back({"STORY", false, "NEXT VERSION"});  // continue the host's save / pick a chapter: next batch
+        out.push_back({"STORY", true, ""});  // the host continues his story, guests load his checkpoint (MissionSync)
+        const auto& chapters = MissionSync::Chapters();
+        for (size_t i = 0; i < chapters.size(); ++i) out.push_back({ChapterLabel(i, chapters[i]), true, ""});
     }
     bool StartMode(int mode) override {
-        if (mode != kModeFreeRide) return false;
         if (PlayerSync::InWorld()) {
-            MC_LOG_INFO("lobby: Free Ride start, but we are in the world already");
+            MC_LOG_INFO("lobby: start of mode %d, but we are in the world already", mode);
             return false;
         }
+        if (mode == kModeStory) return MissionSync::StartStory();
+        if (mode >= kModeFirstChapter) {
+            const auto& chapters = MissionSync::Chapters();
+            const size_t i = static_cast<size_t>(mode - kModeFirstChapter);
+            return i < chapters.size() && MissionSync::StartChapter(chapters[i]);
+        }
+        if (mode != kModeFreeRide) return false;
+        MissionSync::StopFollowing();
         return menu::RequestLoad("free_ride");  // the main menu's own FREE RIDE (menu_parent.LoadGame)
     }
     bool InWorld() override { return PlayerSync::InWorld(); }
@@ -178,7 +226,10 @@ public:
     }
     std::string PlayerCharacter(net::PlayerId id) override { return PlayerSync::CharacterName(id); }
 
-    void DrawHud(render::DrawList& d, float w, float h) override { DrawTags(d, w, h); }
+    void DrawHud(render::DrawList& d, float w, float h) override {
+        DrawTags(d, w, h);
+        DrawNotice(d, w, h);
+    }
 };
 
 }  // namespace

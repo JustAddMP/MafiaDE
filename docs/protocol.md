@@ -9,7 +9,8 @@ Version rules: any incompatible change to these messages needs a bump of `modVer
 (the session build number is derived from it, so mismatched builds are rejected in the handshake). 0.3.0: Hit (0x0400)
 and the character per player. 0.4.0: PlayerModel (0x0102), character choice in the CO-OP panel, punch detection. 0.5.0:
 core 0.5 (protocol 7: the pre-game lobby, core docs/protocol.md "Lobby"); lobby mode indexes: 0 FREE RIDE, 1 STORY (not
-startable yet).
+startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x0203); lobby modes 0 FREE RIDE, 1 STORY,
+2..21 CHAPTER 1..20 (`MissionSync::Chapters()`, the order of `mm_ids_replay`).
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -186,3 +187,27 @@ WorldEnv is sent while the host is in the world: every 4 s and at once when the 
 changes. A guest in the world sets the weather set when it differs (`SetWeatherSet(name, 0, 0)`), the flow speed when it
 differs, and its clock when it is more than 0.05 h (3 game minutes) off (`SetTime(t, 0)`). Guests' own weather/time
 scripts may change things in between; the next WorldEnv puts them back.
+
+### Story: chapter, checkpoint, objectives, cutscenes (0.6.0)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0201 | MissionState | host -> guests (`Broadcast`; `SendTo` a new player) | R | str quest, str checkpoint, str objective, str overrideObjective, str saveId, u8 inWorld |
+| 0x0202 | HostSave | host -> guests (`Broadcast`; `SendTo` a new player) | R | u32 seq, str saveId, u32 size, size bytes (the save file, at most 200 KB) |
+| 0x0203 | Cutscene | host -> guests (`Broadcast`; `SendTo` a new player) | R | str name (`cine_..._cs_object` without the suffix; "" = none) |
+
+- MissionState: `quest` = `GetActiveQuest()` (`mm_110_omerta`), `checkpoint` = the quest's custom state (`cp_020`),
+  the objective ids (`active_objective`, `override_objective`), `saveId` = `GetLoadedSaveId()`, `inWorld`. Sent at
+  once on a change and every 5 s, also from the main menu (then all empty but the save id, inWorld 0). Strings are
+  checked on receipt (`[A-Za-z0-9_.!]`, at most 96 bytes); anything else drops the message.
+- HostSave: the newest `checkpoint_*` save file under the host's `Documents\My Games\Mafia Definitive Edition\Data`
+  (`*.sav`, the save id read from the file) of the point he is at; at the main menu the newest one (what CONTINUE
+  loads). The host looks every 2 s and sends a file when its bytes changed; `seq` counts them. Guests keep only the
+  newest in memory; nothing is written to their disk.
+- Cutscene: the host polls the cutscene objects of his chapter (`IsCutscenePlaybackInProgress`, every 0.25 s) and sends
+  the one that plays, and "" when it ended or was skipped.
+- Guests that follow the host (lobby STORY or CHAPTER, JOIN GAME): load the host's point (docs/game-api.md 14) and,
+  in the world, mirror his objective ids and play/stop his cutscenes. A guest is "at" a point when his own
+  `GetActiveQuest()` / checkpoint equal it; when the host's point differs for `follow_grace` seconds (default 8) and
+  no cutscene plays, the guest quits to the main menu and loads the host's save of that point (one attempt per host
+  point; without a save of it he waits for the next HostSave).

@@ -579,6 +579,44 @@ too. No raw input.
 
 ---------------------------------------------------------------------------------------------------------------
 
+## 6. Chapter loading: the main menu's save loader [confirmed in game 2026-10-15]
+
+Found from the `C_MainMenu` iface handlers (research-characters-missions.md B2) by following `OpenDebugLoadChapter2`
+(handler 0x30201D0 -> 0x301FCC0, which joins the path array and calls the loader at 0x30200F5).
+
+- **`OpenDebugLoadChapterString(this, C_String* name, bool a, bool b)` at 0x3020350** (pattern `ChapterLoad` below). It
+  builds `"/saves/" + name`, creates a 1 MB memory buffer (0x3CB42A0: vtable, +8 capacity, +0x28 bytes used,
+  +0x30 data), reads the file into it through the VFS (`[this+0x2C8]->vf40(...)` gives the file system, its
+  `[+0x10]->vf78(out, path, buffer)` reads), wraps the bytes in a read stream and hands it to the save system
+  (`[this+0x2C8]->vf88(saveObject, stream, path)`), then starts the game session (0x2327940 with a and b).
+  - The read stream: `0x3C981D0(stream, data, size, 0)` (`[s+8]` = data, `[s+0x18]` = size, `[s+0x20]` = size == 0),
+    called once from the loader at 0x302049C (return address 0x30204A1; pattern `ChapterLoad_StreamSite`, the call is
+    at +0x24 of the match). MafiaCoop hooks the stream function and, only for that return address and only while a
+    load of ours is armed, passes other bytes: the save we want loaded (no file is written anywhere).
+  - Callers and their flags (a, b): `OpenDebugLoadChapter2` (Free Ride: `["02_lost_heaven", "lh_freeride_extreme.sav"]`)
+    (0, 0); `MissionReplay` 0x3016800 (chapter select) (0, 1); `StartNewGame` 0x30173D0 (`01_start_game.sav`) (1, 0);
+    0x305DD80 (`freeroam_gui_install.sav`) (0, 1). With (0, 1) `game.savesystem:IsInReplayOrTestDrive()` is true
+    after the load; MafiaCoop turns its swapped loads into (0, 1).
+- Loaded this way (any flags), a save comes in **without its quest running**: `game.director:QuestIsAvailable(q)`
+  false, no mission flow, no objective, no mission NPCs or cutscene objects. `game.director:QuestSetCustomState(q,
+  cp)` + `QuestSetAvailable(q)` (the game's debug `unlockquest`) then start the chapter's flow at that checkpoint.
+  Starting a later checkpoint from the chapter's cp_010 save crashed: Omerta cp_030 from cp_010 ->
+  `C_PlayerVehicleStreaming::ObtainNewPlayerVehicle` sprintf of `/sds/cars/%s.sds` with a null car name
+  (exe+0x2374571 -> 0x61F800).
+- Saves written in such a session go to the **Free Ride slot** (`gamesaves\defaultslot\save0..2.sav`; the story is
+  `aslot`). Their save ids: `freeroam_quest_state_changed` (when a quest is made available), then
+  `checkpoint_mm_<n>_<chapter>_cp_<nnn>` at checkpoints (no zero padding in the number: `checkpoint_mm_20_taxi_cp_010`;
+  the shipped replay saves pad it: `checkpoint_mm_020_taxi_cp_010.sav`).
+- Save files: format `GENR`, 30-50 KB; the save id is plain text inside (`checkpoint_mm_110_omerta_cp_020`,
+  `freeroam_game_close`, `freeroam_before_quest_activated`).
+- Open problem: a guest's chapter load after `game.hud:QuitToMainMenu()` crashed twice (of five) in a co-op session,
+  a null read at exe+0x2E81EF8 (`vf48(obj, [msg+0x28])` returned null; inside a load-time message handler, stack
+  0x2E82898 <- 0x1763DFC <- 0x1262033 <- 0x2405B8B). Not reproduced in single-player runs of the same steps (replay
+  load, quest started, checkpoint reached, cutscene played and unloaded, model override, weather set, puppet factory,
+  quit, load again).
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
@@ -597,6 +635,8 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | hks_error | 0x4914710 | `48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 30 44 8B F2 48` |
 | hks_pushnamedcclosure | 0x49136E0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 30 49 8B F9 41 8B F0 48 8B` |
 | hks_pushcclosure | 0x4914A30 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 40 49 63` |
+| ChapterLoad (OpenDebugLoadChapterString) | 0x3020350 | `48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F0 48 81 EC 10 01 00 00 4C 8B F9 4C 8B F2 48 8B 89 C8 02 00 00` |
+| ChapterLoad_StreamSite (in the loader; the stream call at +0x24) | 0x3020478 | `48 8D 4C 24 68 E8 ?? ?? ?? ?? 48 8D 4C 24 68 48 8B D8 E8 ?? ?? ?? ?? 48 8B D0 48 8D 4D A0 45 33 C9 4C 8B C3 E8 ?? ?? ?? ?? 49 8B 8F C8 02 00 00` |
 | lua_pushlstring | 0xE4DA50 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 BF 1F 00 00` |
 | lua_setfield | 0xE4DCD0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 48` |
 | lua_getfield | 0x1254BC0 | `40 53 48 83 EC 60 0F 29 74 24 50 4D 8B C8 48 8B D9 81 FA F0` |

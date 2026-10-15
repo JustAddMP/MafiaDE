@@ -158,13 +158,15 @@ scripts and still work.
     required" / "wrong password" opens a PASSWORD box; Enter repeats the join with it.
 - **Lobby** (core's panel over the main menu): the players with their character (CHARACTER column) and status
   (HOST / READY / NOT READY), your CHARACTER and OUTFIT rows, then for a guest **READY** (Left/Right/Enter toggle) and
-  for the host **MODE** (FREE RIDE; STORY is listed as "NEXT VERSION") and **START** (waits until every guest is
+  for the host **MODE** (FREE RIDE, STORY, CHAPTER 1..20) and **START** (waits until every guest is
   ready), INVITE FRIENDS, SETTINGS, LEAVE CO-OP / STOP HOSTING, BACK. A guest who joins (JOIN BY IP, JOIN FRIEND, a
   Steam invite, `--join`) gets the lobby by itself as soon as he is at the main menu (not over the title screen).
-  START closes everybody's lobby and every game loads Free Ride the way the menu's own FREE RIDE does (each player
-  presses Enter on his loading screen); everyone starts at the Free Ride start. If the host is already playing, the
-  lobby says "HOST IS PLAYING FREE RIDE" and **JOIN GAME** loads it. The host's host-menu flow and the lobby messages
-  are core's (core docs/protocol.md "Lobby").
+  START closes everybody's lobby and every game loads the mode (each player presses Enter on his loading screen):
+  FREE RIDE the way the menu's own FREE RIDE does; STORY: the host CONTINUEs his save and every guest loads the host's
+  newest checkpoint save, sent over the network; CHAPTER n: everyone loads the shipped start of that chapter. If the
+  host is already playing, the lobby says "HOST IS PLAYING FREE RIDE / STORY" and **JOIN GAME** loads it (in the
+  story: the host's current checkpoint). The host's host-menu flow and the lobby messages are core's (core
+  docs/protocol.md "Lobby"); the story sync is ours (below, "Story").
 - **CO-OP SETTINGS** (main menu CO-OP page, lobby, pause CO-OP panel): NAME (text box; empty = Steam name; used from
   the next session), DEBUG OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE; saved in MafiaCoop.ini.
 - **In the world:** every other player's name floats over his character (fades with distance, no occlusion: it shows
@@ -268,7 +270,10 @@ violation inside a job disables it for the rest of the session instead of crashi
 Globals the dll adds: `mc_log(...)` (writes to our log), `mc_u64(str|num)` / `mc_u64str(v)` (HKS ui64 values),
 `mc_pad(buttons, holdMs, lt, rt, lx, ly, rx, ry)` (tests: holds core's virtual gamepad, needs `--test_pad 1`; e.g.
 `mc_pad(0, 1500, 0, 0, 0, 30000)` walks forward), `mc_player_profile()` ("default override" profile hashes of the
-game's player model manager).
+game's player model manager), and for story tests (main menu): `mc_menu_load("free_ride" | "continue_game")`,
+`mc_load_replay("checkpoint_mm_110_omerta_cp_010.sav")` (a shipped 00_mission_replay save, loaded the way a guest
+loads the host's save), `mc_load_file(path)` (any save file), `mc_follow_reset()` (the guest forgets which host point
+he loaded, so a mismatch reloads it).
 
 Dev console, to explore the API live:
 
@@ -334,6 +339,21 @@ rate, age of the newest snapshot, his health and stance; `alive/seat0` = sitting
 dll swallows that message so an unfocused game keeps running and sending (needed for co-op and for two instances on
 one PC). Set `background_run = 0` to get the original pause-on-alt-tab.
 
+### Story (mission sync)
+
+The host is authoritative; guests play his chapter and checkpoint (docs/game-api.md 14, docs/protocol.md "Story").
+- The host reports his chapter, checkpoint, objective and the cutscene that plays, and sends his newest story
+  checkpoint save (from `Documents\My Games\Mafia Definitive Edition\Data`) whenever the game writes one.
+- A following guest (lobby STORY / CHAPTER, JOIN GAME) loads that save from memory: the main menu's FREE RIDE load
+  with the file's bytes swapped for the host's save (nothing is written to disk), then the chapter's quest is started
+  at the host's checkpoint and he is put next to the host. If the host reaches a checkpoint the guest's own mission
+  flow does not reach within 8 s, the guest leaves for the main menu and loads the host's save of it (see the known
+  crash in docs/re-notes.md 6). The guest sees the host's objective; cutscenes play on both games (the host skipping
+  ends the guest's; a guest who skips waits for the host, "THE HOST IS WATCHING A CUTSCENE"); puppets are hidden
+  while a cutscene plays.
+- Checkpoints a guest's game writes in co-op go to its Free Ride slot (`bslot`), not its story; the game's CONTINUE
+  may then offer that co-op save.
+
 ### In-world test with two instances on one PC
 
 1. Back up the save folder first (`%USERPROFILE%\Documents\My Games\Mafia Definitive Edition`, OneDrive-redirected
@@ -398,6 +418,8 @@ name_tags = 1              ; 0 = no names over the other players (CO-OP SETTINGS
 map_markers = 1            ; 0 = the other players are not on the minimap/map (CO-OP SETTINGS > MAP MARKERS)
 debug_overlay = 0          ; 1 = debug status text at start (CO-OP SETTINGS > DEBUG OVERLAY, F7)
 test_pad = 0               ; 1 = a virtual gamepad for automated tests (mc_pad from the dev console)
+follow_grace = 8           ; guest: seconds the host may be at another checkpoint before we reload his (story)
+story_load = replay        ; replay | story | free: flags of our chapter loads (tests; docs/re-notes.md 6)
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```
 

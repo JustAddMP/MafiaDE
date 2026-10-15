@@ -364,3 +364,43 @@ really on screen" = at least two HOME builds and a poll within the last second (
 **Quitting.** Closing the game window (WM_CLOSE, the X button) ends the process through `ExitProcess` on the game's
 main thread right away (no dialog); the dll's hook leaves the co-op session first (core docs/protocol.md "Leaving
 cleanly").
+
+## 14. Story: chapters, checkpoints, objectives, cutscenes — verified 2026-10-15
+
+Two instances on one PC, Omerta (`mm_110_omerta`, cp_010 and cp_020) and Taxi (`mm_20_taxi`, cp_010). Used by the
+story sync (src/game/mission_sync.cpp + mission_sync.lua; messages in docs/protocol.md "Phase 4"; the loader in
+docs/re-notes.md 6).
+
+| call | notes |
+|---|---|
+| `GetActiveQuest()` (global) | the running chapter, e.g. `"mm_110_omerta"`; `""` in Free Ride and while the quest of a loaded save is not started |
+| `game.director:QuestGetCustomState(q)` | the checkpoint: `"cp_020"`. `QuestGetCustomStatesCount(q)` / `QuestGetCustomStateByIndex(q, i)` list them (Omerta: cp_010 .. cp_120, 13) |
+| `game.director:QuestIsAvailable(q)` / `QuestSetAvailable(q)` / `QuestSetCustomState(q, cp)` | a save loaded through the menu's chapter loader comes without its quest running (false); setting the checkpoint and making the quest available starts the chapter's flow there: objective, mission NPCs, cutscene objects. From the chapter's cp_010 save at cp_010 the intro cutscene played and the flow reached cp_020 on its own; a later checkpoint from the cp_010 save crashed (re-notes 6), so a guest only ever starts a later checkpoint from the host's save of it |
+| `game.game:GetLoadedSaveId()` | `"checkpoint_mm_110_omerta_cp_020"`, `"checkpoint_mm_20_taxi_cp_010"`; `"!none!"` at the main menu and while a world is torn down after a quit |
+| `game.savesystem:IsInReplayOrTestDrive()` | true after a load with the replay flags (MafiaCoop's loads) |
+| globals `active_objective`, `override_objective`, `active_obj_description` | the objective shown: `active_objective` is its **id** (`"mm_110_omerta_cp_020"`); the HUD looks the text up from the id ("Talk to Vincenzo") |
+| `HUD_AddQuestObjective(id)` (global, various_utils.lua) | shows objective `id` (sets `active_objective`, calls `game.hud:UpdateSimpleObjective`); with a quest id it shows the chapter name ("Omerta"). `HUD_AddQuestOverrideObjective(id)` / `HUD_RemoveQuestOverrideObjective()` for the override. The flows' own calls of these globals were not seen by a wrapper installed after the load (they hold the functions) |
+| `game.hud:QuitToMainMenu()` | leaves the world for the main menu at once (no dialog, no save written) |
+| `skipobjective()`, `savemission()` | debug globals that post events to a "temp_mission_flow" kit: nothing happens in this build |
+| cutscene object `game.entitywrapper:GetSceneObjectByName("cine_1100_omerta_cs_object")` -> `GetComponent("C_RuntimeCutsceneComponent")` | exists only while the chapter's quest runs. `IsCutscenePlaybackInProgress()` true while it plays (also when the mission flow plays it); `LoadCutscene()` then (when `IsCutsceneLoadFinished()`) `PlayCutscene2("", "", "", "")` (**four** strings; three = "wrong number of arguments") plays it on demand; `StopCutscene()` ends it (the play sync object is then done), `UnloadCutscene()`. After a stop the screen stays black: `HUD_FaderFadeIn(0.5)` (global) fades back in. `GetCutsceneId()` -1 before a load, 50001 after |
+| `game.gfx:GetCurrentWeatherSetName()` | after chapter loads it can name another chapter's set (`mm_160_harbor_cp_080_harbour_entrance_cutscene` in Omerta) |
+
+**How the co-op story works** (src/game/mission_sync.*):
+- Host: twice a second its chapter, checkpoint, objective and override objective (MissionState) and the cutscene
+  that plays (polling the chapter's `cine_*_cs_object`s, docs/research-world-sync.md B5 list); every 2 s the newest
+  `checkpoint_*` save in `Documents\My Games\Mafia Definitive Edition\Data\<id>\gamesaves` of the point it is at
+  (HostSave, ~35-47 KB).
+- Guest following the host (lobby STORY / CHAPTER, or JOIN GAME): at the main menu it loads the host's point through
+  the menu's FREE RIDE load with the save bytes swapped (the host's save, or for a chapter start the shipped
+  `edit\saves\00_mission_replay` save), then starts the quest at that checkpoint and is put behind the host's puppet.
+  When the host is at another checkpoint for more than 8 s (`follow_grace`) and no cutscene plays, the guest
+  removes the puppets, quits to the main menu and loads the host's save of that checkpoint (waiting for it when it is
+  not there yet). Objectives: the host's ids through `HUD_AddQuestObjective`. Cutscenes: the guest plays its own copy
+  of the host's cutscene object (or its own flow already does), stops it when the host's ends or is skipped, and is
+  held (controls locked, "THE HOST IS WATCHING A CUTSCENE") if it skipped or cannot play it; puppets are hidden
+  while a cutscene plays.
+- Checked: lobby STORY from the Omerta cp_020 save (guest at cp_020 with the quest running and the objective);
+  lobby CHAPTER 10: OMERTA (both at cp_010, intro cutscene on both, both flows reached cp_020 together, the host's
+  cp_020 save went to the guest); lobby CHAPTER 2: TAXI (both in the chapter with objective markers); host cutscene
+  played on the guest, host skip stopped it, guest skip held him until the host's ended; a late joiner (host already at Omerta cp_020) pressing JOIN GAME came in at cp_020 next to him;
+  the guest reloading the host's checkpoint from the world (worked twice; **crashed twice**, re-notes 6).

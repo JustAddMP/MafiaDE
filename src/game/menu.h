@@ -32,8 +32,9 @@ bool Active();
 bool AtMainMenu();
 // AtMainMenu and past the title screen (the menu page also exists, and polls, behind the title).
 bool MainMenuShown();
-// Asks the main menu to start a game the way its own entries do: "free_ride" (FREE RIDE) or "continue_game"
-// (CONTINUE). Done on its next frame. False when the main menu is not up.
+// Asks the main menu to start a game the way its own entries do: "free_ride" (FREE RIDE: its chapter loader on
+// /saves/02_lost_heaven/lh_freeride_extreme.sav, whose contents MissionSync can swap for another save) or
+// "continue_game" (CONTINUE). Done on its next frame. False when the main menu is not up.
 bool RequestLoad(const std::string& what);
 
 // Render thread.

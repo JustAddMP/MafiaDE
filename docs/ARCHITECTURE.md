@@ -31,6 +31,8 @@ src/game/
   player_sync.{h,cpp}    phase 3: local player sampling, puppets, copy cars, weather/time (C++ side; wire format in
   player_sync.lua        docs/protocol.md); the .lua is embedded at build time. Also the CHARACTER/OUTFIT
                          rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel
+  mission_sync.{h,cpp}   phase 4 story: the host's chapter/checkpoint/objective/cutscene and checkpoint save to the
+  mission_sync.lua       guests, guests load and follow it (lobby STORY / CHAPTER); the chapter loader hooks
   menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch;
                          the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
