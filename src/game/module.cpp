@@ -10,6 +10,7 @@
 #include "game/menu.h"
 #include "game/mission_sync.h"
 #include "game/player_sync.h"
+#include "game/save_guard.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -167,6 +168,7 @@ public:
             MissionSync::Install();
         }
         menu::Install(dllDir);
+        save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
     }
     void RenderTick(float dt) override { lua::PollRender(dt); }
 
