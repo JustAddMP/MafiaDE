@@ -3,6 +3,7 @@
 #include "mc/game_module.h"
 
 #include "dll/ui_input.h"
+#include "game/characters.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/player_sync.h"
@@ -34,6 +35,44 @@ bool AimHeld() {
     return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 || ui_input::PadLeftTrigger() > 60;
 }
 
+// The CO-OP panel's CHARACTER and OUTFIT rows (docs/PLAN.md "F"). CHARACTER steps through DEFAULT (the character
+// for your player id: host Tommy, then Paulie, Sam, Salieri) and the list in game/characters.cpp; OUTFIT through that
+// character's outfits. Every step applies at once: you change in the world while browsing, and the others see it.
+void CharacterOptions(std::vector<PanelOption>& out) {
+    const std::string model = PlayerSync::Model();
+    size_t c = 0, o = 0;
+    if (model.empty()) {
+        out.push_back({"CHARACTER", "DEFAULT"});
+        return;
+    }
+    if (!characters::Find(model, &c, &o)) {
+        out.push_back({"CHARACTER", "CUSTOM"});
+        return;
+    }
+    const auto& ch = characters::List()[c];
+    out.push_back({"CHARACTER", ch.name});
+    if (ch.outfits.size() > 1) out.push_back({"OUTFIT", ch.outfits[o].name});
+}
+
+void CharacterStep(size_t index, int delta) {
+    const auto& list = characters::List();
+    const std::string model = PlayerSync::Model();
+    size_t c = 0, o = 0;
+    const bool known = !model.empty() && characters::Find(model, &c, &o);
+    if (index == 0) {  // CHARACTER: DEFAULT, then every character (its first outfit)
+        const int n = static_cast<int>(list.size()) + 1;
+        int pos = known ? static_cast<int>(c) + 1 : 0;
+        if (!known && !model.empty()) pos = delta > 0 ? 0 : 1;  // CUSTOM: next is the first character
+        pos = ((pos + delta) % n + n) % n;
+        PlayerSync::SetModel(pos == 0 ? std::string() : list[static_cast<size_t>(pos - 1)].outfits[0].alias);
+    } else if (index == 1 && known) {  // OUTFIT
+        const auto& outfits = list[c].outfits;
+        const int n = static_cast<int>(outfits.size());
+        const int pos = ((static_cast<int>(o) + delta) % n + n) % n;
+        PlayerSync::SetModel(outfits[static_cast<size_t>(pos)].alias);
+    }
+}
+
 class MafiaModule final : public GameModule {
 public:
     void Init(const std::wstring& dllDir, const std::string& logTag) override {
@@ -52,6 +91,8 @@ public:
     void AppendStatus(std::vector<render::OverlayLine>& out) override { PlayerSync::GetStatus(out); }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
+    void PanelOptions(std::vector<PanelOption>& out) override { CharacterOptions(out); }
+    void PanelOptionStep(size_t index, int delta) override { CharacterStep(index, delta); }
 };
 
 }  // namespace

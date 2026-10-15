@@ -4,6 +4,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
+#include "dll/ui_input.h"
 
 #include <windows.h>
 #include <atomic>
@@ -304,6 +305,26 @@ int McU64Str(lua_State* L) {
     return 1;
 }
 
+// mc_pad(buttons, holdMs [, lt, rt, lx, ly, rx, ry]) -> true if the test pad took it. Tests only: holds a virtual
+// gamepad state (XINPUT_GAMEPAD_* button bits, triggers 0..255, sticks -32768..32767) for holdMs (core's
+// ui_input::SetTestPad; needs test_pad = 1, else false).
+int McPad(lua_State* L) {
+    auto num = [L](int i) { return TypeOf(L, i) == TNumber ? static_cast<double>(ToNumber(L, i)) : 0.0; };
+    auto i16 = [](double v) { return static_cast<int16_t>(v < -32768 ? -32768 : v > 32767 ? 32767 : v); };
+    auto u8 = [](double v) { return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v); };
+    ui_input::TestPadState st;
+    st.buttons = static_cast<uint16_t>(static_cast<uint32_t>(num(1)) & 0xFFFF);
+    st.leftTrigger = u8(num(3));
+    st.rightTrigger = u8(num(4));
+    st.lx = i16(num(5));
+    st.ly = i16(num(6));
+    st.rx = i16(num(7));
+    st.ry = i16(num(8));
+    const double hold = num(2);
+    PushBool(L, ui_input::SetTestPad(st, static_cast<uint32_t>(hold < 0 ? 0 : hold > 60000 ? 60000 : hold)));
+    return 1;
+}
+
 }  // namespace
 
 // ---- setup ----------------------------------------------------------------------------------------------------
@@ -369,7 +390,8 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         RegisterGlobal(L, "mc_log", &McLog);
         RegisterGlobal(L, "mc_u64", &McU64);
         RegisterGlobal(L, "mc_u64str", &McU64Str);
-        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str");
+        RegisterGlobal(L, "mc_pad", &McPad);
+        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
                 Narrow(_dllDir).c_str(), Narrow(_dllDir).c_str(), _tag.c_str());

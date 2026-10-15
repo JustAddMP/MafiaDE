@@ -9,6 +9,7 @@
 #include "net/session.h"
 #include "render/overlay.h"
 
+#include <string>
 #include <vector>
 
 namespace mc::game {
@@ -28,6 +29,11 @@ public:
     static void Tick(float dt, bool enterDown, bool aimDown);
     // Last known health (0..100) of a player (local or remote), -1 if unknown. Any thread.
     static int Health(net::PlayerId id);
+    // Our character (docs/protocol.md "PlayerModel"): the `model` setting, "" = the default for our player id.
+    static std::string Model();
+    // Picks another character (CO-OP panel): saved as `model =` in MafiaCoop.ini, our own player switches at once
+    // (live preview while browsing), and everyone else's puppet of us follows (PlayerModel message).
+    static void SetModel(const std::string& model);
     static void GetStatus(std::vector<render::OverlayLine>& out);
 };
 

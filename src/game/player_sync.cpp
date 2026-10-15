@@ -2,6 +2,8 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/mem.h"
+#include "game/characters.h"
 #include "game/lua.h"
 #include "net/wire.h"
 
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -24,6 +27,7 @@ namespace {
 // ---- protocol (docs/protocol.md "Phase 3") ---------------------------------------------------------------------
 constexpr uint16_t kMsgPlayerState = 0x0100;
 constexpr uint16_t kMsgCarParked = 0x0101;
+constexpr uint16_t kMsgPlayerModel = 0x0102;  // every peer -> everyone: the character he picked and how he looks
 constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
 constexpr uint8_t kStateVersion = 3;
@@ -36,11 +40,6 @@ constexpr float kTeleport = 20.0f;          // metres between two snapshots: a t
 constexpr size_t kMaxInCmds = 64 * 1024;  // network -> Lua lines kept while the script tick does not run (paused)
 
 enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16 };
-
-// Default character per player id (aliases resolved by the Lua glue, M.MODELS / M.Profile): the host stays Tommy as
-// the story dresses him, guests are other story characters. `model = <alias or spawn profile>` in the ini (or
-// --model) overrides it for that player; it is sent in Hello so everyone shows the same character.
-const char* const kDefaultModels[] = {"tommy", "paulie", "sam", "salieri"};
 
 struct PlayerState {
     float pos[3] = {};
@@ -88,6 +87,13 @@ struct Shared {
     std::map<net::PlayerId, Remote> remotes;
     std::map<net::PlayerId, std::string> names;
     std::map<net::PlayerId, std::string> models;  // from the session (Hello); "" = default by id
+    struct Look {
+        std::string model;  // what he picked (alias or profile)
+        std::string look;   // the spawn profile his own game uses for it ("" = resolve the model here)
+    };
+    std::map<net::PlayerId, Look> live;  // PlayerModel messages; win over the Hello model
+    std::string localLook;               // our own story Tommy's profile (decimal hash), reported by the Lua glue
+    bool sendModel = false;              // our PlayerModel must go out (changed, or somebody joined)
     std::vector<net::PlayerId> removed;
     bool removeAll = false;
     PlayerState local;
@@ -112,6 +118,7 @@ Shared& S() {
 
 // render-thread only
 net::Session* _session = nullptr;
+std::set<net::PlayerId> _seenPlayers;  // session players last tick (a new one gets our PlayerModel)
 bool _enterWasDown = false;
 double _sendAccum = 0;
 uint32_t _sent = 0;
@@ -140,17 +147,66 @@ double Now() {
 
 uint32_t NowMs() { return static_cast<uint32_t>(static_cast<uint64_t>(Now() * 1000.0)); }
 
-std::string DefaultModel(net::PlayerId id) {
-    return kDefaultModels[id % (sizeof(kDefaultModels) / sizeof(kDefaultModels[0]))];
-}
-
-// Model shown for a remote player (under the lock): puppet_model (this machine, tests) > his Hello model > default.
+// The character a remote player is shown as (under the lock), as a spawn profile or "tommy" (story Tommy as this
+// game's story dresses him): puppet_model (this machine, tests) > the look his PlayerModel reported > his
+// PlayerModel / Hello model resolved here (characters::Resolve: unknown aliases give the default for his id).
 std::string ProfileFor(const Shared& sh, net::PlayerId id) {
     const std::string cfg = core::Config::Get().GetString("puppet_model");
-    if (!cfg.empty()) return cfg;
+    if (!cfg.empty()) return characters::Resolve(cfg, id);
+    auto live = sh.live.find(id);
+    if (live != sh.live.end()) {
+        if (!live->second.look.empty()) return live->second.look;
+        return characters::Resolve(live->second.model, id);
+    }
     auto it = sh.models.find(id);
-    if (it != sh.models.end() && !it->second.empty()) return it->second;
-    return DefaultModel(id);
+    return characters::Resolve(it != sh.models.end() ? it->second : std::string(), id);
+}
+
+// Our own pick: `model` from MafiaCoop.ini / --model / the CO-OP panel (Config::Set), "" = default for our id.
+std::string LocalModelSetting() { return core::Config::Get().GetString("model"); }
+
+// ---- the game's player model manager (docs/re-notes.md 4): which profile the story put on our player -------------
+// C_PlayerModelManager global: found through the setter behind SwitchDefaultPlayerSpawnProfile (+0x30 default slot,
+// +0x38 override slot) and the script thunk that loads the global before calling it.
+uintptr_t* _modelManager = nullptr;  // address of the global pointer; null = not found (story Tommy falls back)
+
+void FindModelManager() {
+    using core::mem::FindAll;
+    using core::mem::FindPattern;
+    using core::mem::ParsePattern;
+    const uintptr_t setter = FindPattern(
+        "40 53 48 83 EC 20 48 83 79 28 00 48 8B DA 75 06 48 8B 41 50 EB 26 48 8B 41 30 4C 89 41 30 4C 3B C0");
+    if (!setter) {
+        MC_LOG_WARN("sync: player model manager not found (setter pattern); remote players see story Tommy in the "
+                    "checkpoint's outfit");
+        return;
+    }
+    // mov r8,[rsp+40h]; lea rdx,[rsp+38h]; mov rcx,[rip+mgr]; call <setter>  (one per player profile switch)
+    const auto calls = FindAll(core::mem::MainModule().text,
+                               ParsePattern("4C 8B 44 24 40 48 8D 54 24 38 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B 44 24 38"));
+    for (uintptr_t a : calls) {
+        if (core::mem::ResolveRip(a + 17, 1, 5) != setter) continue;
+        _modelManager = reinterpret_cast<uintptr_t*>(core::mem::ResolveRip(a + 10, 3, 7));
+        MC_LOG_INFO("sync: player model manager global at exe+0x%llx",
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(_modelManager) -
+                                                    core::mem::MainModule().base));
+        return;
+    }
+    MC_LOG_WARN("sync: player model manager global not found (%zu candidate calls)", calls.size());
+}
+
+// mc_player_profile() -> "default override" (decimal profile hashes, 0 = empty slot), or nil. Main thread.
+int McPlayerProfile(lua_State* L) {
+    uintptr_t mgr = 0;
+    if (_modelManager && core::mem::IsReadable(_modelManager, sizeof(uintptr_t))) mgr = *_modelManager;
+    if (!mgr || !core::mem::IsReadable(reinterpret_cast<void*>(mgr + 0x30), 16)) {
+        lua::PushNil(L);
+        return 1;
+    }
+    const uint64_t def = *reinterpret_cast<const uint64_t*>(mgr + 0x30);
+    const uint64_t ovr = *reinterpret_cast<const uint64_t*>(mgr + 0x38);
+    lua::PushString(L, std::to_string(def) + " " + std::to_string(ovr));
+    return 1;
 }
 
 bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
@@ -458,6 +514,31 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     MC_LOG_INFO("sync: hit by player %u: %.1f (type %u, zone %u)", from, amount, dtype, zone);
 }
 
+// ---- PlayerModel (0x0102, reliable, every peer -> everyone): the character a player picked, and how he looks -------
+// Sent when he picks another character (CO-OP panel), when his story Tommy's clothes change, and whenever a player
+// joins (the Hello model of a session is fixed, so a late joiner would otherwise see the old pick).
+void OnPlayerModel(net::PlayerId from, net::ByteReader& r) {
+    std::string model = r.Str(96);
+    std::string look = r.Str(96);
+    if (!r.Ok()) return;
+    if (!model.empty() && !characters::SafeProfile(model)) model.clear();  // ends up in a Lua command line
+    if (!look.empty() && !characters::SafeProfile(look)) look.clear();
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);  // kept even before we are active: it can arrive in the poll that completes our join
+    if (from == sh.localId || from >= net::kMaxPlayers) return;
+    auto& cur = sh.live[from];
+    if (cur.model == model && cur.look == look) return;
+    cur.model = model;
+    cur.look = look;
+    MC_LOG_INFO("sync: player %u is %s (model '%s', look '%s')", from,
+                characters::DisplayName(model.empty() || (!characters::Find(model, nullptr, nullptr) &&
+                                                           characters::Resolve(model, from) != model)
+                                            ? characters::DefaultModel(from)
+                                            : model)
+                    .c_str(),
+                model.c_str(), look.c_str());
+}
+
 // ---- local sample ---------------------------------------------------------------------------------------------------
 // "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz aim reload shots ax ay az"
 bool ParseSample(const std::string& line, PlayerState& s) {
@@ -539,6 +620,7 @@ bool LoadModule(lua_State* L) {
         return false;
     }
     MC_LOG_INFO("sync: Lua glue loaded (%s, version %s)", origin, lua::ToDisplay(L, -1).c_str());
+    lua::RegisterGlobal(L, "mc_player_profile", &McPlayerProfile);
     return true;
 }
 
@@ -564,12 +646,7 @@ void MainTick(lua_State* L, float dt) {
         if (active) {
             const double now = Now();
             cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
-            {
-                auto mine = sh.models.find(sh.localId);
-                const std::string model =
-                    mine != sh.models.end() && !mine->second.empty() ? mine->second : DefaultModel(sh.localId);
-                cmds += "M " + model + "\n";
-            }
+            cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
@@ -632,6 +709,13 @@ void MainTick(lua_State* L, float dt) {
                     sh.outEnv.push_back(line);
                 else if (line.rfind("HT ", 0) == 0)
                     sh.outHits.push_back(line);
+                else if (line.rfind("ML ", 0) == 0) {  // our story Tommy's profile changed
+                    const std::string look = line.substr(3);
+                    if (characters::SafeProfile(look) && look != sh.localLook) {
+                        sh.localLook = look;
+                        sh.sendModel = true;
+                    }
+                }
             }
         }
         if (ok) {
@@ -647,6 +731,7 @@ void MainTick(lua_State* L, float dt) {
 
 // ---- public ------------------------------------------------------------------------------------------------------------
 void PlayerSync::Install() {
+    FindModelManager();
     lua::AddTickCallback(&MainTick);
     MC_LOG_INFO("sync: installed (state message 0x%04x, %d Hz, %d ms interpolation delay)", kMsgPlayerState,
                 static_cast<int>(1.0 / kSendInterval), static_cast<int>(kInterpDelay * 1000));
@@ -658,9 +743,12 @@ void PlayerSync::Attach(net::Session& session) {
     session.On(kMsgCarParked, &OnCarParked);
     session.On(kMsgWorldEnv, &OnWorldEnv);
     session.On(kMsgHit, &OnHit);
+    session.On(kMsgPlayerModel, &OnPlayerModel);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
+    sh.live.clear();
+    sh.sendModel = true;
     sh.remotes.clear();
     sh.localId = net::kNoPlayer;
 }
@@ -671,8 +759,10 @@ void PlayerSync::Detach() {
         _session->Off(kMsgCarParked);
         _session->Off(kMsgWorldEnv);
         _session->Off(kMsgHit);
+        _session->Off(kMsgPlayerModel);
     }
     _session = nullptr;
+    _seenPlayers.clear();
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (sh.active || !sh.remotes.empty()) {
@@ -687,6 +777,7 @@ void PlayerSync::Detach() {
     sh.outEnv.clear();
     sh.outHits.clear();
     sh.models.clear();
+    sh.live.clear();
     sh.lastWeather.clear();
 }
 
@@ -696,6 +787,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.remotes.erase(id);
     sh.names.erase(id);
     sh.models.erase(id);
+    sh.live.erase(id);
     sh.removed.push_back(id);
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
 }
@@ -707,6 +799,8 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     PlayerState local;
     bool send = false;
     std::vector<std::string> parked, env, hits;
+    bool sendModel = false;
+    std::string modelLook;
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -734,8 +828,17 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             sh.names.clear();
             sh.models.clear();
             for (const auto& p : _session->Players()) {
+                if (p.id != sh.localId && !_seenPlayers.count(p.id)) sh.sendModel = true;
                 sh.names[p.id] = p.name;
                 sh.models[p.id] = p.model;
+            }
+            _seenPlayers.clear();
+            for (const auto& [id, name] : sh.names) _seenPlayers.insert(id);
+            if (sh.sendModel) {  // a player joined, our pick changed, or our story look changed
+                sh.sendModel = false;
+                sendModel = true;
+                const std::string resolved = characters::Resolve(LocalModelSetting(), sh.localId);
+                modelLook = resolved == "tommy" ? sh.localLook : resolved;
             }
             for (auto it = sh.remotes.begin(); it != sh.remotes.end();) {
                 if (!sh.names.count(it->first)) {  // left without an event we saw
@@ -778,6 +881,14 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             MC_LOG_INFO("sync: sent Hit to player %u (%s)", victim, line.c_str() + 3);
         }
     }
+    if (sendModel && active) {
+        const std::string model = LocalModelSetting();
+        net::ByteWriter mw(200);
+        mw.Str(characters::SafeProfile(model) ? model : std::string());
+        mw.Str(modelLook);
+        _session->Broadcast(kMsgPlayerModel, mw.Span(), net::Reliability::Reliable);
+        MC_LOG_INFO("sync: sent PlayerModel (model '%s', look '%s')", model.c_str(), modelLook.c_str());
+    }
     if (!send) return;
     net::ByteWriter w(128);
     Write(w, local, NowMs());
@@ -787,6 +898,17 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     // its SendList with SendTo (docs/interest.md "Integration").
     _session->Broadcast(kMsgPlayerState, w.Span(), net::Reliability::Unreliable);
     if (++_sent == 1) MC_LOG_INFO("sync: sending local state (%zu bytes)", w.Size());
+}
+
+std::string PlayerSync::Model() { return LocalModelSetting(); }
+
+void PlayerSync::SetModel(const std::string& model) {
+    if (!core::Config::Get().Set("model", model))
+        MC_LOG_WARN("sync: could not save model = %s in the settings file", model.c_str());
+    MC_LOG_INFO("sync: our character is now %s (%s)", characters::DisplayName(model).c_str(), model.c_str());
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    sh.sendModel = true;
 }
 
 int PlayerSync::Health(net::PlayerId id) {
@@ -818,7 +940,7 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
             if (c != std::string::npos) pupState[item.substr(0, c)] = item.substr(c + 1);
         }
     }
-    char buf[160];
+    char buf[200];
     std::snprintf(buf, sizeof(buf), "Sync: %s, puppet factory %s, %s shared car(s)",
                   sh.localValid && Now() - sh.localAt < 1.0 ? "in world" : "no local player", factory.c_str(),
                   cars.c_str());
@@ -828,8 +950,15 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
         auto nameIt = sh.names.find(id);
         auto st = pupState.find(std::to_string(id));
         const PlayerState* last = rem.snaps.empty() ? nullptr : &rem.snaps.back().s;
-        std::snprintf(buf, sizeof(buf), "  %s: puppet %s, %.0f Hz, last %.1f s ago, health %d%s%s",
-                      nameIt != sh.names.end() ? nameIt->second.c_str() : "?",
+        auto live = sh.live.find(id);
+        auto hello = sh.models.find(id);
+        std::string picked =
+            live != sh.live.end() ? live->second.model : hello != sh.models.end() ? hello->second : std::string();
+        if (picked.empty() || (!characters::Find(picked, nullptr, nullptr) && characters::Resolve(picked, id) != picked))
+            picked = characters::DefaultModel(id);  // unknown alias: he is shown as the default for his id
+        const std::string who = characters::DisplayName(picked);
+        std::snprintf(buf, sizeof(buf), "  %s (%s): puppet %s, %.0f Hz, last %.1f s ago, health %d%s%s",
+                      nameIt != sh.names.end() ? nameIt->second.c_str() : "?", who.c_str(),
                       st != pupState.end() ? st->second.c_str() : "pending", rem.rateHz, now - rem.lastRecv,
                       last ? static_cast<int>(last->health) : -1, last && (last->flags & kCrouch) ? ", crouch" : "",
                       last && (last->flags & kAim) ? ", aim" : "");

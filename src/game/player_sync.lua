@@ -5,16 +5,17 @@
 -- Input (cmds, one line per command):
 --   L id host                                                                    our own player id, 1 = we host
 --                                                                                (sent every tick while a session runs)
---   Q id model                                                                   a remote player is in the session
+--   Q id profile                                                                 a remote player is in the session
 --                                                                                (load his model before he shows up)
---   T id model x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
---                                                                                remote player target (model: spawn
---                                                                                profile or alias, M.Profile)
+--   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
+--                                                                                remote player target (profile: spawn
+--                                                                                profile path or decimal hash, or
+--                                                                                "tommy" = story Tommy; M.Profile)
 --   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
 --   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
---   M model                                                                      our own model (alias/profile; "tommy" or
---                                                                                "" = as the story dresses him)
+--   M profile                                                                    our own model (profile; "tommy" = as the
+--                                                                                story dresses him)
 --   E                                                                            enter key pressed (ride along)
 --   A                                                                            aim input held (RMB / left trigger)
 --   R id                                                                         remove that puppet
@@ -25,7 +26,8 @@
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
---            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit)
+--            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
+--            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel)
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -33,7 +35,7 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 4
+M.version = 5
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
@@ -59,26 +61,14 @@ local REPLAY_OPEN = 0.15   -- s the shield stays down for a replayed bullet
 local SHOT_SCALE = 2.6     -- first guess of the game's damage scale for an NPC bullet on the player (learned live)
 local RAM_SUM = 0.25       -- s over which the collision damage of one ram is summed into one Hit
 local MODEL_RECHECK = 3    -- s between re-applications of our model override (mission scripts may clear it)
--- Characters by alias. Player models are spawn profiles (C_String for the spawner, a string for the player switches,
--- which hash it themselves; docs/game-api.md 12). "tommy" = the outfit of the loaded checkpoint (mm_spawn_profiles),
--- like the story would dress him. Paulie and Sam were checked in game as the player and as puppets (Sam's puppet
--- variant wears a long coat and hat, his player model does not); the others are recovered names, not yet checked.
-M.MODELS = {
-  paulie = "characters/scotch/game/main/game_main_paulie",
-  sam = "characters/scotch/game/main/game_main_sam",
-  salieri = "characters/scotch/game/main/game_main_salieri",
-  frank = "characters/scotch/game/main/game_main_frank",
-  vincenzo = "characters/scotch/game/main/game_main_vincenzo",
-  ralph = "characters/scotch/game/main/game_main_ralph",
-  young_salieri = "visuals/temp/young_salieri",
-  morello = "visuals/temp/young_morello",
-  thug = "visuals/temp/trailer_thug",
-  tommy_suit = "visuals/hero/game_main_tommy_gangster_suit_2_hat",
-  tommy_casual = "visuals/hero/game_main_tommy_casual",
-  tommy_cab = "visuals/hero/game_main_tommy_cab_driver_flatcap",
-  tommy_racing = "visuals/hero/game_main_tommy_racing_outfit",
-  tommy_sailor = "visuals/hero/game_main_tommy_sailor",
-}
+-- Characters: the C++ side resolves every alias (src/game/characters.cpp) and hands us spawn profiles (paths or
+-- decimal hashes; both work for the player switches and the runtime spawner, docs/game-api.md 12), or "tommy" for
+-- Tommy as the loaded story dresses him. A profile that never finishes loading (unknown to this game build) is marked
+-- bad and replaced by the default character for that player id, the same table as characters.cpp kDefaults.
+local DEFAULT_PROFILES = { [0] = "tommy", "characters/scotch/game/main/game_main_paulie",
+  "characters/scotch/game/main/game_main_sam", "characters/scotch/game/main/game_main_salieri" }
+local LOAD_TIMEOUT = 12    -- s a spawn profile may take to load (puppet) or to switch (our player) before it is bad
+M.badProfiles = M.badProfiles or {}
 
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -110,11 +100,18 @@ function M.Player()
   return p
 end
 
--- The spawn profile for a model alias or profile name. "tommy" (or "") = what the loaded checkpoint dresses Tommy in.
-function M.Profile(model)
-  if model and model:find("/") then return model end
-  local p = model and M.MODELS[model]
-  if p then return p end
+-- The default character's profile for a player id ("0", "1", ...), as M.Profile gives it.
+function M.Fallback(id)
+  return M.Profile(DEFAULT_PROFILES[(tonumber(id) or 0) % 4])
+end
+
+-- The spawn profile for a profile name, a bad one replaced by the default for player `id`. "tommy" (or "") = what
+-- the loaded checkpoint dresses Tommy in.
+function M.Profile(model, id)
+  if model and model ~= "" and model ~= "tommy" then
+    if M.badProfiles[model] and id then return M.Fallback(id) end
+    return model
+  end
   local save = game.game:GetLoadedSaveId() or ""
   local mission, cp = save:match("checkpoint_(mm_[%w_]-)_(cp_%d+)")
   local t = mission and mm_spawn_profiles and mm_spawn_profiles[mission]
@@ -193,7 +190,19 @@ function M.SpawnTick()
   if f.busy then
     local pp = M.pup[f.busy]
     if not pp then f.busy = nil; return end
-    if not f.load:IsDone() then return end
+    if not f.load:IsDone() then
+      -- A profile this game does not know never finishes loading, and the spawner stays stuck on it: mark it bad,
+      -- give the puppet the default character for its player and start a fresh factory.
+      if M.now - (f.loadT or M.now) > LOAD_TIMEOUT then
+        M.badProfiles[pp.profile] = true
+        local fb = M.Fallback(pp.id)
+        log(string.format("puppet %s: profile %s did not load in %d s, using %s instead", pp.id, pp.profile,
+          LOAD_TIMEOUT, fb))
+        if fb == pp.profile then pp.fails = 99 else pp.profile = fb end
+        M.FactoryReset("a profile did not load")
+      end
+      return
+    end
     if not pp.tx then  -- preloaded, no position yet: wait, unless another player needs the component now
       pp.st = "preloaded"
       for _, o in pairs(M.pup) do
@@ -212,6 +221,9 @@ function M.SpawnTick()
     pcall(function() so.invulnerability = false end)
     pcall(function() so.health = PUP_HEALTH end)
     try("DespawnImmunity", so.DespawnImmunity, so, true)
+    -- The civilian AI steps out of the way of cars; the real player cannot see the remote car coming that way, so the
+    -- puppet stands its ground and a ram hits it like it would hit him (docs/game-api.md 11)
+    try("InterruptAvoidingCar", so.InterruptAvoidingCar, so)
     pp.guid = tostring(so:GetGUID())  -- its DAMAGE events are found by this (M.OnDamageEvent)
     pp.deadShown = nil
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
@@ -230,7 +242,7 @@ function M.SpawnTick()
   end
   if pick then
     f.comp:SetSpawnProfile(pick.profile)
-    f.load = f.comp:GetSpawnProfileLoadSyncObject()
+    f.load, f.loadT = f.comp:GetSpawnProfileLoadSyncObject(), M.now
     f.busy, pick.st = pick.id, "loading"
   end
 end
@@ -744,7 +756,8 @@ end
 -- from the attacker's puppet (game.shotmgr:CreateShots), so the victim gets the game's own bullet hit reaction and
 -- damage; anything else (punches, rams, a replayed bullet that did not land) is DoDamage, which plays a flinch.
 -- Puppets never die from hits on the attacker's screen (health topped up); a puppet dies when its player is dead or
--- downed. Events come from two blanket subscriptions (every human's DAMAGE and DEATH), registered once per loaded world.
+-- downed. Events come from blanket subscriptions (every human's DAMAGE and DEATH, and the melee swings, M.MeleeTick),
+-- registered once per loaded world.
 -- ---------------------------------------------------------------------------------------------------------------
 local function guidStr(o)
   if not valid(o) then return nil end
@@ -770,7 +783,6 @@ function M.IsLocalAttacker(g)
 end
 
 function M.OnPuppetDamage(pp, m)
-  pp.dmgSeen = true  -- this tick's health drop is explained (M.MeleeCheck)
   local enemy = tostring(m:GetEnemyGUID())
   local amount = tonumber(m:GetDamageAmount()) or 0
   local dtype, zone = tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0
@@ -856,10 +868,11 @@ function M.WatchDamage(p)
   if M.dmg.key == key then return end
   M.UnwatchDamage()
   local ids = {}
-  for _, ev in ipairs({ { "DAMAGE", M.OnDamageEvent }, { "DEATH", M.OnDeathEvent } }) do
-    local name, fn = ev[1], ev[2]
+  for _, ev in ipairs({ { "DAMAGE", M.OnDamageEvent }, { "DEATH", M.OnDeathEvent },
+      { "MELEE_LIGHT_ATTACK", M.OnMeleeEvent, false }, { "MELEE_HEAVY_ATTACK", M.OnMeleeEvent, true } }) do
+    local name, fn, arg = ev[1], ev[2], ev[3]
     local good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
-      local ok, err = pcall(fn, m)
+      local ok, err = pcall(fn, m, arg)
       if not ok then logErr("damage event", err) end
     end, enums.EventType.HUMAN, enums.HumanMessages[name])
     if good and tonumber(id) and tonumber(id) >= 0 then
@@ -869,7 +882,8 @@ function M.WatchDamage(p)
     end
   end
   M.dmg = { key = key, ids = ids }
-  log("watching damage and deaths (" .. #ids .. " subscriptions)")
+  M.swings = {}
+  log("watching damage, deaths and our punches (" .. #ids .. " subscriptions)")
 end
 
 -- Puppet health and death, every tick before driving it. True while the puppet is (being made) dead.
@@ -891,25 +905,67 @@ function M.PuppetLife(pp)
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
   end
-  M.MeleeCheck(pp, so)
   if (tonumber(so.health) or 0) < PUP_HEALTH * 0.75 then pcall(function() so.health = PUP_HEALTH end) end
-  pp.lastHealth, pp.dmgSeen = tonumber(so.health), nil
   return false
 end
 
--- Punches: the player's melee hits on a puppet (a friendly AI human) play its hit reaction and take health, but send
--- no DAMAGE (nor any other HUMAN/ACTOR) message (checked in game). A health drop without a DAMAGE event while the
--- local player stands within reach on foot with no gun in hand is his punch (or kick, or melee weapon).
-local MELEE_REACH = 2.5
-function M.MeleeCheck(pp, so)
-  local h, last = tonumber(so.health), pp.lastHealth
-  if not h or not last or pp.dmgSeen or h > last - 0.5 then return end
-  local p = M.Player()
-  if not p or p:GetOwner() or p:HaveFireWeaponInHand() then return end
-  local a, b = p:GetPos(), so:GetPos()
-  local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
-  if dx * dx + dy * dy + dz * dz > MELEE_REACH * MELEE_REACH then return end
-  if M.friendlyFire then M.SendHit(pp, last - h, 3, 1, 0) end  -- 3 = enums.DamageType.MELEE
+-- Punches (docs/game-api.md 11). Our player's swing sends MELEE_LIGHT_ATTACK / MELEE_HEAVY_ATTACK to himself, with the
+-- human the game aimed it at as opponent. A puppet with a story profile (AI type 0) can be that opponent: the punch
+-- lands like on any NPC and its DAMAGE event sends the Hit (M.OnPuppetDamage). Puppets with an ally or Tommy profile
+-- (AI type 1) are never picked by the game's melee targeting, so the swing goes into the air (opponent 0); then the
+-- puppet in reach in front of us at the moment of impact is the one we hit: a Hit with the damage a punch does to an
+-- NPC (10, a charged punch 36) and a small DoDamage on the puppet for its flinch.
+local SWING_IMPACT = 0.25  -- s from the swing to the impact (the DAMAGE of a landed punch comes 0.19-0.2 s after it)
+local SWING_REACH = 1.9    -- m from us to the puppet
+local SWING_DAMAGE = { light = 10, heavy = 36 }
+M.swings = M.swings or {}
+
+function M.OnMeleeEvent(m, heavy)
+  if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
+  local good, opp = pcall(m.GetOpponentGUID, m)
+  M.swings[#M.swings + 1] = { t = M.now, heavy = heavy, opp = good and tostring(opp) or "" }
+end
+
+-- The puppet our swing reaches: on foot, within SWING_REACH, in front of us (45 degrees either side), nearest first.
+function M.SwingTarget(p)
+  local a, d = p:GetPos(), p:GetDir()
+  local best, bestD
+  for _, pp in pairs(M.pup) do
+    if pp.st == "alive" and valid(pp.so) and not pp.veh and not pp.hidden and (pp.health or 100) > 0 then
+      local b = pp.so:GetPos()
+      local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+      local dist = math.sqrt(dx * dx + dy * dy)
+      if dist <= SWING_REACH and math.abs(dz) < 1.2 and dist > 1e-3 and (dx * d.x + dy * d.y) / dist >= 0.7 and
+          (not bestD or dist < bestD) then
+        best, bestD = pp, dist
+      end
+    end
+  end
+  return best
+end
+
+function M.MeleeTick(p)
+  if #M.swings == 0 then return end
+  local keep = {}
+  for _, sw in ipairs(M.swings) do
+    if M.now - sw.t < SWING_IMPACT then
+      keep[#keep + 1] = sw
+    else
+      local aimed = false
+      for _, pp in pairs(M.pup) do
+        if pp.guid and pp.guid == sw.opp then aimed = true end  -- the game targeted a puppet: its DAMAGE tells
+      end
+      local pp = not aimed and M.friendlyFire and not p:GetOwner() and M.SwingTarget(p)
+      if pp then
+        local amount = sw.heavy and SWING_DAMAGE.heavy or SWING_DAMAGE.light
+        log(string.format("our %s punch reached puppet %s (not a melee target for the game)", sw.heavy and "heavy" or
+          "light", pp.id))
+        M.SendHit(pp, amount, 3, 1, 0)  -- 3 = enums.DamageType.MELEE, zone 1 = BODY
+        pcall(pp.so.DoDamage, pp.so, 1)  -- its flinch
+      end
+    end
+  end
+  M.swings = keep
 end
 
 -- A puppet fired: when the shot passes near the local player, he ignores damage for a moment. That bullet is only
@@ -1067,10 +1123,28 @@ end
 
 -- Our own character (docs/game-api.md 12): the player model manager's override slot, which survives the story's
 -- checkpoint scripts (they switch the default slot). Re-applied every few seconds and after every load, in case a
--- mission script cleared it; "tommy" or "" = no override (as the story dresses him).
+-- mission script cleared it; "tommy" or "" = no override (as the story dresses him). A switch that does not finish
+-- within LOAD_TIMEOUT (a profile this game does not know) marks the profile bad: we become the default character for
+-- our player id instead (M.Profile). As story Tommy we report the profile the story put on us ("ML <hash>", from the
+-- model manager's default slot), so the others' puppet of us wears the same clothes (PlayerModel, docs/protocol.md).
 function M.ModelTick(p)
   local want = M.myModel or ""
-  local prof = (want ~= "" and want ~= "tommy") and M.Profile(want) or nil
+  local prof = (want ~= "" and want ~= "tommy") and M.Profile(want, M.localId) or nil
+  if prof == "tommy" then prof = nil end
+  local pend = M.modelPend
+  if prof and pend and pend.prof == prof and not pend.done then
+    local good, done = pcall(pend.so.IsDone, pend.so)
+    if good and done then
+      pend.done = true
+      log(string.format("our model switch done in %.1f s", M.now - pend.t))
+    elseif M.now - pend.t > LOAD_TIMEOUT then
+      M.badProfiles[prof] = true
+      log("our model " .. prof .. " did not load in " .. LOAD_TIMEOUT .. " s, using the default for player " .. M.localId)
+      M.modelPend, M.modelKey = nil, nil
+      return
+    end
+  end
+  if not prof then M.ReportLook() end
   local key = tostring(game.game:GetLoadedSaveId()) .. "|" .. tostring(M.inWorldAt) .. "|" .. tostring(prof)
   if M.modelKey == key and M.now - (M.modelT or 0) < MODEL_RECHECK then return end
   local first = M.modelKey ~= key
@@ -1078,14 +1152,30 @@ function M.ModelTick(p)
   if not prof then
     if M.modelSet then
       try("ClearOverridePlayerSpawnProfile", p.ClearOverridePlayerSpawnProfile, p)
-      M.modelSet = nil
+      M.modelSet, M.modelPend = nil, nil
       log("our model: back to the story's")
     end
     return
   end
-  local good, err = pcall(p.SwitchOverridePlayerSpawnProfile, p, prof)
+  local good, so = pcall(p.SwitchOverridePlayerSpawnProfile, p, prof)
   M.modelSet = prof
-  if first then log("our model: " .. prof .. (good and "" or (" failed: " .. tostring(err)))) end
+  if first then
+    log("our model: " .. prof .. (good and "" or (" failed: " .. tostring(so))))
+    if good and so then M.modelPend = { prof = prof, so = so, t = M.now } end
+  end
+end
+
+-- As story Tommy: tell the others which profile the story put on us (the default slot of the model manager, a
+-- decimal hash; mc_player_profile() from the dll). Checked once a second; an event only when it changes.
+function M.ReportLook()
+  if M.now - (M.lookT or -10) < 1 or not mc_player_profile then return end
+  M.lookT = M.now
+  local s = mc_player_profile()
+  local def = s and s:match("^(%d+)")
+  if not def or def == "0" or def == M.lastLook then return end
+  M.lastLook = def
+  M.events[#M.events + 1] = "ML " .. def
+  log("our story look: profile " .. def)
 end
 
 -- Session over: our own character back to the story's.
@@ -1093,7 +1183,7 @@ function M.ModelReset()
   if not M.modelSet then return end
   local p = game.game:GetActivePlayer()
   if p then pcall(p.ClearOverridePlayerSpawnProfile, p) end
-  M.modelSet, M.modelKey = nil, nil
+  M.modelSet, M.modelKey, M.modelPend = nil, nil, nil
   log("our model: back to the story's (session ended)")
 end
 
@@ -1218,7 +1308,7 @@ function M.Update(dt, cmds)
       local pp = M.pup[id]
       if pp and pp.model ~= f[3] then M.Remove(id); pp = nil end
       if not pp then
-        pp = { id = id, st = "queued", model = f[3], profile = M.Profile(f[3]) }
+        pp = { id = id, st = "queued", model = f[3], profile = M.Profile(f[3], id) }
         M.pup[id] = pp
         log("puppet " .. id .. " queued (" .. f[3] .. ": " .. pp.profile .. ")")
       end
@@ -1240,7 +1330,7 @@ function M.Update(dt, cmds)
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
       if not M.pup[f[2]] then
-        M.pup[f[2]] = { id = f[2], st = "queued", model = f[3], profile = M.Profile(f[3]) }
+        M.pup[f[2]] = { id = f[2], st = "queued", model = f[3], profile = M.Profile(f[3], f[2]) }
         log("puppet " .. f[2] .. " queued ahead (" .. f[3] .. ")")
       end
     elseif op == "K" then
@@ -1295,6 +1385,8 @@ function M.Update(dt, cmds)
     if not good then logErr("replay", err) end
     good, err = pcall(M.RamTick)
     if not good then logErr("ram", err) end
+    good, err = pcall(M.MeleeTick, player)
+    if not good then logErr("melee", err) end
     good, err = pcall(M.DownTick, player)
     if not good then logErr("down", err) end
     pcall(M.DemigodTick, player)
