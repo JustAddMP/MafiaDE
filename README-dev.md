@@ -15,7 +15,7 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
   menu entries.
 
 Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
-one tag (currently core v0.2.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+one tag (currently core v0.3.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
 (docs/PLAN.md).
 
 ## Build
@@ -41,7 +41,7 @@ build.cmd
   - `proxy_test.exe`: core's `tests\proxy_test.cpp` built against our descriptor (tests our launcher and proxy
     without the game; see below).
   - Object files go to `out\obj\game\`, core's to `out\obj\core\`.
-- Core's own tests (net_loopback, net_password, net_interest, net_fuzz, proxy_test with a made-up game):
+- Core's own tests (net_loopback, net_password, net_kick, net_interest, net_fuzz, proxy_test with a made-up game, ...):
   `external\core\build.cmd`, then the exes in `external\core\out\` (see core's README.md).
 - Any compile or link error stops the build with exit code 1.
 
@@ -155,6 +155,10 @@ scripts and still work.
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
+  While hosting, Up from the first entry selects a guest in the player list; Enter offers **KICK** / **KICK AND BAN**
+  with a confirmation ("Kick <name>? Enter = yes, Esc = no"). The guest sees "You were kicked by the host" and goes
+  back to idle; a banned guest's rejoin (same IP, or same SteamID over Steam) is refused with "You are banned from
+  this session" until the host stops hosting (core Session::Kick / KickAndBan).
 - **Steam invites:** accepting an invite (or *Join Game* in the friends list) at the main menu or in the world leaves
   the current session and joins the host; a banner says "Joining your friend's game..." and then
   "Connected to <host>'s game".
