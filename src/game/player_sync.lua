@@ -807,18 +807,44 @@ function M.Burning(pp)
   return pp.burnT ~= nil and M.now - pp.burnT < 8
 end
 
+-- Releasing a puppet: at once, unless it burns: the fire update keeps a list of burning humans and may read a released
+-- one (docs/game-api.md 15). Such a puppet is hidden and released 4 s after the fire is out.
+M.grave = M.grave or {}
+function M.Release(pp, so)
+  if not valid(so) then return end
+  local f = M.fac
+  if M.Burning(pp) then
+    pcall(so.ShowModel, so, false)
+    pcall(so.SetPhysState, so, 2)
+    M.grave[#M.grave + 1] = { so = so, t = M.now, burnT = pp.burnT }
+    log("puppet " .. tostring(pp.id) .. ": burns: hidden, released once the fire is out")
+  elseif f.comp then
+    pcall(f.comp.ReleaseObjectRaw, f.comp, so)
+  end
+end
+
+function M.GraveTick()
+  if #M.grave == 0 then return end
+  local keep = {}
+  for _, g in ipairs(M.grave) do
+    if not valid(g.so) then
+      -- gone already (with the factory or the world)
+    elseif M.now - g.t > 4 and not (g.burnT and M.now - g.burnT < 8) then
+      if M.fac.comp then pcall(M.fac.comp.ReleaseObjectRaw, M.fac.comp, g.so) end
+    else
+      keep[#keep + 1] = g
+    end
+  end
+  M.grave = keep
+end
+
 function M.Remove(id)
   local pp = M.pup[id]
   if not pp then return end
   M.Unmark(pp)
   local f = M.fac
   if f.busy == id then f.busy = nil end
-  if valid(pp.so) and M.Burning(pp) then
-    pcall(pp.so.ShowModel, pp.so, false)
-    log("puppet " .. id .. " burns: hidden, not released")
-  elseif valid(pp.so) and f.comp then
-    pcall(f.comp.ReleaseObjectRaw, f.comp, pp.so)
-  end
+  M.Release(pp, pp.so)
   M.pup[id] = nil
   log("puppet " .. id .. " removed")
 end
@@ -1004,9 +1030,8 @@ function M.PuppetLife(pp)
     local f = M.fac
     -- its map marker goes first: the navigation module updates its markers once a second and read the released
     -- puppet through a stale marker (crash in exe+0x243a915, docs/game-api.md 15)
-    if M.Burning(pp) then return true end  -- released once the fire is out
     M.Unmark(pp)
-    if f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, so) end
+    M.Release(pp, so)
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
   end
@@ -1486,6 +1511,7 @@ function M.Update(dt, cmds)
   local player = M.Player()
   if player and not M.inWorldAt then
     M.inWorldAt = M.now
+    M.grave = {}  -- a new world: the old one's entities are gone
     log("local player in world")
   elseif not player then
     M.inWorldAt = nil
@@ -1578,6 +1604,7 @@ function M.Update(dt, cmds)
     end
     local good, err = pcall(M.ReplayTick, player)
     if not good then logErr("replay", err) end
+    pcall(M.GraveTick)
     good, err = pcall(M.RamTick)
     if not good then logErr("ram", err) end
     good, err = pcall(M.MeleeTick, player)

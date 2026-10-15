@@ -10,7 +10,8 @@ Version rules: any incompatible change to these messages needs a bump of `modVer
 and the character per player. 0.4.0: PlayerModel (0x0102), character choice in the CO-OP panel, punch detection. 0.5.0:
 core 0.5 (protocol 7: the pre-game lobby, core docs/protocol.md "Lobby"); lobby mode indexes: 0 FREE RIDE, 1 STORY (not
 startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x0203); lobby modes 0 FREE RIDE, 1 STORY,
-2..21 CHAPTER 1..20 (`MissionSync::Chapters()`, the order of `mm_ids_replay`).
+2..21 CHAPTER 1..20 (`MissionSync::Chapters()`, the order of `mm_ids_replay`). 0.7.0: NpcStates (0x0210), NpcDeath
+(0x0211), NpcHit (0x0410); shared cars take a standing car of the same model as the driver's car.
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -211,3 +212,35 @@ scripts may change things in between; the next WorldEnv puts them back.
   `GetActiveQuest()` / checkpoint equal it; when the host's point differs for `follow_grace` seconds (default 8) and
   no cutscene plays, the guest quits to the main menu and loads the host's save of that point (one attempt per host
   point; without a save of it he waits for the next HostSave).
+- Deaths and failed missions in a chapter loaded through the chapter loader (replay flags: lobby CHAPTER, every guest
+  load): a following guest who dies reloads the host's point the same way (no Retry: in a replay-style load the game
+  answers a death or a failed mission with the free roam state from before the quest, another world). The host who
+  dies there, or whose mission fails, goes back to the main menu and loads his own newest save of the point he was at
+  (`mc_story_reload`, `save_guard::MissionAborts`); guests wait meanwhile. A host in a normal story load (lobby STORY,
+  CONTINUE) keeps the game's own YOU DIED / checkpoint flow.
+- A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
+  instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
+
+### NPCs (0.7.0)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U | u8 n (at most 16), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u8 health, u8 flags (1 dead, 2 in a car), u8 aiType, str weapon ("-" = none) |
+| 0x0211 | NpcDeath | host -> guests (`Broadcast`) | R | u32 key |
+| 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId |
+
+- key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`). The host sends the 48 nearest NPCs
+  within 120 m of himself or any guest's puppet, 5 times a second (several messages when more than 16); a death also
+  goes out reliably at once.
+- A guest pairs each host NPC with the nearest human of his own world within 1.5 m of it (the same mission scripts
+  spawn the same NPCs at the same spots on every game, docs/game-api.md 15) and keeps the pairing. A paired copy:
+  dies when the host's dies (killed; a civilian that takes no damage is hidden), keeps 5000 health while the host's
+  lives (the guest's own shots never kill it there), is put back to the host's position when it is more than 6 m off
+  for 1.5 s (NPCs with a job only: AI type not 0, not in a car). A hit by the guest on a copy goes to the host as
+  NpcHit; the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit
+  reaction and damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`.
+- Unpaired host NPCs (ambient pedestrians that differ per game, NPCs the guest's game has not spawned) are not shown
+  on the guest's game: no copies are spawned for them.
+- Ambient traffic and pedestrians stay local to each game. Cars a player drives are shared as before (Phase 3); a
+  remote driver's car is first looked for here: a car of the same model standing where his car stands (within 3 m)
+  is taken as his car (mission cars are not doubled), and no copy is spawned into another car standing there.

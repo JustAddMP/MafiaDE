@@ -609,11 +609,45 @@ Found from the `C_MainMenu` iface handlers (research-characters-missions.md B2) 
   the shipped replay saves pad it: `checkpoint_mm_020_taxi_cp_010.sav`).
 - Save files: format `GENR`, 30-50 KB; the save id is plain text inside (`checkpoint_mm_110_omerta_cp_020`,
   `freeroam_game_close`, `freeroam_before_quest_activated`).
-- Open problem: a guest's chapter load after `game.hud:QuitToMainMenu()` crashed twice (of five) in a co-op session,
-  a null read at exe+0x2E81EF8 (`vf48(obj, [msg+0x28])` returned null; inside a load-time message handler, stack
-  0x2E82898 <- 0x1763DFC <- 0x1262033 <- 0x2405B8B). Not reproduced in single-player runs of the same steps (replay
-  load, quest started, checkpoint reached, cutscene played and unloaded, model override, weather set, puppet factory,
-  quit, load again).
+- Solved 2026-10-15 (section 7): a guest's chapter load after `game.hud:QuitToMainMenu()` crashed with a null read at
+  exe+0x2E81EF8 whenever the save loaded had another save id than the first save loaded through the chapter loader in
+  that process (the loader's storage keeps one entry keyed by the first id). It looked random (2 of 5) because a
+  reload of the same checkpoint the guest had first loaded worked.
+
+## 7. The save system: load requests, slot storages, save files [confirmed in game 2026-10-15]
+
+Found from the crash above (dump: message at `rbx`, its vtable 0x4EB3378; the handler logs `"Loading save (Id: "`).
+Used by src/game/save_guard.cpp.
+
+- **Load request** `Handle* LoadRequest(storageMgr, Handle* out, uint32 slot, C_String id, C_String storageName)` at
+  0x2E78060 (pattern `SaveSys_LoadRequest`; two siblings of the same shape at 0x2E66890 / 0x2E66B80 allocate 0x38-byte
+  messages and follow every load). `this->vf40(storageName)` gives the storage object; a 0x48-byte message (vtable
+  0x4EB3378: +0x20 storage, +0x28 slot, +0x30 id) is queued and handled on GameMainThread by 0x2E81C80
+  ("Loading save (Id: ...)"), which looks the id up with `storage->vf48(slot, id)` (0x2E74A80 -> `Find` 0x2E6E320:
+  walks the storage's entry list for slot + id) and calls `vf58` on the result **without a null check** (0x2E81EF8).
+  - Storage names seen: `aslot` (story; CONTINUE loads `slot 1, aslot`), `bslot` (Free Ride), `debugloadchapter` (the
+    main menu's chapter loader, i.e. our in-memory loads, slot 1).
+  - `debugloadchapter` holds **one** entry, created by the first chapter load of the process and keyed by that save's
+    id; later chapter loads replace its data but not its key. Loading a save with another id: `Find` returns null ->
+    crash. MafiaCoop's fix (save_guard `FindDetour`): while a load through `debugloadchapter` is under way (its request
+    seen in the last 120 s), a failed lookup for that load's id in that storage returns the storage's entry (the one
+    every chapter load uses). Checked: 9 forced reloads in a row in a lobby CHAPTER session (cp_010 first, then the
+    host's cp_020 save each time; before the fix 2 of 2 crashed on the first), 5 + 3 + 3 in STORY sessions.
+- **Save files** are written by a save thread through the game's file layer with **`CreateFileA`** (paths with mixed
+  `/` and `\`: `...\Data\/<steamid>/gamesaves/default/bslot/save1.sav`, CREATE_ALWAYS); the profiles
+  (`profiles/temporaryprofile/*.pf`) the same way from GameMainThread. In a replay-style session (our loads) the game
+  writes `bslot` saves when a quest is made available (`freeroam_quest_state_changed`), at checkpoints and on
+  `QuitToMainMenu` (`freeroam_game_close`). save_guard redirects every `CreateFileA` / `DeleteFileA` / `CopyFileExA` below
+  `gamesaves` to `%TEMP%\MafiaCoop\coop-saves\<pid>\gamesaves\...` while a guest is in a co-op session (writes always,
+  reads when the scratch file exists, so a Retry reads this session's checkpoint). Checked: a STORY session with 3
+  forced reloads and a guest death: 10 save writes redirected, every file in the save folder byte-identical
+  afterwards (only `Savesideoconfig.cfg`, the window size, changed; `gamesettings.pf` was rewritten with the same
+  bytes).
+- **Death or a failed mission in a replay-style load**: the game loads `freeroam_before_quest_activated` (slot 2,
+  storage `aslot`): the free roam state from before the quest. In our sessions that put players into another world
+  (once the user's own Omerta story). The story sync reloads the checkpoint instead (docs/protocol.md "Story").
+- `game.savesystem:EnableSaveLogic(name)` takes a string (a named save logic), not a switch; `RequestCheckpointSave()`
+  wrote nothing in a replay-style session.
 
 ---------------------------------------------------------------------------------------------------------------
 
@@ -637,6 +671,9 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | hks_pushcclosure | 0x4914A30 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 40 49 63` |
 | ChapterLoad (OpenDebugLoadChapterString) | 0x3020350 | `48 89 5C 24 18 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 F0 48 81 EC 10 01 00 00 4C 8B F9 4C 8B F2 48 8B 89 C8 02 00 00` |
 | ChapterLoad_StreamSite (in the loader; the stream call at +0x24) | 0x3020478 | `48 8D 4C 24 68 E8 ?? ?? ?? ?? 48 8D 4C 24 68 48 8B D8 E8 ?? ?? ?? ?? 48 8B D0 48 8D 4D A0 45 33 C9 4C 8B C3 E8 ?? ?? ?? ?? 49 8B 8F C8 02 00 00` |
+| SaveSys_LoadRequest (section 7) | 0x2E78060 | `48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 48 83 EC 20 48 8B 01 48 8B FA 48 8B 6C 24 70 49 8B F1 48 8B D5 45 8B F8 4C 8B F1 FF 50 40 B9 48 00 00 00` |
+| SaveSys_Find (storage entry lookup, section 7) | 0x2E6E320 | `48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 49 8B 00 8B EA 48 8B F1 48 89 44 24 40 49 8B D0 48 8D 4C 24 40 49 8B F8 33 DB` |
+| Lua_GetEntityByGUID (thunk; its calls at +0x39/+0x46/+0x61/+0x69/+0x89 give entity manager, lookup by id, the wrapper steps and the push; `mc_entity`) | 0x239E510 | `48 89 5C 24 08 48 89 74 24 20 57 48 83 EC 20 BA 01 00 00 00 48 8B F1 44 8B C2 E8 ?? ?? ?? ?? 33 FF 4C 8D 44 24 38 48 8B CE 89 7C 24 38 8D 57 02 E8 ?? ?? ?? ?? 8B 5C 24 38 E8` |
 | lua_pushlstring | 0xE4DA50 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 BF 1F 00 00` |
 | lua_setfield | 0xE4DCD0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 48` |
 | lua_getfield | 0x1254BC0 | `40 53 48 83 EC 60 0F 29 74 24 50 4D 8B C8 48 8B D9 81 FA F0` |

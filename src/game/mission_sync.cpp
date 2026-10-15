@@ -880,13 +880,14 @@ void MissionSync::Detach() {
 void MissionSync::Tick(float dt) {
     _now += dt;
     {
-        // A following guest's game writes no saves into his own slots (save_guard); that stays so until he is out of
-        // the co-op world (at the main menu) after he stopped following or left the session.
+        // A guest's game writes no saves into his own slots while he is in a co-op session (the host's story, Free
+        // Ride autosaves, the save a load writes); that stays so until he is out of the co-op world (at the main
+        // menu) after the session ended (save_guard).
         Shared& sh = S();
         bool following;
         {
             std::lock_guard lock(sh.mu);
-            following = sh.following && _session && !_session->IsHost();
+            following = _session && _session->IsActive() && !_session->IsHost();
         }
         if (following) save_guard::Block(true);
         else if (save_guard::Blocking() && !PlayerSync::InWorld()) save_guard::Block(false);

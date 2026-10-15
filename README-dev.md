@@ -273,7 +273,11 @@ Globals the dll adds: `mc_log(...)` (writes to our log), `mc_u64(str|num)` / `mc
 game's player model manager), and for story tests (main menu): `mc_menu_load("free_ride" | "continue_game")`,
 `mc_load_replay("checkpoint_mm_110_omerta_cp_010.sav")` (a shipped 00_mission_replay save, loaded the way a guest
 loads the host's save), `mc_load_file(path)` (any save file), `mc_follow_reset()` (the guest forgets which host point
-he loaded, so a mismatch reloads it).
+he loaded, so a mismatch reloads it), `mc_follow_force()` (a following guest in the world goes to the main menu and
+loads the host's point again: the reload path), `mc_start("story" | quest id | "quest@cp_040")` (at the main menu:
+what the lobby's START of that mode does on this game; `quest@cp` = host only, the chapter start save with its quest
+started at that checkpoint), `mc_story_reload()` (what a death in a co-op chapter calls), `mc_entity(id)` and
+`mc_entity_ids(type)` (the entity table: a wrapper by entity id, every id of a type, 8 humans, 10 cars).
 
 Dev console, to explore the API live:
 
@@ -347,12 +351,23 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
 - A following guest (lobby STORY / CHAPTER, JOIN GAME) loads that save from memory: the main menu's FREE RIDE load
   with the file's bytes swapped for the host's save (nothing is written to disk), then the chapter's quest is started
   at the host's checkpoint and he is put next to the host. If the host reaches a checkpoint the guest's own mission
-  flow does not reach within 8 s, the guest leaves for the main menu and loads the host's save of it (see the known
-  crash in docs/re-notes.md 6). The guest sees the host's objective; cutscenes play on both games (the host skipping
+  flow does not reach within 8 s, the guest leaves for the main menu and loads the host's save of it (a crash on this
+  reload is fixed: docs/re-notes.md 7). The guest sees the host's objective; cutscenes play on both games (the host skipping
   ends the guest's; a guest who skips waits for the host, "THE HOST IS WATCHING A CUTSCENE"); puppets are hidden
   while a cutscene plays.
-- Checkpoints a guest's game writes in co-op go to its Free Ride slot (`bslot`), not its story; the game's CONTINUE
-  may then offer that co-op save.
+- A guest's game writes no saves into his own slots while he is in a co-op session: every save file goes to
+  `%TEMP%\MafiaCoop\coop-saves\<pid>` (read back from there in the session, folders of ended games removed at the next
+  start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`.
+- Dying in a co-op chapter (or failing its mission) reloads the checkpoint: a guest the host's, the host his own (the
+  game itself would load the free roam state from before the quest in these loads). After a load or cutscene the
+  guest stands 1.5 m to the host's right.
+- NPCs (docs/protocol.md "NPCs", docs/game-api.md 15): the host sends the NPCs near the players; each guest pairs them
+  with the NPCs of his own mission run (same spots) and keeps them in line: dead when the host's die, health kept, put
+  back when they wander off. A guest's hits on them go to the host (replayed as shots from his puppet), so the host's
+  NPC dies and the guest's copy with it. The debug status line shows `NPCs: 31 of the host's 66 paired` (guest) or
+  `NPCs: sending 48, guest hits 2` (host). Not yet: the host's enemies ignore the guests' puppets; ambient traffic and
+  pedestrians are local. A car another player drives is the car of that model standing at the same spot here, if
+  there is one (mission cars are not doubled).
 
 ### In-world test with two instances on one PC
 

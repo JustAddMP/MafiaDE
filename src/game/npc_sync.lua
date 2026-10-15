@@ -138,26 +138,6 @@ function N.HostSend(p, ev)
     end
   end
   table.sort(list, function(a, b) return a.d < b.d end)
-  -- hostile NPCs within 60 m of a puppet: that puppet becomes a target for them (N.Befriend); 10 s after the last
-  -- one is gone it is a civilian again
-  for _, it in ipairs(list) do
-    local h = it.e.h
-    if aiOf(h) == 2 and not h:IsDeath() then
-      for _, pp in pairs(M.pup or {}) do
-        if pp.tx and pp.so and (pp.tx - it.q.x) ^ 2 + (pp.ty - it.q.y) ^ 2 < 3600 then
-          pp.friendT = M.now
-          N.Befriend(pp)
-        end
-      end
-    end
-  end
-  for _, pp in pairs(M.pup or {}) do
-    if pp.friendSo and pp.friendSo == pp.so and valid(pp.so) and M.now - (pp.friendT or 0) > 10 then
-      pp.friendSo = nil
-      pcall(pp.so.SwitchBrain, pp.so, 0)
-      log("puppet " .. tostring(pp.id) .. ": no enemies near, civilian brain again")
-    end
-  end
   for i = 1, math.min(#list, MAX_SEND) do
     local e, q, h = list[i].e, list[i].q, list[i].e.h
     local d = h:GetDir()
@@ -211,22 +191,13 @@ function N.HostHit(from, key, amount, dtype, zone, weapon)
   N.Engage(h, pp)
 end
 
--- Enemies only shoot at the player's side: a puppet is a civilian (AI type 0) to them, so enemy AI ignores it. With
--- the FRIEND brain (AI type 1, what the story's allies have) enemies see, target and shoot it like they do Paulie in a
--- shootout (docs/game-api.md 15). Puppets get it once hostile NPCs are near them on the host.
-function N.Befriend(pp)
-  if not (pp and pp.so and valid(pp.so)) then return end
-  pp.friendT = M.now
-  if pp.friendSo == pp.so then return end
-  pp.friendSo = pp.so
-  local good = pcall(pp.so.SwitchBrain, pp.so, 1)
-  log("puppet " .. tostring(pp.id) .. ": friend brain (enemies near)" .. (good and "" or " failed"))
-end
-
+-- Enemies only shoot at the player's side; a puppet is a civilian to them (AI type 0), so the host's enemy AI does not
+-- target the guests' puppets. Giving a puppet the FRIEND brain (SwitchBrain(1)) made enemies shoot it, but switching
+-- a human's brain from a script crashed the game seconds later (exe+0x243a915, docs/game-api.md 15), so it is not
+-- done. Each guest's own copies of the enemies fight him on his game.
 -- An NPC that a guest attacked fights back at the guest's puppet (hostile NPCs only; civilians flee on their own).
 function N.Engage(h, pp)
   if not (pp and pp.so and valid(pp.so)) or h:IsDeath() then return end
-  N.Befriend(pp)
   local ai = aiOf(h)
   if ai ~= 2 and ai ~= 4 then return end
   pcall(h.SetShootTargetPriority, h, pp.so:GetGUID(), 100, true, true)
@@ -343,18 +314,11 @@ function N.Enforce(s, e, p)
   end
   -- never killed by our own shots: the host decides (its death comes back)
   if (tonumber(h.health) or COPY_HEALTH) < COPY_HEALTH * 0.5 then pcall(function() h.health = COPY_HEALTH end) end
-  -- hostile when the host's is (an ambush that started on the host, an NPC the host provoked)
-  local ai = aiOf(h)
-  if s.ai == 2 and ai ~= 2 and not s.turned then
-    s.turned = true
-    if s.weapon ~= "-" and not (pcall(h.InventoryHaveWeapon, h, s.weapon) and h:InventoryHaveWeapon(s.weapon)) then
-      try("AddWeapon", h.DbgTesting_HelperInventory_AddWeapon, h, s.weapon, 60)
-    end
-    if s.weapon ~= "-" then try("InventorySelect", h.InventorySelect, h, s.weapon, true, true) end
-    try("SwitchBrain", h.SwitchBrain, h, 2)
-    pcall(h.SetBattleArchetype, h, "archetype_triggerman_base")
-    try("Attack", h.Attack, h, p)
-    log("host NPC " .. s.key .. " is hostile: so is our " .. e.id)
+  -- hostile on the host but not here: only noted (our own mission flow makes its enemies hostile itself; switching
+  -- a civilian's brain from a script crashed the game in tests)
+  if s.ai == 2 and aiOf(h) ~= 2 and not s.notedHostile then
+    s.notedHostile = true
+    log("host NPC " .. s.key .. " is hostile, our " .. e.id .. " is not (yet)")
   end
   -- pulled back when it walked off (not in cars: they drive their own way)
   -- (only NPCs with a job: enemies, allies, police, scripted ones; plain civilians wander their own way here)

@@ -2,8 +2,10 @@
 
 **Status: in development, playable but not optimal.** A from-scratch co-op mod: one small DLL, no separate
 server, Steam invites. Players see each other walking, running, armed and driving, can shoot, punch and run each
-other over, and each picks the character he plays as. Weather and time follow the host; the host's NPCs, traffic and
-missions are not shared yet.
+other over, and each picks the character he plays as. Weather, time and the story follow the host (chapter,
+checkpoint, objectives, cutscenes); mission NPCs are kept in step with the host's (deaths, your hits on them) and
+mission cars are not doubled. Enemies on the host's screen do not aim at the other players yet, and ambient traffic
+is each player's own.
 
 ## What you need
 
@@ -15,8 +17,8 @@ missions are not shared yet.
 2. Host: choose **CO-OP → Host Co-op Game** in the main menu. The co-op lobby opens: invite friends (or let them join
    by IP), wait until everyone is ready, pick the mode and press **START**: **FREE RIDE**, **STORY** (the host
    continues his story; everyone else joins him at his checkpoint) or a **CHAPTER** from its start. In the story the
-   friends follow the host: his checkpoints, objectives and cutscenes. Your own story save is not touched (co-op
-   story checkpoints go to the Free Ride save slot).
+   friends follow the host: his checkpoints, objectives and cutscenes. A friend's game saves nothing into his own
+   save slots while he is in a co-op game (story or Free Ride). (The host in CHAPTER mode saves into his Free Ride slot, never his story.)
 3. Join: accept the Steam invite, or choose **CO-OP → Join by IP**. You land in the lobby: pick your character and
    set **READY**.
 4. Your character: pause menu → **CO-OP** → **CHARACTER** / **OUTFIT** (Left/Right). Tommy, Paulie, Sam, Salieri,

@@ -403,4 +403,44 @@ docs/re-notes.md 6).
   lobby CHAPTER 10: OMERTA (both at cp_010, intro cutscene on both, both flows reached cp_020 together, the host's
   cp_020 save went to the guest); lobby CHAPTER 2: TAXI (both in the chapter with objective markers); host cutscene
   played on the guest, host skip stopped it, guest skip held him until the host's ended; a late joiner (host already at Omerta cp_020) pressing JOIN GAME came in at cp_020 next to him;
-  the guest reloading the host's checkpoint from the world (worked twice; **crashed twice**, re-notes 6).
+  the guest reloading the host's checkpoint from the world (crashed 2 of 5 before the fix in re-notes 7; after it 9 of 9
+  in a CHAPTER session and 11 of 11 in STORY sessions).
+
+## 15. Mission NPCs and cars on two games, the entity table — checked 2026-10-15
+
+Two instances on one PC; chapters Taxi (`mm_20_taxi` cp_010/cp_020) and Bon Appetit (`mm_140_salieri` cp_020). Used by
+src/game/npc_sync.* (messages in docs/protocol.md "NPCs") and the shared cars in player_sync.lua.
+
+| call | notes |
+|---|---|
+| `mc_entity_ids(type)` (ours, src/game/lua.cpp) | every entity id of that type (low byte of the id: 8 human, 9 player, 10 car), space separated. The game keeps its entities in a table indexed by `id >> 8` (the lookup behind `GetEntityByGUID`, exe+0x233AC10, ignores the low byte); the scan stops after 8192 empty slots (~13 000 slots in a story world). There is no "humans/cars in a radius" call for scripts; this is it |
+| `mc_entity(id)` (ours) | the wrapper of entity `id` (the number `tostring(guid)` ends with), nil when that slot holds another entity now. Same steps as `game.entitywrapper:GetEntityByGUID`, which only accepts a `C_EntityGuid` object |
+| `GetPlayersEnemies()` | the enemies the AI module lists for the player; police in sight showed up there outside any fight |
+| blanket `ON_ACTIVATE` | never fired for humans (only `ON_DEACTIVATE` of passing pedestrians): no spawn feed |
+| `h:GetName()` | `behavior_object_prime-NN-` for spawned humans: generated, **different on each game**; a car's name is its model name. Entity ids differ between the games too |
+| positions | the same mission scripts at the same checkpoint put mission NPCs and parked mission cars at **the same spots on both games** (the Taxi depot's civilians matched to 0.0-0.3 m, the mission taxi to 0.5-1.1 m): the key for pairing (npc_sync: nearest within 1.5 m, then kept). Ambient pedestrians and traffic differ per game (31 of the host's 66 humans paired at the depot, 26 of 37 at Salieri's) |
+| `h:SwitchBrain(t)` | changed a civilian to `AI_TYPE` 2 (enemy, it then shot at the player) or a puppet to 1 (friend: the host's enemies then shot the puppet), **but the game crashed seconds later** in a once-a-second update over a list of humans (exe+0x243A915, a stale entry), every time in Bon Appetit and in two of five Taxi tests. Not used by MafiaCoop; some civilians refuse it (type stays 0) |
+| civilians and damage | some paired civilian copies on the guest took no damage at all (`DoDamage`, `health = 0`, bullets from the player, from a puppet or from themselves); their host counterparts died from the host's bullet. npc_sync hides such a copy when the host's dies |
+| `CreateShots(puppet, ...)` at an NPC | a guest's bullet replayed on the host from his puppet: the NPC took it (its health and death on the host), its DAMAGE event names the puppet |
+| `game.traffic:FindNearestSpawnedVehicle(slot, pos, radius)` -> sync object, then `GetNearestFoundSpawnedEntity(slot)` | the nearest *traffic* car only (a culver 40 m away, not the mission taxi next to the player) |
+| `game.traffic:GetLastPlayerCar()` / `GetLastPlayerVehicle()` / `GetLastObtainedPlayerCar()` | nil at Taxi cp_010 (the mission taxi is not "the player's car" there) |
+| `FIRE` damage (type 8) | an enemy with the triggerman archetype threw fire; burning humans then took 0.1 damage per frame. A burning puppet is not released by MafiaCoop until 8 s after the fire (the fire update keeps a list of burning humans) |
+| map markers | `RegisterHumanEntityDirect` markers must be unregistered **before** the human is released (MafiaCoop did it a tick later) |
+
+**How it plays** (verified unless noted):
+- Pairing: on a guest the host's NPCs near either player are paired with his own (logs "host NPC k is our l (0.01 m
+  apart)"); host NPCs that died on the host died on the guest at once (Taxi: a civilian shot by a hostile NPC on the
+  host, a hostile NPC); one civilian copy took no damage and stayed alive (since then it is hidden after 3 tries, not
+  checked in game); a guest's shots on his copy of a hostile NPC went to the host,
+  were replayed from his puppet there, the host's NPC died and the guest's copy with it (Taxi, twice).
+- Enemies and guests: on each game the enemies fight that game's own player (each game runs the mission's AI); the
+  host's enemies do **not** target the guests' puppets (a puppet is a civilian to them, and the brain switch that
+  would change it crashes the game). Not checked in a real mission shootout: no chapter's combat could be reached by
+  the automated tests (they cannot drive), the NPCs were made hostile with `SwitchBrain` for the tests.
+- Mission cars: the host got into the Taxi chapter's taxi; the guest's game took its own taxi standing there as the
+  host's car ("our own shubert_six_taxi stands there (0.5 m): it is this car here") instead of spawning a copy on top
+  of it. Before, the copy shoved the guest's taxi, his mission failed and the game loaded the free roam state from
+  before the quest. When both stood in their own taxis (the guest after loading the host's cp_020 save), the host's game
+  spawned no copy into its own taxi ("another car stands where it is") until the guest's car had moved off. The NPC
+  driver puppet is thrown out of a mission taxi repeatedly (the car does not keep an NPC at its wheel), so the host
+  is seen next to his car, not in it, on the guest's game.

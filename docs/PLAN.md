@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-15.
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-15 (batch 6).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -13,7 +13,7 @@ interest.md).
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
 | 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done for keyboard; gamepad/mouse/Steam invite untested; lobby: Free Ride, Story and chapter select |
-| 4 Shared world | Weather/time, story (chapter, checkpoint, objectives) and cutscenes done; NPCs and traffic next |
+| 4 Shared world | Weather/time, story (chapter, checkpoint, objectives) and cutscenes done; NPCs and mission cars partly (host-authoritative pairing, deaths, guest hits) |
 | 6 polish | Not started |
 
 ## Working rules
@@ -140,16 +140,38 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    (two instances): **Omerta** (lobby STORY from the cp_020 save: guest at cp_020 with the quest, objective and
    markers; lobby CHAPTER 10: OMERTA: both at cp_010, both flows reached cp_020 together after the intro, the host's
    cp_020 save reached the guest; late join with JOIN GAME at cp_020) and **Taxi** (lobby CHAPTER 2: TAXI, both in the
-   chapter with objective markers). Known issue: when the guest has to reload the host's checkpoint from the world
-   (quit to the main menu, load), the guest's game crashed in 2 of 5 runs (exe+0x2E81EF8, re-notes 6); a later
-   checkpoint is only ever loaded from the host's save of it (from the chapter start it crashed). Other chapters and
-   checkpoints than these were not played.
+   chapter with objective markers). A later checkpoint is only ever loaded from the host's save of it (from the chapter
+   start it crashed). Other chapters and checkpoints than these were not played.
+   Reload crash fixed 2026-10-15 (mod 0.7.0, re-notes 7): the guest's reload of the host's checkpoint from the world
+   crashed (2 of 5) when the save had another id than the first one loaded in that game (the chapter loader's storage
+   keeps one entry); now 9 of 9 forced reloads in a CHAPTER session and 11 of 11 in STORY sessions without a crash.
+   A guest's saves in a co-op session go to a scratch folder (`%TEMP%\MafiaCoop\coop-saves\<pid>`), never to his save
+   slots: after STORY sessions with reloads and a guest death every save and profile file was byte-identical (two
+   instances share one save folder, so this was checked with the host in his story slot); in Free Ride the guest's
+   autosaves were redirected too (0 real writes). Deaths
+   and failed missions in a chapter loaded through the chapter loader (the game would load the free roam state from
+   before the quest) reload the checkpoint instead: guest death -> the host's checkpoint, host death -> his own
+   (checked in Taxi). The guest is placed beside the host (1.5 m to his right) after loads and cutscenes.
 - [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
    invisible proxy for each guest so its AI targets them. Prototype both, measure.
+   Partly done 2026-10-15 (mod 0.7.0, src/game/npc_sync.*, game-api.md 15, protocol.md "NPCs"): every game runs the
+   mission, so instead of spawning copies the guest pairs the host's NPCs with his own (same spots; found through the
+   entity table, `mc_entity_ids`) and the host is authoritative for them (states 5 Hz, deaths, health). Checked in Taxi:
+   pairing (0.0-1.3 m), host NPC deaths repeated on the guest, a guest's shots on his copy went to the host, were
+   replayed there as shots from his puppet and killed the host's NPC, whose death came back. In Bon Appetit only the
+   pairing was checked (26 of 37 near Salieri's). **Open:** the host's enemies do not target the guests' puppets (they
+   are civilians to the AI; the only way found, `SwitchBrain`, crashes the game), not checked in a real shootout (the
+   tests cannot drive to one; NPCs were made hostile by script), some civilian copies take no damage on the guest.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
+   Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose
+   model stands at the same spot on the other game is taken as that game's car (the mission's cars are not doubled:
+   the copy spawned on top of the guest's mission taxi had made his mission fail), and no copy is spawned into another
+   car. Checked in Taxi (host took the mission taxi, the guest's game used its own; both in their own taxis after the
+   guest loaded cp_020, no copy until they parted). **Open:** the host's puppet is thrown out of a mission car on the
+   guest's game (it does not keep an NPC at the wheel), only one chapter checked, police and mission traffic local.
 - [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
   Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
   guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the
