@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-14.
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-15.
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -32,7 +32,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.2.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.3.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -116,7 +116,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [ ] Player name tags above puppets (projected 2D text via our overlay) and minimap blips if feasible.
 - [ ] Settings page (name, show tags, debug overlay).
 
-- [ ] **Session password** (network side + tests done in 65c562f; tick after the menus are checked in game): the host can set an optional password (CO-OP page: "Set password", reusing the text box
+- [x] **Session password** (network side + tests done in 65c562f; menus checked in game 2026-10-15: SET PASSWORD on
+  the host, guest gets the PASSWORD box on JOIN BY IP, joins with it): the host can set an optional password (CO-OP page: "Set password", reusing the text box
   from Join by IP; ini `password=`). Joining a passworded game prompts for it. Never sent in plain text: the host
   sends a random challenge after Hello and the guest answers with HMAC-SHA256(password, challenge) via Windows
   BCrypt (no extra libraries); wrong answers get Reject "wrong password", with a short delay and a per-address attempt
@@ -124,12 +125,13 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   panel shows a lock icon when a password is set. Protocol version bump; loopback tests for right/wrong/missing
   password and the attempt limit.
 
-- [ ] **Kick**: the host picks a player in the pause-menu CO-OP panel and chooses Kick; the player is disconnected
+- [x] **Kick**: the host picks a player in the pause-menu CO-OP panel and chooses Kick; the player is disconnected
   with the banner "You were kicked by the host". Only the host can kick (core Session::Kick). Done includes loopback
   tests: the kicked player gets the reason, guests can't kick.
-- [ ] **Kick and ban**: Kick plus a ban for the rest of the session (SteamID and IP address); a banned player's
+- [x] **Kick and ban**: Kick plus a ban for the rest of the session (SteamID and IP address); a banned player's
   rejoin is refused with a clear reason. The ban list clears when the host stops hosting. Done includes tests: refused
-  on rejoin by SteamID and by address, list cleared in a new session.
+  on rejoin by SteamID and by address, list cleared in a new session. Done in core v0.3.0 (tests: net_kick); checked
+  in game 2026-10-15 (kick, rejoin, kick and ban, banned rejoin refused; by address only, two instances on one PC).
 
 ### D. Release / distribution
 - [x] Stable protocol build number (currently changes every rebuild → only identical builds connect): derive from
