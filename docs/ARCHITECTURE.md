@@ -55,7 +55,7 @@ Game code lives in `mc::game`.
   the Lua bridge is required (co-op disabled without it), the menu entries are optional.
 - Two threads (confirmed at runtime, re-notes 1.5):
   - **Render thread:** core's Present hook calls `Mod::Tick(dt)`: `RenderTick` (Lua results, dev console), the
-    session, and `SessionTick` (sending the 20 Hz player state, receiving snapshots).
+    session, and `SessionTick` (sending the 60 Hz player state, receiving snapshots).
   - **GameMainThread:** the `C_ScriptMachine::Tick` hook drains the Lua bridge's job queue and runs the per-tick
     callbacks (player sync: sample the local player, drive puppets and copy cars). **Every game/Lua call happens
     here.**

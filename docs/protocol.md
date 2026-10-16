@@ -29,7 +29,7 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 20 Hz | see below |
+| 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 60 Hz (0.9.0; was 20) | see below |
 | 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw |
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103-0x01FF | reserved (phase 3 events) | | | |
@@ -59,12 +59,28 @@ f32 qx, qy, qz, qw        car rotation (quaternion, GetRot: v.x v.y v.z s)
 f32 cvx, cvy, cvz         car velocity
 ```
 
-Receivers keep up to 64 snapshots per player and render them **100 ms in the past** on the sender's clock:
-`renderTime = now - offset - 0.1`, where `offset = localReceiveTime - senderTime` is tracked as a running minimum
+Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
+running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
+before 0.9.0: 20 Hz and 100 ms): `renderTime = now - offset - 0.05`, where `offset = localReceiveTime - senderTime` is tracked as a running minimum
 (slowly relaxed upward, 1 % per message, to follow drift). Between two snapshots everything is lerped (heading
 renormalised, car quaternion nlerp with sign fix, discrete fields from the nearer one); past the newest snapshot the
 position is extrapolated with the velocity for at most 250 ms, then held. Old/duplicate snapshots (sender time not
-newer) are dropped, so loss and reordering need no reliability.
+newer) are dropped, so loss and reordering need no reliability. The interpolated position is then moved forward
+along its velocity by the same 50 ms (at most 1.5 m; player and car), so what is shown is where the player is now,
+not where he was 50 ms ago.
+
+**Measured (0.9.0, two games on one PC, `trace_pos = 1` and `tools/pos_error.py`, docs/README-dev.md):** the network
+part (the target the puppet is steered to vs. where the player really is) was 0.11 m on average and 0.47 m at most
+while running with 20 Hz / 100 ms, and 0.02-0.06 m on average (p95 0.10 m) with 60 Hz / 50 ms and the lead; a car at
+up to 20.6 m/s: 0.12 m average, 0.34 m max (before: 0.29 m average and 1.04 m max at only up to 9.7 m/s). The
+puppet itself was the real desync: the game's AI walk toward the target starts late, is slower than a running
+player and sometimes does not move at all, so a host running around was shown 2.5 m behind on average and up to 9.3 m
+off (stuck until the 2 s "blocked" snap). Since 0.9.0 the puppet is pulled toward the target every tick (30 x dt of
+the gap above 0.3 m, put there at once above 1.5 m) and its walk is re-aimed at once when the player turns sharply:
+0.3-0.5 m on average, p95 0.4-0.7 m, in Free Ride and in Taxi, right after a lobby CHAPTER start and after a
+checkpoint reload. Traffic for two players in Taxi with NPC sync: host -> guest 15.4 KB/s (NpcStates 10.8, PlayerState
+3.5), guest -> host 4.4 KB/s, no loss, no resends, no relay drops; the checkpoint save (HostSave, ~36 KB) goes out only
+when the file changed.
 
 ### Shared cars, seats and ownership
 
@@ -134,7 +150,7 @@ aliases (a newer version's, a typo) are shown as that default.
 Fire, aim, crouch, reload: a receiver turns `aim` (or a new shot, kept for 1 s as hip fire) into
 `DbgTesting_AimAtDir(ax, ay, az)` on the puppet, fires one real shot per new `shots` count (trigger press/release, at
 most a few per tick; a far backlog is skipped), `crouch` into `SetStalkMove`, and a rising `reload` into a reload
-press. Shots are not separate messages: they ride on the 20 Hz state, so a lost packet only delays them by 50 ms.
+press. Shots are not separate messages: they ride on the player state (60 Hz), so a lost packet only delays them by a frame or two.
 
 ## Phase 6: damage between players (app ids 0x0400-0x04FF)
 
@@ -225,7 +241,7 @@ scripts may change things in between; the next WorldEnv puts them back.
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U | u8 n (at most 16), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u8 health, u8 flags (1 dead, 2 in a car), u8 aiType, str weapon ("-" = none) |
+| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u8 health, u8 flags (1 dead, 2 in a car), u8 aiType, str weapon ("-" = none) |
 | 0x0211 | NpcDeath | host -> guests (`Broadcast`) | R | u32 key |
 | 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId |
 

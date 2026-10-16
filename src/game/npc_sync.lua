@@ -16,7 +16,7 @@
 --   D key                                        guest: that host NPC died
 --   H from key amount dtype zone weapon          host: guest `from` hit host NPC `key` on his screen
 -- Output (events, one per line):
---   NS key x y z hx hy health flags ai weapon    host: NPC state (5 Hz, nearest first, at most MAX_SEND)
+--   NS key x y z hx hy health flags ai weapon    host: NPC state (10 Hz, nearest first, at most MAX_SEND)
 --   ND key                                       host: NPC died
 --   NH key amount dtype zone weapon              guest: we hit (our copy of) host NPC key
 --   ST text                                      status for the overlay (once a second)
@@ -27,7 +27,7 @@ local N = M.Npc
 N.version = 1
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
-local SEND_INTERVAL = 0.2   -- s between host state rounds
+local SEND_INTERVAL = 0.1   -- s between host state rounds (10 Hz; ~10 KB/s for 48 NPCs)
 local RANGE = 120           -- m from the host or a puppet: NPCs sent
 local MAX_SEND = 48         -- NPCs per round
 local MATCH_DIST = 1.5      -- m: a guest NPC this close to a host NPC (when first paired) is its copy

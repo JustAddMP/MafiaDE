@@ -291,12 +291,27 @@ Dev console, to explore the API live:
   `tools\devlua.ps1 -Tag host -Code 'return game.game:GetActivePlayer():GetPos()'` does the round trip.
 - What was found this way is in `docs/game-api.md`.
 
+## Network statistics and measuring desync
+
+- Every 5 s (`net_log_interval`, 0 = off) each game logs `net:` lines: per peer rtt, loss, KB/s and packets each way,
+  resends, the reliable backlog, then KB/s and messages/s per message (PlayerState, NpcStates, HostSave, ...), and any
+  drops (core's NetMonitor, external/core/docs/protocol.md "Traffic statistics"). F7 shows the last second.
+- Settings (ini or `--key value`): `net_budget_kbps` (per-peer limit, KiB/s, default 1024), `net_state_hz` (default
+  60), `net_interp_ms` (default 50).
+- Position error between two games: start both with `--trace_pos 1`; each logs its player and every puppet ten times a
+  second. `python tools/pos_error.py out\logs\mafiacoop-host.log out\logs\mafiacoop-guest.log [--from HH:MM:SS]
+  [--to HH:MM:SS]` prints, per direction, on foot and in a car, the distance between where a player really is and
+  where his puppet / car copy is on the other screen (and the network part alone, "target"). Numbers from 0.9.0 are in
+  docs/protocol.md "PlayerState". The test pad (`mc_pad`) did not move the player in some sessions; keyboard keys
+  sent to the focused window (W/A/S/D) always did.
+
 ## Player sync (phase 3)
 
-Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x0100, docs/protocol.md) at 20 Hz and
+Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x0100, docs/protocol.md) at 60 Hz and
 shows every other player as a **puppet**: an AI human in that player's character (host = Tommy as the story dresses
-him, guest 1 = Paulie, guest 2 = Sam, guest 3 = Salieri, or the `model` he set) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (100 ms
-buffer), snaps when more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
+him, guest 1 = Paulie, guest 2 = Sam, guest 3 = Salieri, or the `model` he set) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (50 ms
+buffer, moved forward by the velocity), is pulled toward it every tick (the AI walk alone trailed by metres), snaps when
+more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
 Puppets only appear once the local player is in a loaded world (not in the main menu).
 
 Cars: when a player drives, the others see the same car (their own copy of it) following the driver, with the

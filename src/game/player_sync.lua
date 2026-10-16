@@ -779,13 +779,21 @@ function M.Drive(pp)
     pp.stuckT = nil
   end
   if spd2 > 0.16 or d2 > 1.0 then
-    if M.now - pp.lastMove > 0.3 or pp.lastMode ~= pp.mode then
+    -- a sharp turn of the player re-aims the walk at once (otherwise the AI kept walking the old way for up to 0.3 s
+    -- and overshot by 2-4 m before M.Pull brought it back)
+    local turned = false
+    if spd2 > 0.16 and pp.mvx then
+      local l = math.sqrt(spd2 * (pp.mvx * pp.mvx + pp.mvy * pp.mvy))
+      turned = l > 0 and (pp.vx * pp.mvx + pp.vy * pp.mvy) / l < 0.7
+    end
+    if M.now - pp.lastMove > 0.3 or pp.lastMode ~= pp.mode or turned then
       local mode = MODES[pp.mode] or "RUN"
       if d2 > 9 and pp.mode < 2 then mode = "RUN" end
       if d2 > 25 then mode = "SPRINT" end
-      local la = 0.5
+      local la = 0.3
       so:MoveVec(V(pp.tx + pp.vx * la, pp.ty + pp.vy * la, pp.tz), mode)
       pp.lastMove, pp.lastMode, pp.moving = M.now, pp.mode, true
+      pp.mvx, pp.mvy = pp.vx, pp.vy
       pp.moves = (pp.moves or 0) + 1
     end
   else
@@ -796,8 +804,58 @@ function M.Drive(pp)
     local d = so:GetDir()
     if not (pp.cb and pp.cb.aim) and d.x * pp.hx + d.y * pp.hy < 0.97 then so:SetDir(V(pp.hx, pp.hy, 0)) end
   end
+  M.Pull(pp, so)
   M.Weapon(pp)
   M.Combat(pp)
+end
+
+-- Dev (trace_pos = 1): our position and every puppet's, 10 times a second, for measuring the position error between
+-- two games (tools/pos_error.py pairs one game's "trace L" lines with the other's "trace P" lines by log time).
+-- L: x y z [car x y z]; P id: puppet x y z, tgt x y z (where the network says it is now) [car x y z ctgt x y z].
+function M.TraceTick(player)
+  if M.now - (M.traceT or -1) < 0.1 then return end
+  M.traceT = M.now
+  local p = player:GetPos()
+  local car = player:GetOwner()
+  local line = string.format("trace L %.2f %.2f %.2f", p.x, p.y, p.z)
+  if valid(car) then
+    local c = car:GetPos()
+    line = line .. string.format(" car %.2f %.2f %.2f", c.x, c.y, c.z)
+  end
+  mc_log(line)
+  for id, pp in pairs(M.pup) do
+    if pp.st == "alive" and valid(pp.so) and pp.tx then
+      local q = pp.so:GetPos()
+      line = string.format("trace P %s %.2f %.2f %.2f tgt %.2f %.2f %.2f", id, q.x, q.y, q.z, pp.tx, pp.ty, pp.tz)
+      local c = pp.veh and pp.vkey and M.cars[pp.vkey]
+      if c and valid(c.ent) then
+        local e = c.ent:GetPos()
+        line = line .. string.format(" car %.2f %.2f %.2f ctgt %.2f %.2f %.2f", e.x, e.y, e.z, pp.cx or 0, pp.cy or 0,
+          pp.cz or 0)
+      end
+      mc_log(line)
+    end
+  end
+end
+
+-- The puppet's AI walk (MoveVec) starts late, is slower than a running player and sometimes does not move at all, so
+-- on its own the puppet trailed its player by 2.5 m on average and up to 9 m (measured 2026-10-16, tools/pos_error.py).
+-- Each tick it is pulled toward where its player is now (a fraction PULL_GAIN x dt of the gap); the walk animation
+-- still comes from MoveVec. With it (and the walk re-aimed at sharp turns) the error was 0.34 m on average, 0.6 m p95.
+local PULL_GAIN = 30   -- 1/s
+local PULL_MIN = 0.3   -- m: closer than this the AI's own steps are left alone
+local PULL_SNAP = 1.5  -- m: farther than this (the AI walked off the wrong way) it is put there at once
+function M.Pull(pp, so)
+  local dt = M.now - (pp.pullT or M.now)
+  pp.pullT = M.now
+  if dt <= 0 or dt > 0.5 then return end
+  local q = so:GetPos()
+  local dx, dy, dz = pp.tx - q.x, pp.ty - q.y, pp.tz - q.z
+  local d = math.sqrt(dx * dx + dy * dy)
+  if d <= PULL_MIN or dz > 2 or dz < -2 then return end
+  local k = math.min(1, PULL_GAIN * dt)
+  if d > PULL_SNAP then k = 1 end
+  so:SetPos(V(q.x + dx * k, q.y + dy * k, q.z + dz * k))
 end
 
 -- A puppet that burns (FIRE damage in the last 8 s) is not released: the game's fire update keeps a list of burning
@@ -1598,6 +1656,8 @@ function M.Update(dt, cmds)
       enter = true
     elseif op == "A" then
       aimInput = true
+    elseif op == "Z" then
+      M.trace = true
     elseif op == "G" then
       M.tags, M.markers = f[2] == "1", f[3] == "1"
     elseif op == "R" then
@@ -1672,6 +1732,7 @@ function M.Update(dt, cmds)
     pcall(M.RideTick, player)
   end
 
+  if M.trace and player then pcall(M.TraceTick, player) end
   local st = {}
   for id, pp in pairs(M.pup) do
     local tag = ""

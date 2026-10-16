@@ -31,9 +31,19 @@ constexpr uint16_t kMsgPlayerModel = 0x0102;  // every peer -> everyone: the cha
 constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
 constexpr uint8_t kStateVersion = 3;
-constexpr double kSendInterval = 0.05;      // 20 Hz
-constexpr double kInterpDelay = 0.10;       // render remote players 100 ms in the past
+// State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (tools/pos_error.py): at 20 Hz
+// with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
+// ~4 KB/s per player. ini: net_state_hz (10..120, default 60), net_interp_ms (0..500, default 50).
+double SendInterval() {
+    static const double v = 1.0 / std::clamp(core::Config::Get().GetInt("net_state_hz", 60), 10, 120);
+    return v;
+}
+double InterpDelay() {
+    static const double v = std::clamp(core::Config::Get().GetInt("net_interp_ms", 50), 0, 500) / 1000.0;
+    return v;
+}
 constexpr double kMaxExtrapolate = 0.25;    // then hold
+constexpr float kMaxLead = 1.5f;            // m: the most the "now" lead may move a position (see Interpolate)
 constexpr size_t kMaxSnaps = 64;
 constexpr float kTeleport = 20.0f;          // metres between two snapshots: a teleport, not lerped (a car copy swept
                                             // through the line would run over whoever stands on it)
@@ -220,6 +230,12 @@ int McPlayerProfile(lua_State* L) {
 }
 
 bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
+// Dev/measurement: the Lua glue logs our position and every puppet's (real and target) 10 times a second ("trace L/P"
+// lines; tools/pos_error.py pairs two logs into the position error between the games).
+bool TracePos() {
+    static const bool on = core::Config::Get().GetBool("trace_pos", false);
+    return on;
+}
 bool NameTagsOn() { return core::Config::Get().GetInt("name_tags", 1) != 0; }
 bool MapMarkersOn() { return core::Config::Get().GetInt("map_markers", 1) != 0; }
 
@@ -347,7 +363,7 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
 float Lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 PlayerState Interpolate(const Remote& rem, double now) {
-    const double rt = now - rem.offset - kInterpDelay;
+    const double rt = now - rem.offset - InterpDelay();
     const auto& sn = rem.snaps;
     if (rt <= sn.front().t) return sn.front().s;
     if (rt >= sn.back().t) {
@@ -397,6 +413,26 @@ PlayerState Interpolate(const Remote& rem, double now) {
         if (len > 1e-6f)
             for (int k = 0; k < 4; ++k) s.quat[k] = q[k] / len;
     }
+    return s;
+}
+
+// Where the remote player is now: the interpolated state (InterpDelay in the past, smooth) moved forward along its
+// velocity by that delay, at most kMaxLead metres. Without it a car copy trails its driver by speed x delay.
+PlayerState Present(const Remote& rem, double now) {
+    PlayerState s = Interpolate(rem, now);
+    const float lead = static_cast<float>(InterpDelay());
+    auto push = [lead](float* p, const float* v) {
+        float d[3], len = 0;
+        for (int i = 0; i < 3; ++i) {
+            d[i] = v[i] * lead;
+            len += d[i] * d[i];
+        }
+        len = std::sqrt(len);
+        const float k = len > kMaxLead ? kMaxLead / len : 1.0f;
+        for (int i = 0; i < 3; ++i) p[i] += d[i] * k;
+    };
+    push(s.pos, s.vel);
+    if (s.flags & kInVehicle) push(s.cpos, s.cvel);
     return s;
 }
 
@@ -660,6 +696,7 @@ void MainTick(lua_State* L, float dt) {
             cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
             cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
             cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1\n" : "0\n");
+            if (TracePos()) cmds += "Z\n";  // dev: log positions 10 times a second (trace_pos = 1)
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
@@ -671,7 +708,7 @@ void MainTick(lua_State* L, float dt) {
                     cmds += "Q " + std::to_string(id) + " " + ProfileFor(sh, id) + "\n";
             }
             for (auto& [id, rem] : sh.remotes) {
-                if (!rem.snaps.empty()) AppendTarget(cmds, ProfileFor(sh, id), id, Interpolate(rem, now));
+                if (!rem.snaps.empty()) AppendTarget(cmds, ProfileFor(sh, id), id, Present(rem, now));
             }
         }
     }
@@ -765,7 +802,7 @@ void PlayerSync::Install() {
     FindModelManager();
     lua::AddTickCallback(&MainTick);
     MC_LOG_INFO("sync: installed (state message 0x%04x, %d Hz, %d ms interpolation delay)", kMsgPlayerState,
-                static_cast<int>(1.0 / kSendInterval), static_cast<int>(kInterpDelay * 1000));
+                static_cast<int>(1.0 / SendInterval() + 0.5), static_cast<int>(InterpDelay() * 1000));
 }
 
 void PlayerSync::Attach(net::Session& session) {
@@ -883,8 +920,8 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             }
         }
         _sendAccum += dt;
-        if (active && _sendAccum >= kSendInterval) {
-            _sendAccum = std::fmod(_sendAccum, kSendInterval);
+        if (active && _sendAccum >= SendInterval()) {
+            _sendAccum = std::fmod(_sendAccum, SendInterval());
             if (sh.localValid && Now() - sh.localAt < 1.0) {
                 local = sh.local;
                 send = true;

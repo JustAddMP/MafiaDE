@@ -280,6 +280,15 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [x] Crash handler: don't let a first-chance stack overflow use up the one-shot dump flag.
 - [x] Host relay rate limits for guest chat/app messages; evict oldest un-handshaken UDP connections when slots are full.
 - [x] Launcher: require a value for keys like --password (reject "--password --x").
+- [x] **Bandwidth and player desync** (user, 2026-10-16: "there was some desync with the players loaded"). Done
+  2026-10-16 (core v0.6.0, docs/protocol.md "PlayerState", README-dev.md "Network statistics"): traffic statistics per
+  peer and per message in the log every 5 s and on F7; limits raised (relay 1 MB/s per guest, interest 512 KB/s,
+  `net_budget_kbps`), though a two-player session uses ~15 KB/s and nothing was ever dropped: the network was not the
+  cause. Measured with `trace_pos` + tools/pos_error.py: the network target was within 0.1-0.5 m, but the puppet's AI
+  walk trailed a running player by 2.5 m on average and up to 9.3 m. Now 60 Hz states, 50 ms interpolation plus a
+  velocity lead, the puppet pulled toward the target each tick and re-aimed on sharp turns, NpcStates 10 Hz and size
+  capped: on foot 0.3-0.5 m average (p95 <= 0.7 m) in Free Ride and Taxi, after a CHAPTER start and a checkpoint reload;
+  a car copy at up to 20.6 m/s 0.12 m average. Over Steam P2P between two PCs not measured.
 - Every pattern/Lua call fails soft (log + disable feature); keep it that way.
 - Crash triage: `out\logs\crash-*.dmp` + log stack (module+offset) → symbolize with the PDBs in out\.
 - Long-session test (1 h, two instances, driving + shooting) before each release.

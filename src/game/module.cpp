@@ -192,6 +192,22 @@ public:
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
+    const char* MessageName(uint16_t id) override {  // names in the traffic statistics (core NetMonitor)
+        switch (id) {
+        case 0x0100: return "PlayerState";
+        case 0x0101: return "CarParked";
+        case 0x0102: return "PlayerModel";
+        case 0x0200: return "WorldEnv";
+        case 0x0201: return "MissionState";
+        case 0x0202: return "HostSave";
+        case 0x0203: return "Cutscene";
+        case 0x0210: return "NpcStates";
+        case 0x0211: return "NpcDeath";
+        case 0x0400: return "Hit";
+        case 0x0410: return "NpcHit";
+        default: return nullptr;
+        }
+    }
     void AppendStatus(std::vector<render::OverlayLine>& out) override {
         PlayerSync::GetStatus(out);
         MissionSync::GetStatus(out);

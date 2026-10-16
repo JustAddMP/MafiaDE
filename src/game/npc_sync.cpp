@@ -105,12 +105,18 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     Append(buf);
 }
 
+// One NpcStates message per kPerPacket NPCs; fewer when long weapon names would push it past the unreliable limit
+// (core kMaxUnreliableMessage, a larger message is refused by the transport and was lost before 0.9.0).
+constexpr size_t kMaxStatesBytes = 1000;  // payload; the session header adds a few bytes
+constexpr size_t kMaxNpcBytes = 4 + 12 + 2 + 3 + 1 + 48;  // one NPC with the longest weapon name
+
 void SendStates(const std::vector<std::string>& lines) {
-    for (size_t at = 0; at < lines.size(); at += kPerPacket) {
+    for (size_t at = 0; at < lines.size();) {
         net::ByteWriter w;
-        const size_t n = std::min(kPerPacket, lines.size() - at);
-        w.U8(static_cast<uint8_t>(n));
-        for (size_t i = 0; i < n; ++i) {
+        w.U8(0);  // count, patched below
+        size_t n = 0;
+        for (; at + n < lines.size() && n < kPerPacket && w.Size() + kMaxNpcBytes <= kMaxStatesBytes; ++n) {
+            const size_t i = n;
             std::istringstream in(lines[at + i].substr(3));
             uint32_t key = 0;
             float x = 0, y = 0, z = 0, hx = 0, hy = 0;
@@ -128,8 +134,10 @@ void SendStates(const std::vector<std::string>& lines) {
             w.U8(static_cast<uint8_t>(ai));
             w.Str(SafeWeapon(weapon) ? weapon : "-");
         }
-        _session->Broadcast(kMsgNpcStates, w.Span(), net::Reliability::Unreliable);
-        ++_statesSent;
+        std::vector<uint8_t> buf = w.Take();
+        buf[0] = static_cast<uint8_t>(n);
+        at += n;
+        if (_session->Broadcast(kMsgNpcStates, buf, net::Reliability::Unreliable)) ++_statesSent;
     }
 }
 
