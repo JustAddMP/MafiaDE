@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 62 patterns below; prints OK/FAIL each)
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 69 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -646,9 +646,41 @@ Used by src/game/save_guard.cpp.
   overwrote his Free Ride): checked with a CHAPTER 10: OMERTA session through the intro to cp_020 (4 host writes and 4
   guest writes redirected, the host's cp_010 and cp_020 checkpoints still found in his scratch tree and sent to the
   guest): all 18 save and profile files byte-identical afterwards (only `videoconfig.cfg` changed).
-- **Death or a failed mission in a replay-style load**: the game loads `freeroam_before_quest_activated` (slot 2,
-  storage `aslot`): the free roam state from before the quest. In our sessions that put players into another world
-  (once the user's own Omerta story). The story sync reloads the checkpoint instead (docs/protocol.md "Story").
+- **Slot profiles** (`profiles\temporaryprofile\aslot.pf`, `bslot.pf`; XML `C_SaveDataUnwrapped`): the slot's
+  script data storage (hashed names: the slot's current quest `mm_110_omerta`, positions, a weapons table) plus
+  difficulty settings. Written with `CreateFileA` at loads and quest starts by both games of a co-op chapter: after a
+  CHAPTER 2: TAXI session with failed missions the story slot's `aslot.pf` said `mm_20_taxi` and 2 weapons instead of
+  `mm_110_omerta` and 5. Earlier checks found it byte-identical only by chance (the Omerta chapter is the user's own
+  story point, and the wrong-world load of the real story rewrote it). Since 0.9.1 save_guard redirects
+  `aslot/bslot/cslot.pf` with the saves; checked byte-identical after a two-player Taxi session with a failed mission
+  on each side.
+- **Death or a failed mission in a replay-style load** [confirmed in game 2026-10-16]: leaving the mission area
+  (Taxi cp_010, Omerta cp_020: "You abandoned the objective") makes the game load `freeroam_before_quest_activated`
+  (slot 2, storage `aslot`) at once, with no fail screen: the free roam state from before the quest, i.e. the
+  player's own story (`aslot\save1.sav`; here the user's Omerta). Two load requests 0.3 s apart. A normal story
+  load (CONTINUE) shows the fail screen instead (Load Last Checkpoint / Restart Chapter / Return to Main Menu) and
+  loads the story's checkpoint (`checkpoint_..., slot 1, aslot`).
+  - The load handler (0x2E81C80): `entry = storage->vf48(slot, id)`; `entry->vf58()` (0x21F1F80 for these entries:
+    `return [entry+0x18]`, the save data) non-null -> the request is done with that data, **no file read**; null ->
+    a buffer is allocated and the storage's file layer reads the file (`[storage]->vf58()->vf48(out, slot, id,
+    buffer)`). So the first such load in a process reads `aslot\save1.sav` with `CreateFileA` and later ones use the
+    entry's data (checked: a different file content was ignored on the second load).
+  - The story and Free Ride slot storages (vtables 0x4EB2F60 and 0x4EB3120) look entries up with 0x2E74C80
+    (`Info* (this, uint32 slot, C_String* id)`, walks `[this+0x20]..[this+0x28]`: `[entry+8]` slot, `[entry+0x10]` id;
+    pattern `SaveSys_SlotFind`); `debugloadchapter` (vtable 0x4EB2D78) uses 0x2E74A80 -> `Find` 0x2E6E320.
+  - MafiaCoop (save_guard, 0.9.1), only while the save slots are blocked (a lobby CHAPTER host, every guest): a
+    lookup of `freeroam_before_quest_activated` through 0x2E74C80 returns the `debugloadchapter` entry, whose data
+    loads the Free Ride start (the carrier file of our loads; checked: position -944 -233, no quest, the same as a
+    FREE RIDE start); the real entry is never used, so its data is never filled with ours either. As a second layer, a
+    read of a real save file within 20 s of that request is served from `coop-saves\<pid>\session-checkpoint.dat`
+    (the session's newest checkpoint; checked before the lookup hook existed: that load then brought up the Taxi
+    checkpoint with its quest running). The story sync then leaves that world for the main menu once it is up
+    (quitting while its loading screen waits for Enter hung the game on a black screen) and loads the checkpoint
+    (docs/protocol.md "Story"). Checked with the user's real save read into the entry first (a failed replay load
+    outside co-op): before the hook the co-op failure brought up his Omerta, after it the Free Ride start.
+  - The `debugloadchapter` storage: the menu's own FREE RIDE load asks for its save (`freeroam_test`) in slot 2, our
+    swapped loads in slot 1. After one of them the other found no entry and crashed at 0x2E81EF8 (a FREE RIDE start
+    after a co-op chapter in the same process); `FindDetour` now hands out the storage's one entry for any slot.
 - `game.savesystem:EnableSaveLogic(name)` takes a string (a named save logic), not a switch; `RequestCheckpointSave()`
   wrote nothing in a replay-style session.
 
@@ -704,6 +736,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | ChapterLoad_StreamSite (in the loader; the stream call at +0x24) | 0x3020478 | `48 8D 4C 24 68 E8 ?? ?? ?? ?? 48 8D 4C 24 68 48 8B D8 E8 ?? ?? ?? ?? 48 8B D0 48 8D 4D A0 45 33 C9 4C 8B C3 E8 ?? ?? ?? ?? 49 8B 8F C8 02 00 00` |
 | SaveSys_LoadRequest (section 7) | 0x2E78060 | `48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 48 83 EC 20 48 8B 01 48 8B FA 48 8B 6C 24 70 49 8B F1 48 8B D5 45 8B F8 4C 8B F1 FF 50 40 B9 48 00 00 00` |
 | SaveSys_Find (storage entry lookup, section 7) | 0x2E6E320 | `48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 49 8B 00 8B EA 48 8B F1 48 89 44 24 40 49 8B D0 48 8D 4C 24 40 49 8B F8 33 DB` |
+| SaveSys_SlotFind (story / Free Ride slot storage lookup, section 7) | 0x2E74C80 | `48 89 5C 24 18 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 20 33 ED 41 83 CF FF 89 6C 24 60 4D 8B E0 48 8B 59 20 4C 8B E9 48 3B 59 28` |
 | Lua_GetEntityByGUID (thunk; its calls at +0x39/+0x46/+0x61/+0x69/+0x89 give entity manager, lookup by id, the wrapper steps and the push; `mc_entity`) | 0x239E510 | `48 89 5C 24 08 48 89 74 24 20 57 48 83 EC 20 BA 01 00 00 00 48 8B F1 44 8B C2 E8 ?? ?? ?? ?? 33 FF 4C 8D 44 24 38 48 8B CE 89 7C 24 38 8D 57 02 E8 ?? ?? ?? ?? 8B 5C 24 38 E8` |
 | lua_pushlstring | 0xE4DA50 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 BF 1F 00 00` |
 | lua_setfield | 0xE4DCD0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 48` |

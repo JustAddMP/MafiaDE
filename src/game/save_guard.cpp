@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace mc::game::save_guard {
 namespace {
@@ -34,9 +35,16 @@ FindFn _origFind = nullptr;
 std::atomic<bool> _block{false};
 std::atomic<uint32_t> _redirected{0};
 std::atomic<uint32_t> _aborts{0};
+std::atomic<ULONGLONG> _abortAt{0};      // when the game last asked for the free roam state before the quest
+std::atomic<uint32_t> _substituted{0};   // reads of a real save served from the session save instead
 uintptr_t _exe = 0;
 std::mutex _mu;
 std::string _scratch;  // ...\MafiaCoop\coop-saves\<pid> (no trailing slash)
+
+std::string ToLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
 
 std::string Str(void* cstring) {  // a C_String passed by value: a pointer to the object, whose first field is char*
     if (!cstring) return "(null)";
@@ -74,7 +82,9 @@ void* LoadDetour(void* self, void* out, uint32_t slot, void* id, void* name) {
     MC_LOG_INFO("savesys: load of '%s' (slot %u, %s) from%s", saveId.c_str(), slot, storage.c_str(), Callers().c_str());
     if (saveId == "freeroam_before_quest_activated") {
         ++_aborts;
-        MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)");
+        _abortAt = GetTickCount64();
+        MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)%s",
+                    _block.load() ? ": it gets the session's checkpoint instead" : "");
     }
     if (storage == "debugloadchapter") {
         std::lock_guard lock(_dbgMu);
@@ -104,20 +114,59 @@ void* FindDetour(void* self, uint32_t slot, void* id) {
         }
         return r;
     }
-    if (loading && name == _dbgId && self == _dbgSelf && slot == _dbgSlot && _dbgEntry) {
-        MC_LOG_INFO("savesys: chapter load of '%s': the storage only knows its first save id, using its entry %p",
-                    name.c_str(), _dbgEntry);
+    // any slot: the menu's own FREE RIDE load asks for slot 2, our swapped (replay-style) loads for slot 1; after one
+    // of them the other found no entry and crashed the same way (0.9.1)
+    if (loading && name == _dbgId && self == _dbgSelf && _dbgEntry) {
+        MC_LOG_INFO("savesys: chapter load of '%s' (slot %u): the storage only knows its first save (slot %u), using its "
+                    "entry %p",
+                    name.c_str(), slot, _dbgSlot, _dbgEntry);
         return _dbgEntry;
     }
     MC_LOG_WARN("savesys: no save '%s' in slot %u (storage %p)", name.c_str(), slot, self);
     return r;
 }
 
+// A failed mission (or a death the game handles itself) in a chapter loaded through the chapter loader: the game asks
+// for "freeroam_before_quest_activated" in the story storage (aslot, slot 2), a save of the player's own story,
+// outside the co-op session (docs/re-notes.md 7). The load handler uses the entry the storage's lookup returns; when
+// that entry already holds data (exe+0x2E81EFB: entry->vf58() non-null) no file is read, and an entry keeps the data
+// of its first read in the process. So serving the file from the session's checkpoint (CreateFileADetour) is not
+// enough once the game has read that save before (a mission failed in single player before hosting). While the save
+// slots are blocked (a co-op chapter, a guest) the lookup of that id in a slot storage (aslot / bslot share this
+// lookup, exe+0x2E74C80) returns the chapter loader's entry instead: the save of this session we loaded last.
+constexpr const char* kAbortId = "freeroam_before_quest_activated";
+constexpr const char* kPatSlotFind =
+    "48 89 5C 24 18 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 20 33 ED 41 83 CF FF 89 6C 24 60 4D 8B E0 "
+    "48 8B 59 20 4C 8B E9 48 3B 59 28";
+FindFn _origSlotFind = nullptr;
+std::atomic<uint32_t> _abortSwaps{0};
+
+void* SlotFindDetour(void* self, uint32_t slot, void* id) {
+    const std::string name = Str(id);  // read before the call: the callee releases the string
+    void* r = _origSlotFind(self, slot, id);
+    if (!_block.load() || name != kAbortId) return r;
+    std::lock_guard lock(_dbgMu);
+    if (!_dbgEntry) {
+        MC_LOG_WARN("savesys: lookup of '%s' in a co-op session, but no chapter load seen: the game's own save is used",
+                    name.c_str());
+        return r;
+    }
+    const uint32_t n = ++_abortSwaps;
+    if (n <= 20 || n % 100 == 0)
+        MC_LOG_INFO("savesys: lookup #%u of '%s' (slot %u): the chapter loader's entry %p (this session's save) "
+                    "instead of %p",
+                    n, name.c_str(), slot, _dbgEntry, r);
+    return _dbgEntry;
+}
+
 // ---- the save files (Documents\My Games\Mafia Definitive Edition\Data\<id>\gamesaves\<profile>\<slot>\saveN.sav) ----
 // The game reads and writes them with CreateFileA from its file layer (paths with mixed / and \). While Block() is
 // on, every access below "gamesaves" goes to a scratch copy of the tree instead: writes always, reads when the scratch
 // file exists (so a Retry reads the checkpoint written in this session), deletes and copies likewise. The real files
-// are never opened for writing.
+// are never opened for writing. The same for the save slots' profiles (profiles\<profile>\aslot.pf, bslot.pf,
+// cslot.pf): they hold the slot's script data (its current chapter, the weapons it has), which a co-op chapter
+// rewrote with its own (0.9.1; seen: the story slot's mm_110_omerta became mm_20_taxi). gamesettings.pf and the other
+// profile files (settings) are left alone.
 std::string Redirect(const char* path, bool write) {
     if (!path || !_block.load()) return {};
     std::string p(path);
@@ -125,8 +174,14 @@ std::string Redirect(const char* path, bool write) {
         if (c == '/') c = '\\';
     std::string lower = p;
     for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    const size_t at = lower.find("\\gamesaves\\");
-    if (at == std::string::npos) return {};
+    size_t at = lower.find("\\gamesaves\\");
+    if (at == std::string::npos) {
+        const size_t profiles = lower.find("\\profiles\\");
+        const std::string file = lower.substr(lower.find_last_of('\\') + 1);
+        if (profiles == std::string::npos || !(file == "aslot.pf" || file == "bslot.pf" || file == "cslot.pf"))
+            return {};
+        at = profiles;  // ...\coop-saves\<pid>\profiles\...
+    }
     std::string scratch;
     {
         std::lock_guard lock(_mu);
@@ -144,6 +199,23 @@ std::string Redirect(const char* path, bool write) {
     return target;
 }
 
+// The session's checkpoint (SetSessionSave): <scratch>\session-checkpoint.dat (not *.sav: the host's checkpoint scan
+// reads the scratch tree). Served for a read of a real save file (gamesaves\...\aslot or bslot) in the 20 s after the
+// game asked for "freeroam_before_quest_activated" (docs/re-notes.md 7).
+std::string SessionSaveFor(const char* path) {
+    std::string lower(path);
+    for (char& c : lower) c = static_cast<char>(c == '/' ? '\\' : std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("\\gamesaves\\") == std::string::npos || lower.find(".sav") == std::string::npos) return {};
+    std::string scratch;
+    {
+        std::lock_guard lock(_mu);
+        scratch = _scratch;
+    }
+    if (scratch.empty() || lower.find(ToLower(scratch)) == 0) return {};  // our own scratch files stay as they are
+    const std::string sub = scratch + "\\session-checkpoint.dat";
+    return GetFileAttributesA(sub.c_str()) == INVALID_FILE_ATTRIBUTES ? std::string() : sub;
+}
+
 using CreateFileAFn = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using DeleteFileAFn = BOOL(WINAPI*)(LPCSTR);
 using CopyFileExAFn = BOOL(WINAPI*)(LPCSTR, LPCSTR, LPPROGRESS_ROUTINE, LPVOID, LPBOOL, DWORD);
@@ -155,12 +227,22 @@ HANDLE WINAPI CreateFileADetour(LPCSTR name, DWORD access, DWORD share, LPSECURI
                                 DWORD flags, HANDLE tmpl) {
     const bool write = (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE)) != 0 ||
                        disp == CREATE_ALWAYS || disp == CREATE_NEW || disp == TRUNCATE_EXISTING;
+    if (!write && name && _block.load() && GetTickCount64() - _abortAt.load() < 20000) {
+        const std::string sub = SessionSaveFor(name);
+        if (!sub.empty()) {
+            const uint32_t n = ++_substituted;
+            MC_LOG_INFO("savesys: read #%u of %s served from the session's checkpoint %s", n, name, sub.c_str());
+            return _origCreateFileA(sub.c_str(), access, share, sa, disp, flags, tmpl);
+        }
+    }
     const std::string to = Redirect(name, write);
     if (to.empty()) {
         // the profile and save files written for real (diagnostics: what the game writes outside our redirect)
         if (write && name && (std::strstr(name, "gamesaves") || std::strstr(name, "profiles")) &&
             std::strstr(name, "Mafia Definitive Edition"))
             MC_LOG_INFO("savesys: written: %s", std::strrchr(name, '/') ? std::strrchr(name, '/') + 1 : name);
+        if (!write && name && _block.load() && std::strstr(name, "gamesaves"))
+            MC_LOG_INFO("savesys: read of a real save in a co-op session: %s", name);
         return _origCreateFileA(name, access, share, sa, disp, flags, tmpl);
     }
     if (write) {
@@ -236,6 +318,10 @@ void Install() {
         MC_LOG_WARN("savesys: load request not found (save loads are not logged)");
     if (const uintptr_t a = core::mem::FindPattern(kPatFind))
         core::hook::Install("SaveSys_Find", reinterpret_cast<void*>(a), &FindDetour, &_origFind);
+    if (const uintptr_t a = core::mem::FindPattern(kPatSlotFind))
+        core::hook::Install("SaveSys_SlotFind", reinterpret_cast<void*>(a), &SlotFindDetour, &_origSlotFind);
+    else
+        MC_LOG_WARN("savesys: slot lookup not found: a failed mission in co-op may load a save outside the session");
     char tmp[MAX_PATH];
     const DWORD n = GetTempPathA(MAX_PATH, tmp);
     if (n && n < MAX_PATH) {
@@ -279,6 +365,27 @@ void Block(bool on) {
     MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (co-op session: the real save slots are not "
                                      "touched)").c_str()
                                   : "saves go to the real save slots again");
+}
+
+void SetSessionSave(const std::vector<uint8_t>& bytes, const std::string& id) {
+    std::string dir;
+    {
+        std::lock_guard lock(_mu);
+        dir = _scratch;
+    }
+    if (!_block.load() || dir.empty() || bytes.empty()) return;
+    CreateDirectoryA(dir.c_str(), nullptr);
+    const std::string path = dir + "\\session-checkpoint.dat";
+    HANDLE h = _origCreateFileA ? _origCreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr)
+                                : CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        MC_LOG_WARN("savesys: could not write the session checkpoint %s", path.c_str());
+        return;
+    }
+    DWORD done = 0;
+    WriteFile(h, bytes.data(), static_cast<DWORD>(bytes.size()), &done, nullptr);
+    CloseHandle(h);
+    MC_LOG_INFO("savesys: session checkpoint: %s (%zu bytes)", id.c_str(), bytes.size());
 }
 
 bool Blocking() { return _block.load(); }

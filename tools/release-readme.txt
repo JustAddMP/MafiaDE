@@ -101,6 +101,10 @@ KNOWN ISSUES
 - Ambient traffic, pedestrians and police are each player's own (not shared).
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit); other chapters and checkpoints may behave
   differently. A friend who falls behind the host's checkpoint is reloaded at the host's checkpoint.
+- A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the last co-op
+  checkpoint in two loads: first a short stop in a Free Ride world (press Enter on its loading screen as usual), then
+  the checkpoint. Your own story saves are never loaded or changed. Failing by leaving the mission area was tested;
+  running out of time and losing a mission car were not.
 - Name tags show through walls (no line-of-sight check).
 - If a player's game is killed (Task Manager, crash) instead of closed, the others wait for a 10 second timeout
   before he is shown as gone. Closing the game normally tells everyone at once. There is no automatic reconnect.

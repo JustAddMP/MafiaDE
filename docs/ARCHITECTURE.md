@@ -33,7 +33,7 @@ src/game/
                          rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel
   mission_sync.{h,cpp}   phase 4 story: the host's chapter/checkpoint/objective/cutscene and checkpoint save to the
   mission_sync.lua       guests, guests load and follow it (lobby STORY / CHAPTER); the chapter loader hooks;
-                         deaths / failed missions in chapter loads reload the checkpoint
+                         deaths / failed missions in chapter loads reload the checkpoint (never a save outside the session)
   npc_sync.{h,cpp,lua}   phase 4 NPCs: host-authoritative mission NPCs (states, deaths), guests pair them with
                          their own copies, guests' hits replayed on the host from their puppets
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a

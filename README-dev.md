@@ -398,14 +398,19 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
   while a cutscene plays.
 - A guest's game writes no saves into his own slots while he is in a co-op session: every save file goes to
   `%TEMP%\MafiaCoop\coop-saves\<pid>` (read back from there in the session, folders of ended games removed at the next
-  start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`. The host of a lobby
-  CHAPTER session is redirected the same way from START on (the game would otherwise save that chapter into his Free
+  start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`. The slots' profiles
+  (`profiles\...\aslot.pf`, `bslot.pf`, `cslot.pf`: the slot's script data) are redirected the same way (0.9.1).
+  The host of a lobby CHAPTER session is redirected the same way from START on (the game would otherwise save that chapter into his Free
   Ride slot); his checkpoint scan reads the scratch tree too, so his new checkpoints still reach the guests. The host
   of a STORY session continues his own story and keeps saving it (that is his campaign, as in single player); in Free
   Ride the host's game saves his Free Ride as usual.
-- Dying in a co-op chapter (or failing its mission) reloads the checkpoint: a guest the host's, the host his own (the
-  game itself would load the free roam state from before the quest in these loads). After a load or cutscene the
-  guest stands 1.5 m to the host's right.
+- Dying in a co-op chapter (or failing its mission) reloads the checkpoint: a guest the host's, the host his own. The
+  game itself answers a failed mission in these loads with a load of `freeroam_before_quest_activated`, a save of the
+  player's own story; save_guard keeps that load inside the session (the slot lookup gets the chapter loader's entry,
+  the save file read is served from `coop-saves\<pid>\session-checkpoint.dat`; docs/re-notes.md 7), and once that
+  world is up mission_sync leaves it for the main menu and loads the checkpoint (log: `our mission failed`). A STORY
+  host keeps the game's own fail screen (his campaign). After a load or cutscene the guest stands 1.5 m to the host's
+  right.
 - NPCs (docs/protocol.md "NPCs", docs/game-api.md 15): the host sends the NPCs near the players; each guest pairs them
   with the NPCs of his own mission run (same spots) and keeps them in line: dead when the host's die, health kept, put
   back when they wander off. A guest's hits on them go to the host (replayed as shots from his puppet), so the host's

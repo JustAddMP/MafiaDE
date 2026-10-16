@@ -234,7 +234,11 @@ scripts may change things in between; the next WorldEnv puts them back.
   answers a death or a failed mission with the free roam state from before the quest, another world). The host who
   dies there, or whose mission fails, goes back to the main menu and loads his own newest save of the point he was at
   (`mc_story_reload`, `save_guard::MissionAborts`); guests wait meanwhile. A host in a normal story load (lobby STORY,
-  CONTINUE) keeps the game's own YOU DIED / checkpoint flow.
+  CONTINUE) keeps the game's own YOU DIED / checkpoint flow and its "You abandoned the objective" screen.
+  Since 0.9.1 the free roam load the game starts on a failed mission never reaches the player's own saves: in a
+  co-op chapter (save slots blocked) it gets the chapter loader's entry (in practice the Free Ride start) and the
+  takeover leaves that world as soon as it is up (docs/re-notes.md 7). While the host is in it his MissionState
+  carries that save id (`freeroam_...`), so guests do not follow him there.
 - A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
   instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
 

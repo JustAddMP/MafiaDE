@@ -255,10 +255,10 @@ std::atomic<bool> _selfReload{false};   // host: reload our own newest checkpoin
 Point _selfPoint;                       // host: the point being reloaded
 std::vector<uint8_t> _selfBytes;        // host: its save
 double _selfMenuSince = -1;
-Point _lastHostPoint;                   // host: the story point we were last at (with a checkpoint save of it)
-std::vector<uint8_t> _lastHostBytes;
-uint32_t _abortsSeen = 0;               // save_guard::MissionAborts() handled
-bool _selfQuitWanted = false;           // host: leave the free roam world the game loaded after a failed mission
+uint32_t _abortsSeen = 0;               // save_guard::MissionAborts() handled (host and guest)
+bool _selfQuitWanted = false;           // host: leave the world the game loaded after a failed mission
+bool _abortReloadWanted = false;        // guest: the same, then load the host's point
+double _abortReloadAt = 0;
 double _selfQuitAt = 0;
 std::mutex _testMu;
 std::string _testStart;                 // tests (mc_start): "story", a quest id or "quest@cp", started like a lobby START
@@ -445,16 +445,39 @@ bool ReadReplaySave(const std::string& file, std::vector<uint8_t>& out) {
     return ReadFile(path, out);
 }
 
+// The checkpoint this co-op session is at: the save of the point we last loaded through the chapter loader or (host)
+// last reached. A failed mission is answered with it (HostSelfReload, save_guard::SetSessionSave).
+std::mutex _sessionMu;
+Point _sessionPoint;
+std::vector<uint8_t> _sessionBytes;
+
+void RememberSessionSave(const std::vector<uint8_t>& bytes) {
+    const std::string id = SaveIdIn(bytes);
+    const Point p = ParseSaveId(id);
+    if (p.quest.empty()) return;
+    {
+        std::lock_guard lock(_sessionMu);
+        if (_sessionPoint == p && _sessionBytes == bytes) return;
+        _sessionPoint = p;
+        _sessionBytes = bytes;
+    }
+    save_guard::SetSessionSave(bytes, id);
+}
+
 // Main menu: load `bytes` as a save (the FREE RIDE load with its file swapped).
 bool ArmAndLoad(std::vector<uint8_t> bytes) {
     if (!_origStreamInit || bytes.empty()) return false;
+    const std::vector<uint8_t> copy = bytes;
     {
         std::lock_guard lock(_swapMu);
         _swapBytes = std::move(bytes);
         _swapArmed = true;
         _swapArmedAt = GetTickCount64();
     }
-    if (menu::RequestLoad("free_ride")) return true;
+    if (menu::RequestLoad("free_ride")) {
+        RememberSessionSave(copy);
+        return true;
+    }
     std::lock_guard lock(_swapMu);
     _swapArmed = false;
     return false;
@@ -515,6 +538,23 @@ void GuestFollow() {
     }
     const bool inWorld = PlayerSync::InWorld();
     if (inWorld && _now - _loadingSince > 8) _loadingSince = -1;
+    // Our mission failed (or the game handled a death itself): it loads the free roam state from before the quest, a
+    // save of our own story; save_guard serves the session's checkpoint instead. Once that world is up we leave it and
+    // load the host's point, like after a death.
+    // (Not before: right after the request we are still in the old world, and leaving it during the load hung the
+    // game on a black screen.)
+    if (const uint32_t aborts = save_guard::MissionAborts(); aborts != _abortsSeen) {
+        _abortsSeen = aborts;
+        if (following && !_abortReloadWanted) {
+            MC_LOG_INFO("mission: our mission failed: back to the host's checkpoint once this world is up");
+            _abortReloadWanted = true;
+            _abortReloadAt = _now;
+        }
+    }
+    if (_abortReloadWanted && inWorld && PlayerSync::SaveId().rfind("freeroam", 0) == 0 && _now - _abortReloadAt > 3) {
+        _abortReloadWanted = false;
+        if (following) _forceReload = true;
+    }
     if (!following || !hostStory) return;
     const Point host = HostPoint();
     if (inWorld && _forceReload.exchange(false) && !host.quest.empty()) {
@@ -583,22 +623,31 @@ void HostSelfReload() {
             std::lock_guard lock(sh.mu);
             at = sh.local;
         }
-        if (inWorld && !at.quest.empty() && !_hostSave.empty() && ParseSaveId(_hostSaveId) == at &&
-            !(_lastHostPoint == at && _lastHostBytes == _hostSave)) {
-            _lastHostPoint = at;
-            _lastHostBytes = _hostSave;
-        }
+        if (inWorld && !at.quest.empty() && !_hostSave.empty() && ParseSaveId(_hostSaveId) == at)
+            RememberSessionSave(_hostSave);  // our newest checkpoint of the point we are at
     }
-    // A failed mission in a replay-style load: the game loads the free roam state from before the quest (another
-    // world). Back to our last checkpoint instead, once that world is up.
+    // A failed mission (or a death the game handles itself) in a replay-style load: the game loads the free roam state
+    // from before the quest, a save of the player's own story outside the session. save_guard serves the file it reads
+    // from the session's checkpoint instead, so that world is ours; once it is up we go back to the main menu and load
+    // that checkpoint through the chapter loader (its quest started there, the guests follow as after any load).
     const uint32_t aborts = save_guard::MissionAborts();
     if (aborts != _abortsSeen) {
         _abortsSeen = aborts;
-        if (!_lastHostPoint.quest.empty() && _selfPoint.quest.empty()) {
-            MC_LOG_INFO("mission: our mission failed at %s %s: reloading that checkpoint", _lastHostPoint.quest.c_str(),
-                        _lastHostPoint.cp.c_str());
-            _selfPoint = _lastHostPoint;
-            _selfBytes = _lastHostBytes;
+        Point p;
+        std::vector<uint8_t> bytes;
+        {
+            std::lock_guard lock(_sessionMu);
+            p = _sessionPoint;
+            bytes = _sessionBytes;
+        }
+        if (!save_guard::Blocking()) {
+            // a STORY host plays his own story: the game's own flow stays
+        } else if (p.quest.empty()) {
+            MC_LOG_WARN("mission: our mission failed but no checkpoint of this session is known");
+        } else if (_selfPoint.quest.empty()) {
+            MC_LOG_INFO("mission: our mission failed: reloading our checkpoint %s %s", p.quest.c_str(), p.cp.c_str());
+            _selfPoint = p;
+            _selfBytes = std::move(bytes);
             _selfMenuSince = -1;
             _selfQuitWanted = true;
             _selfQuitAt = _now;
@@ -860,6 +909,13 @@ void MissionSync::Attach(net::Session& session) {
     _hostSave.clear();
     _hostSaveId.clear();
     _scanAccum = kScanInterval;
+    _abortsSeen = save_guard::MissionAborts();  // missions failed before this session are not ours to answer
+    _abortReloadWanted = _selfQuitWanted = false;
+    {
+        std::lock_guard lock(_sessionMu);
+        _sessionPoint = {};
+        _sessionBytes.clear();
+    }
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.host = {};

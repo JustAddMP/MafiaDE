@@ -49,6 +49,9 @@ those two files); it only ever deletes its own files.
 - Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi);
   ambient traffic, pedestrians and police are each player's own.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only.
+- A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the checkpoint
+  in two loads: first a short stop in a Free Ride world (press Enter on its loading screen as usual), then the
+  checkpoint. Failing by leaving the area was tested; timers and destroyed mission cars were not.
 - Name tags show through walls. A killed game (not closed) makes the others wait for a 10 s timeout.
 - The co-op panels were tested with a virtual gamepad and mouse messages, not a physical gamepad; Steam invites
   between two PCs not fully tested.

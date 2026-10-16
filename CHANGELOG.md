@@ -3,6 +3,28 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.9.1 (2026-10-16), pre-release
+
+Fixes:
+- A failed mission in a co-op CHAPTER (leaving the mission area, abandoning the objective) no longer loads the
+  player's own story save. In these chapter loads the game answers a failed mission by loading "the free roam state
+  from before the quest", which is a save of the player's own campaign (the reported case: the host's real Omerta
+  story). The mod now keeps that load inside the session: the game gets a save of the co-op session instead (in
+  practice the Free Ride start, never a save of the player's), and as soon as that world is up the host goes back to
+  his last co-op checkpoint, a friend to the host's. Before, the host's takeover only started once the wrong world
+  was up, and in that world his game even sent the story save on to the friends. Checked: 8 failed missions of the
+  host (Taxi cp_010 five times, one of them with the story save already read earlier in that game and one with a
+  friend connected; Omerta cp_020 three times) and 4 of a friend (Taxi three times, Omerta in a STORY game once):
+  each time back at the checkpoint, no crash.
+- A co-op CHAPTER (and a friend's co-op game) no longer rewrites the save slots' profile files (`aslot.pf`, the
+  story slot's script data: its current chapter and weapons; seen: the story slot's Omerta became Taxi). They go to
+  the co-op scratch folder like the saves. Checked: a two-player CHAPTER game with a failed mission on each side,
+  every save and profile file byte-identical afterwards (only the window size file changed).
+- No crash when FREE RIDE is started from the main menu after a co-op chapter in the same game (the chapter
+  loader's save storage only knew the first slot it was used with).
+- The host of a STORY game keeps the game's own "You abandoned the objective" screen (Load Last Checkpoint): that is
+  his own campaign.
+
 ## 0.9.0 (2026-10-16), pre-release
 
 Players stay in sync:

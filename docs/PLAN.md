@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.9.0).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.9.1).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -151,7 +151,15 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    autosaves were redirected too (0 real writes). Deaths
    and failed missions in a chapter loaded through the chapter loader (the game would load the free roam state from
    before the quest) reload the checkpoint instead: guest death -> the host's checkpoint, host death -> his own
-   (checked in Taxi). The guest is placed beside the host (1.5 m to his right) after loads and cutscenes; when a car
+   (checked in Taxi). Fixed in 0.9.1 (re-notes 7): a failed mission loaded the player's own story save (the user's
+   Omerta) before the takeover, and the host's game then sent that story's checkpoint to the guests; now that load
+   gets a save of the session (the Free Ride start) and the takeover leaves it as soon as it is up. Checked: host
+   failures 5x Taxi cp_010 (one with the real save already cached in the game, one with a guest connected) and 3x
+   Omerta cp_020, guest failures 3x Taxi (CHAPTER) and 1x Omerta (STORY); a STORY host keeps the game's own fail
+   screen.
+   Not checked: failing by timer or a destroyed mission car. Also 0.9.1: the slots' profiles (`aslot.pf`, the story
+   slot's script data) were rewritten by co-op chapters (unnoticed before: the checked chapter was the user's own
+   Omerta); now redirected with the saves, all files byte-identical after a two-player Taxi game with failures. The guest is placed beside the host (1.5 m to his right) after loads and cutscenes; when a car
    stands on that spot he goes to the other side or behind the host (0.8.0; checked: a car spawned on the spot, the
    guest landed on the ground 3 m from it). The host of a lobby CHAPTER session is redirected too (0.8.0; before, the
    chapter overwrote his Free Ride slot): checked with CHAPTER 10: OMERTA through the intro to cp_020, the host's
@@ -289,6 +297,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    https://github.com/JustAddMP/MafiaDE/releases/tag/v0.8.0 (pre-release; release notes list features and known issues).
 - [x] GitHub pre-release v0.9.0 (player sync, enemies target guests, mission car driver, gamepad/mouse in the panels;
    core v0.7.0). Done 2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.9.0 (zip + symbols zip).
+- [x] GitHub pre-release v0.9.1 (a failed mission never loads a save outside the co-op session; FREE RIDE after a
+   chapter no longer crashes). Done 2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.9.1.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
