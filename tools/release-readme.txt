@@ -90,13 +90,13 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- Enemies and NPCs are partly shared. Mission characters are matched up between the games and their deaths and
-  your hits on them are shared; the host's enemies also aim at the other players (since 0.9.0), and on each
-  player's own game they fight him too. A chapter's own big shootout has not been played through in co-op yet.
-  Some passers-by take no damage on a friend's game. enemies_target_guests = 0 in MafiaCoop.ini turns the
-  enemies-aim-at-friends part off if it causes trouble. Since 0.10.0 a chapter's own shootout (Bon Appetit's
-  restaurant ambush) was played in co-op; a friend's kills there were not checked, and a friend alone in a fight
-  cannot win it (his copies of the enemies only die when the host's do).
+- Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
+  both ways (since 0.11.0 a friend's kill also kills the host's enemy, so a friend can clear a fight on his own),
+  health follows the host's game, and the host's enemies also aim at the other players. Each game spawns a fight's
+  later waves when its own player gets there, so stay together: an enemy that only the host's game spawned shoots
+  at a friend without being seen on his screen. Tested in one chapter's shootout (Bon Appetit's restaurant), not
+  played through to its end; other chapters' fights were not tried. enemies_target_guests = 0 in MafiaCoop.ini
+  turns the enemies-aim-at-friends part off if it causes trouble.
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
   screen (checked in Taxi and Bon Appetit). Where each player starts in his own mission car, the host's character
   waits hidden until the cars have parted. The car being handed back when the host gets out was not checked. Only a

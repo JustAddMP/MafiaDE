@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.10.0).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.11.0).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -216,6 +216,29 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    at 100), and after a guest reload in the moving fight his copies did not pair again. The guest's copies keep 5000
    health while the host's NPC lives, so a guest alone in a fight cannot win it. Not ticked. Civilian copies that take
    no damage: not investigated further.
+   0.11.0 (2026-10-16, game-api.md 15, protocol.md "NPCs"): **guest copies are killable, the host's NPC dies with
+   them**: no more 5000 health; a copy's health follows the host's NPC down (u16 in NpcStates), the guest's shots hurt
+   it on his game and still go to the host (replayed from his puppet), and when they kill it the guest sends a lethal
+   NpcHit: the host's NPC is killed 0.8 s later if the hit itself did not do it. **Re-pairing**: NPCs with a job that
+   found no partner at the same spot within 2 s are paired with the nearest free local NPC of the same battle
+   archetype (a tag in NpcStates) or AI type within 40 m (nearest first over all pairs), dead host NPCs too (their
+   copy dies); a pairing is released after 5 s without states. **A host reload is followed**: a guest at the host's
+   checkpoint loads it again when the host left his world (failed mission, death) and came back. **Passers-by that
+   took no damage** were deactivated humans (`IsActive()` false on both games: not simulated, no damage from bullets,
+   `DoDamage` or `health = 0`) that had been paired; they are skipped now. **Why the Bon Appetit enemies took no
+   damage**: the mission keeps the four attackers in front of Pepe's `invulnerability = true` through cp_040 and
+   cp_050 (on each game, for its own player; "Circle round and ambush attackers"); only the waves that come round the
+   back are vulnerable. A guest's kill of such an enemy (his game let him) makes the host's NPC vulnerable for it;
+   invulnerable allies and civilians are left alone. Checked in two runs of Bon Appetit (lobby CHAPTER, Salieri's car
+   to Pepe's, ambush cutscenes, cp_040 and cp_050): 10 guest kills counted on the host (`guest N killed his copy` ->
+   `host NPC died`, 5 by the replayed shots, 5 by the lethal hit), host kills repeated on the guest, a host
+   `DoDamage(30)` took the guest's copy 100 -> 64 too, the host's enemies shot the guest's puppet and the hits reached
+   him (downed, respawned), the guest alone cleared both cp_050 waves (4 + 4 enemies, the host did not shoot); the
+   host walked from cp_040 into cp_050 and the guest followed his checkpoint; after the guest's reload mid-fight 7 of 7
+   and 8 of 8 enemies paired again (`same kind, moved apart` at 5-8 m), after the host's death reload the guest
+   reloaded on his own and 6 of 6 paired; no crash in either run. **Not done**: the cp_050 ambush itself (the four
+   invulnerable attackers) was not completed: the tests teleport and cannot walk the route the mission waits for, so
+   the chapter did not reach cp_060; no second chapter's fight. Not ticked.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
    Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose

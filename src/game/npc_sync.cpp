@@ -62,7 +62,8 @@ bool SafeWeapon(const std::string& s) {
 }
 
 // ---- messages ----------------------------------------------------------------------------------------------------------
-// NpcStates: u8 count, then per NPC: u32 key, f32 x y z, i8 hx hy (x127), u8 health, u8 flags, u8 ai, str weapon
+// NpcStates: u8 count, then per NPC: u32 key, f32 x y z, i8 hx hy (x127), u16 health, u8 flags, u8 ai, u32 tag,
+// str weapon (tag: the NPC's battle archetype hash, the same on every game for the same mission NPC; 0 = none)
 void OnStates(net::PlayerId from, net::ByteReader& r) {
     if (from != 0 || (_session && _session->IsHost())) return;
     const uint8_t n = r.U8();
@@ -71,12 +72,14 @@ void OnStates(net::PlayerId from, net::ByteReader& r) {
         const uint32_t key = r.U32();
         const float x = r.F32(), y = r.F32(), z = r.F32();
         const float hx = r.I8() / 127.0f, hy = r.I8() / 127.0f;
-        const uint8_t hp = r.U8(), flags = r.U8(), ai = r.U8();
+        const uint16_t hp = r.U16();
+        const uint8_t flags = r.U8(), ai = r.U8();
+        const uint32_t tag = r.U32();
         const std::string w = r.Str(48);
         if (r.Failed() || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return;
-        char buf[160];
-        std::snprintf(buf, sizeof buf, "N %u %.2f %.2f %.2f %.3f %.3f %u %u %u %s\n", key, x, y, z, hx, hy, hp, flags,
-                      ai, SafeWeapon(w) ? w.c_str() : "-");
+        char buf[176];
+        std::snprintf(buf, sizeof buf, "N %u %.2f %.2f %.2f %.3f %.3f %u %u %u %u %s\n", key, x, y, z, hx, hy,
+                      static_cast<unsigned>(hp), flags, ai, tag, SafeWeapon(w) ? w.c_str() : "-");
         lines += buf;
     }
     ++_statesRecv;
@@ -90,17 +93,18 @@ void OnDeath(net::PlayerId from, net::ByteReader& r) {
     Append("D " + std::to_string(key) + "\n");
 }
 
-// NpcHit: u32 key, f32 amount, u8 dtype, u8 zone, u32 weapon
+// NpcHit: u32 key, f32 amount, u8 dtype, u8 zone, u32 weapon, u8 flags (1 = lethal: the guest's copy died of it)
 void OnHit(net::PlayerId from, net::ByteReader& r) {
     if (!_session || !_session->IsHost() || from == 0) return;
     const uint32_t key = r.U32();
     const float amount = r.F32();
     const uint8_t dtype = r.U8(), zone = r.U8();
     const uint32_t weapon = r.U32();
+    const uint8_t hitFlags = r.U8();
     if (r.Failed() || !std::isfinite(amount) || amount < 0 || amount > 10000) return;
     char buf[128];
-    std::snprintf(buf, sizeof buf, "H %u %u %.2f %u %u %u\n", static_cast<unsigned>(from), key, amount, dtype, zone,
-                  weapon);
+    std::snprintf(buf, sizeof buf, "H %u %u %.2f %u %u %u %u\n", static_cast<unsigned>(from), key, amount, dtype, zone,
+                  weapon, hitFlags & 1u);
     ++_hitsRecv;
     Append(buf);
 }
@@ -108,7 +112,7 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
 // One NpcStates message per kPerPacket NPCs; fewer when long weapon names would push it past the unreliable limit
 // (core kMaxUnreliableMessage, a larger message is refused by the transport and was lost before 0.9.0).
 constexpr size_t kMaxStatesBytes = 1000;  // payload; the session header adds a few bytes
-constexpr size_t kMaxNpcBytes = 4 + 12 + 2 + 3 + 1 + 48;  // one NPC with the longest weapon name
+constexpr size_t kMaxNpcBytes = 4 + 12 + 2 + 2 + 2 + 4 + 1 + 48;  // one NPC with the longest weapon name
 
 void SendStates(const std::vector<std::string>& lines) {
     for (size_t at = 0; at < lines.size();) {
@@ -121,17 +125,19 @@ void SendStates(const std::vector<std::string>& lines) {
             uint32_t key = 0;
             float x = 0, y = 0, z = 0, hx = 0, hy = 0;
             unsigned hp = 0, flags = 0, ai = 0;
+            double tag = 0;  // u32 (Lua writes it as an integer)
             std::string weapon;
-            in >> key >> x >> y >> z >> hx >> hy >> hp >> flags >> ai >> weapon;
+            in >> key >> x >> y >> z >> hx >> hy >> hp >> flags >> ai >> tag >> weapon;
             w.U32(key);
             w.F32(x);
             w.F32(y);
             w.F32(z);
             w.I8(static_cast<int8_t>(std::lround(std::clamp(hx, -1.0f, 1.0f) * 127)));
             w.I8(static_cast<int8_t>(std::lround(std::clamp(hy, -1.0f, 1.0f) * 127)));
-            w.U8(static_cast<uint8_t>(std::min(hp, 255u)));
+            w.U16(static_cast<uint16_t>(std::min(hp, 65535u)));
             w.U8(static_cast<uint8_t>(flags));
             w.U8(static_cast<uint8_t>(ai));
+            w.U32(tag >= 0 && tag <= 4294967295.0 ? static_cast<uint32_t>(tag) : 0u);
             w.Str(SafeWeapon(weapon) ? weapon : "-");
         }
         std::vector<uint8_t> buf = w.Take();
@@ -284,19 +290,20 @@ void NpcSync::Tick(float) {
         }
         return;
     }
-    for (const auto& h : hits) {  // "NH key amount dtype zone weapon"
+    for (const auto& h : hits) {  // "NH key amount dtype zone weapon flags"
         std::istringstream in(h.substr(3));
         uint32_t key = 0;
         float amount = 0;
-        unsigned dtype = 0, zone = 0;
+        unsigned dtype = 0, zone = 0, hitFlags = 0;
         double weapon = 0;
-        in >> key >> amount >> dtype >> zone >> weapon;
+        in >> key >> amount >> dtype >> zone >> weapon >> hitFlags;
         net::ByteWriter w;
         w.U32(key);
         w.F32(amount);
         w.U8(static_cast<uint8_t>(dtype));
         w.U8(static_cast<uint8_t>(zone));
         w.U32(static_cast<uint32_t>(weapon));
+        w.U8(static_cast<uint8_t>(hitFlags & 1u));
         _session->SendToHost(kMsgNpcHit, w.Span(), net::Reliability::Reliable);
         ++_hitsSent;
     }

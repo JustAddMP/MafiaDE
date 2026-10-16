@@ -297,6 +297,7 @@ double _now = 0;
 std::atomic<bool> _forceReload{false};  // guest: quit and load the host's point although we are there (mc_follow_force,
                                         // mc_story_reload after a death)
 bool _forceLeaving = false;             // a forced reload is leaving the world: our (stale) point must not count as reached
+bool _hostLeftWorld = false;            // guest in the world: the host left his world (a failed mission, a death reload)
 std::atomic<bool> _selfReload{false};   // host: reload our own newest checkpoint (we died in a replay-style load)
 Point _selfPoint;                       // host: the point being reloaded
 std::vector<uint8_t> _selfBytes;        // host: its save
@@ -699,6 +700,30 @@ void GuestFollow() {
     if (_abortReloadWanted && inWorld && PlayerSync::SaveId().rfind("freeroam", 0) == 0 && _now - _abortReloadAt > 3) {
         _abortReloadWanted = false;
         if (following) _forceReload = true;
+    }
+    // The host left his world and came back (he failed the mission or died and reloaded his checkpoint): his world
+    // starts that checkpoint afresh (its NPCs alive again), so we load it too when we are at the same point; at
+    // another point the mismatch below loads it anyway. (Seen in Bon Appetit cp_050: the host's reload brought the
+    // wave back that the guest had already cleared on his game, and its enemies shot at him unseen.)
+    {
+        bool hostOut, hostAtPoint;
+        {
+            std::lock_guard lock(sh.mu);
+            hostOut = sh.host.known && (!sh.host.inWorld || sh.host.quest.empty());
+            hostAtPoint = hostStory;
+        }
+        if (!following || !inWorld) {
+            _hostLeftWorld = false;
+        } else if (hostOut) {
+            if (!_hostLeftWorld) MC_LOG_INFO("mission: the host left his world: we reload his point when he is back");
+            _hostLeftWorld = true;
+        } else if (_hostLeftWorld && hostAtPoint) {
+            _hostLeftWorld = false;
+            if (local == HostPoint()) {
+                MC_LOG_INFO("mission: the host is back at his checkpoint after a reload: we load it again too");
+                _forceReload = true;
+            }
+        }
     }
     if (!following || !hostStory) return;
     const Point host = HostPoint();

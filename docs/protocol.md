@@ -228,7 +228,9 @@ scripts may change things in between; the next WorldEnv puts them back.
   in the world, mirror his objective ids and play/stop his cutscenes. A guest is "at" a point when his own
   `GetActiveQuest()` / checkpoint equal it; when the host's point differs for `follow_grace` seconds (default 8) and
   no cutscene plays, the guest quits to the main menu and loads the host's save of that point (one attempt per host
-  point; without a save of it he waits for the next HostSave).
+  point; without a save of it he waits for the next HostSave). 0.11.0: when the host leaves his world (inWorld 0 or
+  no quest: a failed mission, a death reload) while the guest is in his, and comes back at the point the guest is at,
+  the guest loads that point again too (the host's world restarted the checkpoint; its NPCs live again).
 - Deaths and failed missions in a chapter loaded through the chapter loader (replay flags: lobby CHAPTER, every guest
   load): a following guest who dies reloads the host's point the same way (no Retry: in a replay-style load the game
   answers a death or a failed mission with the free roam state from before the quest, another world). The host who
@@ -242,24 +244,32 @@ scripts may change things in between; the next WorldEnv puts them back.
 - A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
   instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
 
-### NPCs (0.7.0)
+### NPCs (0.7.0; 0.11.0 changed NpcStates and NpcHit)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u8 health, u8 flags (1 dead, 2 in a car), u8 aiType, str weapon ("-" = none) |
+| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u16 health (0.11.0; was u8), u8 flags (1 dead, 2 in a car), u8 aiType, u32 tag (0.11.0: the battle archetype, hashed; 0 = none), str weapon ("-" = none) |
 | 0x0211 | NpcDeath | host -> guests (`Broadcast`) | R | u32 key |
-| 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId |
+| 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (0.11.0: 1 = lethal, the guest's copy died of his hits) |
 
 - key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`). The host sends the 48 nearest NPCs
   within 120 m of himself or any guest's puppet, 5 times a second (several messages when more than 16); a death also
   goes out reliably at once.
 - A guest pairs each host NPC with the nearest human of his own world within 1.5 m of it (the same mission scripts
-  spawn the same NPCs at the same spots on every game, docs/game-api.md 15) and keeps the pairing. A paired copy:
-  dies when the host's dies (killed; a civilian that takes no damage is hidden), keeps 5000 health while the host's
-  lives (the guest's own shots never kill it there), is put back to the host's position when it is more than 6 m off
-  for 1.5 s (NPCs with a job only: AI type not 0, not in a car). A hit by the guest on a copy goes to the host as
-  NpcHit; the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit
-  reaction and damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`.
+  spawn the same NPCs at the same spots on every game, docs/game-api.md 15) and keeps the pairing. 0.11.0: a host NPC
+  with a job (AI type not 0) that found none there within 2 s is paired with the nearest free local human of the same
+  tag (or, when one side has no tag, the same AI type) within 40 m: after a guest's reload, a late join or NPCs that
+  streamed in late the fight has moved on. All candidate pairs are taken nearest first (same spot before moved apart,
+  the same tag counts at half its distance); dead host NPCs are paired too (their copy is killed). Deactivated humans
+  (`IsActive()` false) are neither sent nor paired. A pairing is released after 5 s without a state. A paired copy:
+  dies when the host's dies (killed; one that still does not die after 3 tries is hidden); its health follows the host's
+  NPC down (never up); is put back to the host's position when it is more than 6 m off for 1.5 s (NPCs with a job
+  only: AI type not 0, not in a car). A hit by the guest on a copy hurts it on his game and goes to the host as NpcHit;
+  the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit reaction and
+  damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`. When the guest's
+  copy dies within 1.5 s of his hit, he sends a lethal NpcHit (no damage of its own): 0.8 s later the host kills his
+  NPC if it still lives (an enemy that his mission keeps invulnerable is made vulnerable for it; an invulnerable
+  ally or civilian is left alone).
 - Enemies and guests (0.9.0): on the host each guest's puppet gets the FRIEND brain 2 s after it spawned
   (`SwitchBrain(1)`, docs/game-api.md 15; ini `enemies_target_guests = 0` turns it off), so the host's enemies shoot at
   it. Their hits on a puppet go to that guest as a Hit with source 1 and the NPC's key; the guest takes it (an NPC

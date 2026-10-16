@@ -44,9 +44,9 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- Enemies: the host's enemies aim at the other players too; a chapter's own shootout (Bon Appetit) was played in
-  co-op, but a friend's kills there were not checked, and a friend alone in a fight cannot win it (his copies of the
-  enemies only die when the host's do); some passers-by take no damage on a friend's game.
+- Enemies: shared in fights (deaths both ways, health, the host's enemies aim at friends too) but tested in one
+  chapter's shootout only (Bon Appetit's restaurant, not played to its end). Each game spawns a fight's later waves
+  when its own player gets there: stay together, or an enemy only the host's game spawned shoots at a friend unseen.
 - Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi
   and Bon Appetit; handing the car back when he gets out is not checked); ambient traffic, pedestrians and police are
   each player's own.

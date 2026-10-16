@@ -3,6 +3,35 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.11.0 (2026-10-16), pre-release
+
+Fights:
+- A friend can win a fight. His game's enemies were kept at 5000 health while the host's lived, so only the host
+  could really kill them. Now their health follows the host's game, the friend's own bullets hurt and kill them on
+  his game, and the host's enemy dies with them (his bullet is replayed on the host's game from the friend's
+  character; when that misses, the kill is passed on anyway). Checked in Bon Appetit's restaurant fight with two
+  games on one PC: 10 kills by the friend counted on the host, and with the host not shooting the friend cleared two
+  attack waves on his own. The host's kills and the damage he deals show on the friend's game as before.
+- Enemies match up again after a reload. After a friend reloaded a checkpoint mid-fight, his enemies were not
+  matched with the host's any more (the fight had moved on, and only characters at the same spot were matched). Now
+  an enemy that has moved is matched with the nearest one of the same kind within 40 m; enemies the host already
+  killed die on the friend's game too. Checked: after a friend's reload in the fight every enemy (7 of 7, 8 of 8)
+  matched again.
+- When the host's mission fails or he dies and his checkpoint reloads, a friend at that checkpoint now reloads it
+  too. Before, his game kept its own fight while the host's started over, and the host's enemies that came back shot
+  at him unseen. Checked: the host died in the fight, the friend reloaded on his own and all 6 enemies matched.
+- Passers-by that took no damage on a friend's game were characters the game keeps switched off; they are no longer
+  matched with the host's.
+- Why the restaurant enemies took no damage in the 0.10.0 test: the mission keeps the four attackers in front of the
+  restaurant unhurtable until the player has circled round to them; the attack waves that come round the back can
+  be killed. A friend whose game lets him kill one of those four also kills the host's.
+
+Not finished: Bon Appetit's restaurant fight was not played to its end (the last part waits for a route the tests
+cannot walk), and other chapters' fights were not tried. Each game spawns a fight's later waves when its own player
+gets there, so stay together.
+
+Everyone needs 0.11.0 (0.10.x cannot join it: the NPC messages changed).
+
 ## 0.10.0 (2026-10-16), pre-release
 
 Story:

@@ -5,38 +5,45 @@
 -- Every game runs the chapter's own mission scripts at the host's checkpoint, so the mission NPCs exist on every
 -- game, spawned by the same scripts at the same places. The host is authoritative for them: it sends the state of the
 -- NPCs near any player (position, heading, health, dead, AI type, weapon); each guest pairs every host NPC with its
--- own copy (same spot when first seen, docs/game-api.md 15) and keeps that copy in line: dead when the host's is dead,
--- hostile when the host's is, pulled back when it wanders off, never killed by the guest's own shots (those are
--- sent to the host, whose NPC takes them; its death comes back). The host's NPCs react to a guest's shots because the
--- host replays them as real shots from the guest's puppet.
+-- own copy (same spot when first seen, docs/game-api.md 15; after a reload or for NPCs that moved, the nearest free
+-- one of the same kind within LOOSE_DIST) and keeps that copy in line: its health follows the host's NPC, it dies
+-- when the host's dies, it is pulled back when it wanders off. The guest's own shots hurt his copy on his game and
+-- are also sent to the host, whose NPC takes them (replayed as real shots from the guest's puppet, so it turns on
+-- the puppet); when the guest's shot kills his copy, the host's NPC is killed too (a lethal hit).
 --
 -- Input (cmds, one line per command):
 --   S active host localId                        session running, we host, our player id
---   N key x y z hx hy health flags ai weapon     guest: a host NPC (flags: 1 dead, 2 in a car)
+--   N key x y z hx hy health flags ai tag weapon  guest: a host NPC (flags: 1 dead, 2 in a car; tag: archetype)
 --   D key                                        guest: that host NPC died
---   H from key amount dtype zone weapon          host: guest `from` hit host NPC `key` on his screen
+--   H from key amount dtype zone weapon lethal   host: guest `from` hit host NPC `key` on his screen (lethal 1: his
+--                                                copy died of it)
 -- Output (events, one per line):
---   NS key x y z hx hy health flags ai weapon    host: NPC state (10 Hz, nearest first, at most MAX_SEND)
+--   NS key x y z hx hy health flags ai tag weapon  host: NPC state (10 Hz, nearest first, at most MAX_SEND)
 --   ND key                                       host: NPC died
---   NH key amount dtype zone weapon              guest: we hit (our copy of) host NPC key
+--   NH key amount dtype zone weapon lethal       guest: we hit (our copy of) host NPC key
 --   ST text                                      status for the overlay (once a second)
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
 M.Npc = M.Npc or {}
 local N = M.Npc
-N.version = 1
+N.version = 2
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
 local SEND_INTERVAL = 0.1   -- s between host state rounds (10 Hz; ~10 KB/s for 48 NPCs)
 local RANGE = 120           -- m from the host or a puppet: NPCs sent
 local MAX_SEND = 48         -- NPCs per round
 local MATCH_DIST = 1.5      -- m: a guest NPC this close to a host NPC (when first paired) is its copy
+local LOOSE_DIST = 40       -- m: NPCs with a job (enemies, allies, police) that moved apart (a fight after a reload, a
+                            -- late join, NPCs streamed in late): the nearest free one of the same kind this close
+local LOOSE_WAIT = 2        -- s a host NPC stays unpaired before the loose match is tried
+local RELEASE = 5           -- s without a state: a pairing is given up (the local NPC is free to pair again)
+local LETHAL_WAIT = 0.8     -- s after a guest's lethal hit: the host's NPC still alive is killed
+local OUR_HIT_TIME = 1.5    -- s: our copy that dies this soon after our hit died of our hit
 local PULL_DIST = 6         -- m: a copy farther than this from the host's NPC for PULL_TIME is put back
 local PULL_TIME = 1.5
 local PULL_DIST_FIGHT = 12  -- m: the same for hostile NPCs (they run and take cover on their own in a fight)
 local STALE = 3             -- s without a state: the host NPC is out of range (pairing kept, nothing enforced)
 local REPLAY_WAIT = 0.35    -- s a replayed guest bullet has to land on the host's NPC before DoDamage is used
-local COPY_HEALTH = 5000    -- a guest copy's health while the host's NPC lives (our shots never kill it here)
 
 local function log(s) if mc_log then mc_log("npc: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -63,6 +70,7 @@ N.byLocal = N.byLocal or {}  -- guest: local id -> host key
 N.sent = N.sent or {}      -- host: key -> last dead flag sent
 N.replays = N.replays or {}
 N.hitq = N.hitq or {}      -- guest: hits from the DAMAGE callbacks, sent with the next update
+N.lethal = N.lethal or {}  -- host: guests' lethal hits waiting for the NPC to die
 
 -- Humans that are ours, not mission NPCs: the puppets and the puppet factory's driver.
 local function ours(id)
@@ -111,6 +119,38 @@ local function aiOf(h)
   return good and tonumber(a) or 0
 end
 
+-- The NPC's battle archetype as a u32 (0 = none): the same mission NPC has the same one on every game, so it tells
+-- apart NPCs of different kinds when pairing them by position is not enough.
+local function tagOf(h)
+  local good, a = pcall(h.GetBattleArchetype, h)
+  if not good or a == nil then return 0 end
+  local n = tonumber(a)
+  if not n then
+    n = 5381
+    for i = 1, #tostring(a) do n = (n * 33 + string.byte(tostring(a), i)) % 4294967296 end
+  end
+  return math.floor(n) % 4294967296
+end
+
+local function healthOf(h)
+  local hp = tonumber(h.health) or 0
+  if hp <= 0 then return 0 end
+  return math.max(1, math.min(65535, math.ceil(hp)))
+end
+
+-- Deactivated humans (the game keeps some in the world switched off: not simulated, they take no damage from anyone,
+-- bullets, DoDamage or `health = 0`, and do not move) are no mission NPCs to share: such a "copy" was what looked
+-- like a passer-by that takes no damage on the guest's game.
+local function active(h)
+  local good, a = pcall(h.IsActive, h)
+  return not good or a ~= false
+end
+
+local function invulnerable(h)
+  local good, v = pcall(function() return h.invulnerability end)
+  return good and v == true
+end
+
 -- ---- host -------------------------------------------------------------------------------------------------------------
 -- Viewpoints: the host and every puppet (the guests).
 local function viewpoints(p)
@@ -128,7 +168,7 @@ function N.HostSend(p, ev)
   local list = {}
   for id, e in pairs(N.ents) do
     local h = e.h
-    if valid(h) then
+    if valid(h) and active(h) then
       local q = h:GetPos()
       local best
       for _, v in ipairs(vps) do
@@ -144,9 +184,9 @@ function N.HostSend(p, ev)
     local d = h:GetDir()
     local dead = h:IsDeath()
     local flags = (dead and 1 or 0) + (h:GetOwner() and 2 or 0)
-    local hp = math.max(0, math.min(255, math.floor((tonumber(h.health) or 0) + 0.5)))
-    ev[#ev + 1] = string.format("NS %d %.2f %.2f %.2f %.3f %.3f %d %d %d %s", e.id, q.x, q.y, q.z, d.x, d.y, hp, flags,
-      aiOf(h), weaponOf(h))
+    if not e.tagT or M.now - e.tagT > 2 then e.tag, e.tagT = tagOf(h), M.now end
+    ev[#ev + 1] = string.format("NS %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s", e.id, q.x, q.y, q.z, d.x, d.y,
+      dead and 0 or healthOf(h), flags, aiOf(h), e.tag or 0, weaponOf(h))
     if dead and not N.sent[e.id] then
       N.sent[e.id] = true
       ev[#ev + 1] = "ND " .. e.id
@@ -160,12 +200,19 @@ end
 
 -- A guest's hit on our NPC: a bullet is replayed as a real shot from his puppet (the NPC's own hit reaction, damage
 -- and AI response: it turns on the puppet); anything else, or a replay that did not land, is DoDamage.
-function N.HostHit(from, key, amount, dtype, zone, weapon)
+function N.HostHit(from, key, amount, dtype, zone, weapon, lethal)
   local e = N.ents[key]
   if not e or not valid(e.h) or e.h:IsDeath() then return end
   local h = e.h
   local pp = M.pup and M.pup[from]
   N.hitsIn = (N.hitsIn or 0) + 1
+  if lethal then
+    -- the guest's copy died of this hit: the host's NPC dies too (below, if the hit itself does not kill it)
+    N.lethal[#N.lethal + 1] = { t = M.now, key = key, from = from }
+    log(string.format("guest %s killed his copy of NPC %d (health here %.0f)", from, key, tonumber(h.health) or -1))
+    if pp then N.Engage(h, pp) end
+    return
+  end
   if dtype == 0 and pp and pp.so and valid(pp.so) and pp.st == "alive" and not pp.veh then
     local a = pp.so:GetBonePos("Head")
     local b = h:GetPos()
@@ -239,7 +286,9 @@ function N.OnDamage(m, receiverId)
   local dtype, zone = tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0
   local weapon = tonumber(m:GetWeaponID()) or 0
   if amount > 0 then
-    N.hitq[#N.hitq + 1] = string.format("NH %d %.2f %d %d %.0f", key, amount, dtype, zone, weapon)
+    local s = N.host[key]
+    if s then s.ourHitT, s.ourHit, s.ourType, s.ourZone, s.ourWeapon = M.now, amount, dtype, zone, weapon end
+    N.hitq[#N.hitq + 1] = string.format("NH %d %.2f %d %d %.0f 0", key, amount, dtype, zone, weapon)
     N.hitsOut = (N.hitsOut or 0) + 1
     if N.hitsOut <= 30 or N.hitsOut % 50 == 0 then
       log(string.format("we hit host NPC %d (our %d): %.1f type %d zone %d (hit #%d)", key, receiverId, amount, dtype,
@@ -259,6 +308,34 @@ function N.FightsUs(key)
 end
 
 function N.ReplayTick()
+  local waiting = {}
+  for _, l in ipairs(N.lethal) do
+    local e = N.ents[l.key]
+    if not (e and valid(e.h)) or e.h:IsDeath() then
+      if e and valid(e.h) then
+        N.guestKills = (N.guestKills or 0) + 1
+        log(string.format("host NPC %d is dead: guest %s's kill (#%d)", l.key, l.from, N.guestKills))
+      end
+    elseif M.now - l.t >= LETHAL_WAIT then
+      -- an enemy the mission keeps invulnerable here dies too: the guest's game let him kill it (its scripts made it
+      -- vulnerable where the guest's player is); allies and civilians it protects are left alone
+      if invulnerable(e.h) and aiOf(e.h) ~= 2 then
+        log("host NPC " .. l.key .. " is invulnerable here (the mission): the guest's kill is not repeated")
+      else
+        if invulnerable(e.h) then
+          pcall(function() e.h.invulnerability = false end)
+          log("host NPC " .. l.key .. " is invulnerable here (the mission): made vulnerable for the guest's kill")
+        end
+        pcall(e.h.DoDamage, e.h, 100000)
+        N.guestKills = (N.guestKills or 0) + 1
+        log(string.format("host NPC %d killed: guest %s's kill (#%d, health then %.0f)", l.key, l.from, N.guestKills,
+          tonumber(e.h.health) or -1))
+      end
+    else
+      waiting[#waiting + 1] = l
+    end
+  end
+  N.lethal = waiting
   local keep = {}
   for _, r in ipairs(N.replays) do
     if not r.landed and M.now - r.t > REPLAY_WAIT then
@@ -274,23 +351,64 @@ function N.ReplayTick()
 end
 
 -- ---- guest ------------------------------------------------------------------------------------------------------------
--- Pair host NPC `k` with the nearest free local human within MATCH_DIST.
-local function pair(key, s)
-  local best, bestD
+-- Pairing: every host NPC with a state gets one local human. First the strict match (the same spot: the same mission
+-- script spawned both, MATCH_DIST); a host NPC with a job (AI type not 0) that found none within LOOSE_WAIT s gets the
+-- nearest free local human of the same kind (the same archetype tag, or the same AI type) within LOOSE_DIST: after a
+-- reload of the guest, a late join or NPCs that streamed in late the fight has moved on, and the two games' NPCs are
+-- no longer at the same spots. Dead host NPCs are paired too, so the guest's copy dies (enemies the host already
+-- killed die on a guest who reloaded). Pairs are taken nearest first over all candidates.
+local function link(key, s, id, d, how)
+  s.loc, s.ourHitT, s.deadHere, s.killT, s.kills, s.hidden, s.notedHostile = id, nil, nil, nil, 0, nil, nil
+  N.byLocal[id] = key
+  N.paired = (N.paired or 0) + 1
+  local loose = how ~= "same spot"
+  if loose then N.pairedLoose = (N.pairedLoose or 0) + 1 end
+  if N.paired <= 80 or (loose and N.pairedLoose <= 80) then
+    log(string.format("host NPC %d is our %d (%.2f m apart, %s%s)", key, id, d, how,
+      s.dead and ", dead on the host" or ""))
+  end
+end
+
+function N.PairAll()
+  local free = {}
   for id, e in pairs(N.ents) do
-    if not N.byLocal[id] and valid(e.h) then
+    if not N.byLocal[id] and valid(e.h) and not e.h:IsDeath() and active(e.h) then
       local q = e.h:GetPos()
-      local d = (q.x - s.x) ^ 2 + (q.y - s.y) ^ 2 + (q.z - s.z) ^ 2
-      if d <= MATCH_DIST * MATCH_DIST and (not bestD or d < bestD) then best, bestD = id, d end
+      free[#free + 1] = { id = id, x = q.x, y = q.y, z = q.z, ai = aiOf(e.h), tag = tagOf(e.h) }
     end
   end
-  if best then
-    s.loc = best
-    N.byLocal[best] = key
-    local h = N.ents[best].h
-    pcall(function() h.health = COPY_HEALTH end)
-    N.paired = (N.paired or 0) + 1
-    if N.paired <= 60 then log(string.format("host NPC %d is our %d (%.2f m apart)", key, best, math.sqrt(bestD))) end
+  if #free == 0 then return end
+  local cands = {}
+  for key, s in pairs(N.host) do
+    if not s.loc and M.now - s.t <= STALE then
+      s.unpairedSince = s.unpairedSince or M.now
+      local loose = s.ai ~= 0 and M.now - s.unpairedSince >= LOOSE_WAIT
+      for i, f in ipairs(free) do
+        local d = math.sqrt((f.x - s.x) ^ 2 + (f.y - s.y) ^ 2 + (f.z - s.z) ^ 2)
+        if d <= MATCH_DIST and not s.dead then
+          cands[#cands + 1] = { d = d, dist = d, s = s, i = i, how = "same spot" }
+        elseif loose and d <= LOOSE_DIST and f.ai ~= 0 and math.abs(f.z - s.z) < 8 then
+          local sameTag = (s.tag or 0) ~= 0 and f.tag == s.tag
+          local sameAi = f.ai == s.ai
+          if sameTag or (sameAi and ((s.tag or 0) == 0 or f.tag == 0)) then
+            -- the same archetype counts double: a near NPC of another kind loses to a farther one of this kind
+            cands[#cands + 1] = { d = sameTag and d * 0.5 or d, dist = d, s = s, i = i,
+              how = sameTag and "same kind, moved apart" or "same AI type, moved apart" }
+          end
+        end
+      end
+    end
+  end
+  table.sort(cands, function(a, b)
+    if (a.how == "same spot") ~= (b.how == "same spot") then return a.how == "same spot" end
+    return a.d < b.d
+  end)
+  local used = {}
+  for _, c in ipairs(cands) do
+    if not used[c.i] and not c.s.loc then
+      used[c.i] = true
+      link(c.s.key, c.s, free[c.i].id, c.dist, c.how)
+    end
   end
 end
 
@@ -310,11 +428,12 @@ function N.Enforce(s, e, p)
         N.Kill(h)
         if s.kills == 1 then log("host NPC " .. s.key .. " is dead: our " .. e.id .. " dies") end
       else
-        -- some civilians take no damage from scripts (or anyone's bullets) on this game: out of sight instead
+        -- some humans take no damage from scripts (or anyone's bullets) on this game: out of sight instead
         s.hidden = true
         pcall(h.ShowModel, h, false)
         pcall(h.SetPhysState, h, 2)
-        log("our " .. e.id .. " does not die: hidden like the host's dead NPC " .. s.key)
+        log(string.format("our %d does not die (health %.0f, invulnerable %s): hidden like the host's dead NPC %d",
+          e.id, tonumber(h.health) or -1, tostring(invulnerable(h)), s.key))
       end
     end
     return
@@ -322,12 +441,24 @@ function N.Enforce(s, e, p)
   if h:IsDeath() then
     if not s.deadHere then
       s.deadHere = true
-      log("our copy " .. e.id .. " of host NPC " .. s.key .. " died here while the host's lives")
+      if M.now - (s.ourHitT or -10) <= OUR_HIT_TIME then
+        -- we killed it: the host's NPC dies too (a lethal hit, N.HostHit)
+        N.hitq[#N.hitq + 1] = string.format("NH %d %.2f %d %d %.0f 1", s.key, s.ourHit or 0, s.ourType or 0,
+          s.ourZone or 0, s.ourWeapon or 0)
+        N.kills = (N.kills or 0) + 1
+        log(string.format("we killed our %d: host NPC %d dies too (our kill #%d)", e.id, s.key, N.kills))
+      else
+        log("our copy " .. e.id .. " of host NPC " .. s.key .. " died here while the host's lives")
+      end
     end
     return
   end
-  -- never killed by our own shots: the host decides (its death comes back)
-  if (tonumber(h.health) or COPY_HEALTH) < COPY_HEALTH * 0.5 then pcall(function() h.health = COPY_HEALTH end) end
+  -- health follows the host's NPC down (his shots and everyone else's there), never up: our own hits hurt our copy
+  -- here at once, and the host's NPC may not take them (the mission keeps it invulnerable on his game until his
+  -- player gets somewhere, Bon Appetit cp_040; or the replayed shot missed): when our hits kill our copy, the host's
+  -- NPC is killed too (the lethal hit above)
+  local hp, here = tonumber(s.hp) or 0, tonumber(h.health) or 0
+  if hp > 0 and here > hp + 0.5 then pcall(function() h.health = hp end) end
   -- hostile on the host but not here: only noted (our own mission flow makes its enemies hostile itself; switching
   -- a civilian's brain from a script crashed the game in tests)
   if s.ai == 2 and aiOf(h) ~= 2 and not s.notedHostile then
@@ -358,21 +489,33 @@ end
 function N.GuestTick(p)
   local matched, live = 0, 0
   for key, s in pairs(N.host) do
+    if s.loc and M.now - s.t > RELEASE then  -- out of the host's range (or gone): the local NPC is free again
+      N.byLocal[s.loc] = nil
+      s.loc = nil
+    end
     if M.now - s.t > 30 then
-      if s.loc then N.byLocal[s.loc] = nil end
       N.host[key] = nil
     elseif M.now - s.t <= STALE then
       live = live + 1
-      if not s.loc and not s.dead then pair(key, s) end
       local e = s.loc and N.ents[s.loc]
-      if e and valid(e.h) then
+      if s.loc and not (e and valid(e.h) and active(e.h)) then
+        N.byLocal[s.loc] = nil
+        s.loc, e = nil, nil
+      end
+      if e then
+        s.unpairedSince = nil
         matched = matched + 1
         local good, err = pcall(N.Enforce, s, e, p)
         if not good then log("enforce error: " .. tostring(err)) end
       end
     end
   end
-  N.status = string.format("NPCs: %d of the host's %d paired", matched, live)
+  if M.now - (N.pairT or -10) >= 0.5 then
+    N.pairT = M.now
+    local good, err = pcall(N.PairAll)
+    if not good then log("pairing error: " .. tostring(err)) end
+  end
+  N.status = string.format("NPCs: %d of the host's %d paired, our kills %d", matched, live, N.kills or 0)
 end
 
 -- ---- update -----------------------------------------------------------------------------------------------------------
@@ -390,7 +533,7 @@ function N.Update(dt, cmds)
       local s = N.host[key] or { key = key }
       N.host[key] = s
       s.x, s.y, s.z, s.hx, s.hy = tonumber(f[3]), tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7])
-      s.hp, s.ai, s.weapon = tonumber(f[8]), tonumber(f[10]), f[11] or "-"
+      s.hp, s.ai, s.tag, s.weapon = tonumber(f[8]), tonumber(f[10]), tonumber(f[11]) or 0, f[12] or "-"
       local flags = tonumber(f[9]) or 0
       s.dead = s.dead or (flags % 2) == 1
       s.car = math.floor(flags / 2) % 2 == 1
@@ -400,7 +543,7 @@ function N.Update(dt, cmds)
       if s then s.dead = true end
     elseif f[1] == "H" then
       local good, err = pcall(N.HostHit, f[2], tonumber(f[3]), tonumber(f[4]) or 0, tonumber(f[5]) or 0,
-        tonumber(f[6]) or 0, tonumber(f[7]) or 0)
+        tonumber(f[6]) or 0, tonumber(f[7]) or 0, f[8] == "1")
       if not good then log("hit error: " .. tostring(err)) end
     end
   end
@@ -408,7 +551,7 @@ function N.Update(dt, cmds)
   local key = p and (tostring(game.game:GetLoadedSaveId()) .. "|" .. tostring(M.inWorldAt)) or nil
   if key ~= N.worldKey then  -- another world: nothing carries over
     N.worldKey = key
-    N.ents, N.host, N.byLocal, N.sent, N.replays = {}, {}, {}, {}, {}
+    N.ents, N.host, N.byLocal, N.sent, N.replays, N.lethal = {}, {}, {}, {}, {}, {}
     N.scanT = -10
   end
   if not (active and p) then return table.concat(ev, "\n") end
@@ -424,7 +567,8 @@ function N.Update(dt, cmds)
       if not good then log("send error: " .. tostring(err)) end
     end
     pcall(N.ReplayTick)
-    N.status = string.format("NPCs: sending %d, guest hits %d", N.hostCount or 0, N.hitsIn or 0)
+    N.status = string.format("NPCs: sending %d, guest hits %d, guest kills %d", N.hostCount or 0, N.hitsIn or 0,
+      N.guestKills or 0)
   else
     local good, err = pcall(N.GuestTick, p)
     if not good then log("guest error: " .. tostring(err)) end
