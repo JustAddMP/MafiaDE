@@ -423,7 +423,7 @@ src/game/npc_sync.* (messages in docs/protocol.md "NPCs") and the shared cars in
 | blanket `ON_ACTIVATE` | never fired for humans (only `ON_DEACTIVATE` of passing pedestrians): no spawn feed |
 | `h:GetName()` | `behavior_object_prime-NN-` for spawned humans: generated, **different on each game**; a car's name is its model name. Entity ids differ between the games too |
 | positions | the same mission scripts at the same checkpoint put mission NPCs and parked mission cars at **the same spots on both games** (the Taxi depot's civilians matched to 0.0-0.3 m, the mission taxi to 0.5-1.1 m): the key for pairing (npc_sync: nearest within 1.5 m, then kept). Ambient pedestrians and traffic differ per game (31 of the host's 66 humans paired at the depot, 26 of 37 at Salieri's) |
-| `h:SwitchBrain(t)` | changed a civilian to `AI_TYPE` 2 (enemy, it then shot at the player) or a puppet to 1 (friend: the host's enemies then shot the puppet), **but the game crashed seconds later** in a once-a-second update over a list of humans (exe+0x243A915, a stale entry), every time in Bon Appetit and in two of five Taxi tests. Not used by MafiaCoop; some civilians refuse it (type stays 0) |
+| `h:SwitchBrain(t)` | changed a civilian to `AI_TYPE` 2 (enemy, it then shot at the player) or a puppet to 1 (friend: the host's enemies then shot the puppet), **but the game crashed seconds later** in a once-a-second update over a list of humans (exe+0x243A915, a stale entry; since 0.9.0 guarded, re-notes 8, and used for puppets), every time in Bon Appetit and in two of five Taxi tests. Not used by MafiaCoop; some civilians refuse it (type stays 0) |
 | civilians and damage | some paired civilian copies on the guest took no damage at all (`DoDamage`, `health = 0`, bullets from the player, from a puppet or from themselves); their host counterparts died from the host's bullet. npc_sync hides such a copy when the host's dies |
 | `CreateShots(puppet, ...)` at an NPC | a guest's bullet replayed on the host from his puppet: the NPC took it (its health and death on the host), its DAMAGE event names the puppet |
 | `game.traffic:FindNearestSpawnedVehicle(slot, pos, radius)` -> sync object, then `GetNearestFoundSpawnedEntity(slot)` | the nearest *traffic* car only (a culver 40 m away, not the mission taxi next to the player) |
@@ -431,20 +431,40 @@ src/game/npc_sync.* (messages in docs/protocol.md "NPCs") and the shared cars in
 | `FIRE` damage (type 8) | an enemy with the triggerman archetype threw fire; burning humans then took 0.1 damage per frame. A burning puppet is not released by MafiaCoop until 8 s after the fire (the fire update keeps a list of burning humans) |
 | map markers | `RegisterHumanEntityDirect` markers must be unregistered **before** the human is released (MafiaCoop did it a tick later) |
 
+**Enemies and guests (0.9.0).** What decides whether an enemy shoots at a human is its brain, not the AI type its
+spawn profile reports: a puppet spawned from an `ai_ally_` profile reads `GetAIType()` 1 but enemies ignored it,
+even with `enemy:Attack(puppet)`; a car crew spawned with an enemy profile (`ObtainCarWithCrew(model,
+{"characters/ai/morello/ai_enemy_morello_enforcer", ...})`) is AI type 2 and hostile from the start, and a crew with
+an `ai_ally_` profile is not spawned at all (empty seats). After `SwitchBrain(1)` the host's enemies shot the guest's
+puppet (four and three NPC bullets of 10 in two runs, Brothel cp_015 in Salieri's yard, the host out of sight inside
+the bar). The switch itself is safe; freeing a living friend-brain human crashed the game (re-notes 8), which the
+dll's guard now prevents. Fights in these tests were set up with such enemy crews spawned on both games at the same
+spot (they paired like mission NPCs); the chapters' own shootouts were not reached by the automated tests (they all
+begin with a drive or a walk the tests cannot follow).
+
 **How it plays** (verified unless noted):
 - Pairing: on a guest the host's NPCs near either player are paired with his own (logs "host NPC k is our l (0.01 m
   apart)"); host NPCs that died on the host died on the guest at once (Taxi: a civilian shot by a hostile NPC on the
   host, a hostile NPC); one civilian copy took no damage and stayed alive (since then it is hidden after 3 tries, not
   checked in game); a guest's shots on his copy of a hostile NPC went to the host,
   were replayed from his puppet there, the host's NPC died and the guest's copy with it (Taxi, twice).
-- Enemies and guests: on each game the enemies fight that game's own player (each game runs the mission's AI); the
-  host's enemies do **not** target the guests' puppets (a puppet is a civilian to them, and the brain switch that
-  would change it crashes the game). Not checked in a real mission shootout: no chapter's combat could be reached by
-  the automated tests (they cannot drive), the NPCs were made hostile with `SwitchBrain` for the tests.
+- Enemies and guests: on each game the enemies fight that game's own player (each game runs the mission's AI); since
+  0.9.0 the host's enemies also target the guests' puppets (friend brain, above) and their hits reach the guest: in
+  the first run he went 100 -> 74 -> 39 -> 13 health from three relayed bullets, was downed and respawned next to the
+  host; with his own hostile copies alive the relayed hits are skipped ("our copy fights us here"). Pairing in that
+  fight: 29-35 of the host's 48-53 NPCs; both host NPC deaths repeated on the guest at once. A guest's kill of his copy
+  was not re-checked here (the guest's own spawned copies were despawned by his game); it was checked in Taxi before.
+  Not checked in a chapter's own scripted shootout.
 - Mission cars: the host got into the Taxi chapter's taxi; the guest's game took its own taxi standing there as the
   host's car ("our own shubert_six_taxi stands there (0.5 m): it is this car here") instead of spawning a copy on top
   of it. Before, the copy shoved the guest's taxi, his mission failed and the game loaded the free roam state from
   before the quest. When both stood in their own taxis (the guest after loading the host's cp_020 save), the host's game
   spawned no copy into its own taxi ("another car stands where it is") until the guest's car had moved off. The NPC
   driver puppet is thrown out of a mission taxi repeatedly (the car does not keep an NPC at its wheel), so the host
-  is seen next to his car, not in it, on the guest's game.
+  was seen next to his car, not in it, on the guest's game. Since 0.9.0 the guest's mission taxi is swapped for a copy
+  after the second throw-out and the puppet drives that (Taxi cp_010: thrown out once, swapped, seated, stayed at the
+  wheel while the host drove, `B4-taxi-swap-guest.png`; after the guest followed to cp_020 the host's taxi is a copy
+  and the puppet stayed seated there too). The mission car coming back when the host parks was not checked (the
+  Taxi mission does not let the player out). In chapters that start with each player in his own mission car (Lost
+  Heaven chase, Taxi cp_020) the guest sits in his own car where the host's would be: the host's puppet waits hidden
+  until the cars have parted, as before.

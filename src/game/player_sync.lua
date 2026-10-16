@@ -262,6 +262,7 @@ function M.SpawnTick()
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
     pp.seatTries, pp.exitSo = 0, nil
     pp.cb = nil
+    pp.ally, pp.spawnT = nil, M.now
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
       pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
     return
@@ -302,14 +303,34 @@ end
 -- A car the local player has driven does not keep an NPC in its driver seat (the puppet is thrown out a few
 -- frames after GetOnVehicle). When another player takes the wheel of such a car, this game swaps it for a fresh
 -- copy at the same place: our own copy is despawned, a real car (not spawned by us) is deactivated (hidden).
-function M.Swap(c)
+-- keepOrig: an adopted mission car (M.FindLocalCar) is kept, hidden, and comes back where the copy is parked
+-- (M.Restore), so this game's own mission still has its car afterwards.
+function M.Swap(c, keepOrig)
   if c.qid then
     pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
   elseif valid(c.ent) then
     try("Deactivate", c.ent.Deactivate, c.ent)
+    if keepOrig then c.orig = c.ent end
   end
-  c.ent, c.qid, c.st, c.closed, c.localDriven = nil, nil, "new", nil, nil
-  log("car " .. c.key .. ": replaced by a fresh copy for the new driver")
+  c.ent, c.qid, c.st, c.closed, c.localDriven, c.noAdopt = nil, nil, "new", nil, nil, keepOrig
+  log("car " .. c.key .. ": replaced by a fresh copy for the new driver" .. (keepOrig and " (ours hidden meanwhile)" or ""))
+end
+
+-- The remote driver parked a copy that stands in for our hidden mission car: the mission car comes back at the
+-- copy's place and the copy goes.
+function M.Restore(c)
+  local orig = c.orig
+  c.orig = nil
+  if not valid(orig) then return end
+  if valid(c.ent) then
+    local p, q = c.ent:GetPos(), c.ent:GetRot()
+    if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
+    pcall(orig.SetPos, orig, p)
+    pcall(orig.SetRot, orig, q)
+  end
+  try("Activate", orig.Activate, orig)
+  c.ent, c.qid, c.adopted, c.noAdopt = orig, nil, true, nil
+  log("car " .. c.key .. ": our mission car is back where the copy was parked")
 end
 
 function M.DropCar(c)
@@ -397,8 +418,14 @@ end
 function M.CarTick(c)
   if c.st == "new" then
     if M.now - (c.lookT or -10) < 0.5 then return end
+    -- right after a load the mission has not placed its cars yet: a copy spawned then landed on this game's own
+    -- mission car a moment later (Taxi cp_020: the guest's taxi was thrown on its side)
+    local good, loading = pcall(game.hud.IsLoadingScreenUp, game.hud)
+    if good and loading then M.loadingT = M.now end
+    if M.now - (M.inWorldAt or M.now) < 5 or M.now - (M.loadingT or -10) < 4 then return end
     c.lookT = M.now
-    local own, dist, block = M.FindLocalCar(c)
+    local own, dist, block
+    if not c.noAdopt then own, dist, block = M.FindLocalCar(c) end
     if own then
       c.ent, c.st, c.adopted = own, "ready", true
       try("SetDespawnImmunity", own.SetDespawnImmunity, own, true)
@@ -443,6 +470,7 @@ function M.CarTick(c)
       if c.parkApply then  -- final resting transform from the last driver
         c.parkApply = nil
         setTransform(c)
+        if c.orig then M.Restore(c) end
       end
     end
   end
@@ -615,6 +643,14 @@ function M.Seat(pp, c)
   end
   if pp.seated then  -- was seated, now is not: thrown out (happens while a fresh copy settles, see also M.Swap)
     pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
+    -- A mission car of this game (adopted, M.FindLocalCar) does not keep an NPC at its wheel either: it is swapped
+    -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice.
+    if pp.ejects == 2 and pp.seat == 0 and c.adopted and not c.localIn and c.st == "ready" then
+      log("puppet " .. pp.id .. " is thrown out of our mission car " .. c.key .. ": a copy takes its place")
+      M.Swap(c, true)
+      pp.ejects, pp.seatTries = 0, 0
+      return false
+    end
     if pp.ejects == 3 then log("puppet " .. pp.id .. " keeps getting thrown out of car " .. pp.vkey .. ", retrying slower") end
   end
   -- Retry once a second; after repeated failures every 4 s with the puppet hidden in between.
@@ -727,6 +763,7 @@ function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
+  if M.isHost and M.allyOn and not pp.ally then M.Ally(pp, so) end
   if pp.veh then
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
@@ -836,6 +873,23 @@ function M.TraceTick(player)
       mc_log(line)
     end
   end
+end
+
+-- Enemies react to guests (host only; ini enemies_target_guests = 0 turns it off). The
+-- game's enemies only target the player's side: a puppet is a civilian to them, and its spawn profile does not change
+-- that (an ai_ally_ profile reads AI type 1 but enemies still ignored it, even when told to Attack it). Its brain is
+-- switched to FRIEND (SwitchBrain(1)) 2 s after it spawned, on foot; from then on the host's enemies shoot at it, and
+-- their hits go to the guest as Hits from an NPC (npc_sync.lua N.OnDamage, M.HurtByNpc on his game). Brain switches
+-- crashed the game before: a friend-brain human sits in the game-sectors module's list of humans and was freed without
+-- leaving it (a puppet released alive, the factory despawned), and the module's once-a-second walk read it
+-- (exe+0x243A915). The dll's guard (src/game/sectors_guard.cpp) drops such stale entries before each walk; without
+-- the guard (another game build) the C++ side turns this off. Civilian NPCs are never switched (npc_sync.lua).
+function M.Ally(pp, so)
+  if pp.veh or pp.hidden or M.now - (pp.spawnT or M.now) < 2 or so:IsDeath() then return end
+  pp.ally = true
+  local good = pcall(so.SwitchBrain, so, 1)
+  log(string.format("puppet %s: friend brain %s (AI type %s): the host's enemies target it", pp.id,
+    good and "set" or "FAILED", tostring(so:GetAIType())))
 end
 
 -- The puppet's AI walk (MoveVec) starts late, is slower than a running player and sometimes does not move at all, so
@@ -981,6 +1035,16 @@ function M.OnPuppetDamage(pp, m)
     return
   end
   M.SendHit(pp, amount, dtype, zone, weapon)
+end
+
+-- Host: one of our NPCs hit guest pp's puppet: the guest takes it (M.HurtByNpc on his game).
+function M.SendNpcHit(pp, amount, dtype, zone, weapon, npc)
+  if amount <= 0 then return end
+  M.hitq[#M.hitq + 1] = string.format("HT %s %.2f %d %d %.0f 0 0 0 1 %d", pp.id, amount, dtype, zone, weapon, npc or 0)
+  M.npcHitsSent = (M.npcHitsSent or 0) + 1
+  if M.npcHitsSent <= 30 or M.npcHitsSent % 50 == 0 then
+    log(string.format("an NPC hit puppet %s: %.1f type %d: sent to him (#%d)", pp.id, amount, dtype, M.npcHitsSent))
+  end
 end
 
 function M.SendHit(pp, amount, dtype, zone, weapon)
@@ -1182,6 +1246,15 @@ end
 
 -- The game's own damage call: SCRIPT damage with a flinch. A guest is never killed by it (he is downed instead,
 -- M.DownTick); the host dies like in single player (YOU DIED, load the last checkpoint).
+-- One of the host's NPCs hit our puppet on the host's game (an enemy shooting at us there, docs/game-api.md 15): the
+-- same damage as if it had hit us here. An NPC bullet takes ~2.6x its DAMAGE amount off a player (SHOT_SCALE, learned
+-- in M.Replay); other types count as they are. Not subject to friendly fire.
+function M.HurtByNpc(p, from, amount, dtype, zone)
+  local want = dtype == 0 and amount * (M.shotScale or SHOT_SCALE) or amount
+  M.npcHits = (M.npcHits or 0) + 1
+  M.HurtScript(p, from, want / (M.dmgScale or 0.65), dtype, zone, "host NPC #" .. M.npcHits)
+end
+
 function M.HurtScript(p, from, amount, dtype, zone, how)
   local h0 = tonumber(p.health) or 0
   local raw = amount
@@ -1237,8 +1310,18 @@ function M.ReplayTick(p)
 end
 
 -- A Hit from another player (H line).
-function M.ApplyHit(p, from, amount, dtype, zone)
-  if M.down or p:IsDeath() or not M.friendlyFire then return end
+function M.ApplyHit(p, from, amount, dtype, zone, byNpc, npc)
+  if M.down or p:IsDeath() then return end
+  if byNpc then
+    -- our own copy of that NPC is hostile and fights us here (its hits are already ours): not twice
+    if M.Npc and M.Npc.FightsUs and M.Npc.FightsUs(npc) then
+      M.npcHitsCovered = (M.npcHitsCovered or 0) + 1
+      if M.npcHitsCovered <= 10 then log("host NPC " .. tostring(npc) .. " hit our puppet there: our copy fights us here, not applied") end
+      return
+    end
+    return M.HurtByNpc(p, from, amount, dtype, zone)
+  end
+  if not M.friendlyFire then return end
   local pp = M.pup[from]
   if dtype == 0 and pp and pp.st == "alive" and valid(pp.so) and pp.guid and not pp.veh and not pp.hidden then
     -- a guest must not die from it: if the bullet could take him below the "downed" line, DoDamage (capped) instead
@@ -1659,7 +1742,7 @@ function M.Update(dt, cmds)
     elseif op == "Z" then
       M.trace = true
     elseif op == "G" then
-      M.tags, M.markers = f[2] == "1", f[3] == "1"
+      M.tags, M.markers, M.allyOn = f[2] == "1", f[3] == "1", f[4] ~= "0"
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
@@ -1687,7 +1770,8 @@ function M.Update(dt, cmds)
       if not good then logErr("watch damage", err) end
     end
     for _, h in ipairs(hits) do
-      local good, err = pcall(M.ApplyHit, player, h[2], tonumber(h[3]) or 0, tonumber(h[4]) or 0, tonumber(h[5]) or 0)
+      local good, err = pcall(M.ApplyHit, player, h[2], tonumber(h[3]) or 0, tonumber(h[4]) or 0, tonumber(h[5]) or 0,
+        h[10] == "1", tonumber(h[11]))
       if not good then logErr("hit", err) end
     end
     local good, err = pcall(M.ReplayTick, player)

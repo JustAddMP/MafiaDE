@@ -76,5 +76,10 @@ bool PCall(lua_State* L, int nargs, int nresults, std::string* err);
 using CFunction = int (*)(lua_State*);
 void RegisterGlobal(lua_State* L, const char* name, CFunction fn);
 
+// The game's entity table (the lookup behind mc_entity): true when `entity` is a live entity, i.e. its id still
+// resolves to it. Never touches freed memory unguarded. GameMainThread.
+bool EntityLookupAvailable();
+bool EntityIsLive(const void* entity);
+
 }  // namespace lua
 }  // namespace mc::game

@@ -33,6 +33,7 @@ local MAX_SEND = 48         -- NPCs per round
 local MATCH_DIST = 1.5      -- m: a guest NPC this close to a host NPC (when first paired) is its copy
 local PULL_DIST = 6         -- m: a copy farther than this from the host's NPC for PULL_TIME is put back
 local PULL_TIME = 1.5
+local PULL_DIST_FIGHT = 12  -- m: the same for hostile NPCs (they run and take cover on their own in a fight)
 local STALE = 3             -- s without a state: the host NPC is out of range (pairing kept, nothing enforced)
 local REPLAY_WAIT = 0.35    -- s a replayed guest bullet has to land on the host's NPC before DoDamage is used
 local COPY_HEALTH = 5000    -- a guest copy's health while the host's NPC lives (our shots never kill it here)
@@ -191,11 +192,10 @@ function N.HostHit(from, key, amount, dtype, zone, weapon)
   N.Engage(h, pp)
 end
 
--- Enemies only shoot at the player's side; a puppet is a civilian to them (AI type 0), so the host's enemy AI does not
--- target the guests' puppets. Giving a puppet the FRIEND brain (SwitchBrain(1)) made enemies shoot it, but switching
--- a human's brain from a script crashed the game seconds later (exe+0x243a915, docs/game-api.md 15), so it is not
--- done. Each guest's own copies of the enemies fight him on his game.
--- An NPC that a guest attacked fights back at the guest's puppet (hostile NPCs only; civilians flee on their own).
+-- Enemies only shoot at the player's side. On the host each guest's puppet gets the FRIEND brain (player_sync.lua
+-- M.Ally), so the host's enemies target it and their hits reach the guest (N.OnDamage); each guest's own copies of
+-- the enemies fight him on his game as well. An NPC that a guest attacked fights back at the guest's puppet (hostile
+-- NPCs only; civilians flee on their own).
 function N.Engage(h, pp)
   if not (pp and pp.so and valid(pp.so)) or h:IsDeath() then return end
   local ai = aiOf(h)
@@ -209,15 +209,20 @@ end
 function N.OnDamage(m, receiverId)
   if M.isHost then
     local enemy = tonumber(tostring(m:GetEnemyGUID()):match("(%d+)%s*$"))
-    if enemy and N.ents[enemy] then  -- one of our NPCs hit a guest's puppet: it fights the guest (counted, logged)
+    if enemy and N.ents[enemy] then  -- one of our NPCs hit a guest's puppet: the guest takes the hit on his game
       for id, pp in pairs(M.pup or {}) do
         if pp.so and valid(pp.so) and idOf(pp.so) == receiverId then
           N.puppetHits = (N.puppetHits or 0) + 1
+          local amount = tonumber(m:GetDamageAmount()) or 0
           if N.puppetHits <= 20 or N.puppetHits % 50 == 0 then
-            log(string.format("NPC %d hit guest %s's puppet (%.1f, type %s; #%d)", enemy, id,
-              tonumber(m:GetDamageAmount()) or 0, tostring(m:GetDamageType()), N.puppetHits))
+            log(string.format("NPC %d hit guest %s's puppet (%.1f, type %s; #%d)", enemy, id, amount,
+              tostring(m:GetDamageType()), N.puppetHits))
           end
-          return false
+          if pp.st == "alive" and M.SendNpcHit then
+            M.SendNpcHit(pp, amount, tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0,
+              tonumber(m:GetWeaponID()) or 0, enemy)
+          end
+          return true
         end
       end
     end
@@ -242,6 +247,15 @@ function N.OnDamage(m, receiverId)
     end
   end
   return true
+end
+
+-- Guest: host NPC `key` hit our puppet on the host's game. True when our copy of it is alive and hostile here: then it
+-- fights us on our own game and its hits land here already (player_sync.lua M.ApplyHit skips the relayed one).
+function N.FightsUs(key)
+  local s = key and N.host[key]
+  local e = s and s.loc and N.ents[s.loc]
+  if not (e and valid(e.h)) or e.h:IsDeath() then return false end
+  return aiOf(e.h) == 2
 end
 
 function N.ReplayTick()
@@ -325,7 +339,8 @@ function N.Enforce(s, e, p)
   if s.ai ~= 0 and not s.car and not h:GetOwner() and M.inWorldAt and M.now - M.inWorldAt > 3 then
     local q = h:GetPos()
     local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2)
-    if d > PULL_DIST then
+    -- enemies in a fight run and take cover differently on each game: only one far off (12 m) is put back
+    if d > (s.ai == 2 and PULL_DIST_FIGHT or PULL_DIST) then
       s.offSince = s.offSince or M.now
       if M.now - s.offSince > PULL_TIME then
         s.offSince = nil

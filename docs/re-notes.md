@@ -654,6 +654,33 @@ Used by src/game/save_guard.cpp.
 
 ---------------------------------------------------------------------------------------------------------------
 
+## 8. The game-sectors list of humans: the exe+0x243A915 crash [confirmed in game 2026-10-16]
+
+The crash that brain switches (`SwitchBrain`), released burning humans and humans released with a map marker all
+ended in (docs/game-api.md 15) is one list:
+
+- `C_GameSectorsModule::TickInGame` (exe+0x243A7B0, registered by its init exe+0x243A3B0 next to the string
+  `[TM]C_GameSectorsModule::TickInGame`) calls exe+0x243A870 every frame: `this+0x70 += elapsedMs`; once the sum
+  passes 1000 it walks a vector of entity pointers (`begin = this+0x58`, `end = this+0x60`) and, for each entity with
+  `[entity+0xF0] == 0`, calls its virtual function at vtable +0x120 (exe+0x243A915). A freed entity in the vector =
+  call through freed memory (`read of address 0xffffffffffffffff`).
+- One component class (vtable around exe+0x4E97470) adds its human in one method (exe+0x2D12040 ->
+  exe+0x24396F0, push_back on `this+0x58`) and removes it in another (exe+0x2D121A0 -> exe+0x243A140, swap with the
+  last and shrink), both only when `[component+0x298] == 0`. No RTTI names in this build.
+- Measured: a puppet given the FRIEND brain and then freed alive crashed the game 0.1-0.6 s later every time (spawner
+  `ReleaseObjectRaw`, the factory's `DespawnEntityImmediately`, also after `Deactivate` or `SwitchBrain(0)` first);
+  freed long after it had died it did not. A world change soon after such a puppet died also crashed a few seconds
+  into the next world.
+- MafiaCoop's guard (src/game/sectors_guard.cpp): a hook on exe+0x243A870 that, right before each walk, drops every
+  pointer whose id (`+0x18`) no longer resolves to it in the entity table (the lookup behind `GetEntityByGUID`,
+  docs/game-api.md 15). Nothing is removed until one entry has been seen live (layout check), and the hook goes in
+  only when the walk's `mov rdi, [rbx+60h]; mov rbx, [rbx+58h]` is where expected. Checked: the alive friend-brain
+  puppet freed with the factory, which crashed every time before, logged "dropped 1 stale human(s) ... (69 live)"
+  and the game ran on; two more such drops in a 15-minute session with guest reloads, factory resets and a host death
+  and reload, no crash.
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
@@ -667,6 +694,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | hksi_lua_call | 0x4911AB0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 30 48 63 F2 41` |
 | hks_newstate | 0x4913C50 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 54 41 56 41 57 48 83 EC 30 48 83` |
 | lua_newstate | 0x4911640 | `48 89 5C 24 08 57 48 81 EC C0 00 00 00 48 8B FA 48 8B D9 48 85 C9 75 3D` |
+| GameSectors_Update | 0x243A870 | `48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 50 01 51 70 48 8B D9 E8 ?? ?? ?? ?? 48 8B F8 48 83 78 08 00 75 1D B9 08 00 00 00 E8 ?? ?? ?? ?? 48 85 C0` (section 8) |
 | hksi_lua_newthread | 0x4912590 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 40 48 8B 79 10` |
 | hksi_lua_resume | 0x49131D0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 30 48 63 F2 48 8B D9 48 85 C9 75 3D E8 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? 41 B9 8A 21 11` |
 | hks_error | 0x4914710 | `48 89 5C 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 30 44 8B F2 48` |

@@ -1,4 +1,5 @@
 #include "game/player_sync.h"
+#include "game/sectors_guard.h"
 
 #include "core/config.h"
 #include "core/log.h"
@@ -232,6 +233,12 @@ int McPlayerProfile(lua_State* L) {
 bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
 // Dev/measurement: the Lua glue logs our position and every puppet's (real and target) 10 times a second ("trace L/P"
 // lines; tools/pos_error.py pairs two logs into the position error between the games).
+// Host: the guests' puppets get the friend brain so the host's enemies shoot at them (player_sync.lua M.Ally).
+// Only with the game-sectors guard in place (sectors_guard.h): a friend-brain human freed by the game crashed it.
+bool EnemiesTargetGuests() {
+    return sectors_guard::Active() && core::Config::Get().GetInt("enemies_target_guests", 1) != 0;
+}
+
 bool TracePos() {
     static const bool on = core::Config::Get().GetBool("trace_pos", false);
     return on;
@@ -525,7 +532,9 @@ void OnWorldEnv(net::PlayerId from, net::ByteReader& r) {
 }
 
 // ---- Hit (0x0400, reliable, attacker -> victim): the attacker's player hit the victim's puppet -----------------------
-// Lua event line: "HT victim amount dtype zone weapon dx dy dz"
+// Lua event line: "HT victim amount dtype zone weapon dx dy dz [src npc]" (src 1: the sender's NPC with entity id `npc`
+// hit the puppet, not his player; the victim takes it whatever the friendly-fire setting says, unless his own copy of
+// that NPC fights him). Wire: the fields, then u8 src and u32 npc (0.9.0).
 bool WriteHit(net::ByteWriter& w, const std::string& line, net::PlayerId& victim) {
     std::istringstream in(line);
     std::string tag;
@@ -535,6 +544,10 @@ bool WriteHit(net::ByteWriter& w, const std::string& line, net::PlayerId& victim
     double weapon = 0;
     in >> tag >> v >> amount >> dtype >> zone >> weapon >> dir[0] >> dir[1] >> dir[2];
     if (!in || tag != "HT" || v >= net::kMaxPlayers || !std::isfinite(amount) || amount <= 0) return false;
+    int src = 0;
+    unsigned long npc = 0;
+    if (!(in >> src)) src = 0;
+    if (src != 1 || !(in >> npc)) npc = 0;
     victim = static_cast<net::PlayerId>(v);
     w.U8(victim);
     w.F32(std::min(amount, 1000.0f));
@@ -542,6 +555,8 @@ bool WriteHit(net::ByteWriter& w, const std::string& line, net::PlayerId& victim
     w.U8(static_cast<uint8_t>(std::clamp(zone, 0, 255)));
     w.U32(weapon >= 0 && weapon < 4294967295.0 ? static_cast<uint32_t>(weapon) : 0xFFFFFFFFu);
     for (float f : dir) w.F32(std::isfinite(f) ? f : 0.0f);
+    w.U8(src == 1 ? 1 : 0);
+    w.U32(static_cast<uint32_t>(npc));
     return true;
 }
 
@@ -553,13 +568,17 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     const uint32_t weapon = r.U32();
     float dir[3];
     for (float& f : dir) f = r.F32();
+    const uint8_t src = r.AtEnd() ? 0 : r.U8();
+    const uint32_t npc = r.AtEnd() ? 0 : r.U32();
     if (!r.Ok() || !std::isfinite(amount) || amount <= 0 || amount > 1000 || !InRange(dir, 3, kMaxCoord)) return;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || victim != sh.localId || from == sh.localId) return;
-    AppendLine(sh.inCmds, kMaxInCmds, "H %u %.2f %u %u %lu %.3f %.3f %.3f\n", from, amount, dtype, zone,
-               static_cast<unsigned long>(weapon), dir[0], dir[1], dir[2]);
-    MC_LOG_INFO("sync: hit by player %u: %.1f (type %u, zone %u)", from, amount, dtype, zone);
+    AppendLine(sh.inCmds, kMaxInCmds, "H %u %.2f %u %u %lu %.3f %.3f %.3f %u %lu\n", from, amount, dtype, zone,
+               static_cast<unsigned long>(weapon), dir[0], dir[1], dir[2], src == 1 ? 1u : 0u,
+               static_cast<unsigned long>(npc));
+    MC_LOG_INFO("sync: hit by %s %u: %.1f (type %u, zone %u)", src == 1 ? "an NPC on the game of player" : "player",
+                from, amount, dtype, zone);
 }
 
 // ---- PlayerModel (0x0102, reliable, every peer -> everyone): the character a player picked, and how he looks -------
@@ -695,7 +714,8 @@ void MainTick(lua_State* L, float dt) {
             const double now = Now();
             cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
             cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
-            cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1\n" : "0\n");
+            cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1 " : "0 ") +
+                    (EnemiesTargetGuests() ? "1\n" : "0\n");
             if (TracePos()) cmds += "Z\n";  // dev: log positions 10 times a second (trace_pos = 1)
             cmds += sh.inCmds;
             sh.inCmds.clear();

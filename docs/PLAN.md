@@ -172,6 +172,16 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    pairing was checked (26 of 37 near Salieri's). **Open:** the host's enemies do not target the guests' puppets (they
    are civilians to the AI; the only way found, `SwitchBrain`, crashes the game), not checked in a real shootout (the
    tests cannot drive to one; NPCs were made hostile by script), some civilian copies take no damage on the guest.
+   0.9.0 (2026-10-16, game-api.md 15, re-notes 8): **enemies now react to guests**: the host gives each guest's
+   puppet the FRIEND brain; the crash it caused before is understood (a freed friend-brain human stays in the
+   game-sectors module's list, exe+0x243A915) and guarded in the dll (stale entries dropped before each walk: the
+   repro that crashed every time now logs "dropped 1 stale human" and runs on; a 15-min churn of guest reloads,
+   factory resets and a host death: no crash). Checked in Brothel cp_015 with enemy crews spawned by script on both
+   games at the same spot (paired like mission NPCs): the host's enemies shot the guest's puppet, the hits reached the
+   guest (100 -> 13, downed, respawned beside the host) and are skipped while his own copy of that enemy fights him;
+   host NPC deaths repeated on the guest. **Still open:** a chapter's own scripted shootout (every chapter start
+   probed begins with a drive or walk the tests cannot follow), a guest kill re-checked in a fight (checked in Taxi
+   before), civilian copies that take no damage.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
    Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose
@@ -180,6 +190,11 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    car. Checked in Taxi (host took the mission taxi, the guest's game used its own; both in their own taxis after the
    guest loaded cp_020, no copy until they parted). **Open:** the host's puppet is thrown out of a mission car on the
    guest's game (it does not keep an NPC at the wheel), only one chapter checked, police and mission traffic local.
+   0.9.0 (2026-10-16): the guest's mission car is swapped for a copy (his own hidden meanwhile) when the host's puppet
+   is thrown out of it twice; the puppet then stays at the wheel (Taxi cp_010 while the host drove, and the copy at
+   cp_020). Copies wait for the loading screen to be gone (one spawned during the load flipped the guest's taxi).
+   **Still open:** the mission car coming back when the host parks (Taxi does not let the player out), a second
+   chapter (the chase and Taxi cp_020 put each player in his own mission car, so the host's puppet waits hidden).
 - [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
   Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
   guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the

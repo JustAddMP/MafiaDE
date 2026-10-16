@@ -421,6 +421,18 @@ int McEntity(lua_State* L) {
 
 }  // namespace
 
+bool EntityLookupAvailable() { return _ent.find && _ent.mgr; }
+
+bool EntityIsLive(const void* entity) {
+    if (!entity || !EntityLookupAvailable()) return false;
+    __try {
+        const uint32_t id = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(entity) + 0x18);
+        return _ent.find(_ent.mgr(), id, 0) == entity;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // ---- setup ----------------------------------------------------------------------------------------------------
 bool Install(const std::wstring& dllDir, const std::string& tag) {
     _dllDir = dllDir;

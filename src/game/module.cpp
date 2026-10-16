@@ -12,6 +12,7 @@
 #include "game/npc_sync.h"
 #include "game/player_sync.h"
 #include "game/save_guard.h"
+#include "game/sectors_guard.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -171,6 +172,7 @@ public:
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
+        sectors_guard::Install();  // makes the friend-brain puppets safe (player_sync.lua M.Ally)
     }
     void RenderTick(float dt) override { lua::PollRender(dt); }
 

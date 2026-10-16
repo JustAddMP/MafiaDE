@@ -11,7 +11,8 @@ and the character per player. 0.4.0: PlayerModel (0x0102), character choice in t
 core 0.5 (protocol 7: the pre-game lobby, core docs/protocol.md "Lobby"); lobby mode indexes: 0 FREE RIDE, 1 STORY (not
 startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x0203); lobby modes 0 FREE RIDE, 1 STORY,
 2..21 CHAPTER 1..20 (`MissionSync::Chapters()`, the order of `mm_ids_replay`). 0.7.0: NpcStates (0x0210), NpcDeath
-(0x0211), NpcHit (0x0410); shared cars take a standing car of the same model as the driver's car.
+(0x0211), NpcHit (0x0410); shared cars take a standing car of the same model as the driver's car. 0.9.0: PlayerState
+at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet).
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -156,7 +157,7 @@ press. Shots are not separate messages: they ride on the player state (60 Hz), s
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0400 | Hit | attacker -> victim (`SendTo`, relayed by the host) | R | u8 victim, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, f32 dx, dy, dz |
+| 0x0400 | Hit | attacker -> victim (`SendTo`, relayed by the host) | R | u8 victim, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, f32 dx, dy, dz, u8 source (0.9.0: 0 the sender's player, 1 an NPC of the sender's game), u32 npc (its entity id there) |
 
 The attacker's game decides what hit. Puppets are AI humans that take damage like any NPC (their own hit reaction plays
 on the attacker's screen) and never die from it there (health kept at 5000). When the local player's bullet, punch or
@@ -255,8 +256,19 @@ scripts may change things in between; the next WorldEnv puts them back.
   for 1.5 s (NPCs with a job only: AI type not 0, not in a car). A hit by the guest on a copy goes to the host as
   NpcHit; the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit
   reaction and damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`.
+- Enemies and guests (0.9.0): on the host each guest's puppet gets the FRIEND brain 2 s after it spawned
+  (`SwitchBrain(1)`, docs/game-api.md 15; ini `enemies_target_guests = 0` turns it off), so the host's enemies shoot at
+  it. Their hits on a puppet go to that guest as a Hit with source 1 and the NPC's key; the guest takes it (an NPC
+  bullet as ~2.6x its DAMAGE amount, the downed rules apply, friendly fire does not matter) unless his own copy of
+  that NPC is alive and hostile: then it fights him on his own game already and the relayed hit is skipped, so he is
+  not hurt twice. Hostile copies are put back only when more than 12 m off (6 m for other NPCs with a job).
 - Unpaired host NPCs (ambient pedestrians that differ per game, NPCs the guest's game has not spawned) are not shown
   on the guest's game: no copies are spawned for them.
 - Ambient traffic and pedestrians stay local to each game. Cars a player drives are shared as before (Phase 3); a
   remote driver's car is first looked for here: a car of the same model standing where his car stands (within 3 m)
   is taken as his car (mission cars are not doubled), and no copy is spawned into another car standing there.
+  Such a mission car does not keep an NPC at its wheel: when the remote driver's puppet is thrown out of it twice
+  (0.9.0), it is swapped for a fresh copy (the mission car hidden with `Deactivate`, the copy spawned in its place) and
+  the puppet drives the copy; when the remote driver parks it, the mission car comes back at the copy's place. No
+  copy is looked for or spawned during a loading screen and for 4 s after it (a copy spawned before the mission had
+  placed its car landed on it).
