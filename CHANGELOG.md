@@ -3,6 +3,29 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.9.0 (2026-10-16), pre-release
+
+Players stay in sync:
+- The other player is shown where he really is. Measured on one PC: on foot his character was 2.5 m behind on average
+  and up to 9 m off (the game's own walking for him starts late and is slower than a running player); now 0.3-0.5 m on
+  average (95 % within 0.7 m), also right after a lobby start and a checkpoint reload. A car at 70 km/h: 0.1 m. The
+  game sends its player 60 times a second (was 20) and shows the others 50 ms behind (was 100 ms), moved forward along
+  their speed.
+- Traffic statistics in the log every 5 s and on F7 (per player and per message); the network limits are much higher
+  (`net_budget_kbps`, default 1 MB/s per player), though two players use only about 15-20 KB/s. Core v0.6.0.
+
+Story and NPCs:
+- The host's enemies now shoot at the other players too, and those hits hurt them on their own game (not twice when
+  their own copy of that enemy already fights them). The game crash this caused before (in the game's own list of
+  humans, exe+0x243A915) is guarded by the mod. `enemies_target_guests = 0` in MafiaCoop.ini turns it off.
+- In a mission car the host now sits at the wheel on a friend's screen (Taxi), instead of standing next to it.
+- No car copy is spawned while a loading screen is up (one spawned then had landed on a friend's own mission car).
+
+Menus:
+- Gamepad (d-pad, A, B, left/right on settings) and mouse (hover, click, wheel) checked in the CO-OP panel, the lobby
+  and CO-OP SETTINGS, with a virtual pad and real window mouse messages; a physical gamepad was not tried.
+- Tests can drive the panels from a file (core v0.7.0 `test_input`).
+
 ## 0.8.0 (2026-10-15), first public pre-release
 
 Fixes:

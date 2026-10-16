@@ -302,7 +302,9 @@ Learned the hard way:
   / `--test_pad 1` the dll adds a virtual pad on user 0 that the game uses like a real one (left stick walked the
   player 4.7 m in 1.5 s); tests press it from Lua with `mc_pad(buttons, holdMs, lt, rt, lx, ly, rx, ry)` (XINPUT bits,
   e.g. `mc_pad(0, 1500, 0, 0, 0, 30000)` = stick forward). Dev Lua does not run while the pause menu is open (scripts
-  are paused), so it cannot press the pad inside our panels yet.
+  are paused), so it cannot press the pad inside our panels; core 0.7's `test_input` does (README-dev.md "Testing the
+  co-op panels"). The game itself ignored the test pad in some sessions (no walking, START did not open the pause
+  menu) while our panels, which read XInput through the same hook, always saw it.
 
 ## 12. Player model (character) — verified 2026-10-15
 

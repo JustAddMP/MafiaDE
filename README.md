@@ -44,12 +44,14 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- The host's enemies do not aim at the other players yet (mission NPCs are matched up and their deaths and your hits
-  on them are shared); some passers-by take no damage on a friend's game.
-- Mission cars are only partly shared; ambient traffic, pedestrians and police are each player's own.
-- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) only.
+- Enemies: the host's enemies now aim at the other players too, but a chapter's own big shootout has not been played
+  through in co-op yet (tested with enemies placed by script); some passers-by take no damage on a friend's game.
+- Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi);
+  ambient traffic, pedestrians and police are each player's own.
+- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only.
 - Name tags show through walls. A killed game (not closed) makes the others wait for a 10 s timeout.
-- Co-op panels are keyboard-first (gamepad and mouse not finished); Steam invites between two PCs not fully tested.
+- The co-op panels were tested with a virtual gamepad and mouse messages, not a physical gamepad; Steam invites
+  between two PCs not fully tested.
 
 ## For developers
 

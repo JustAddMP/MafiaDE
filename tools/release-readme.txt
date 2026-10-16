@@ -90,12 +90,14 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- Enemies and NPCs are only partly shared. Mission characters are matched up between the games and their deaths
-  and your hits on them are shared, but the host's enemies do not aim at or attack the other players (on each
-  player's own game they fight him). Some passers-by take no damage on a friend's game. A real shootout in co-op
-  has not been fully tested.
-- Mission cars are only partly shared: a mission car is not doubled, but on a friend's screen the host's character
-  can be seen standing next to a mission car he is driving. Only a few chapters were checked.
+- Enemies and NPCs are partly shared. Mission characters are matched up between the games and their deaths and
+  your hits on them are shared; the host's enemies also aim at the other players (since 0.9.0), and on each
+  player's own game they fight him too. A chapter's own big shootout has not been played through in co-op yet.
+  Some passers-by take no damage on a friend's game. enemies_target_guests = 0 in MafiaCoop.ini turns the
+  enemies-aim-at-friends part off if it causes trouble.
+- Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
+  screen (checked in Taxi). Where each player starts in his own mission car, the host's character waits hidden
+  until the cars have parted. Only a few chapters were checked.
 - Ambient traffic, pedestrians and police are each player's own (not shared).
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit); other chapters and checkpoints may behave
   differently. A friend who falls behind the host's checkpoint is reloaded at the host's checkpoint.
@@ -105,7 +107,8 @@ KNOWN ISSUES
 - Punches do not work near Salieri's bar (where Free Ride starts) or at some story checkpoints: the game itself
   turns fists off there.
 - Your own new character shows once you close the pause menu (the others see it at once).
-- The co-op menus and panels are made for the keyboard; gamepad and mouse in them are not finished.
+- The co-op panels work with keyboard, gamepad (d-pad, A, B) and mouse; they were tested with a virtual gamepad,
+  not a physical one.
 - Steam invites between two different PCs and accounts have not been fully tested; joining by IP is the tested
   route.
 - Only the Steam version of the game (build 16502642) is supported.

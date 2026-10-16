@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-15 (batch 6).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.9.0).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -12,7 +12,7 @@ interest.md).
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
-| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done for keyboard; gamepad/mouse/Steam invite untested; lobby: Free Ride, Story and chapter select |
+| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs untested; lobby: Free Ride, Story and chapter select |
 | 4 Shared world | Weather/time, story (chapter, checkpoint, objectives) and cutscenes done; NPCs and mission cars partly (host-authoritative pairing, deaths, guest hits) |
 | 6 polish | Not started |
 
@@ -33,7 +33,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.5.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.7.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -208,7 +208,14 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 
 ### C. Phase 5 polish (native UI)
 - [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.
-- [ ] Gamepad + mouse in our panels; test JOIN FRIEND and a real Steam invite with two accounts/PCs.
+- [x] Gamepad + mouse in our panels. Done 2026-10-16 (core v0.7.0 test input, README-dev.md "Testing the co-op
+  panels"): with a virtual XInput pad (the same hook a real pad goes through) and mouse events, two instances in Free
+  Ride: pause CO-OP panel d-pad up/down, right/left on CHARACTER, A, B, mouse hover/click/wheel; CO-OP SETTINGS; the
+  lobby (host pad, guest mouse); real window mouse messages (PostMessage) selected and clicked a row too. The panels
+  were opened through the test input, not the pause menu's CO-OP entry (that entry was checked with the keyboard in
+  0.5.0). A physical gamepad needs a human.
+- [ ] JOIN FRIEND and a real Steam invite with two accounts on two PCs (needs two Steam accounts and a human; joining
+  by IP and lobbies over UDP are what the automated tests use).
 - [x] CO-OP page refreshes when a background join completes. Done 2026-10-15 (game-api.md 13 "Main menu live
   refresh"): the patched main menu polls us every frame (an enterFrame listener) and rebuilds the page when what it
   shows changed; checked in game: the host's page went to LOBBY (1 PLAYER) when hosting started and to LOBBY (2
@@ -280,6 +287,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    `core/version.h` (cached, `--check-only`, `--skip-version-check`); dll banner when patterns are missing.
 - [x] GitHub pre-release v0.8.0 with the new zip (and a symbols zip). Done 2026-10-15:
    https://github.com/JustAddMP/MafiaDE/releases/tag/v0.8.0 (pre-release; release notes list features and known issues).
+- [x] GitHub pre-release v0.9.0 (player sync, enemies target guests, mission car driver, gamepad/mouse in the panels;
+   core v0.7.0). Done 2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.9.0 (zip + symbols zip).
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

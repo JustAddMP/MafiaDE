@@ -15,7 +15,7 @@ overlay, co-op UI, SWF patcher) is [JustAddMP/core](https://github.com/JustAddMP
   menu entries.
 
 Generic fixes go to core first (commit there, its tests pass) and are released as a core version tag; this repo pins
-one tag (currently core v0.5.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
+one tag (currently core v0.7.0) and moves with `tools\update_core.cmd vX.Y.Z`, which rebuilds and runs the tests
 (docs/PLAN.md).
 
 ## Build
@@ -297,13 +297,36 @@ Dev console, to explore the API live:
   resends, the reliable backlog, then KB/s and messages/s per message (PlayerState, NpcStates, HostSave, ...), and any
   drops (core's NetMonitor, external/core/docs/protocol.md "Traffic statistics"). F7 shows the last second.
 - Settings (ini or `--key value`): `net_budget_kbps` (per-peer limit, KiB/s, default 1024), `net_state_hz` (default
-  60), `net_interp_ms` (default 50).
+  60), `net_interp_ms` (default 50). Host: `enemies_target_guests` (default 1: the host's enemies target the guests' puppets,
+  docs/game-api.md 15).
 - Position error between two games: start both with `--trace_pos 1`; each logs its player and every puppet ten times a
   second. `python tools/pos_error.py out\logs\mafiacoop-host.log out\logs\mafiacoop-guest.log [--from HH:MM:SS]
   [--to HH:MM:SS]` prints, per direction, on foot and in a car, the distance between where a player really is and
   where his puppet / car copy is on the other screen (and the network part alone, "target"). Numbers from 0.9.0 are in
   docs/protocol.md "PlayerState". The test pad (`mc_pad`) did not move the player in some sessions; keyboard keys
   sent to the focused window (W/A/S/D) always did.
+
+## Testing the co-op panels (gamepad and mouse)
+
+Scripts in the game stop while the pause menu is open, so tests drive the panels from the dll instead (core 0.7,
+external/core/src/dll/test_input.h): start the games with `--test_input 1` and write commands into
+`out\dev\<log tag>.input.txt`, e.g.
+
+```
+open pause            # the pause CO-OP panel (also: lobby, settings, joinip)
+pad DOWN              # virtual XInput pad (the same hook a real pad goes through); A, B, LEFT, RIGHT, A+B, 0x1000 ...
+pad A
+move 600 360          # mouse in backbuffer pixels, handed to the panel's input queue
+click 634 465
+wheel 1
+wait 300
+dump                  # the open panel, its rows with hit boxes and the selected row, into the log
+```
+
+Checked 2026-10-16 (two instances, Free Ride): pause CO-OP panel d-pad up/down, right/left on CHARACTER, A on
+SETTINGS, B back, mouse hover and click (into SETTINGS), wheel; CO-OP SETTINGS d-pad; the lobby (host: d-pad to
+MODE; guest: mouse hover and click on SETTINGS). Real window mouse messages (`PostMessage` WM_MOUSEMOVE /
+WM_LBUTTONDOWN to the game window) selected a row and clicked BACK too. Not checked: a physical gamepad.
 
 ## Player sync (phase 3)
 
