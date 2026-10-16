@@ -362,6 +362,9 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [x] GitHub pre-release v0.10.0 (checkpoint reloads at the save's spot, failed-mission stop confirmed for the player,
    name tags behind walls, 4 s disconnect detection; core v0.8.0). Done 2026-10-16:
    https://github.com/JustAddMP/MafiaDE/releases/tag/v0.10.0.
+- [x] GitHub pre-release v0.11.0 (fights: guest kills count on the host, health follows the host, re-pairing after
+   reloads, guests follow a host's checkpoint reload; no core change). Done 2026-10-16:
+   https://github.com/JustAddMP/MafiaDE/releases/tag/v0.11.0.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
