@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.11.0).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.12.0).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -13,7 +13,7 @@ interest.md).
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
 | 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs untested; lobby: Free Ride, Story and chapter select |
-| 4 Shared world | Weather/time, story (chapter, checkpoint, objectives) and cutscenes done; NPCs and mission cars partly (host-authoritative pairing, deaths, guest hits) |
+| 4 Shared world | Weather/time, story (chapter, checkpoint, objectives), cutscenes and mission NPCs done (pairing, deaths and hits both ways, copies of host-only enemies; one chapter's fight checked); mission cars partly |
 | 6 polish | Not started |
 
 ## Working rules
@@ -184,7 +184,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    longer sits through it while the host is already past it (Bon Appetit: 3 minutes of ambush film): only the host's
    cutscene holds a reload. A crash in the game-sectors walk during a failed mission's load with a friend-brain puppet
    (Omerta, host) is guarded (re-notes 8).
-- [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
+- [x] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
    invisible proxy for each guest so its AI targets them. Prototype both, measure.
@@ -239,6 +239,36 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    reloaded on his own and 6 of 6 paired; no crash in either run. **Not done**: the cp_050 ambush itself (the four
    invulnerable attackers) was not completed: the tests teleport and cannot walk the route the mission waits for, so
    the chapter did not reach cp_060; no second chapter's fight. Not ticked.
+   0.12.0 (2026-10-16, game-api.md 15, protocol.md "NPCs"): **host-only enemies get a copy on the guest's game**:
+   each game spawns a checkpoint's waves for its own player, so an enemy only the host's game had brought in shot the
+   guest unseen. Now a host NPC with a job that stays unpaired for 5 s (2 s loose pairing + 3 s), alive, on foot,
+   within 90 m of the guest and with a known spawn profile is spawned on the guest's game from a second runtime
+   spawner (like the player puppets): same profile, the host's weapon, driven from the host's states like a player
+   puppet (position plus velocity, pulled along, heading), firing when the host's NPC fires (ON_SHOOT counted on the
+   host, a u8 in NpcStates), health and death from the host, the guest's hits and kills going to the host as before.
+   **The profile**: no getter on a human (the hash is not in its object; searched at runtime with `mc_memfind`); a
+   mission spawner names its humans `behavior_object_prime-NN-<spawner>`, the spawners are type-65 entities whose
+   runtime spawner component reports the profile (u64 in NpcStates). The copy is a civilian factory spawn but takes
+   the enemy profile's brain (AI type 2): no brain switch, no melee orders; in a fight it took out its own pistol and
+   some bullets hit the guest although it aims past him, so those are given back on the guest and the host's gun put
+   back. No doubles: a free local NPC of the same kind at the same spot or within 40 m takes over from a copy (also
+   seen when the guest's game spawned its own after a load); same-spot pairing now needs the same kind (the guest's
+   kitchen rifleman had been paired with the host's kitchen machine gunner). Copies go 12 s after death, 5 s after the
+   last state, in a car, beyond 110 m, during cutscenes, at session end and with the world (load); at most 10; none in
+   the first 10 s after a load. Crash safety: copies never get a brain switch or a map marker, burning ones are hidden
+   and released after the fire, the game-sectors guard dropped 4-5 stale humans at the failed-mission loads.
+   **Checked in Bon Appetit** (lobby CHAPTER, three sessions of 22-24 min, run logs in the batch notes): host walked
+   into the kitchen (real steps, `walk.lua`) -> host-only kitchen machine gunner, kitchen rifleman, yard triggermen,
+   balcony gunner and alley machine gunner appeared as copies on the guest (15 copies, 2 forced by switching off the
+   guest's own enemy), 0.0-0.3 m from the host's standing, ~1 s behind running, firing with it (`B3c-copy-guest.png`);
+   guest killed 5 copies -> host's NPC died each time; host kills killed the copies; `4 spawned copies went with the
+   old world` on the guest's follow load, none doubled after loads (9 of 9 paired); 3 failed-mission reloads, no
+   crash. **The cp_050 ambush is solved**: walk kitchen -> back door -> alley (373.9 417.1 .. 395.1 414.4) -> behind
+   the attackers (410 418 .. 410 398) with the alley wave dead, and the four attackers become vulnerable; the whole
+   restaurant fight was cleared on both games (one attacker killed by the guest). **Not done**: right after the
+   cleared fight the mission failed both times on the way to Salieri (`dummy_cp_050_obj_search_for_salieri`; probably
+   the teleport steps), so the chapter did not reach cp_060; no second chapter's fight; enemies only the guest's game
+   spawned are still his alone. Ticked: a chapter's real fight works end to end, host-triggered waves included.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
    Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose
@@ -365,6 +395,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [x] GitHub pre-release v0.11.0 (fights: guest kills count on the host, health follows the host, re-pairing after
    reloads, guests follow a host's checkpoint reload; no core change). Done 2026-10-16:
    https://github.com/JustAddMP/MafiaDE/releases/tag/v0.11.0.
+- [x] GitHub pre-release v0.12.0 (copies of enemies only the host's game spawned; NPC messages changed). Done
+  2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.12.0.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

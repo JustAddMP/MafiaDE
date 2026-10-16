@@ -7,6 +7,7 @@
 #include "dll/ui_input.h"
 
 #include <windows.h>
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <unordered_set>
 #include <vector>
 
 namespace mc::game::lua {
@@ -420,6 +422,178 @@ int McEntity(lua_State* L) {
     return 1;
 }
 
+// ---- memory probes (dev) -------------------------------------------------------------------------------------------
+// Reads go through ReadProcessMemory on our own process, so a bad pointer only fails the read.
+bool ReadMem(const void* at, void* out, size_t n) {
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), at, out, n, &got) && got == n;
+}
+
+uint8_t* EntityById(uint32_t id) {
+    __try {
+        uint8_t* e = _ent.find(_ent.mgr(), id, 0);
+        if (!e || *reinterpret_cast<uint32_t*>(e + 0x18) != id) return nullptr;
+        return e;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// mc_fnv(text) -> the game's 64-bit name hash of `text` (FNV-1, the hash behind spawn profile names) as a decimal string
+int McFnv(lua_State* L) {
+    const char* s = ToString(L, 1);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char* c = s ? s : ""; *c; ++c) h = (h * 0x100000001b3ull) ^ static_cast<uint8_t>(*c);
+    PushString(L, std::to_string(h));
+    return 1;
+}
+
+// mc_memfind(id, value [, span [, depth]]) -> where `value` sits in the object of entity `id` and in the objects that
+// object points to (pointers in its first `span` bytes, down to `depth` levels, 1-3): "+0x1a0 +0x10>+0x38 ...". A
+// decimal value is searched as a u64 (8-aligned), anything else as text (any alignment). Dev only: finding a field.
+void MemFindRec(uint64_t at, int level, int depth, size_t span, const std::string& needle, bool text, std::string& path,
+                std::string& out, std::unordered_set<uint64_t>& seen) {
+    if (out.size() > 3000 || seen.size() > 400000) return;
+    std::vector<uint8_t> buf(span);
+    if (!ReadMem(reinterpret_cast<void*>(at), buf.data(), span)) return;
+    seen.insert(at);
+    char tmp[32];
+    const size_t step = text ? 1 : 8;
+    for (size_t i = 0; i + needle.size() <= span; i += step) {
+        if (std::memcmp(buf.data() + i, needle.data(), needle.size()) == 0) {
+            std::snprintf(tmp, sizeof tmp, "+0x%zx ", i);
+            out += path + tmp;
+        }
+    }
+    if (level + 1 >= depth) return;
+    for (size_t i = 0; i + 8 <= span; i += 8) {
+        uint64_t p = 0;
+        std::memcpy(&p, buf.data() + i, 8);
+        if (p < 0x10000 || p > 0x7FFFFFFFFFFFull || (p & 7)) continue;
+        if (seen.count(p)) continue;
+        std::snprintf(tmp, sizeof tmp, "+0x%zx>", i);
+        const size_t keep = path.size();
+        path += tmp;
+        MemFindRec(p, level + 1, depth, level + 1 >= 2 ? 0x100 : 0x400, needle, text, path, out, seen);
+        path.resize(keep);
+    }
+}
+
+int McMemFind(lua_State* L) {
+    const double id = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    const char* vs = ToString(L, 2);
+    const double spanArg = TypeOf(L, 3) == TNumber ? static_cast<double>(ToNumber(L, 3)) : 0x800;
+    const size_t span = static_cast<size_t>(spanArg < 0x40 ? 0x40 : spanArg > 0x4000 ? 0x4000 : spanArg) & ~size_t(7);
+    const double depthArg = TypeOf(L, 4) == TNumber ? static_cast<double>(ToNumber(L, 4)) : 2;
+    const int depth = depthArg < 1 ? 1 : depthArg > 5 ? 5 : static_cast<int>(depthArg);
+    uint8_t* e = (_ent.find && id > 0) ? EntityById(static_cast<uint32_t>(id)) : nullptr;
+    std::string out;
+    if (e && vs && *vs) {
+        std::string needle;
+        bool text = false;
+        char* end = nullptr;
+        const uint64_t v = _strtoui64(vs, &end, 10);
+        if (end && *end == 0) {
+            needle.assign(reinterpret_cast<const char*>(&v), 8);
+        } else {
+            needle = vs;
+            text = true;
+        }
+        std::string path;
+        std::unordered_set<uint64_t> seen;
+        MemFindRec(reinterpret_cast<uint64_t>(e), 0, depth, span, needle, text, path, out, seen);
+    }
+    PushString(L, out);
+    return 1;
+}
+
+// The RTTI class name of an object whose first qword is a vtable of the exe ("" if not one).
+std::string ClassOf(uint64_t obj) {
+    const uint64_t base = core::mem::MainModule().base, size = core::mem::MainModule().size;
+    uint64_t vt = 0, col = 0;
+    if (!ReadMem(reinterpret_cast<void*>(obj), &vt, 8) || vt < base || vt >= base + size) return "";
+    if (!ReadMem(reinterpret_cast<void*>(vt - 8), &col, 8) || col < base || col >= base + size) return "";
+    uint32_t sig = 0, td = 0;
+    if (!ReadMem(reinterpret_cast<void*>(col), &sig, 4) || sig != 1) return "";
+    if (!ReadMem(reinterpret_cast<void*>(col + 12), &td, 4)) return "";
+    char name[96] = {};
+    if (!ReadMem(reinterpret_cast<void*>(base + td + 16), name, sizeof name - 1)) return "";
+    return name;
+}
+
+// mc_memdump(id, path, bytes) -> the qwords at a path of entity `id` (path as mc_memfind prints it, "" = the entity),
+// one line each: offset, value, and the class of the object it points to. Dev only.
+int McMemDump(lua_State* L) {
+    const double id = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    const char* path = ToString(L, 2);
+    const double nArg = TypeOf(L, 3) == TNumber ? static_cast<double>(ToNumber(L, 3)) : 0x100;
+    const size_t n = static_cast<size_t>(nArg < 8 ? 8 : nArg > 0x2000 ? 0x2000 : nArg) & ~size_t(7);
+    uint8_t* e = (_ent.find && id > 0) ? EntityById(static_cast<uint32_t>(id)) : nullptr;
+    std::string out;
+    if (e) {
+        uint64_t cur = reinterpret_cast<uint64_t>(e);
+        bool ok = true;
+        for (const char* s = path ? path : ""; ok && *s;) {
+            while (*s == '+' || *s == '>' || *s == ' ') ++s;
+            if (!*s) break;
+            char* end = nullptr;
+            const uint64_t off = _strtoui64(s, &end, 16);
+            if (end == s) break;
+            s = end;
+            uint64_t v = 0;
+            ok = ReadMem(reinterpret_cast<void*>(cur + off), &v, 8);
+            cur = v;
+        }
+        std::vector<uint64_t> q(n / 8);
+        const uint64_t base = core::mem::MainModule().base, size = core::mem::MainModule().size;
+        if (ok && ReadMem(reinterpret_cast<void*>(cur), q.data(), n)) {
+            char buf[160];
+            std::string self = ClassOf(cur);
+            if (!self.empty()) out += "self " + self + "\n";
+            for (size_t i = 0; i < q.size(); ++i) {
+                const uint64_t v = q[i];
+                std::string what;
+                if (v >= base && v < base + size) {
+                    std::snprintf(buf, sizeof buf, "exe+0x%llx", static_cast<unsigned long long>(v - base));
+                    what = buf;
+                } else if (v >= 0x10000 && v <= 0x7FFFFFFFFFFFull && !(v & 7)) {
+                    what = ClassOf(v);
+                }
+                std::snprintf(buf, sizeof buf, "+0x%zx %llx %s\n", i * 8, static_cast<unsigned long long>(v), what.c_str());
+                out += buf;
+            }
+        }
+    }
+    PushString(L, out);
+    return 1;
+}
+
+// mc_memread(id, "path") -> the u64 at a path as mc_memfind prints it ("+0x10>+0x38"), as a decimal string ("" if not
+// readable). Dev only.
+int McMemRead(lua_State* L) {
+    const double id = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    const char* path = ToString(L, 2);
+    uint8_t* e = (_ent.find && id > 0) ? EntityById(static_cast<uint32_t>(id)) : nullptr;
+    std::string out;
+    if (e && path) {
+        uint64_t cur = reinterpret_cast<uint64_t>(e), v = 0;
+        bool ok = true;
+        for (const char* s = path; ok && *s;) {
+            while (*s == '+' || *s == '>' || *s == ' ') ++s;
+            if (!*s) break;
+            char* end = nullptr;
+            const uint64_t off = _strtoui64(s, &end, 16);
+            if (end == s) break;
+            s = end;
+            ok = ReadMem(reinterpret_cast<void*>(cur + off), &v, 8);
+            cur = v;
+        }
+        if (ok) out = std::to_string(*path ? v : cur);
+    }
+    PushString(L, out);
+    return 1;
+}
+
 }  // namespace
 
 // ---- ray cast (mc_raycast) ----------------------------------------------------------------------------------------
@@ -592,9 +766,13 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         RegisterGlobal(L, "mc_u64", &McU64);
         RegisterGlobal(L, "mc_u64str", &McU64Str);
         RegisterGlobal(L, "mc_pad", &McPad);
+        RegisterGlobal(L, "mc_fnv", &McFnv);
         if (_ent.push) {
             RegisterGlobal(L, "mc_entity", &McEntity);
             RegisterGlobal(L, "mc_entity_ids", &McEntityIds);
+            RegisterGlobal(L, "mc_memfind", &McMemFind);
+            RegisterGlobal(L, "mc_memread", &McMemRead);
+            RegisterGlobal(L, "mc_memdump", &McMemDump);
         }
         if (_ray.cast) RegisterGlobal(L, "mc_raycast", &McRayCast);
         MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s",

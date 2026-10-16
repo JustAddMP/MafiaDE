@@ -3,6 +3,35 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.12.0 (2026-10-16), pre-release
+
+Fights:
+- Enemies that only the host's game spawned now show on a friend's game. Each game spawns a fight's later waves when
+  its own player gets there, so an enemy the host's game had brought in (the host walked into the kitchen, round the
+  back) shot at a friend without being seen. Now the friend's game spawns a copy of it: the same character (the
+  mission's own spawn profile) with the host's weapon, moving and firing as the host's enemy does. The friend can
+  shoot and kill it, and the host's enemy dies with it; when the host kills it, the copy dies too. The copy runs no
+  fight of its own: the host's enemy already shoots at the friend there, and those hits reach him as before (a
+  copy's own bullet that still hits him is given back).
+- When the friend's own game spawns that enemy after all (he walks there himself), his own takes over and the copy
+  goes: no doubles. Copies go with a reload, during cutscenes, when the enemy gets into a car, is out of range (90 m)
+  or has been dead for 12 s; at most 10 at a time.
+- Characters standing at the same spot on both games are only matched when they are of the same kind (before, the
+  host's kitchen machine gunner could be matched with the friend's kitchen rifleman standing there).
+- Checked in Bon Appetit (lobby CHAPTER, two games on one PC, three sessions of 22-24 minutes): the kitchen machine
+  gunner and rifleman, the yard and balcony gunners and the alley machine gunner that only the host's game had
+  brought in appeared on the friend's game (15 copies, two of them forced in a test), stayed with the host's (0.0-0.3
+  m apart standing, about a second behind when running) and fired when the host's fired; the friend killed five of
+  them and the host's died with them, the host's kills removed them. The restaurant fight was cleared to its last
+  enemy (the host circled round behind the four attackers, which then could be killed; one of them by the friend). No
+  crash, with three failed-mission reloads and checkpoint follows.
+
+Not finished: right after the cleared fight the chapter failed each time on the way to Salieri (the tests move by
+small teleports, which the mission probably took as leaving the area), so Bon Appetit was not played past cp_050;
+no second chapter's fight.
+
+Everyone needs 0.12.0 (0.11.x cannot join it: the NPC messages changed).
+
 ## 0.11.0 (2026-10-16), pre-release
 
 Fights:

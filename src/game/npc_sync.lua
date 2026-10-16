@@ -10,15 +10,24 @@
 -- when the host's dies, it is pulled back when it wanders off. The guest's own shots hurt his copy on his game and
 -- are also sent to the host, whose NPC takes them (replayed as real shots from the guest's puppet, so it turns on
 -- the puppet); when the guest's shot kills his copy, the host's NPC is killed too (a lethal hit).
+-- A host NPC with a job that has no partner on the guest's game (a wave only the host's game spawned: each game
+-- spawns a checkpoint's waves for its own player) gets a spawned copy there (0.12.0): the same spawn profile (the
+-- host reads it from the mission spawner named in the NPC's name), its weapon, driven like a player puppet from the
+-- host's states (walk, heading, shots), health and death from the host, hittable like any copy. It is a civilian on
+-- the guest's game (it runs no fight of its own: the host's enemy already shoots at the guest's puppet and those
+-- hits reach him). When the guest's own game spawns that NPC later, his own takes over and the copy goes.
 --
 -- Input (cmds, one line per command):
 --   S active host localId                        session running, we host, our player id
---   N key x y z hx hy health flags ai tag weapon  guest: a host NPC (flags: 1 dead, 2 in a car; tag: archetype)
+--   N key x y z hx hy health flags ai tag weapon profile shots
+--                                                guest: a host NPC (flags: 1 dead, 2 in a car; tag: archetype;
+--                                                profile: its spawn profile hash, 0 = unknown; shots: fired, mod 256)
 --   D key                                        guest: that host NPC died
 --   H from key amount dtype zone weapon lethal   host: guest `from` hit host NPC `key` on his screen (lethal 1: his
 --                                                copy died of it)
 -- Output (events, one per line):
---   NS key x y z hx hy health flags ai tag weapon  host: NPC state (10 Hz, nearest first, at most MAX_SEND)
+--   NS key x y z hx hy health flags ai tag weapon profile shots
+--                                                host: NPC state (10 Hz, nearest first, at most MAX_SEND)
 --   ND key                                       host: NPC died
 --   NH key amount dtype zone weapon lethal       guest: we hit (our copy of) host NPC key
 --   ST text                                      status for the overlay (once a second)
@@ -26,7 +35,7 @@ MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
 M.Npc = M.Npc or {}
 local N = M.Npc
-N.version = 2
+N.version = 3
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
 local SEND_INTERVAL = 0.1   -- s between host state rounds (10 Hz; ~10 KB/s for 48 NPCs)
@@ -44,6 +53,16 @@ local PULL_TIME = 1.5
 local PULL_DIST_FIGHT = 12  -- m: the same for hostile NPCs (they run and take cover on their own in a fight)
 local STALE = 3             -- s without a state: the host NPC is out of range (pairing kept, nothing enforced)
 local REPLAY_WAIT = 0.35    -- s a replayed guest bullet has to land on the host's NPC before DoDamage is used
+-- spawned copies (guest)
+local COPY_WAIT = 3         -- s a host NPC with a job stays unpaired (after the LOOSE_WAIT pairing) before it gets a copy
+local COPY_RANGE = 90       -- m from our player: host NPCs farther away get no copy (and lose theirs at COPY_RANGE + 20)
+local MAX_COPIES = 10       -- copies at once (each is a full human on the guest's game)
+local COPY_DEAD_KEEP = 12   -- s a dead copy lies before it is released
+local COPY_LOAD_TIMEOUT = 12  -- s a spawn profile may take to load before it counts as bad (the spawner is then reset)
+local COPY_SNAP = 10        -- m: farther off its host NPC than this, a copy is put there at once
+local COPY_AFTER_LOAD = 10  -- s after our world loaded before copies are spawned (our own mission spawns its NPCs then)
+local FACTORY_CAR = "shubert_e_six"
+local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 
 local function log(s) if mc_log then mc_log("npc: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -71,6 +90,13 @@ N.sent = N.sent or {}      -- host: key -> last dead flag sent
 N.replays = N.replays or {}
 N.hitq = N.hitq or {}      -- guest: hits from the DAMAGE callbacks, sent with the next update
 N.lethal = N.lethal or {}  -- host: guests' lethal hits waiting for the NPC to die
+N.copies = N.copies or {}  -- guest: host key -> spawned copy { key, so, id, st, prof, ... } (also a puppet-like table)
+N.copyIds = N.copyIds or {}  -- guest: local id of a spawned copy -> host key
+N.cfac = N.cfac or { st = "none", t = 0 }  -- guest: the copies' spawner (a factory like player_sync.lua's)
+N.cgrave = N.cgrave or {}  -- guest: burning copies waiting to be released
+N.shots = N.shots or {}    -- host: NPC id -> shots fired (mod 256), from the ON_SHOOT events
+N.spawners = N.spawners or {}  -- host: spawner name -> { {x, y, z, prof}, ... } (mission spawners, entity type 65)
+N.badProfiles = N.badProfiles or {}
 
 -- Humans that are ours, not mission NPCs: the puppets and the puppet factory's driver.
 local function ours(id)
@@ -79,6 +105,9 @@ local function ours(id)
   end
   local f = M.fac
   if f and f.drv and valid(f.drv) and idOf(f.drv) == id then return true end
+  if N.copyIds[id] then return true end
+  local c = N.cfac
+  if c and c.drvId == id then return true end
   return false
 end
 
@@ -152,6 +181,101 @@ local function invulnerable(h)
 end
 
 -- ---- host -------------------------------------------------------------------------------------------------------------
+-- An NPC's spawn profile. There is no getter on a human; but a human that a mission spawner made is named after it
+-- (`behavior_object_prime-NN-<spawner>`), and the spawners are scene objects (entity type 65) whose runtime spawner
+-- component tells its profile (a decimal hash; docs/game-api.md 15). "0" when it is not known (traffic, police from
+-- the generators, our puppets).
+function N.SpawnerScan()
+  N.spT = M.now
+  local t, n = {}, 0
+  for s in string.gmatch(mc_entity_ids(65), "%d+") do
+    local o = mc_entity(tonumber(s))
+    local good, name = pcall(function() return o and o:GetName() end)
+    if good and name and name ~= "" then
+      local prof
+      for _, cn in ipairs({ "C_RuntimeSpawnerComponent", "C_SpawnerComponent" }) do
+        local ok, c = pcall(o.GetComponent, o, cn)
+        if ok and c and c.GetSpawnProfile then
+          local ok2, pr = pcall(c.GetSpawnProfile, c)
+          pr = ok2 and tostring(pr) or ""
+          if pr:match("^%d+$") and pr ~= "0" then prof = pr break end
+        end
+      end
+      if prof then
+        local q = o:GetPos()
+        t[name] = t[name] or {}
+        table.insert(t[name], { x = q.x, y = q.y, z = q.z, prof = prof })
+        n = n + 1
+      end
+    end
+  end
+  N.spawners = t
+  if n ~= N.spawnerCount then
+    N.spawnerCount = n
+    log("mission spawners with a profile: " .. n)
+  end
+end
+
+function N.ProfileOf(e)
+  if e.prof then return e.prof end
+  local good, name = pcall(e.h.GetName, e.h)
+  local sp = good and tostring(name):match("^behavior_object_prime%-%x+%-(.+)$")
+  if not sp or sp:match("^behavior_object_prime") then e.prof = "0" return e.prof end
+  local list = N.spawners[sp]
+  if not list and M.now - (N.spT or -10) > 3 then
+    pcall(N.SpawnerScan)
+    list = N.spawners[sp]
+  end
+  if not list then
+    e.profTries = (e.profTries or 0) + 1
+    if e.profTries >= 5 then
+      e.prof = "0"
+      log("NPC " .. e.id .. " comes from spawner " .. sp .. ", which was not found: no profile")
+    end
+    return "0"
+  end
+  local q = e.h:GetPos()
+  local best, bd
+  for _, c in ipairs(list) do
+    local d = (c.x - q.x) ^ 2 + (c.y - q.y) ^ 2 + (c.z - q.z) ^ 2
+    if not bd or d < bd then best, bd = c, d end
+  end
+  e.prof = best.prof
+  N.profKnown = (N.profKnown or 0) + 1
+  if N.profKnown <= 40 then log("NPC " .. e.id .. " comes from spawner " .. sp .. ": profile " .. e.prof) end
+  return e.prof
+end
+
+-- Host: the NPCs' shots, counted from their ON_SHOOT events (one subscription per world, like player_sync.lua's
+-- DAMAGE watch); the guests' copies fire as many.
+function N.WatchShots()
+  local key = N.worldKey
+  if N.shotWatch and N.shotWatch.key == key then return end
+  N.UnwatchShots()
+  local good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
+    pcall(function()
+      local r = tonumber(tostring(m:GetReceiverGUID()):match("(%d+)%s*$"))
+      if r and N.ents[r] then
+        N.shots[r] = ((N.shots[r] or 0) + 1) % 256
+        N.shotEvents = (N.shotEvents or 0) + 1
+        if N.shotEvents <= 5 then log("NPC " .. r .. " fired (shot event #" .. N.shotEvents .. ")") end
+      end
+    end)
+  end, enums.EventType.HUMAN, enums.HumanMessages.ON_SHOOT)
+  if good and tonumber(id) and tonumber(id) >= 0 then
+    N.shotWatch = { key = key, id = id }
+    log("watching NPC shots")
+  else
+    N.shotWatch = { key = key }
+    log("could not watch NPC shots (" .. tostring(id) .. ")")
+  end
+end
+
+function N.UnwatchShots()
+  if N.shotWatch and N.shotWatch.id then pcall(game.game.UnregisterBlanketEvent, game.game, N.shotWatch.id) end
+  N.shotWatch = nil
+end
+
 -- Viewpoints: the host and every puppet (the guests).
 local function viewpoints(p)
   local v = {}
@@ -185,8 +309,13 @@ function N.HostSend(p, ev)
     local dead = h:IsDeath()
     local flags = (dead and 1 or 0) + (h:GetOwner() and 2 or 0)
     if not e.tagT or M.now - e.tagT > 2 then e.tag, e.tagT = tagOf(h), M.now end
-    ev[#ev + 1] = string.format("NS %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s", e.id, q.x, q.y, q.z, d.x, d.y,
-      dead and 0 or healthOf(h), flags, aiOf(h), e.tag or 0, weaponOf(h))
+    local prof = "0"
+    if not dead then
+      local good, pr = pcall(N.ProfileOf, e)
+      prof = good and pr or "0"
+    end
+    ev[#ev + 1] = string.format("NS %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s %s %d", e.id, q.x, q.y, q.z, d.x, d.y,
+      dead and 0 or healthOf(h), flags, aiOf(h), e.tag or 0, weaponOf(h), prof, N.shots[e.id] or 0)
     if dead and not N.sent[e.id] then
       N.sent[e.id] = true
       ev[#ev + 1] = "ND " .. e.id
@@ -280,6 +409,8 @@ function N.OnDamage(m, receiverId)
   end
   local key = N.byLocal[receiverId]
   if not key then return false end
+  local cc = N.copyIds[receiverId] and N.copies[N.copyIds[receiverId]]
+  if cc and tonumber(m:GetDamageType()) == 8 then cc.burnT = M.now end  -- FIRE: see N.ReleaseCopy
   local enemy = tostring(m:GetEnemyGUID())
   if not (M.IsLocalAttacker and M.IsLocalAttacker(enemy)) then return true end  -- our copy, hit by someone else
   local amount = tonumber(m:GetDamageAmount()) or 0
@@ -304,6 +435,7 @@ function N.FightsUs(key)
   local s = key and N.host[key]
   local e = s and s.loc and N.ents[s.loc]
   if not (e and valid(e.h)) or e.h:IsDeath() then return false end
+  if s.copy then return false end  -- a spawned copy only shows the host's NPC: its hits come from the host
   return aiOf(e.h) == 2
 end
 
@@ -358,6 +490,7 @@ end
 -- no longer at the same spots. Dead host NPCs are paired too, so the guest's copy dies (enemies the host already
 -- killed die on a guest who reloaded). Pairs are taken nearest first over all candidates.
 local function link(key, s, id, d, how)
+  s.copy = N.copyIds[id] ~= nil
   s.loc, s.ourHitT, s.deadHere, s.killT, s.kills, s.hidden, s.notedHostile = id, nil, nil, nil, 0, nil, nil
   N.byLocal[id] = key
   N.paired = (N.paired or 0) + 1
@@ -380,17 +513,22 @@ function N.PairAll()
   if #free == 0 then return end
   local cands = {}
   for key, s in pairs(N.host) do
-    if not s.loc and M.now - s.t <= STALE then
+    -- a host NPC shown by a spawned copy is paired again as soon as our own game has that NPC (our mission spawned
+    -- it after all): our own takes over and the copy goes
+    if (not s.loc or s.copy) and M.now - s.t <= STALE then
       s.unpairedSince = s.unpairedSince or M.now
-      local loose = s.ai ~= 0 and M.now - s.unpairedSince >= LOOSE_WAIT
+      local loose = s.ai ~= 0 and (s.copy or M.now - s.unpairedSince >= LOOSE_WAIT)
       for i, f in ipairs(free) do
         local d = math.sqrt((f.x - s.x) ^ 2 + (f.y - s.y) ^ 2 + (f.z - s.z) ^ 2)
-        if d <= MATCH_DIST and not s.dead then
+        -- the same spot and the same kind (0.12.0: another of our NPCs that stands there, e.g. our kitchen rifleman
+        -- where the host's kitchen machine gunner came in, is not it; a spawned copy gives way only to its own kind)
+        local kindOk = (s.tag or 0) == 0 or f.tag == 0 or f.tag == s.tag
+        if d <= MATCH_DIST and not s.dead and kindOk then
           cands[#cands + 1] = { d = d, dist = d, s = s, i = i, how = "same spot" }
         elseif loose and d <= LOOSE_DIST and f.ai ~= 0 and math.abs(f.z - s.z) < 8 then
           local sameTag = (s.tag or 0) ~= 0 and f.tag == s.tag
           local sameAi = f.ai == s.ai
-          if sameTag or (sameAi and ((s.tag or 0) == 0 or f.tag == 0)) then
+          if sameTag or (sameAi and ((s.tag or 0) == 0 or f.tag == 0) and not s.copy) then
             -- the same archetype counts double: a near NPC of another kind loses to a farther one of this kind
             cands[#cands + 1] = { d = sameTag and d * 0.5 or d, dist = d, s = s, i = i,
               how = sameTag and "same kind, moved apart" or "same AI type, moved apart" }
@@ -405,8 +543,11 @@ function N.PairAll()
   end)
   local used = {}
   for _, c in ipairs(cands) do
-    if not used[c.i] and not c.s.loc then
+    if not used[c.i] and (not c.s.loc or c.s.copy) then
       used[c.i] = true
+      if c.s.copy then
+        N.DropCopy(c.s.key, "our own game has this NPC now (our " .. free[c.i].id .. ", " .. c.how .. ")")
+      end
       link(c.s.key, c.s, free[c.i].id, c.dist, c.how)
     end
   end
@@ -461,6 +602,7 @@ function N.Enforce(s, e, p)
   if hp > 0 and here > hp + 0.5 then pcall(function() h.health = hp end) end
   -- hostile on the host but not here: only noted (our own mission flow makes its enemies hostile itself; switching
   -- a civilian's brain from a script crashed the game in tests)
+  if s.copy then return end  -- a spawned copy is driven from the host's states (N.DriveCopy)
   if s.ai == 2 and aiOf(h) ~= 2 and not s.notedHostile then
     s.notedHostile = true
     log("host NPC " .. s.key .. " is hostile, our " .. e.id .. " is not (yet)")
@@ -497,7 +639,7 @@ function N.GuestTick(p)
       N.host[key] = nil
     elseif M.now - s.t <= STALE then
       live = live + 1
-      local e = s.loc and N.ents[s.loc]
+      local e = s.loc and (N.ents[s.loc] or (s.copy and N.copies[key] and N.copies[key].ent))
       if s.loc and not (e and valid(e.h) and active(e.h)) then
         N.byLocal[s.loc] = nil
         s.loc, e = nil, nil
@@ -515,7 +657,332 @@ function N.GuestTick(p)
     local good, err = pcall(N.PairAll)
     if not good then log("pairing error: " .. tostring(err)) end
   end
-  N.status = string.format("NPCs: %d of the host's %d paired, our kills %d", matched, live, N.kills or 0)
+  local good, err = pcall(N.CopiesTick, p)
+  if not good then log("copies error: " .. tostring(err)) end
+  local nc = 0
+  for _, c in pairs(N.copies) do if c.st == "alive" then nc = nc + 1 end end
+  N.status = string.format("NPCs: %d of the host's %d paired (%d spawned copies), our kills %d", matched, live, nc,
+    N.kills or 0)
+end
+
+-- ---- spawned copies (guest) -------------------------------------------------------------------------------------------
+-- The copies' spawner: a crewed traffic car parked 40 m below our player whose driver carries a runtime spawner
+-- component (the recipe of player_sync.lua's puppet factory, docs/game-api.md 3); one profile at a time. Despawning
+-- it removes every copy it made.
+-- wait: a burning copy holds the reset back (the despawn would release it); a lost spawner is despawned anyway (its
+-- driver is gone: whatever it made goes with its car).
+function N.FacReset(why, wait)
+  local f = N.cfac
+  if wait then
+    for _, c in pairs(N.copies) do
+      if c.burnT and M.now - c.burnT < 8 then
+        if not f.burnWait then log("copy spawner reset (" .. tostring(why) .. ") waits: a copy burns") end
+        f.burnWait = true
+        return false
+      end
+    end
+  end
+  if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
+  if why then log("copy spawner reset: " .. tostring(why)) end
+  for key, c in pairs(N.copies) do N.Forget(key, c) end
+  N.cgrave = {}
+  N.cfac = { st = "none", t = -1 }
+  return true
+end
+
+function N.FacTick(dt, need, p)
+  local f = N.cfac
+  f.t = f.t + dt
+  if f.st == "none" then
+    if not need or f.t < 0 then return end
+    local so, id = try("copy spawner ObtainCarWithCrew", game.traffic.ObtainCarWithCrew, game.traffic, FACTORY_CAR,
+      { FACTORY_PROFILE })
+    if so and id then
+      f.st, f.so, f.id, f.t = "obtain", so, id, 0
+    else
+      f.t = -5
+    end
+  elseif f.st == "obtain" then
+    if f.so:IsDone() then
+      local q = p:GetPos()
+      f.sp = game.traffic:SpawnCar(f.id, V(q.x + 3, q.y, q.z - 40), V(1, 0, 0))
+      f.st, f.t = "spawn", 0
+    elseif f.t > 6 then
+      N.FacReset("obtain timeout", true)
+    end
+  elseif f.st == "spawn" then
+    if f.sp:IsDone() then
+      local car = game.traffic:GetSpawnedEntity(f.id)
+      local drv = car and car:GetSeatOwner(0)
+      if not valid(drv) then N.FacReset("no crew", true) return end
+      pcall(car.FixCarPos, car, true)
+      pcall(car.SetDespawnImmunity, car, true)
+      if not drv:GetComponent("C_RuntimeSpawnerComponent") then drv:AddComponent("C_RuntimeSpawnerComponent") end
+      local comp = drv:GetComponent("C_RuntimeSpawnerComponent")
+      if not comp then N.FacReset("no spawner component", true) return end
+      pcall(drv.SetDemigod, drv, true)
+      pcall(drv.DespawnImmunity, drv, true)
+      pcall(drv.SetReactionOnSound, drv, false)
+      pcall(drv.InterruptCivilWander, drv)
+      pcall(drv.LockControls, drv, true)
+      f.car, f.drv, f.drvId, f.comp, f.st, f.t, f.busy = car, drv, idOf(drv), comp, "ready", 0, nil
+      N.ents[f.drvId] = nil
+      log("copy spawner ready")
+    elseif f.t > 8 then
+      N.FacReset("spawn timeout", true)
+    end
+  elseif f.st == "ready" then
+    if not valid(f.drv) or not valid(f.car) or f.drv:IsDeath() then
+      N.FacReset("copy spawner lost", false)
+      return
+    end
+    if f.t > 3 then
+      f.t = 0
+      local q, cp = p:GetPos(), f.car:GetPos()
+      if (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 > 120 * 120 then f.car:SetPos(V(q.x + 3, q.y, q.z - 40)) end
+    end
+  end
+end
+
+-- A copy's entity is gone (released, with the spawner or the world): forget it.
+function N.Forget(key, c)
+  if c.id then N.copyIds[c.id] = nil end
+  local s = N.host[key]
+  if s and s.copy then
+    if s.loc then N.byLocal[s.loc] = nil end
+    s.loc, s.copy = nil, nil
+  end
+  N.copies[key] = nil
+end
+
+-- Release a copy (one that burns is hidden first and released once the fire is out: the game's fire update keeps a
+-- list of burning humans and read a released one, docs/game-api.md 15). Copies carry no map marker.
+function N.ReleaseCopy(c)
+  if not (c.so and valid(c.so)) then return end
+  if c.burnT and M.now - c.burnT < 8 then
+    pcall(c.so.ShowModel, c.so, false)
+    pcall(c.so.SetPhysState, c.so, 2)
+    N.cgrave[#N.cgrave + 1] = { so = c.so, burnT = c.burnT }
+    return
+  end
+  local f = N.cfac
+  if f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, c.so) end
+end
+
+function N.DropCopy(key, why)
+  local c = N.copies[key]
+  if not c then return end
+  if c.so then N.ReleaseCopy(c) end
+  if N.cfac.busy == key then N.cfac.busy = nil end
+  N.Forget(key, c)
+  N.dropped = (N.dropped or 0) + 1
+  if N.dropped <= 80 then log("copy of host NPC " .. key .. " removed: " .. why) end
+end
+
+function N.DropAllCopies(why)
+  local n = 0
+  for key, _ in pairs(N.copies) do
+    N.DropCopy(key, why)
+    n = n + 1
+  end
+  return n
+end
+
+-- The host NPCs that should have a copy: alive, with a job (AI type not 0), a known profile, on foot, near us, without
+-- a partner for LOOSE_WAIT + COPY_WAIT s; nearest first.
+function N.CopyWanted(p)
+  local q = p:GetPos()
+  local list = {}
+  for key, s in pairs(N.host) do
+    if not s.loc and not N.copies[key] and not s.dead and not s.car and s.ai ~= 0 and M.now - s.t <= 1
+        and s.prof and s.prof ~= "0" and not N.badProfiles[s.prof] and s.unpairedSince
+        and M.now - s.unpairedSince >= LOOSE_WAIT + COPY_WAIT then
+      local d = math.sqrt((s.x - q.x) ^ 2 + (s.y - q.y) ^ 2)
+      if d <= COPY_RANGE and math.abs(s.z - q.z) < 30 then list[#list + 1] = { s = s, d = d } end
+    end
+  end
+  table.sort(list, function(a, b) return a.d < b.d end)
+  return list
+end
+
+-- One copy at a time through the spawner: profile, load, create.
+function N.SpawnCopyTick(p)
+  local f = N.cfac
+  if f.st ~= "ready" then return end
+  if f.busy then
+    local c = N.copies[f.busy]
+    local s = N.host[f.busy]
+    if not c or not s or s.loc or s.dead then
+      if c and not c.so then N.copies[f.busy] = nil end
+      f.busy = nil
+      return
+    end
+    if not f.load:IsDone() then
+      if M.now - f.loadT > COPY_LOAD_TIMEOUT then
+        N.badProfiles[c.prof] = true
+        log("copy profile " .. c.prof .. " did not load in " .. COPY_LOAD_TIMEOUT .. " s: not used again")
+        N.copies[f.busy] = nil
+        f.busy = nil
+        N.FacReset("a profile did not load", true)
+      end
+      return
+    end
+    f.busy = nil
+    local so = try("copy CreateObject", f.comp.CreateObject, f.comp)
+    if not valid(so) then N.copies[c.key] = nil return end
+    so:SetPos(V(s.x, s.y, s.z))
+    so:SetDir(V(s.hx, s.hy, 0))
+    so:Activate()
+    pcall(so.SetDemigod, so, false)
+    pcall(function() so.invulnerability = false end)
+    pcall(so.DespawnImmunity, so, true)
+    -- a civilian: it runs no fight of its own (never a brain switch, never a melee order: both crashed the game,
+    -- docs/game-api.md 11/15); it does not run from gunfire or cars, it only shows the host's NPC
+    pcall(so.SetReactionOnSound, so, false)
+    pcall(so.InterruptCivilWander, so)
+    pcall(so.InterruptAvoidingCar, so)
+    local hp = tonumber(s.hp) or 0
+    if hp > 0 then pcall(function() so.health = hp end) end
+    c.so, c.id, c.st, c.spawnT = so, idOf(so), "alive", M.now
+    c.ent = { h = so, id = c.id }
+    c.tx, c.ty, c.tz, c.hx, c.hy, c.lastMove, c.moving = s.x, s.y, s.z, s.hx, s.hy, -1, false
+    c.shots, c.wantWeapon, c.weapon = s.shots or 0, nil, nil
+    c.noShield = true
+    N.copyIds[c.id] = c.key
+    N.ents[c.id] = nil
+    link(c.key, s, c.id, 0, "spawned copy")
+    N.spawned = (N.spawned or 0) + 1
+    log(string.format("host NPC %d had no partner here: spawned a copy (our %d, profile %s, AI type here %s, " ..
+      "weapon %s, #%d)", c.key, c.id, c.prof, tostring(aiOf(so)), tostring(s.weapon), N.spawned))
+    return
+  end
+  local n = 0
+  for _, _ in pairs(N.copies) do n = n + 1 end
+  if n >= MAX_COPIES then return end
+  local w = N.CopyWanted(p)[1]
+  if not w then return end
+  local s = w.s
+  local c = { key = s.key, st = "loading", prof = s.prof }
+  local ok = pcall(f.comp.SetSpawnProfile, f.comp, s.prof)
+  if not ok then N.badProfiles[s.prof] = true return end
+  N.copies[s.key] = c
+  f.load, f.loadT, f.busy = f.comp:GetSpawnProfileLoadSyncObject(), M.now, s.key
+end
+
+-- Drive a copy like a player puppet (player_sync.lua M.Drive): walk/run toward where the host's NPC is (its states
+-- plus its velocity), pulled along each tick; its weapon; its shots (player_sync.lua M.Combat) fired along its
+-- heading, and past us when it faces us: a copy's bullet is only a picture (the host's NPC shot at our puppet there and
+-- that hit reaches us).
+local MOVE_MODES = { { 4.2, "SPRINT" }, { 1.8, "RUN" }, { 0, "WALK" } }
+function N.DriveCopy(c, s, p)
+  local so = c.so
+  if so:IsDeath() then
+    c.deadT = c.deadT or M.now
+    if M.now - c.deadT > COPY_DEAD_KEEP then N.DropCopy(c.key, "dead for " .. COPY_DEAD_KEEP .. " s") end
+    return
+  end
+  local age = math.min(0.25, M.now - s.t)
+  c.tx, c.ty, c.tz = s.x + (s.vx or 0) * age, s.y + (s.vy or 0) * age, s.z
+  c.hx, c.hy = s.hx, s.hy
+  local q = so:GetPos()
+  local dx, dy, dz = c.tx - q.x, c.ty - q.y, c.tz - q.z
+  local d2 = dx * dx + dy * dy
+  if d2 > COPY_SNAP * COPY_SNAP or dz > 4 or dz < -4 then
+    so:SetPos(V(c.tx, c.ty, c.tz))
+    so:SetDir(V(c.hx, c.hy, 0))
+    c.moving, c.lastMove = false, M.now
+  else
+    local spd = math.sqrt((s.vx or 0) ^ 2 + (s.vy or 0) ^ 2)
+    if spd > 0.4 or d2 > 1.0 then
+      if M.now - c.lastMove > 0.3 then
+        local mode = "WALK"
+        for _, m in ipairs(MOVE_MODES) do if spd >= m[1] then mode = m[2] break end end
+        if d2 > 16 and mode == "WALK" then mode = "RUN" end
+        so:MoveVec(V(c.tx + (s.vx or 0) * 0.3, c.ty + (s.vy or 0) * 0.3, c.tz), mode)
+        c.lastMove, c.moving = M.now, true
+      end
+    else
+      if c.moving then
+        so:MoveVec(V(c.tx, c.ty, c.tz), "WALK")
+        c.moving = false
+      end
+      local d = so:GetDir()
+      if not (c.cb and c.cb.aim) and d.x * c.hx + d.y * c.hy < 0.97 then so:SetDir(V(c.hx, c.hy, 0)) end
+    end
+    if M.Pull then M.Pull(c, so) end
+  end
+  c.wantWeapon = (s.weapon and s.weapon ~= "-") and s.weapon or ""
+  c.shots = s.shots or 0
+  -- the profile's own loadout may take its gun back out (its AI picked its pistol): the host's weapon again
+  if c.wantWeapon ~= "" and M.now - (c.wpT or 0) > 2 then
+    c.wpT = M.now
+    local good, sel = pcall(so.InventoryGetSelected, so)
+    if good and tostring(sel) ~= c.wantWeapon then c.weapon = nil end
+  end
+  local ax, ay, az = c.hx, c.hy, 0
+  local me = p:GetPos()
+  local mx, my, mz = me.x - q.x, me.y - q.y, me.z - q.z
+  local ml = math.sqrt(mx * mx + my * my)
+  if ml > 0.5 and (mx * c.hx + my * c.hy) / ml > 0.8 then
+    -- it faces us: aim past us (1.6 m beside and 2 m above), so its bullets fly by but do not hit us
+    local sx, sy = -my / ml, mx / ml
+    local tx, ty, tz = mx + sx * 1.6, my + sy * 1.6, mz + 2.2
+    local l = math.sqrt(tx * tx + ty * ty + tz * tz)
+    ax, ay, az = tx / l, ty / l, tz / l
+  end
+  c.ax, c.ay, c.az, c.aim, c.crouch, c.reload = ax, ay, az, false, false, false
+  if M.Weapon then M.Weapon(c) end
+  if M.Combat then M.Combat(c) end
+end
+
+function N.CopiesTick(p)
+  local f = N.cfac
+  local want = M.now - (M.inWorldAt or M.now) > COPY_AFTER_LOAD and not M.cutscene
+  -- copies go during a cutscene (puppets are hidden then too) and come back afterwards
+  if M.cutscene and next(N.copies) then N.DropAllCopies("a cutscene plays") end
+  local any = false
+  for key, c in pairs(N.copies) do
+    any = true
+    local s = N.host[key]
+    if c.st == "alive" then
+      if not (c.so and valid(c.so)) then
+        N.Forget(key, c)
+      elseif not s or M.now - s.t > RELEASE then
+        N.DropCopy(key, "the host no longer sends it (out of range or gone)")
+      elseif s.car then
+        N.DropCopy(key, "it got into a car on the host's game")
+      elseif s.loc ~= c.id then
+        N.DropCopy(key, "paired otherwise")
+      else
+        local q, me = c.so:GetPos(), p:GetPos()
+        if (q.x - me.x) ^ 2 + (q.y - me.y) ^ 2 > (COPY_RANGE + 20) ^ 2 and not c.so:IsDeath() then
+          N.DropCopy(key, "far from us")
+        elseif M.now - s.t <= STALE then
+          local good, err = pcall(N.DriveCopy, c, s, p)
+          if not good then
+            c.errs = (c.errs or 0) + 1
+            if c.errs <= 5 then log("copy " .. key .. " drive error: " .. tostring(err)) end
+          end
+        end
+      end
+    end
+  end
+  if #N.cgrave > 0 then
+    local keep = {}
+    for _, g in ipairs(N.cgrave) do
+      if not valid(g.so) then
+        -- gone already
+      elseif M.now - g.burnT > 8 then
+        if f.comp then pcall(f.comp.ReleaseObjectRaw, f.comp, g.so) end
+      else
+        keep[#keep + 1] = g
+      end
+    end
+    N.cgrave = keep
+  end
+  local need = want and (any or #N.CopyWanted(p) > 0)
+  if f.st ~= "none" or need then N.FacTick(M.dt or 0.033, need, p) end
+  if want then N.SpawnCopyTick(p) end
 end
 
 -- ---- update -----------------------------------------------------------------------------------------------------------
@@ -532,8 +999,18 @@ function N.Update(dt, cmds)
       local key = tonumber(f[2])
       local s = N.host[key] or { key = key }
       N.host[key] = s
+      local px, py, pt = s.x, s.y, s.t
       s.x, s.y, s.z, s.hx, s.hy = tonumber(f[3]), tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7])
+      -- its velocity from the last two states (spawned copies lead by it), smoothed
+      if pt and M.now - pt > 0.03 and M.now - pt < 0.6 then
+        local vx, vy = (s.x - px) / (M.now - pt), (s.y - py) / (M.now - pt)
+        if vx * vx + vy * vy > 100 then vx, vy = 0, 0 end
+        s.vx, s.vy = 0.5 * (s.vx or vx) + 0.5 * vx, 0.5 * (s.vy or vy) + 0.5 * vy
+      elseif pt then
+        s.vx, s.vy = 0, 0
+      end
       s.hp, s.ai, s.tag, s.weapon = tonumber(f[8]), tonumber(f[10]), tonumber(f[11]) or 0, f[12] or "-"
+      s.prof, s.shots = f[13] or "0", tonumber(f[14]) or 0
       local flags = tonumber(f[9]) or 0
       s.dead = s.dead or (flags % 2) == 1
       s.car = math.floor(flags / 2) % 2 == 1
@@ -551,8 +1028,19 @@ function N.Update(dt, cmds)
   local key = p and (tostring(game.game:GetLoadedSaveId()) .. "|" .. tostring(M.inWorldAt)) or nil
   if key ~= N.worldKey then  -- another world: nothing carries over
     N.worldKey = key
+    local n = 0
+    for _, _ in pairs(N.copies) do n = n + 1 end
+    if n > 0 then log(n .. " spawned copies went with the old world") end
     N.ents, N.host, N.byLocal, N.sent, N.replays, N.lethal = {}, {}, {}, {}, {}, {}
+    N.copies, N.copyIds, N.cgrave, N.shots, N.spawners = {}, {}, {}, {}, {}
+    N.cfac = { st = "none", t = 0 }  -- its car went with the world
+    N.shotWatch, N.spT = nil, nil
     N.scanT = -10
+  end
+  M.dt = dt
+  if not active and p and (next(N.copies) or N.cfac.st ~= "none") then  -- the session ended: our copies go
+    N.DropAllCopies("the session ended")
+    N.FacReset("session ended", true)
   end
   if not (active and p) then return table.concat(ev, "\n") end
   if M.now - (N.scanT or -10) >= SCAN_INTERVAL then
@@ -561,6 +1049,7 @@ function N.Update(dt, cmds)
     if not good then log("scan error: " .. tostring(err)) end
   end
   if host then
+    pcall(N.WatchShots)
     if M.now - (N.sendT or -10) >= SEND_INTERVAL then
       N.sendT = M.now
       local good, err = pcall(N.HostSend, p, ev)

@@ -1,8 +1,8 @@
-Mafia: Definitive Edition - Co-op (MafiaCoop) 0.8.0, pre-release
-=================================================================
+Mafia: Definitive Edition - Co-op (MafiaCoop) 0.12.0, pre-release
+==================================================================
 
 An unofficial, fan-made co-op mod: play Mafia: Definitive Edition together with friends. One small DLL, no separate
-server, Steam invites. This is a PRE-RELEASE: playable, but parts of the world (enemies, traffic) are not shared yet.
+server, Steam invites. This is a PRE-RELEASE: playable, but parts of the world (traffic, pedestrians, police) are not shared.
 Read "Known issues" below before you play.
 
 Contents of this zip
@@ -92,10 +92,11 @@ KNOWN ISSUES
 ------------
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
   both ways (since 0.11.0 a friend's kill also kills the host's enemy, so a friend can clear a fight on his own),
-  health follows the host's game, and the host's enemies also aim at the other players. Each game spawns a fight's
-  later waves when its own player gets there, so stay together: an enemy that only the host's game spawned shoots
-  at a friend without being seen on his screen. Tested in one chapter's shootout (Bon Appetit's restaurant), not
-  played through to its end; other chapters' fights were not tried. enemies_target_guests = 0 in MafiaCoop.ini
+  health follows the host's game, and the host's enemies also aim at the other players. Since 0.12.0 an enemy that
+  only the host's game spawned (the host got somewhere first) shows on a friend's game as a copy that moves and
+  fires with it and can be killed. An enemy only a friend's game spawned is his alone (the host does not see it).
+  Tested in one chapter's shootout (Bon Appetit's restaurant, cleared to the last enemy, the chapter not played past
+  it); other chapters' fights were not tried. enemies_target_guests = 0 in MafiaCoop.ini
   turns the enemies-aim-at-friends part off if it causes trouble.
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
   screen (checked in Taxi and Bon Appetit). Where each player starts in his own mission car, the host's character

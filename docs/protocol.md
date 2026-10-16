@@ -12,7 +12,9 @@ core 0.5 (protocol 7: the pre-game lobby, core docs/protocol.md "Lobby"); lobby 
 startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x0203); lobby modes 0 FREE RIDE, 1 STORY,
 2..21 CHAPTER 1..20 (`MissionSync::Chapters()`, the order of `mm_ids_replay`). 0.7.0: NpcStates (0x0210), NpcDeath
 (0x0211), NpcHit (0x0410); shared cars take a standing car of the same model as the driver's car. 0.9.0: PlayerState
-at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet).
+at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet). 0.12.0:
+NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
+partner on their game.
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -244,11 +246,11 @@ scripts may change things in between; the next WorldEnv puts them back.
 - A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
   instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
 
-### NPCs (0.7.0; 0.11.0 changed NpcStates and NpcHit)
+### NPCs (0.7.0; 0.11.0 changed NpcStates and NpcHit; 0.12.0 NpcStates)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u16 health (0.11.0; was u8), u8 flags (1 dead, 2 in a car), u8 aiType, u32 tag (0.11.0: the battle archetype, hashed; 0 = none), str weapon ("-" = none) |
+| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u16 health (0.11.0; was u8), u8 flags (1 dead, 2 in a car), u8 aiType, u32 tag (0.11.0: the battle archetype, hashed; 0 = none), str weapon ("-" = none), u64 profile (0.12.0: its spawn profile hash, 0 = unknown), u8 shots (0.12.0: shots it fired, mod 256) |
 | 0x0211 | NpcDeath | host -> guests (`Broadcast`) | R | u32 key |
 | 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (0.11.0: 1 = lethal, the guest's copy died of his hits) |
 
@@ -276,8 +278,23 @@ scripts may change things in between; the next WorldEnv puts them back.
   bullet as ~2.6x its DAMAGE amount, the downed rules apply, friendly fire does not matter) unless his own copy of
   that NPC is alive and hostile: then it fights him on his own game already and the relayed hit is skipped, so he is
   not hurt twice. Hostile copies are put back only when more than 12 m off (6 m for other NPCs with a job).
-- Unpaired host NPCs (ambient pedestrians that differ per game, NPCs the guest's game has not spawned) are not shown
-  on the guest's game: no copies are spawned for them.
+- Spawned copies (0.12.0): a host NPC with a job (AI type not 0), on foot, alive, with a known profile, within 90 m of
+  the guest, that found no partner for 5 s (2 s for the loose pairing, then 3 s more; none in the first 10 s after
+  the guest's world loaded) gets a copy on the guest's game: a human from a runtime spawner (like the player
+  puppets) with that spawn profile, its health, and the NPC's weapon. The host knows the profile from the NPC's name:
+  a human a mission spawner made is called `behavior_object_prime-NN-<spawner name>`, and the spawner (entity type
+  65, by that name, the nearest when several share it) tells its profile (docs/game-api.md 15); 0 for NPCs from
+  traffic or police generators, which then get no copy. The copy is driven from the states like a player puppet
+  (walk/run toward the position plus the velocity of the last two states, pulled along, heading when standing), aims
+  and fires when the shot counter goes up (along its heading; past the guest, 1.6 m beside and 2 m above him, when it
+  faces him: its bullets are only a picture, the host's NPC already shot at the guest's puppet and that hit comes as
+  a Hit). It is paired like any copy: the guest's hits go to the host as NpcHit, a lethal one kills the host's NPC,
+  the host's death kills it; relayed hits of that NPC are always applied (it never fights the guest itself). It is
+  released 12 s after its death, 5 s after the last state (out of range, gone), when the NPC gets into a car, when
+  the guest is more than 110 m away, during a cutscene, when the session ends and with the world (loads). When the
+  guest's own game spawns that NPC after all (a free local NPC at the same spot, or of the same tag within 40 m), his
+  own takes over and the copy is released: no doubles. At most 10 copies at a time, one spawn profile loading at a
+  time. Unpaired NPCs without a job (ambient pedestrians that differ per game) still get no copy.
 - Ambient traffic and pedestrians stay local to each game. Cars a player drives are shared as before (Phase 3); a
   remote driver's car is first looked for here: a car of the same model standing where his car stands (within 3 m)
   is taken as his car (mission cars are not doubled), and no copy is spawned into another car standing there.

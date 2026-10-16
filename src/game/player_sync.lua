@@ -742,7 +742,7 @@ function M.Combat(pp)
     if ammo < 2 then  -- refill the clip
       try("HelperInventory_AddWeapon", so.DbgTesting_HelperInventory_AddWeapon, so, pp.weapon, 60)
     end
-    M.ShieldFromShot(so, dx, dy, dz)
+    if not pp.noShield then M.ShieldFromShot(so, dx, dy, dz) end  -- npc_sync.lua's copies aim past us instead
     try("ShootReload", so.DbgTesting_ShootReload, so, true, false, 0)
     c.so, c.t, c.op = so:DbgTesting_SemaphoreNextFrame(), M.now, "press"
     c.shots = (c.shots + 1) % 256
@@ -1078,6 +1078,17 @@ end
 -- Our own DAMAGE: a bullet from a puppet we replayed has landed.
 function M.OnLocalDamage(m)
   local enemy = tostring(m:GetEnemyGUID())
+  local eid = tonumber(enemy:match("(%d+)%s*$"))
+  if eid and M.Npc and M.Npc.copyIds and M.Npc.copyIds[eid] then
+    -- a spawned copy of a host NPC hit us (npc_sync.lua): its shots are only pictures (they aim past us, but its gun
+    -- still found us sometimes): undone on the next tick; the host's NPC's real hits come as Hits from the host
+    M.copyHits = (M.copyHits or 0) + 1
+    M.undoTo = math.max(M.undoTo or 0, M.lastHealth or 0)
+    if M.copyHits <= 10 or M.copyHits % 50 == 0 then
+      log("a spawned NPC copy hit us (" .. tostring(m:GetDamageAmount()) .. "): undone (#" .. M.copyHits .. ")")
+    end
+    return
+  end
   for _, r in ipairs(M.replays) do
     if not r.landed and r.guid == enemy then r.landed = true return end
   end
@@ -1449,6 +1460,21 @@ end
 
 -- Our demigod flag: on while shielded or downed (not while a replayed bullet is on its way), off otherwise (only
 -- switched off again if we switched it on).
+-- Health taken by a spawned copy's bullet (M.OnLocalDamage) is given back; our health is kept for that each tick.
+function M.CopyUndoTick(p)
+  local h = tonumber(p.health) or 0
+  if M.undoTo then
+    if h < M.undoTo and not p:IsDeath() and not M.down then
+      pcall(function() p.health = M.undoTo end)
+      M.undone = (M.undone or 0) + 1
+      if M.undone <= 10 then log(string.format("health given back: %.1f -> %.1f", h, M.undoTo)) end
+      h = M.undoTo
+    end
+    M.undoTo = nil
+  end
+  M.lastHealth = h
+end
+
 function M.DemigodTick(p)
   local want = M.down ~= nil or (M.now < (M.shieldUntil or 0) and M.now >= (M.openUntil or 0))
   if want ~= (M.demi or false) then
@@ -1819,6 +1845,7 @@ function M.Update(dt, cmds)
     good, err = pcall(M.DownTick, player)
     if not good then logErr("down", err) end
     pcall(M.DemigodTick, player)
+    pcall(M.CopyUndoTick, player)
     if active then
       good, err = pcall(M.ModelTick, player)
       if not good then logErr("model", err) end

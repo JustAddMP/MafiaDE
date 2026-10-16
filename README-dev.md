@@ -282,7 +282,11 @@ he loaded, so a mismatch reloads it), `mc_follow_force()` (a following guest in 
 loads the host's point again: the reload path), `mc_start("story" | quest id | "quest@cp_040")` (at the main menu:
 what the lobby's START of that mode does on this game; `quest@cp` = host only, the chapter start save with its quest
 started at that checkpoint), `mc_story_reload()` (what a death in a co-op chapter calls), `mc_entity(id)` and
-`mc_entity_ids(type)` (the entity table: a wrapper by entity id, every id of a type, 8 humans, 10 cars).
+`mc_entity_ids(type)` (the entity table: a wrapper by entity id, every id of a type, 8 humans, 10 cars, 65 spawners),
+`mc_fnv(text)` (the game's 64-bit name hash of a profile path, as a decimal string) and, for finding fields at
+runtime, `mc_memfind(id, value [, span [, depth]])` (where a u64 or a text sits in an entity's object and the objects
+it points to), `mc_memread(id, "+0x10>+0x38")` and `mc_memdump(id, path, bytes)` (reads go through
+ReadProcessMemory, so a bad pointer only fails the read).
 
 Dev console, to explore the API live:
 

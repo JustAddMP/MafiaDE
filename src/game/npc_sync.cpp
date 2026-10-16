@@ -63,7 +63,8 @@ bool SafeWeapon(const std::string& s) {
 
 // ---- messages ----------------------------------------------------------------------------------------------------------
 // NpcStates: u8 count, then per NPC: u32 key, f32 x y z, i8 hx hy (x127), u16 health, u8 flags, u8 ai, u32 tag,
-// str weapon (tag: the NPC's battle archetype hash, the same on every game for the same mission NPC; 0 = none)
+// str weapon, u64 profile, u8 shots (tag: the NPC's battle archetype hash, the same on every game for the same mission
+// NPC; 0 = none. profile: its spawn profile hash, 0 = unknown; shots: shots it fired, mod 256; both 0.12.0)
 void OnStates(net::PlayerId from, net::ByteReader& r) {
     if (from != 0 || (_session && _session->IsHost())) return;
     const uint8_t n = r.U8();
@@ -76,10 +77,13 @@ void OnStates(net::PlayerId from, net::ByteReader& r) {
         const uint8_t flags = r.U8(), ai = r.U8();
         const uint32_t tag = r.U32();
         const std::string w = r.Str(48);
+        const uint64_t profile = r.U64();
+        const uint8_t shots = r.U8();
         if (r.Failed() || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) return;
-        char buf[176];
-        std::snprintf(buf, sizeof buf, "N %u %.2f %.2f %.2f %.3f %.3f %u %u %u %u %s\n", key, x, y, z, hx, hy,
-                      static_cast<unsigned>(hp), flags, ai, tag, SafeWeapon(w) ? w.c_str() : "-");
+        char buf[208];
+        std::snprintf(buf, sizeof buf, "N %u %.2f %.2f %.2f %.3f %.3f %u %u %u %u %s %llu %u\n", key, x, y, z, hx, hy,
+                      static_cast<unsigned>(hp), flags, ai, tag, SafeWeapon(w) ? w.c_str() : "-",
+                      static_cast<unsigned long long>(profile), static_cast<unsigned>(shots));
         lines += buf;
     }
     ++_statesRecv;
@@ -112,7 +116,7 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
 // One NpcStates message per kPerPacket NPCs; fewer when long weapon names would push it past the unreliable limit
 // (core kMaxUnreliableMessage, a larger message is refused by the transport and was lost before 0.9.0).
 constexpr size_t kMaxStatesBytes = 1000;  // payload; the session header adds a few bytes
-constexpr size_t kMaxNpcBytes = 4 + 12 + 2 + 2 + 2 + 4 + 1 + 48;  // one NPC with the longest weapon name
+constexpr size_t kMaxNpcBytes = 4 + 12 + 2 + 2 + 2 + 4 + 1 + 48 + 8 + 1;  // one NPC with the longest weapon name
 
 void SendStates(const std::vector<std::string>& lines) {
     for (size_t at = 0; at < lines.size();) {
@@ -126,8 +130,9 @@ void SendStates(const std::vector<std::string>& lines) {
             float x = 0, y = 0, z = 0, hx = 0, hy = 0;
             unsigned hp = 0, flags = 0, ai = 0;
             double tag = 0;  // u32 (Lua writes it as an integer)
-            std::string weapon;
-            in >> key >> x >> y >> z >> hx >> hy >> hp >> flags >> ai >> tag >> weapon;
+            std::string weapon, profile;
+            unsigned shots = 0;
+            in >> key >> x >> y >> z >> hx >> hy >> hp >> flags >> ai >> tag >> weapon >> profile >> shots;
             w.U32(key);
             w.F32(x);
             w.F32(y);
@@ -139,6 +144,8 @@ void SendStates(const std::vector<std::string>& lines) {
             w.U8(static_cast<uint8_t>(ai));
             w.U32(tag >= 0 && tag <= 4294967295.0 ? static_cast<uint32_t>(tag) : 0u);
             w.Str(SafeWeapon(weapon) ? weapon : "-");
+            w.U64(profile.empty() ? 0 : _strtoui64(profile.c_str(), nullptr, 10));
+            w.U8(static_cast<uint8_t>(shots & 0xFF));
         }
         std::vector<uint8_t> buf = w.Take();
         buf[0] = static_cast<uint8_t>(n);
