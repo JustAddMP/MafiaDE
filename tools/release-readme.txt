@@ -94,20 +94,24 @@ KNOWN ISSUES
   your hits on them are shared; the host's enemies also aim at the other players (since 0.9.0), and on each
   player's own game they fight him too. A chapter's own big shootout has not been played through in co-op yet.
   Some passers-by take no damage on a friend's game. enemies_target_guests = 0 in MafiaCoop.ini turns the
-  enemies-aim-at-friends part off if it causes trouble.
+  enemies-aim-at-friends part off if it causes trouble. Since 0.10.0 a chapter's own shootout (Bon Appetit's
+  restaurant ambush) was played in co-op; a friend's kills there were not checked, and a friend alone in a fight
+  cannot win it (his copies of the enemies only die when the host's do).
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
-  screen (checked in Taxi). Where each player starts in his own mission car, the host's character waits hidden
-  until the cars have parted. Only a few chapters were checked.
+  screen (checked in Taxi and Bon Appetit). Where each player starts in his own mission car, the host's character
+  waits hidden until the cars have parted. The car being handed back when the host gets out was not checked. Only a
+  few chapters were checked.
 - Ambient traffic, pedestrians and police are each player's own (not shared).
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit); other chapters and checkpoints may behave
   differently. A friend who falls behind the host's checkpoint is reloaded at the host's checkpoint.
 - A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the last co-op
-  checkpoint in two loads: first a short stop in a Free Ride world (press Enter on its loading screen as usual), then
-  the checkpoint. Your own story saves are never loaded or changed. Failing by leaving the mission area was tested;
-  running out of time and losing a mission car were not.
-- Name tags show through walls (no line-of-sight check).
-- If a player's game is killed (Task Manager, crash) instead of closed, the others wait for a 10 second timeout
-  before he is shown as gone. Closing the game normally tells everyone at once. There is no automatic reconnect.
+  checkpoint in two loads: a short stop in a Free Ride world (its loading screen is confirmed for you and the screen
+  stays black, as long as the game window has focus), then the checkpoint. Your own story saves are never loaded or
+  changed. Failing by leaving the mission area and by losing the mission car were tested; running out of time was
+  not.
+- If a player's game is killed (Task Manager, crash) instead of closed, the others wait about 4.5 seconds before he
+  is shown as gone (net_timeout_s in MafiaCoop.ini). Closing the game normally tells everyone at once. There is no
+  automatic reconnect.
 - Punches do not work near Salieri's bar (where Free Ride starts) or at some story checkpoints: the game itself
   turns fists off there.
 - Your own new character shows once you close the pause menu (the others see it at once).

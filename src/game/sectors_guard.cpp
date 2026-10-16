@@ -31,6 +31,21 @@ uint32_t _walks = 0, _checked = 0;
 bool _loggedLayout = false;
 bool _confirmed = false;  // a live entity was seen in the list: the layout is as expected, removing is safe
 
+// An entry whose position getter (the vtable +0x120 function the walk calls) would read through a component the
+// entity no longer has: humans being torn down with their world (a failed mission's load in Omerta cp_020 with the
+// guest's friend-brain puppet in it) still resolve in the entity table, but [entity+0x348] is already null and the
+// getter (exe+0x2B4C470: mov rax,[rcx+348h]; mov rcx,[rax+298h]; ...) crashed reading null+0x298. Only checked when
+// the getter starts with exactly that load, so other entity classes are left alone.
+bool HalfTorn(void* entity) {
+    const uint8_t* e = static_cast<const uint8_t*>(entity);
+    if (*reinterpret_cast<const uintptr_t*>(e + 0xF0) != 0) return false;  // the walk skips it anyway
+    const uint8_t* fn = *reinterpret_cast<const uint8_t* const*>(*reinterpret_cast<const uintptr_t*>(e) + 0x120);
+    static const uint8_t kLoad[] = {0x48, 0x8B, 0x81, 0x48, 0x03, 0x00, 0x00, 0x48, 0x8B, 0x88, 0x98, 0x02, 0x00, 0x00};
+    if (std::memcmp(fn, kLoad, sizeof kLoad) != 0) return false;
+    const uint8_t* comp = *reinterpret_cast<const uint8_t* const*>(e + 0x348);
+    return !comp || !*reinterpret_cast<const void* const*>(comp + 0x298);
+}
+
 bool Purge(uint8_t* self) {
     __try {
         void*** begin = reinterpret_cast<void***>(self + 0x58);
@@ -38,7 +53,7 @@ bool Purge(uint8_t* self) {
         void** b = *begin;
         void** e = *end;
         if (!b || e < b || e - b > 100000) return false;
-        size_t n = static_cast<size_t>(e - b), live = 0, removed = 0;
+        size_t n = static_cast<size_t>(e - b), live = 0, removed = 0, torn = 0;
         if (!_confirmed) {
             for (size_t i = 0; i < n; ++i)
                 if (lua::EntityIsLive(b[i])) _confirmed = true;
@@ -47,9 +62,12 @@ bool Purge(uint8_t* self) {
         }
         for (size_t i = 0; i < n;) {
             if (lua::EntityIsLive(b[i])) {
-                ++live;
-                ++i;
-                continue;
+                if (!HalfTorn(b[i])) {
+                    ++live;
+                    ++i;
+                    continue;
+                }
+                ++torn;
             }
             b[i] = b[n - 1];  // swap with the last, like the game's own removal (exe+0x243A140)
             --n;
@@ -58,8 +76,9 @@ bool Purge(uint8_t* self) {
         if (removed) {
             *end = b + n;
             _dropped += static_cast<uint32_t>(removed);
-            MC_LOG_WARN("sectors: dropped %zu stale human(s) from the game-sectors list (%zu live) before its walk",
-                        removed, live);
+            MC_LOG_WARN("sectors: dropped %zu stale human(s) from the game-sectors list (%zu half torn down, %zu live) "
+                        "before its walk",
+                        removed, torn, live);
         }
         _checked += static_cast<uint32_t>(live);
         return true;

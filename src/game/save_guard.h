@@ -31,5 +31,12 @@ uint32_t MissionAborts();
 // load of "freeroam_before_quest_activated" (a real story save, outside the session), the save file it reads is
 // served from this one instead.
 void SetSessionSave(const std::vector<uint8_t>& bytes, const std::string& id);
+// fail_load = direct (default): that load reads the session's checkpoint itself (one load, the checkpoint world);
+// freeride: it gets the chapter loader's entry (the Free Ride start), and the story sync loads the checkpoint after it
+// (0.9.1, two loads).
+bool DirectFailLoad();
+// After a direct failed-mission load is in the world: the slot entry it used is emptied again, so a failed mission
+// outside co-op later in this process reads the player's own save again.
+void ForgetFailEntry();
 
 }  // namespace mc::game::save_guard

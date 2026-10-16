@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.9.1).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.10.0).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -33,7 +33,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently v0.7.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently v0.8.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -168,6 +168,22 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    (`--join`, an invite) got the lobby over the title screen, and a START then loaded from behind the title and hung
    on a black screen; "at the main menu" now needs the first script tick (game-api.md 13). Checked: no lobby over the
    title or the loading screen, lobby STORY and CHAPTER starts with a `--join` guest loaded both games.
+   0.10.0 (2026-10-16, re-notes 7): **a reloaded checkpoint starts where its save has the player**: a chapter-loader
+   load always put him at the Free Ride start (Salieri's bar), whatever the save said; Omerta cp_020 does not move him
+   itself, so its reload began at the bar and its leave-the-area check never armed. Now the save's player position is
+   read from the save and he is put there before the quest starts. Checked: Omerta cp_020 failures host 5 (solo) + 3
+   (guest connected), guest 2, each back at the park with the check active again (every later run failed again from
+   the reloaded checkpoint); Taxi cp_010 host 2 + guest 2 at the depot. **One loading screen less after a failed
+   mission**: the short Free Ride stop stays (a one-load variant, `fail_load = direct`, ran the checkpoint as a story
+   load and its own fail screen read the real story save, so it is off), but its loading screen is confirmed
+   automatically (Enter through DirectInput, 3 s after it is up; the game reads it only while its window has focus) and
+   the screen stays black until the checkpoint loads; about 20 s from the failure to the checkpoint's loading screen.
+   **Other failure kinds**: a destroyed mission car (Taxi, host and guest) goes the same way and came back to the
+   checkpoint; with the player inside the car he dies instead (death reload). A timer failure exists in the Race chapter
+   (`mm_50_race_go_time_out`) but was not reached. A guest whose own flow plays a cutscene of an earlier checkpoint no
+   longer sits through it while the host is already past it (Bon Appetit: 3 minutes of ambush film): only the host's
+   cutscene holds a reload. A crash in the game-sectors walk during a failed mission's load with a friend-brain puppet
+   (Omerta, host) is guarded (re-notes 8).
 - [ ] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
@@ -190,6 +206,16 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    host NPC deaths repeated on the guest. **Still open:** a chapter's own scripted shootout (every chapter start
    probed begins with a drive or walk the tests cannot follow), a guest kill re-checked in a fight (checked in Taxi
    before), civilian copies that take no damage.
+   0.10.0 (2026-10-16): **a chapter's own shootout reached through its mission flow**: Bon Appetit (lobby CHAPTER), the
+   host drove Salieri's car to Pepe's (the car moved by script), the chapter's ambush cutscenes played on both games
+   and both were in the restaurant fight at cp_040 (`B3-pepes-host.png`, `B3-pepes-guest.png`). Seen: 11 of the host's
+   18 NPCs paired on the guest; the guest's own enemies shot him (downed, respawned beside the host, then killed and
+   reloaded at the host's checkpoint); the host's enemies shot the guest's puppet and those hits reached the guest
+   (skipped while his own copies fought him); host NPC deaths (4) repeated. **Not checked**: a guest kill counted on
+   the host: the enemies of that phase took no damage on either game (the host's own `DoDamage` and bullets left them
+   at 100), and after a guest reload in the moving fight his copies did not pair again. The guest's copies keep 5000
+   health while the host's NPC lives, so a guest alone in a fight cannot win it. Not ticked. Civilian copies that take
+   no damage: not investigated further.
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
    Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose
@@ -203,6 +229,14 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    cp_020). Copies wait for the loading screen to be gone (one spawned during the load flipped the guest's taxi).
    **Still open:** the mission car coming back when the host parks (Taxi does not let the player out), a second
    chapter (the chase and Taxi cp_020 put each player in his own mission car, so the host's puppet waits hidden).
+   0.10.0 (2026-10-16): **second chapter**: Bon Appetit, the host drove Salieri's car (Salieri beside him); the guest's
+   game took its own Salieri car as the host's ("our own lassiter_v16_roadster stands there: it is this car here") and
+   the host's puppet sat at the wheel with Salieri beside him for the whole drive, no throw-outs
+   (`B4-salieri-wheel-guest.png`). **Still open**: the mission car coming back when the host gets out: neither chapter
+   lets the player out (Bon Appetit kept the doors locked even after `UnlockPlayerEntryPoints`). Ambient traffic and
+   police stay each player's own (accepted). Also fixed: the entity scan (`mc_entity_ids`) missed most cars after
+   several reloads in one game (new entities beyond its 8192-slot gap limit; now 65536), so mission cars were not
+   found. Not ticked.
 - [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
   Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
   guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the
@@ -234,7 +268,10 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   distance (full to 35 m, gone at 90 m), hidden off screen, while the puppet is hidden or dead, and in menus/loading;
   SHOW NAME TAGS in CO-OP SETTINGS turns them off (checked both ways in Free Ride). **No occlusion**: no working ray
   cast was found from script (`StartCollisionQuery` never hits) and `IsVisibleFromCamera` is not a visibility test,
-  so a tag also shows through walls. Minimap: the game's own marker on every puppet
+  so a tag also showed through walls. Occlusion done in 0.10.0 (game-api.md 13): the ray cast behind
+  `GetCollisionPointBelow` works with any from/to (`mc_raycast`); a wall between the camera and the head hides the tag
+  (checked in Free Ride: shown 14 m away in the open, hidden behind a building, both ways twice). Also fixed: a puppet
+  told to die that did not die kept its tag hidden after its player came back Minimap: the game's own marker on every puppet
   (`navigation:RegisterHumanEntityDirect(puppet, 1, 1)`, an orange marker on the minimap and map), MAP MARKERS in
   settings; checked on both screens in Free Ride (the marker followed the other player into a building). Markers off
   was not checked in a capture.
@@ -305,7 +342,9 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   Done 2026-10-15 (core v0.5.0, its docs/protocol.md "Leaving cleanly"): `ExitProcess` / `TerminateProcess(self)`
   hooks leave the session before the process ends. Checked in game: closing the host's window -> the guest's banner
   "HOST LEFT: Host left the game" 4 ms later; closing the guest's window -> "Guest left the game" on the host 3 ms
-  later; STOP HOSTING -> HOST LEFT at once. A kill from outside (taskkill /F) still times out after 10 s.
+  later; STOP HOSTING -> HOST LEFT at once. A kill from outside (taskkill /F) times out after `net_timeout_s` (core v0.8.0: 4 s, was 10 s; a
+  keepalive thread keeps a busy game's peers): guest killed -> host noticed after 4.6 s, host killed -> guest after
+  4.7 s; no false disconnect in this session's loads, failures and reloads (the frame never stalled more than 0.2 s).
 - [x] Overlay: release the backbuffer reference after each draw; log Present/ResizeBuffers thread ids in game to confirm assumptions.
   Done 2026-10-15 (core v0.5.0): a backbuffer view per frame, released after drawing; everything released on device
   removed/reset and at exit. In game: ResizeBuffers ran on the Present thread (logged) and succeeded right after the

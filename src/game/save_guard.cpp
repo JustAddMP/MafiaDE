@@ -1,5 +1,6 @@
 #include "game/save_guard.h"
 
+#include "core/config.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
@@ -35,6 +36,8 @@ FindFn _origFind = nullptr;
 std::atomic<bool> _block{false};
 std::atomic<uint32_t> _redirected{0};
 std::atomic<uint32_t> _aborts{0};
+std::atomic<uint32_t> _abortBurst{0};    // failures: load requests of the abort id more than 5 s apart
+std::atomic<uint32_t> _droppedFor{0};    // the failure whose cached entry data was dropped
 std::atomic<ULONGLONG> _abortAt{0};      // when the game last asked for the free roam state before the quest
 std::atomic<uint32_t> _substituted{0};   // reads of a real save served from the session save instead
 uintptr_t _exe = 0;
@@ -82,6 +85,7 @@ void* LoadDetour(void* self, void* out, uint32_t slot, void* id, void* name) {
     MC_LOG_INFO("savesys: load of '%s' (slot %u, %s) from%s", saveId.c_str(), slot, storage.c_str(), Callers().c_str());
     if (saveId == "freeroam_before_quest_activated") {
         ++_aborts;
+        if (GetTickCount64() - _abortAt.load() > 5000) ++_abortBurst;
         _abortAt = GetTickCount64();
         MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)%s",
                     _block.load() ? ": it gets the session's checkpoint instead" : "");
@@ -140,11 +144,33 @@ constexpr const char* kPatSlotFind =
     "48 8B 59 20 4C 8B E9 48 3B 59 28";
 FindFn _origSlotFind = nullptr;
 std::atomic<uint32_t> _abortSwaps{0};
+std::atomic<bool> _directFail{false};     // fail_load = direct | freeride (default: a Free Ride stop first)
+std::atomic<void*> _failEntry{nullptr};  // the slot entry a direct failed-mission load used
 
 void* SlotFindDetour(void* self, uint32_t slot, void* id) {
     const std::string name = Str(id);  // read before the call: the callee releases the string
     void* r = _origSlotFind(self, slot, id);
     if (!_block.load() || name != kAbortId) return r;
+    if (r && _directFail.load()) {
+        // One load straight back to the checkpoint: the game's own entry, with the data it cached from an earlier read
+        // dropped (entry->vf58() = [entry+0x18]), so the handler reads the save file again, and that read is served
+        // from the session's checkpoint (CreateFileADetour). Only at the first lookup of a failure (the game asks
+        // several times per load and loads twice per failure, 0.3 s apart; dropping the data it had just read crashed
+        // the next lookup's user, exe+0x1A90AB6). The dropped buffer is left alone (a small leak, never freed under
+        // the game); after the load the entry is emptied again (ForgetFailEntry) so that a later failed mission
+        // outside co-op reads the player's own save again.
+        const uint32_t n = ++_abortSwaps;
+        const uint32_t burst = _abortBurst.load();
+        if (_droppedFor.exchange(burst) != burst) {
+            void** data = reinterpret_cast<void**>(static_cast<uint8_t*>(r) + 0x18);
+            MC_LOG_INFO("savesys: lookup #%u of '%s' (slot %u): entry %p, cached data %p dropped: the session's "
+                        "checkpoint is read instead",
+                        n, name.c_str(), slot, r, *data);
+            *data = nullptr;
+            _failEntry = r;
+        }
+        return r;
+    }
     std::lock_guard lock(_dbgMu);
     if (!_dbgEntry) {
         MC_LOG_WARN("savesys: lookup of '%s' in a co-op session, but no chapter load seen: the game's own save is used",
@@ -322,6 +348,7 @@ void Install() {
         core::hook::Install("SaveSys_SlotFind", reinterpret_cast<void*>(a), &SlotFindDetour, &_origSlotFind);
     else
         MC_LOG_WARN("savesys: slot lookup not found: a failed mission in co-op may load a save outside the session");
+    _directFail = core::Config::Get().GetString("fail_load", "freeride") == "direct";
     char tmp[MAX_PATH];
     const DWORD n = GetTempPathA(MAX_PATH, tmp);
     if (n && n < MAX_PATH) {
@@ -389,6 +416,13 @@ void SetSessionSave(const std::vector<uint8_t>& bytes, const std::string& id) {
 }
 
 bool Blocking() { return _block.load(); }
+bool DirectFailLoad() { return _directFail.load(); }
+void ForgetFailEntry() {
+    if (void* e = _failEntry.exchange(nullptr)) {
+        *reinterpret_cast<void**>(static_cast<uint8_t*>(e) + 0x18) = nullptr;
+        MC_LOG_INFO("savesys: the failed-mission entry %p no longer holds the session's checkpoint", e);
+    }
+}
 std::string ScratchDir() {
     if (!_block.load()) return {};
     std::lock_guard lock(_mu);

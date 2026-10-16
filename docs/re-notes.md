@@ -681,6 +681,25 @@ Used by src/game/save_guard.cpp.
   - The `debugloadchapter` storage: the menu's own FREE RIDE load asks for its save (`freeroam_test`) in slot 2, our
     swapped loads in slot 1. After one of them the other found no entry and crashed at 0x2E81EF8 (a FREE RIDE start
     after a co-op chapter in the same process); `FindDetour` now hands out the storage's one entry for any slot.
+- **A chapter-loader load ignores the save's player position** [confirmed in game 2026-10-16]: the player always
+  starts at the Free Ride start (-943 -232, Salieri's bar), also with the flags (0, 0) and on the first load of a
+  process. The position is in the save: the last block keyed `04 00 00 00 D1 05 B3 09 0C 00 00 00` (field hash
+  0x09B305D1, 12 bytes: x y z) followed within 80 bytes by `4C 17 1B 4D 10 00 00 00` (quaternion); earlier blocks
+  with the same key are cars. Chapter starts mostly begin at the bar anyway or their cp_010 setup moves the player;
+  Omerta cp_020 does neither, so its reload started at the bar and its leave-the-area check never armed. MafiaCoop
+  (0.10.0) reads that block (mission_sync.cpp `SaveSpotIn`) and puts the player there 3 s after the load, then starts
+  the quest a second later. Checked: Omerta cp_020 host 5 + 3 (with a guest) failures, guest 2, Taxi host 2 + guest 2:
+  each time at the save's spot, Omerta's check fired again from the reloaded checkpoint.
+- **Failed mission in one load** (tried 2026-10-16, `fail_load = direct`, off by default): letting that
+  `freeroam_before_quest_activated` load read the session's checkpoint itself (the slot entry's cached data at
+  `[entry+0x18]` dropped so the file is read again, and that read served from `session-checkpoint.dat`) does give the
+  checkpoint world in one load, but as a story load: its quest runs at once (before we can move the player), it
+  failed again straight away (the player at the bar), showed the story fail screen, and its Load Last Checkpoint read
+  the player's **real** story checkpoint (`aslot`) and crashed (exe+0x3024566). Dropping the data at every lookup of
+  one load crashed sooner (exe+0x1A90AB6: the next lookup's user got null). So the Free Ride stop stays; its loading
+  screen is confirmed for the player instead (a DirectInput Enter through core `ui_input::PressGameKey`, 3 s after
+  the screen is up; window messages and the virtual pad do not confirm it, and the game reads DirectInput only while
+  its window has focus) and the screen is kept black while that world is up.
 - `game.savesystem:EnableSaveLogic(name)` takes a string (a named save logic), not a switch; `RequestCheckpointSave()`
   wrote nothing in a replay-style session.
 
@@ -710,6 +729,11 @@ ended in (docs/game-api.md 15) is one list:
   puppet freed with the factory, which crashed every time before, logged "dropped 1 stale human(s) ... (69 live)"
   and the game ran on; two more such drops in a 15-minute session with guest reloads, factory resets and a host death
   and reload, no crash.
+- Half torn-down humans (2026-10-16): a host crashed 8 s into a failed mission's load (Omerta cp_020, the guest's
+  friend-brain puppet in the old world) in the getter the walk calls (vtable +0x120 = exe+0x2B4C470: `mov rax,
+  [rcx+348h]; mov rcx, [rax+298h]`): the entity still resolved in the entity table, but `[entity+0x348]` was null.
+  The guard now also drops entries whose getter starts with exactly that load while `[entity+0x348]` (or its
+  `+0x298`) is null. The same failure run 5 more times afterwards (3 host, 2 guest): no crash.
 
 ---------------------------------------------------------------------------------------------------------------
 
@@ -789,6 +813,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | FlashValue_GetString | 0x183EEB0 | `40 57 48 83 EC 20 83 79 10 06 75 4B 48 8B 79 08 48 85 FF 74 42` |
 | FlashValue_Assign | 0x37B6220 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 33 D2 E8 ?? ?? ?? ?? 48 8B 43 08 48 89 47 08 8B 43 10 89 47 10` |
 | FlashValue_Dtor | 0x37B31C0 | `40 53 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 33 D2 48 89 01 48 8B D9 E8 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 03 48 83 C4 20` |
+| RayCast (PhysicsPointBelow) | 0x23E83F0 | `48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC E0 00 00 00 F2 41 0F 10 00 48 8D 05 ?? ?? ?? ?? F2 0F 11 45 EF 49 8B F8 F3 0F 10 4D F3`: query vtable lea at +0x1C, filter 0x404DA386 at +0x55, physics getter call +0x9B (world = [ret+0x58]), cast call +0xAC (exe+0x1A68E50), result release call +0x1C0 |
 
 Rip/call operand offsets used above: `C_GameScriptModule_Tick` +3 (disp) / +7 (end) gives g_ScriptGameMachine; `Steam_MemLoadApi` +9/+0xD gives g_SteamApiTable; `Steam_Init` +0x2F/+0x33 gives the SteamAPI_Init slot, +0x39/+0x3D SteamUser slot, +0x60/+0x64 SteamClient slot; `Lua_Game_GetActivePlayer` E8 rel32 at +0x14 gives the C_Game getter; `ScriptGameMachine_Create` mov [rip+disp],rax at +0x2B (disp +0x2E, end +0x32) also gives g_ScriptGameMachine.
 

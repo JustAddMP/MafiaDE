@@ -3,7 +3,7 @@ rem Builds MafiaCoop (with core from external\core), runs every automated test a
 rem separate symbols zip (PDBs, for reading crash dumps of this build):
 rem   out\release\MafiaCoop-<version>.zip
 rem   out\release\MafiaCoop-<version>-symbols.zip
-rem Usage: tools\make_release.cmd <version>   e.g. tools\make_release.cmd 0.9.1
+rem Usage: tools\make_release.cmd <version>   e.g. tools\make_release.cmd 0.10.0
 rem The version must match modVersion in src\game\game_info.cpp. No game is started.
 setlocal
 if "%~1"=="" ( echo Usage: %~nx0 ^<version^> & exit /b 1 )

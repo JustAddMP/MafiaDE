@@ -3,6 +3,41 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.10.0 (2026-10-16), pre-release
+
+Story:
+- A reloaded checkpoint starts where it should. The game's chapter loader always put the player at the Free Ride
+  start (Salieri's bar), whatever the save said; most checkpoints move him themselves, but Omerta's second one does
+  not, so after a failed mission the host stood at the bar and that checkpoint's leave-the-area check never armed.
+  The mod now puts every player where his checkpoint save has him before the mission resumes. Checked: Omerta's
+  second checkpoint failed and reloaded 8 times by the host (3 with a friend connected) and twice by a friend, Taxi
+  twice each: always back at the checkpoint's spot, and Omerta's check failed the mission again from every reload.
+- A failed mission needs one Enter less: the short Free Ride stop on the way back to the checkpoint is confirmed
+  for you and stays black, so you only see the checkpoint's loading screen (about 20 s after the failure). The game
+  reads that key only while its window has focus. (Going back in a single load was tried and is unsafe: the game
+  then treated the checkpoint as your own story and its fail screen offered your real story save.)
+- Losing the mission car fails the mission the same way and goes back to the checkpoint (checked in Taxi, host and
+  friend). Failing by a mission timer was not reached in the tests.
+- A friend whose own game plays a cutscene of an earlier checkpoint no longer has to watch it to the end while the
+  host is already further on (seen in Bon Appetit: the 3-minute ambush film); he goes straight to the host's
+  checkpoint.
+- Fixed a crash of the host's game during the load after a failed mission (with a friend's character in the world;
+  seen once in Omerta, guarded since; five more failures there ran without a crash).
+
+Players:
+- Name tags hide behind walls: the game's own ray cast checks the line from the camera to the other player's head.
+- A killed or unplugged game is noticed after about 4.5 s (was 10 s): `net_timeout_s` (default 4) in MafiaCoop.ini,
+  `net_steam_timeout_s` (6) over Steam. A game that is only busy is not dropped (core v0.8.0 keepalive thread).
+- Fixed: a friend's name tag could stay hidden for the rest of the session after he was downed.
+- Fixed: after several reloads in one game the mod found only a few of the world's cars (mission cars were not
+  recognised).
+
+Tested, not finished: a chapter's own shootout was reached in co-op (Bon Appetit's restaurant ambush): characters
+matched up, enemies fought both players, the host's enemies hit the friend, deaths were shared; a friend's kill
+counted on the host could not be checked there. In Bon Appetit the host sits at the wheel of the mission car with
+Salieri beside him on a friend's screen (the second chapter after Taxi); the car being handed back when the host gets
+out could not be checked (the mission keeps the doors locked).
+
 ## 0.9.1 (2026-10-16), pre-release
 
 Fixes:

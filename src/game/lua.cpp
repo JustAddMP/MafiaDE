@@ -370,14 +370,15 @@ void* WrapperByIdGuarded(uint32_t id) {
 }
 
 // The entity ids (GUID numbers) of every entity of one type (low byte of the id: 8 human, 9 player, 10 car, ...),
-// space separated. Entities sit in a table indexed by id >> 8; the scan stops after 8192 empty slots in a row.
+// space separated. Entities sit in a table indexed by id >> 8; the scan stops after 65536 empty slots in a row (8192 missed
+// entities after a few reloads in one game: new ones are put further up the table).
 // There is no "entities in a radius" call for scripts; this is it (the caller filters by position).
 size_t EntityIdsGuarded(uint8_t type, uint32_t* out, size_t cap) {
     size_t n = 0;
     __try {
         void* mgr = _ent.mgr();
         uint32_t misses = 0;
-        for (uint32_t idx = 1; idx < 0x100000 && misses < 8192 && n < cap; ++idx) {
+        for (uint32_t idx = 1; idx < 0x100000 && misses < 65536 && n < cap; ++idx) {
             uint8_t* e = _ent.find(mgr, (idx << 8) | type, 0);
             if (!e) {
                 ++misses;
@@ -420,6 +421,90 @@ int McEntity(lua_State* L) {
 }
 
 }  // namespace
+
+// ---- ray cast (mc_raycast) ----------------------------------------------------------------------------------------
+// The script binding game.physics:GetCollisionPointBelow (exe+0x23A2940 -> exe+0x23E83F0) is a real ray cast: it fills a
+// 0x2C-byte query {vtable exe+0x4B357D0, from xyz at +8, to xyz at +0x14 (from.z - 500), filter 0x404DA386 at +0x20, 3 at
+// +0x24, -1 at +0x28} and calls the physics world's cast (exe+0x1A68E50(world, query, result) -> bool; world =
+// [exe+0x1A56C20() + 0x58]); the result has a ref-counted pointer at +0 (released with exe+0x19FD220) and the hit
+// position at +8, the normal at +0x14. StartCollisionQuery never reported a hit. We build the same query with any
+// from/to (docs/game-api.md 13).
+constexpr const char* kPatPointBelow =
+    "48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC E0 00 00 00 F2 41 0F 10 00 48 8D 05 ?? ?? ?? ?? F2 0F "
+    "11 45 EF 49 8B F8 F3 0F 10 4D F3";
+using PhysMgrFn = void* (*)();
+using RayCastFn = bool (*)(void* world, void* query, void* result);
+using ReleaseFn = void (*)(void* p);
+struct {
+    void* vtable = nullptr;
+    PhysMgrFn mgr = nullptr;
+    RayCastFn cast = nullptr;
+    ReleaseFn release = nullptr;
+} _ray;
+
+void InstallRayCast() {
+    const uintptr_t f = core::mem::FindPattern(kPatPointBelow);
+    // the bytes the offsets below rely on: lea rax,[rip+x] / call / mov rcx,[rax+58h] / call / call (release)
+    if (!f || *reinterpret_cast<const uint32_t*>(f + 0x55) != 0x404DA386 || *reinterpret_cast<const uint8_t*>(f + 0x9B) != 0xE8 ||
+        std::memcmp(reinterpret_cast<const void*>(f + 0xA8), "\x48\x8B\x48\x58", 4) != 0 ||
+        *reinterpret_cast<const uint8_t*>(f + 0xAC) != 0xE8 || *reinterpret_cast<const uint8_t*>(f + 0x1C0) != 0xE8) {
+        MC_LOG_WARN("lua: ray cast not found: name tags show through walls");
+        return;
+    }
+    _ray.vtable = reinterpret_cast<void*>(core::mem::ResolveRip(f + 0x1C, 3, 7));
+    _ray.mgr = reinterpret_cast<PhysMgrFn>(CallTarget(f + 0x9B));
+    _ray.cast = reinterpret_cast<RayCastFn>(CallTarget(f + 0xAC));
+    _ray.release = reinterpret_cast<ReleaseFn>(CallTarget(f + 0x1C0));
+}
+
+// true = something is between from and to (hit position in hit[3])
+bool RayCastGuarded(const float from[3], const float to[3], float hit[3], bool& ok) {
+    alignas(16) uint8_t q[0x30] = {};
+    alignas(16) uint8_t r[0x40] = {};
+    *reinterpret_cast<void**>(q) = _ray.vtable;
+    std::memcpy(q + 8, from, 12);
+    std::memcpy(q + 0x14, to, 12);
+    *reinterpret_cast<uint32_t*>(q + 0x20) = 0x404DA386;
+    *reinterpret_cast<uint32_t*>(q + 0x24) = 3;
+    *reinterpret_cast<int32_t*>(q + 0x28) = -1;
+    *reinterpret_cast<uint16_t*>(r + 0x2E) = 0xFFFF;
+    bool got = false;
+    ok = false;
+    __try {
+        uint8_t* m = static_cast<uint8_t*>(_ray.mgr());
+        void* world = m ? *reinterpret_cast<void**>(m + 0x58) : nullptr;
+        if (world) {
+            got = _ray.cast(world, q, r);
+            ok = true;
+            if (got) std::memcpy(hit, r + 8, 12);
+            if (void* ref = *reinterpret_cast<void**>(r)) _ray.release(ref);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+        got = false;
+    }
+    return got;
+}
+
+// mc_raycast(x1, y1, z1, x2, y2, z2) -> hit (bool), x, y, z of the hit; nil when the ray cast is not available.
+int McRayCast(lua_State* L) {
+    float from[3], to[3], hit[3] = {};
+    for (int i = 0; i < 3; ++i) {
+        from[i] = static_cast<float>(ToNumber(L, 1 + i));
+        to[i] = static_cast<float>(ToNumber(L, 4 + i));
+    }
+    bool ok = false;
+    const bool got = _ray.cast ? RayCastGuarded(from, to, hit, ok) : false;
+    if (!ok) {
+        PushNil(L);
+        return 1;
+    }
+    PushBool(L, got);
+    PushNumber(L, hit[0]);
+    PushNumber(L, hit[1]);
+    PushNumber(L, hit[2]);
+    return 4;
+}
 
 bool EntityLookupAvailable() { return _ent.find && _ent.mgr; }
 
@@ -499,6 +584,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
     } else {
         MC_LOG_WARN("lua: GetEntityByGUID not found: mc_entity unavailable (NPCs and mission cars are not matched by id)");
     }
+    InstallRayCast();
     _available = true;
     // Our helpers for scripts; registered on the first tick.
     Post([](lua_State* L) {
@@ -510,8 +596,9 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
             RegisterGlobal(L, "mc_entity", &McEntity);
             RegisterGlobal(L, "mc_entity_ids", &McEntityIds);
         }
-        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s",
-                    _ent.push ? ", mc_entity, mc_entity_ids" : "");
+        if (_ray.cast) RegisterGlobal(L, "mc_raycast", &McRayCast);
+        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s",
+                    _ent.push ? ", mc_entity, mc_entity_ids" : "", _ray.cast ? ", mc_raycast" : "");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
                 Narrow(_dllDir).c_str(), Narrow(_dllDir).c_str(), _tag.c_str());

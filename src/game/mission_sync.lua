@@ -7,14 +7,17 @@
 --   H quest cp obj override inWorld  the host's chapter, checkpoint, objective and override objective ("-" = none)
 --   C name                            the cutscene playing on the host ("-" = none)
 --   Q                                 guest: quit to the main menu (the host reached a checkpoint we load next)
---   T quest cp                        the chapter and checkpoint our last chapter load is for (guest following the
---                                     host, or the host's lobby chapter start): its quest is started once in the world
+--   B                                 keep the screen black (the Free Ride stop of a failed mission, left at once)
+--   T quest cp [x y z dx dy]          the chapter and checkpoint our last chapter load is for (guest following the
+--                                     host, or the host's lobby chapter start): its quest is started once in the world,
+--                                     after the player was put where the save has him (x y z, heading dx dy)
 -- Output: events, one per line:
 --   "GS quest cp hold cutscene"       our chapter and checkpoint, 1 = held while the host watches a cutscene we
 --                                     cannot play, 1 = a cutscene plays here (twice a second)
 --   "MS quest cp obj override"        host: our story state (twice a second; the dll sends it on change)
 --   "CS name"                         host: the cutscene that plays here ("-" = none)
 --   "AC quest cp"                     the T quest was started (or already ran): the dll forgets it
+--   "LS 1|0"                          a loading screen is up (twice a second, also outside the world)
 -- Sets MafiaCoop.cutscene (true while a cutscene plays here or the host's holds us): player_sync.lua hides the
 -- puppets meanwhile.
 MafiaCoop = MafiaCoop or {}
@@ -208,10 +211,35 @@ end
 -- The chapter loader brings the host's save in without its quest running (QuestIsAvailable false: no mission flow,
 -- objectives, mission NPCs or cutscene objects). Selecting the checkpoint (the quest's custom state) and making the
 -- quest available starts the chapter's flow at that checkpoint, like the game's own debug "unlockquest".
-function MS.Activate(t)
+-- A load through the chapter loader starts the player at the Free Ride start, not where the save has him
+-- (mission_sync.cpp SaveSpotIn): a checkpoint whose setup does not move him (Omerta cp_020) then began at Salieri's bar,
+-- outside its mission area, and its leave-the-area check never armed. So first he is put where the save has him (not
+-- on the first ticks after a load: that crashed), then the quest is started there a second later.
+function MS.Activate(t, p)
   if not M.inWorldAt or M.now - M.inWorldAt < 1 then return end  -- not on the first ticks after the load
   local key = tostring(M.inWorldAt) .. "|" .. t.quest .. "|" .. t.cp
   if MS.activeKey == key then return end
+  if t.spot then
+    if MS.spotKey ~= key then
+      if M.now - M.inWorldAt < 3 then return end
+      MS.spotKey, MS.spotT = key, M.now
+      local s = t.spot
+      local from = p:GetPos()
+      local okOwner, car = pcall(p.GetOwner, p)
+      if okOwner and car then  -- seated in a car the load gave us: that is where the save has us anyway
+        log("in a car after the load: not moved")
+        return
+      end
+      local good, err = pcall(function()
+        p:SetPos(Math:newVector(s[1], s[2], s[3] + 0.1))
+        p:SetDir(Math:newVector(s[4], s[5], 0))
+      end)
+      log(string.format("put where the save has us: %.1f %.1f %.1f (were at %.1f %.1f)%s", s[1], s[2], s[3], from.x,
+        from.y, good and "" or (" failed: " .. tostring(err))))
+      return
+    end
+    if M.now - (MS.spotT or 0) < 1 then return end
+  end
   MS.activeKey = key
   local d = game.director
   MS.events[#MS.events + 1] = "AC " .. t.quest .. " " .. dash(t.cp)
@@ -243,6 +271,7 @@ function MS.Update(dt, cmds)
   local ev = {}
   MS.events = ev
   local active, host, following, h, hostCut, quit, target = false, false, false, nil, nil, false, nil
+  local blackout = false
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -254,9 +283,19 @@ function MS.Update(dt, cmds)
       hostCut = undash(f[2])
     elseif f[1] == "Q" then
       quit = true
+    elseif f[1] == "B" then
+      blackout = true
     elseif f[1] == "T" then
       target = { quest = f[2], cp = undash(f[3]) }
+      local s = { tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7]), tonumber(f[8]) }
+      if s[1] and s[2] and s[3] and s[4] and s[5] then target.spot = s end
     end
+  end
+  if blackout and MS.blackKey ~= tostring(M.inWorldAt) then
+    -- the Free Ride stop of a failed mission: the player is not meant to see it (we leave it in a moment)
+    MS.blackKey = tostring(M.inWorldAt)
+    local good, err = pcall(HUD_FaderFadeOut, 0.2)
+    log("Free Ride stop: screen faded out" .. (good and "" or (" failed: " .. tostring(err))))
   end
   if quit and not MS.quitAt then
     -- Leave the world clean first: puppets, their map markers, the puppet factory's car and our car copies are
@@ -272,15 +311,20 @@ function MS.Update(dt, cmds)
     local good, err = pcall(game.hud.QuitToMainMenu, game.hud)
     log("quit to the main menu" .. (good and "" or (" failed: " .. tostring(err))))
   end
+  if M.now - (MS.lsT or -10) >= 0.5 then
+    MS.lsT = M.now
+    local good, up = pcall(game.hud.IsLoadingScreenUp, game.hud)
+    ev[#ev + 1] = "LS " .. ((good and up) and "1" or "0")
+  end
   local p = M.Player and M.Player()
   if not p then
     if MS.held then MS.held = nil end  -- the world (and our lock) went away
     MS.cs = nil
     M.cutscene = nil
-    return ""
+    return table.concat(ev, "\n")
   end
   if active and target then
-    local good, err = pcall(MS.Activate, target)
+    local good, err = pcall(MS.Activate, target, p)
     if not good then log("activate error: " .. tostring(err)) end
   end
   if M.now - (MS.pollT or -10) >= 0.25 then
@@ -297,7 +341,7 @@ function MS.Update(dt, cmds)
       local good, err = pcall(MS.Objectives, h)
       if not good then log("objective error: " .. tostring(err)) end
     end
-    if not MS.cs then pcall(MS.Place, p) end
+    if not MS.cs and not target then pcall(MS.Place, p) end  -- after our quest start (it may move us first)
   elseif MS.cs or MS.held then
     MS.EndCutscene(p)
   end

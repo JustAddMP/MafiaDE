@@ -44,15 +44,17 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- Enemies: the host's enemies now aim at the other players too, but a chapter's own big shootout has not been played
-  through in co-op yet (tested with enemies placed by script); some passers-by take no damage on a friend's game.
-- Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi);
-  ambient traffic, pedestrians and police are each player's own.
+- Enemies: the host's enemies aim at the other players too; a chapter's own shootout (Bon Appetit) was played in
+  co-op, but a friend's kills there were not checked, and a friend alone in a fight cannot win it (his copies of the
+  enemies only die when the host's do); some passers-by take no damage on a friend's game.
+- Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi
+  and Bon Appetit; handing the car back when he gets out is not checked); ambient traffic, pedestrians and police are
+  each player's own.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only.
 - A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the checkpoint
-  in two loads: first a short stop in a Free Ride world (press Enter on its loading screen as usual), then the
-  checkpoint. Failing by leaving the area was tested; timers and destroyed mission cars were not.
-- Name tags show through walls. A killed game (not closed) makes the others wait for a 10 s timeout.
+  in two loads: a short stop in a Free Ride world (confirmed for you and kept black, if the game window has focus),
+  then the checkpoint. Leaving the area and a destroyed mission car were tested; a mission timer was not.
+- A killed game (not closed) makes the others wait about 4.5 s; there is no automatic reconnect.
 - The co-op panels were tested with a virtual gamepad and mouse messages, not a physical gamepad; Steam invites
   between two PCs not fully tested.
 

@@ -172,10 +172,12 @@ scripts and still work.
   docs/protocol.md "Lobby"); the story sync is ours (below, "Story").
 - **CO-OP SETTINGS** (main menu CO-OP page, lobby, pause CO-OP panel): NAME (text box; empty = Steam name; used from
   the next session), DEBUG OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE; saved in MafiaCoop.ini.
-- **In the world:** every other player's name floats over his character (fades with distance, no occlusion: it shows
-  through walls) and he is an orange marker on the minimap and map (docs/game-api.md 13).
+- **In the world:** every other player's name floats over his character (fades with distance, hidden behind walls:
+  a ray from the camera, docs/game-api.md 13) and he is an orange marker on the minimap and map.
 - **Quitting:** when a game closes (window X, the game's quit) the others are told at once: guests see **HOST LEFT**,
-  the host sees "<name> left the game". Killing the process from outside still makes them wait for the 10 s timeout.
+  the host sees "<name> left the game". Killing the process from outside makes them wait for the timeout: `net_timeout_s` (default 4 s over UDP;
+  `net_steam_timeout_s` 6 s over Steam P2P), measured 4.6 s (guest killed) and 4.7 s (host killed). A game that is only
+  busy keeps its peers from the transport's keepalive thread (core v0.8.0).
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
@@ -485,6 +487,9 @@ debug_overlay = 0          ; 1 = debug status text at start (CO-OP SETTINGS > DE
 test_pad = 0               ; 1 = a virtual gamepad for automated tests (mc_pad from the dev console)
 follow_grace = 8           ; guest: seconds the host may be at another checkpoint before we reload his (story)
 story_load = replay        ; replay | story | free: flags of our chapter loads (tests; docs/re-notes.md 6)
+fail_load = freeride       ; freeride | direct: a failed mission's load (direct = one load, unsafe, tests only; re-notes 7)
+net_timeout_s = 4          ; seconds without a packet before a player is dropped (UDP; core v0.8.0; 2..60)
+net_steam_timeout_s = 6    ; the same over Steam P2P
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
 ```
 

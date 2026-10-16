@@ -1157,6 +1157,12 @@ function M.PuppetLife(pp)
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
   end
+  if pp.deadShown then
+    -- its player is back but the puppet never died here (the DoDamage did not kill it): it just goes on; before,
+    -- deadShown stayed set and hid its name tag for the rest of the session
+    pp.deadShown = nil
+    log("puppet " .. pp.id .. ": its player is back (the puppet had not died)")
+  end
   if (tonumber(so.health) or 0) < PUP_HEALTH * 0.75 then pcall(function() so.health = PUP_HEALTH end) end
   return false
 end
@@ -1623,8 +1629,37 @@ end
 -- whether the point is in front of the camera). Markers: the game's own minimap icon for a human
 -- (game.navigation:RegisterHumanEntityDirect(human, 1, 1), an orange marker), removed with UnregisterId. The game does
 -- not give the same entity a second icon after UnregisterId, so a puppet keeps its icon until it is replaced.
+-- Occlusion: a ray from the camera to the head (mc_raycast, the game's own physics ray cast, src/game/lua.cpp) five
+-- times a second; a wall in between hides the tag (after two hits in a row, so a lamp post flicking past does not).
+-- Hits next to the camera, next to our own player (the camera looks over his shoulder) and at the puppet itself
+-- do not count.
 -- ---------------------------------------------------------------------------------------------------------------
 local TAG_HEAD = 0.45  -- m above the head bone
+local TAG_RAY_INTERVAL = 0.2
+
+-- true when something solid is between the camera and the puppet's head
+local function tagOccluded(pp, c, h)
+  if not mc_raycast then return false end
+  if M.now - (pp.rayT or -10) < TAG_RAY_INTERVAL then return pp.occluded or false end
+  pp.rayT = M.now
+  local dx, dy, dz = h.x - c.x, h.y - c.y, h.z - c.z
+  local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+  local blocked = false
+  if len > 2 then
+    local ux, uy, uz = dx / len, dy / len, dz / len
+    local s, e = 0.3, len - 0.6  -- not at the camera, not at the puppet's own head
+    local hit, x, y, z = mc_raycast(c.x + ux * s, c.y + uy * s, c.z + uz * s, c.x + ux * e, c.y + uy * e, c.z + uz * e)
+    if hit and x then
+      local me = game.game:GetActivePlayer()
+      local mp = me and me:GetPos()
+      local nearMe = mp and (x - mp.x) ^ 2 + (y - mp.y) ^ 2 < 0.8 * 0.8 and z > mp.z - 0.2 and z < mp.z + 2.0
+      blocked = not nearMe
+    end
+  end
+  pp.rayHits = blocked and (pp.rayHits or 0) + 1 or 0
+  pp.occluded = pp.rayHits >= 2
+  return pp.occluded
+end
 
 function M.Unmark(pp)
   if pp.blip then pcall(game.navigation.UnregisterId, game.navigation, pp.blip) end
@@ -1658,7 +1693,7 @@ function M.TagsTick()
       local good, h = pcall(so.GetBonePos, so, "Head")
       if not good or not h then h = so:GetPos(); h = V(h.x, h.y, h.z + 1.6) end
       local x, y, on = game.game:ProjectPointToScreen(V(h.x, h.y, h.z + TAG_HEAD))
-      if on and x and y then
+      if on and x and y and c and not tagOccluded(pp, c, V(h.x, h.y, h.z + 0.1)) then
         local dx, dy, dz = h.x - c.x, h.y - c.y, h.z - c.z
         M.events[#M.events + 1] = string.format("NT %s %.4f %.4f %.1f", id, x, y, math.sqrt(dx * dx + dy * dy + dz * dz))
       end

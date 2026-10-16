@@ -5,6 +5,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
+#include "dll/ui_input.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/player_sync.h"
@@ -18,6 +19,7 @@
 #include <shlobj.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -175,6 +177,47 @@ std::string SaveIdIn(const std::vector<uint8_t>& b) {
     return id;
 }
 
+// Where a save puts the player: the position (3 floats, field hash 0x09B305D1) and rotation (quaternion, field hash
+// 0x4D1B174C) of the player entity, the last such position block in the file (earlier ones are cars). A load through
+// the chapter loader does not use it: the player starts at the Free Ride start (Salieri's bar, -943 -232) whatever the
+// save says, and a checkpoint whose own setup does not move him (Omerta cp_020) then started there, away from the
+// mission area and its checks (docs/re-notes.md 7). So the story sync puts him there itself (Lua MS.Activate).
+struct Spot {
+    bool valid = false;
+    float x = 0, y = 0, z = 0, dx = 0, dy = 1;
+};
+
+Spot SaveSpotIn(const std::vector<uint8_t>& b) {
+    static const uint8_t kPos[] = {0x04, 0, 0, 0, 0xD1, 0x05, 0xB3, 0x09, 0x0C, 0, 0, 0};
+    static const uint8_t kRot[] = {0x4C, 0x17, 0x1B, 0x4D, 0x10, 0, 0, 0};
+    Spot s;
+    const auto it = std::find_end(b.begin(), b.end(), std::begin(kPos), std::end(kPos));
+    if (it == b.end() || b.end() - it < static_cast<ptrdiff_t>(sizeof kPos + 12)) return s;
+    const size_t at = static_cast<size_t>(it - b.begin()) + sizeof kPos;
+    float v[3];
+    std::memcpy(v, b.data() + at, sizeof v);
+    for (float f : v)
+        if (!(f > -5000.f && f < 5000.f)) return s;  // also rejects NaN
+    s.valid = true;
+    s.x = v[0];
+    s.y = v[1];
+    s.z = v[2];
+    // heading from the rotation about z: forward (0, 1) turned by yaw = 2 atan2(qz, qw)
+    const auto from = b.begin() + static_cast<ptrdiff_t>(at + 12);
+    const auto to = b.begin() + static_cast<ptrdiff_t>(std::min(b.size(), at + 12 + 80));
+    const auto r = std::search(from, to, std::begin(kRot), std::end(kRot));
+    if (r != to && b.end() - r >= static_cast<ptrdiff_t>(sizeof kRot + 16)) {
+        float q[4];
+        std::memcpy(q, b.data() + (r - b.begin()) + sizeof kRot, sizeof q);
+        const float yaw = 2.f * std::atan2(q[2], q[3]);
+        if (yaw == yaw) {
+            s.dx = -std::sin(yaw);
+            s.dy = std::cos(yaw);
+        }
+    }
+    return s;
+}
+
 // ---- the host's save folder -------------------------------------------------------------------------------------------
 std::filesystem::path SaveRoot() {
     PWSTR docs = nullptr;
@@ -208,6 +251,8 @@ struct Shared {
     Point local;
     bool hold = false;            // guest: held while the host watches a cutscene we cannot play
     bool localCutscene = false;   // a cutscene plays here
+    bool loadingScreen = false;   // a loading screen is up here (Lua "LS")
+    bool blackout = false;        // Lua "B": keep the screen black (the Free Ride stop of a failed mission)
     // host -> network (Lua events)
     std::string msLine;           // last "MS ..." line
     bool msDirty = false;
@@ -218,6 +263,7 @@ struct Shared {
     bool following = false;
     bool hostChapter = false;     // host: a lobby CHAPTER runs (his saves go to the scratch tree, save_guard)
     Point target;                 // the chapter and checkpoint our last follow load should start (Lua "T")
+    Spot targetSpot;              // where that load's save puts the player (Lua "T" moves him there first)
     bool quitPending = false;     // Lua: quit to the main menu
     std::string notice;
 };
@@ -476,6 +522,10 @@ bool ArmAndLoad(std::vector<uint8_t> bytes) {
     }
     if (menu::RequestLoad("free_ride")) {
         RememberSessionSave(copy);
+        const Spot spot = SaveSpotIn(copy);
+        Shared& sh = S();
+        std::lock_guard lock(sh.mu);
+        sh.targetSpot = spot;
         return true;
     }
     std::lock_guard lock(_swapMu);
@@ -522,6 +572,95 @@ Point HostPoint() {
     return ParseSaveId(_blobId);
 }
 
+// A failed mission in a co-op chapter: the game loads "freeroam_before_quest_activated", which save_guard keeps inside
+// the session (docs/re-notes.md 7). With fail_load = direct that load is the session's checkpoint itself: once its
+// world is up (we were out of the world since the request) the checkpoint's quest is started there like after our own
+// loads (Lua "T": put where the save has us, then the quest). With fail_load = freeride it is the Free Ride start, which
+// we leave for the main menu to load the checkpoint (0.9.1).
+struct FailLoad {
+    bool wanted = false;
+    bool sawOut = false;  // the old world went away since the request
+    double at = 0;
+};
+FailLoad _hostFail, _guestFail;
+constexpr const char* kFailSaveId = "freeroam_before_quest_activated";
+
+void ArmFailLoad(FailLoad& f) {
+    f.wanted = true;
+    f.sawOut = false;
+    f.at = _now;
+}
+
+// true once, when the world the game loaded for the failed mission is up
+bool FailWorldUp(FailLoad& f, bool inWorld) {
+    if (!f.wanted) return false;
+    if (!inWorld) f.sawOut = true;
+    if (f.sawOut && inWorld && PlayerSync::SaveId() == kFailSaveId) {
+        f.wanted = false;
+        return true;
+    }
+    if (_now - f.at > 300) {
+        f.wanted = false;
+        MC_LOG_WARN("mission: the world after the failed mission never came up");
+    }
+    return false;
+}
+
+// Direct mode, in the world the failed mission loaded (the session's checkpoint): start its quest there.
+void StartFailWorld() {
+    Point p;
+    std::vector<uint8_t> bytes;
+    {
+        std::lock_guard lock(_sessionMu);
+        p = _sessionPoint;
+        bytes = _sessionBytes;
+    }
+    save_guard::ForgetFailEntry();
+    if (p.quest.empty()) return;
+    MC_LOG_INFO("mission: back at the checkpoint %s %s after the failed mission (one load)", p.quest.c_str(),
+                p.cp.c_str());
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    sh.target = p;
+    sh.targetSpot = SaveSpotIn(bytes);
+}
+
+// The Free Ride stop of a failed mission (fail_load = freeride): its loading screen waits for Enter like every load,
+// and nothing can leave that world before it is confirmed (quitting from the waiting screen hung the game), so we
+// press Enter for the player (a DirectInput key press, core ui_input::PressGameKey): one loading screen less to
+// confirm, and the stop is a few seconds. Only on that world's loading screen.
+void ConfirmFailStop(bool wanted) {
+    static double lastPress = -10, screenSince = -1;
+    static int pressed = 0;
+    if (!wanted) {
+        pressed = 0;
+        screenSince = -1;
+        return;
+    }
+    bool loading;
+    {
+        Shared& sh = S();
+        std::lock_guard lock(sh.mu);
+        loading = sh.loadingScreen;
+    }
+    if (!loading && PlayerSync::SaveId() == kFailSaveId) {  // that world is up: black until we leave it
+        Shared& sh = S();
+        std::lock_guard lock(sh.mu);
+        sh.blackout = true;
+    }
+    if (!loading || PlayerSync::SaveId() != kFailSaveId) {
+        screenSince = -1;
+        return;
+    }
+    if (screenSince < 0) screenSince = _now;
+    // not at once: the old world is still being torn down under the loading screen (a host crashed in the game-sectors
+    // walk 8 s into such a load, re-notes 8), and a person needs a few seconds too
+    if (_now - screenSince < 3 || _now - lastPress < 1.5) return;
+    lastPress = _now;
+    ui_input::PressGameKey(0x1C, 150);  // DIK_RETURN
+    if (++pressed == 1) MC_LOG_INFO("mission: the Free Ride stop after the failed mission: Enter pressed on its loading screen");
+}
+
 // Guest following the host's story: when the host is at another chapter/checkpoint than we are, quit to the main
 // menu (in the world) and load his point (at the main menu). One attempt per host point.
 void GuestFollow() {
@@ -531,9 +670,10 @@ void GuestFollow() {
     {
         std::lock_guard lock(sh.mu);
         following = sh.following;
-        cutscene = !sh.host.cutscene.empty() || sh.localCutscene || sh.hold;
+        cutscene = !sh.host.cutscene.empty() || sh.hold;
+        // (a host in Free Ride has no quest; the world a failed mission loads is a checkpoint of this session)
         hostStory = sh.host.known && sh.host.inWorld && !sh.host.quest.empty() &&
-                    sh.host.saveId.rfind("freeroam", 0) != 0;
+                    (sh.host.saveId.rfind("freeroam", 0) != 0 || sh.host.saveId == kFailSaveId);
         local = sh.local;
     }
     const bool inWorld = PlayerSync::InWorld();
@@ -545,12 +685,17 @@ void GuestFollow() {
     // game on a black screen.)
     if (const uint32_t aborts = save_guard::MissionAborts(); aborts != _abortsSeen) {
         _abortsSeen = aborts;
-        if (following && !_abortReloadWanted) {
+        if (following && save_guard::DirectFailLoad()) {
+            MC_LOG_INFO("mission: our mission failed: the game loads the host's checkpoint");
+            ArmFailLoad(_guestFail);
+        } else if (following && !_abortReloadWanted) {
             MC_LOG_INFO("mission: our mission failed: back to the host's checkpoint once this world is up");
             _abortReloadWanted = true;
             _abortReloadAt = _now;
         }
     }
+    if (FailWorldUp(_guestFail, inWorld) && following) StartFailWorld();
+    ConfirmFailStop(_abortReloadWanted);
     if (_abortReloadWanted && inWorld && PlayerSync::SaveId().rfind("freeroam", 0) == 0 && _now - _abortReloadAt > 3) {
         _abortReloadWanted = false;
         if (following) _forceReload = true;
@@ -581,7 +726,9 @@ void GuestFollow() {
             return;
         }
         // a cutscene holds the reload only when it belongs to the host's chapter (a guest thrown into another chapter,
-        // e.g. by his game's own mission-failed load, goes back at once)
+        // e.g. by his game's own mission-failed load, goes back at once). Only the host's cutscene holds it, not one
+        // our own flow plays at an earlier checkpoint: a guest whose flow played the ambush of Bon Appetit cp_030
+        // (3 minutes of film) sat through it while the host already fought at cp_040.
         if (cutscene && local.quest == host.quest) _cutsceneAt = _now;
         if (_mismatchSince < 0) _mismatchSince = _now;
         if (_now - _cutsceneAt < 5) return;  // not during or right after a cutscene
@@ -644,6 +791,10 @@ void HostSelfReload() {
             // a STORY host plays his own story: the game's own flow stays
         } else if (p.quest.empty()) {
             MC_LOG_WARN("mission: our mission failed but no checkpoint of this session is known");
+        } else if (save_guard::DirectFailLoad()) {
+            MC_LOG_INFO("mission: our mission failed: the game loads our checkpoint %s %s", p.quest.c_str(),
+                        p.cp.c_str());
+            ArmFailLoad(_hostFail);
         } else if (_selfPoint.quest.empty()) {
             MC_LOG_INFO("mission: our mission failed: reloading our checkpoint %s %s", p.quest.c_str(), p.cp.c_str());
             _selfPoint = p;
@@ -653,6 +804,8 @@ void HostSelfReload() {
             _selfQuitAt = _now;
         }
     }
+    if (FailWorldUp(_hostFail, inWorld)) StartFailWorld();
+    ConfirmFailStop(_selfQuitWanted);
     if (_selfQuitWanted && inWorld && PlayerSync::SaveId().rfind("freeroam", 0) == 0 && _now - _selfQuitAt > 3) {
         // the free roam world the game loaded is up: leave it
         _selfQuitWanted = false;
@@ -821,7 +974,20 @@ void MainTick(lua_State* L, float dt) {
             cmds += "C " + Dash(sh.host.cutscene) + "\n";
         }
         if (sh.active && (sh.isHost || sh.following) && !sh.target.quest.empty())
-            cmds += "T " + sh.target.quest + " " + Dash(sh.target.cp) + "\n";
+        {
+            cmds += "T " + sh.target.quest + " " + Dash(sh.target.cp);
+            if (sh.targetSpot.valid) {
+                char spot[96];
+                std::snprintf(spot, sizeof spot, " %.2f %.2f %.2f %.3f %.3f", sh.targetSpot.x, sh.targetSpot.y,
+                              sh.targetSpot.z, sh.targetSpot.dx, sh.targetSpot.dy);
+                cmds += spot;
+            }
+            cmds += "\n";
+        }
+        if (sh.blackout) {
+            cmds += "B\n";
+            sh.blackout = false;
+        }
         if (sh.quitPending) {
             cmds += "Q\n";
             sh.quitPending = false;
@@ -869,6 +1035,8 @@ void MainTick(lua_State* L, float dt) {
                 sh.local = {q == "-" ? std::string() : q, cp == "-" ? std::string() : cp};
                 sh.hold = hold == "1";
                 sh.localCutscene = cut == "1";
+            } else if (line.rfind("LS ", 0) == 0) {
+                sh.loadingScreen = line == "LS 1";
             } else if (line.rfind("AC ", 0) == 0) {  // the target quest runs now: done with it
                 sh.target = {};
             } else if (line.rfind("MS ", 0) == 0) {
@@ -911,6 +1079,7 @@ void MissionSync::Attach(net::Session& session) {
     _scanAccum = kScanInterval;
     _abortsSeen = save_guard::MissionAborts();  // missions failed before this session are not ours to answer
     _abortReloadWanted = _selfQuitWanted = false;
+    _hostFail = _guestFail = {};
     {
         std::lock_guard lock(_sessionMu);
         _sessionPoint = {};
