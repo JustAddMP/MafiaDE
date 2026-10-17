@@ -151,7 +151,10 @@ for a long time.
 | `h:MakeCarOwnership(car)` | accepted; made no difference to seating |
 | `car:SetSteer(x)`, `SetPower(x)`, `SetBrake(x)`, `SetHandbrake(x)` | **UNVERIFIED (static, 2026-10-17, docs/re-notes.md 9)**: one number each; they write the car's control wishes in its vehicle part (entity + 0xF8): steering -1..1 through a response curve, throttle 0..1 (below 0.02 = 0), brake 0..1 (below 0.04 = 0), handbrake 0..1 (below 0.02 = 0). Since 0.13.0 applied every tick to a remote driver's car copy |
 | `car:GetPowerWish()` | **UNVERIFIED (static)**: reads the throttle wish (entity + 0xACC). The other controls have no getter; `mc_car_controls(id)` (ours) reads them |
-| `car:GetGear()` / `SetGear(n)` | **UNVERIFIED (static)**: GetGear returns gearbox +0xB8 minus +0x19C (a gear relative to some base; negative taken as reverse). SetGear is not used (its meaning of `n` is not known) |
+| `car:GetGear()` / `SetGear(n)` | **UNVERIFIED (static)**: GetGear returns gearbox +0xB8 minus +0x19C (a gear relative to some base; negative taken as reverse). SetGear is not used (its meaning of `n` is not known); since 0.14.0 both the driver's and the copy's gear are in the sync trace (LR / CR) to compare |
+| `car:SetEngineOn(on [, b])` / `IsEngineOn()` | **UNVERIFIED** (0.14.0): a car copy's engine is switched on when its driver's controls are first applied and whenever IsEngineOn says it is off (checked once a second; tried as `(true, true)`, then `(true)`), logged. In the 0.13.0 test the copies did not roll under their controls; a traffic car spawned without a driver standing with its engine off is the first suspect |
+| `car:SetSpeed(v)` / `GetSpeed()` | **UNVERIFIED** (0.14.0): GetSpeed returns the velocity vector (used since 0.10.0). SetSpeed is tried with a vector, then with a number; whichever is accepted is logged and used to give a car copy its wanted velocity right after each position / rotation correction (if `SetPos` stops the body, the copy could never roll). Three probes per copy log the speed before and after SetPos, SetRot and SetSpeed |
+| `car:IsCarPosFixed()`, `GetEngineRotations()`, `GetPowerInternal()`, `GetSpeedFloat()` | read for the sync trace only (CR / LR records) |
 | `car:SetAddSteer(deg)` | **UNVERIFIED (static)**: degrees (x pi/180 in the binding), an extra steering angle. Not used |
 | `car:SetImpulse(a, b[, part])` | **UNVERIFIED (static)**: two vectors (and a part index) to the vehicle part (exe+0x1C0A8B0); which is the impulse and which the point is not known. Not used |
 | `mc_car_controls(id)` (ours, src/game/lua.cpp) | **UNVERIFIED**: `steer, power, brake, handbrake, steerLinearity, steerAngle` of car entity `id` (the number in its GUID) read from the fields above, or nil when a read fails or a value is out of range. The driver's game sends them in PlayerState |
@@ -444,6 +447,11 @@ in-game check (README-dev.md "Test checklist: animation and car controls").
   controller pins the copy after a second, logged, and it behaves as before 0.13.0 with steering wheels).
 - The puppet driver is an AI human in the driver seat: if the game gives it an AI driving controller, that may write
   the same controls; then the steering flickers between ours and its (not seen statically; `DestroyController` exists).
+- **First test (0.13.0, two PCs, 2026-10-17):** every car copy was pinned within ~4 s on both games (copy 0.2 m/s,
+  target 4.4 m/s), with the driver's steering and throttle arriving. 0.14.0 starts the copy's engine, gives it its
+  wanted speed after each correction (SetSpeed, probed), retries its physics after 5-40 s, and traces what the copy
+  really has (controls, wheel angle, engine, gear) against the driver's car. On foot the calibrated sprint was only
+  ~3.3 m/s (the AI's), so sprinting players got 1.3-3.2 m ahead: the shortfall is now carried.
 
 ## 15. Mission NPCs and cars on two games, the entity table - checked 2026-10-15
 

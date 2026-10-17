@@ -299,7 +299,10 @@ Dev console, to explore the API live:
   `tools\devlua.ps1 -Tag host -Code 'return game.game:GetActivePlayer():GetPos()'` does the round trip.
 - What was found this way is in `docs/game-api.md`.
 
-## Test checklist: animation and car controls (0.13.0, not yet tested in game)
+## Test checklist: animation and car controls (0.13.0; 0.14.0 fixes not yet tested in game)
+
+First two-PC test of 0.13.0 (2026-10-17): see docs/PLAN.md A/B. After each test, compare the two sync traces
+(`python tools/sync_compare.py <trace A> <trace B>`, "Network statistics and measuring desync" below).
 
 Built from reading the exe only (docs/game-api.md 16, docs/re-notes.md 9). Two instances side by side
 (`--debug-overlay`, see "Two instances on one PC"), Free Ride or a story save, outside the Free Ride start zone if you
@@ -340,8 +343,7 @@ Name tags:
   of one account). A name typed in CO-OP SETTINGS > NAME shows after the next session start; with `--name X` the log
   says `name 'X' (from the command line, this run only ...)`.
 
-Measuring: `--trace_pos 1` on both and `python tools/pos_error.py out\logs\mafiacoop-host.log
-out\logs\mafiacoop-guest.log` as below (the 0.9.0 numbers are in docs/protocol.md "PlayerState").
+Measuring: every session writes a sync trace; compare the two with tools/sync_compare.py (below).
 
 ## Network statistics and measuring desync
 
@@ -351,12 +353,17 @@ out\logs\mafiacoop-guest.log` as below (the 0.9.0 numbers are in docs/protocol.m
 - Settings (ini or `--key value`): `net_budget_kbps` (per-peer limit, KiB/s, default 1024), `net_state_hz` (default
   60), `net_interp_ms` (default 50). Host: `enemies_target_guests` (default 1: the host's enemies target the guests' puppets,
   docs/game-api.md 15).
-- Position error between two games: start both with `--trace_pos 1`; each logs its player and every puppet ten times a
-  second. `python tools/pos_error.py out\logs\mafiacoop-host.log out\logs\mafiacoop-guest.log [--from HH:MM:SS]
-  [--to HH:MM:SS]` prints, per direction, on foot and in a car, the distance between where a player really is and
-  where his puppet / car copy is on the other screen (and the network part alone, "target"). Numbers from 0.9.0 are in
-  docs/protocol.md "PlayerState". The test pad (`mc_pad`) did not move the player in some sessions; keyboard keys
-  sent to the focused window (W/A/S/D) always did.
+- **Sync trace (0.14.0, always on):** each session writes `out\logs\trace\mafiacoop[-<tag>]-<date>-<time>.trace`:
+  every state sent and received, clocks, every controller decision per puppet / car copy, readbacks of what the game
+  really did (car controls, engine, gear, wheel angle; puppet seat, physics, sprint), NPC distances (guest) and a copy
+  of the log. Format: docs/sync-trace.md.
+- **Comparing two games:** `python tools/sync_compare.py <trace of one game> <trace of the other> [--csv DIR]
+  [--worst N]` (the same session; from two PCs or one). Per direction: loss, latency and jitter, the clock offset,
+  the distance between the puppet / car copy and where the player really was at the same moment (per gait), gait
+  matches, snaps / nudges / catching up, pins and retries, copy speed, steering wish and wheel angle against the
+  driver's, seat ejections, NPC distances, the worst moments with wall-clock times; `--csv` for plotting. Numbers from
+  0.9.0 are in docs/protocol.md "PlayerState". The test pad (`mc_pad`) did not move the player in some sessions;
+  keyboard keys sent to the focused window (W/A/S/D) always did.
 
 ## Testing the co-op panels (gamepad and mouse)
 
@@ -555,7 +562,9 @@ window = left              ; left|right: keep the game window on that half of it
 
 - `out\logs\mafiacoop.log` (or `mafiacoop-<tag>.log` with `--log <tag>`; a second concurrent instance without
   `--log` writes `mafiacoop-<pid>.log`): one line per event (timestamp, thread id, level), written to the file straight away.
-  The previous run is kept as `mafiacoop.log.1`. A heartbeat with FPS is logged every 10 s from the Present hook.
+  The previous five runs are kept as `mafiacoop.log.1` (newest) .. `.5`. A heartbeat with FPS is logged every 10 s
+  from the Present hook.
+- `out\logs\trace\*.trace`: the sync trace of each co-op session (docs/sync-trace.md), the newest 20 kept.
 - `out\logs\launcher.log` (`launcher-<tag>.log`, or `launcher-<pid>.log` when a game was already running): what
   the launcher found and did.
 - `out\logs\crash-<date>-<time>.dmp`: a minidump written on a fatal exception. The log gets the exception code,

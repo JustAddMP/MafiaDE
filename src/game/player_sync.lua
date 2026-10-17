@@ -9,7 +9,7 @@
 --                                                                                (load his model before he shows up)
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
 --     inair gait mult reissue mx my mz fix nx ny turn fx fy
---     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned
+--     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
 --                                                                                "tommy" = story Tommy; M.Profile),
@@ -41,6 +41,9 @@
 --            commands), "VS id vkey x y z vx vy vz qx qy qz qw" (the car copy player id drives);
 --            not for the network: "NT id x y dist" (name tag: the puppet's head on screen, x/y -1..1 with y up, dist
 --            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
+-- Sync trace (docs/sync-trace.md): mc_trace(type, text) writes readbacks of what the game really did, 20 times a
+-- second while a session runs: "LR" (our player and the car we drive), "PR" (each puppet), "CR" (each car copy a
+-- remote player drives: the controls it really has, engine, gear, wheel angle).
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -48,7 +51,7 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 8
+M.version = 9
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
@@ -87,6 +90,8 @@ local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
 local function same(a, b) return valid(a) and valid(b) and a == b end
 local function log(s) if mc_log then mc_log("sync: " .. s) end end
+local function trace(kind, text) if mc_trace then mc_trace(kind, text) end end
+local TRACE_PERIOD = 0.05  -- s between readback records (LR / PR / CR)
 -- An error from a per-tick step: logged 5 times, then every 500th time (a broken step must not flood the log).
 local errCount = {}
 local function logErr(what, err)
@@ -404,18 +409,80 @@ local function entId(ent)
   return tonumber(tostring(ent:GetGUID()):match("(%d+)%s*$"))
 end
 
+local function speedOf(ent)
+  local good, v = pcall(ent.GetSpeed, ent)
+  if not good or not v then return -1 end
+  return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+end
+
+-- Gives the copy its wanted velocity after a move: the game's position setter may stop the body (that is what kept
+-- the copies from rolling in the 0.13.0 test: 0.2 m/s against 4.4). SetSpeed takes a vector or, failing that, a
+-- number (the speed along its heading); which one works is logged once.
+function RV.GiveSpeed(st, ent, vx, vy, vz)
+  if st.speedHow == "none" then return end
+  if st.speedHow ~= "number" then
+    local good, err = pcall(ent.SetSpeed, ent, V(vx, vy, vz))
+    if good then
+      if not st.speedHow then st.speedHow = "vector"; log("remote car " .. tostring(ent) .. ": SetSpeed(vector) accepted") end
+      return
+    end
+    if st.speedHow == "vector" then return end
+    log("remote car " .. tostring(ent) .. ": SetSpeed(vector) failed (" .. tostring(err) .. "), trying a number")
+  end
+  local good, err = pcall(ent.SetSpeed, ent, math.sqrt(vx * vx + vy * vy + vz * vz))
+  if good then
+    if st.speedHow ~= "number" then st.speedHow = "number"; log("remote car " .. tostring(ent) .. ": SetSpeed(number) accepted") end
+  else
+    st.speedHow = "none"
+    log("remote car " .. tostring(ent) .. ": SetSpeed failed both ways (" .. tostring(err) .. "): no speed after a move")
+  end
+end
+
+-- Engine on (a copy spawned from traffic stands with its engine off, and power does nothing then); checked again
+-- once a second (hiding the driver, a stall); counted.
+function RV.Engine(st, ent)
+  if M.now - (st.engT or -10) < 1 then return end
+  st.engT = M.now
+  local g0, on = pcall(ent.IsEngineOn, ent)
+  st.eng = g0 and (on and 1 or 0) or -1
+  if g0 and on then return end
+  local good = pcall(ent.SetEngineOn, ent, true, true)
+  if not good then good = pcall(ent.SetEngineOn, ent, true) end
+  local g1, on1 = pcall(ent.IsEngineOn, ent)
+  st.engStarts = (st.engStarts or 0) + 1
+  if st.engStarts <= 3 or st.engStarts % 20 == 0 then
+    log(string.format("remote car %s: engine was %s, SetEngineOn %s, now %s (#%d)", tostring(ent),
+      g0 and tostring(on) or "unknown", good and "ok" or "failed", g1 and tostring(on1) or "unknown", st.engStarts))
+  end
+end
+
 function RV.Drive(st, ent, cmd, tx, ty, tz)
+  -- probe (logged three times, 2 s apart, while the driver moves): the speed the copy kept from the previous tick
+  -- (with last tick's SetSpeed), after SetPos, after SetRot and after SetSpeed: does a move stop the body, does
+  -- SetSpeed give the speed back?
+  local want = math.sqrt((cmd.vx or 0) ^ 2 + (cmd.vy or 0) ^ 2 + (cmd.vz or 0) ^ 2)
+  local probe = cmd.fix ~= 0 and want > 1 and (st.probes or 0) < 3 and M.now - (st.probeT or -10) >= 2
+  local s0 = probe and speedOf(ent)
   if cmd.fix == 2 or cmd.fix == 3 then
     ent:SetPos(V(tx, ty, tz))
   elseif cmd.fix == 1 then
     local p = ent:GetPos()
     ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
   end
+  local s1 = probe and speedOf(ent)
   if cmd.fix ~= 0 then
     local q = Math:newQuat()
     q.v = V(cmd.qx, cmd.qy, cmd.qz)
     q.s = cmd.qw
     ent:SetRot(q)
+    local s2 = probe and speedOf(ent)
+    RV.GiveSpeed(st, ent, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0)
+    if probe then
+      st.probes, st.probeT = (st.probes or 0) + 1, M.now
+      log(string.format("remote car %s: probe #%d (%s): speed %.2f m/s, after SetPos %.2f, after SetRot %.2f, after "
+        .. "SetSpeed %.2f (wanted %.2f, SetSpeed as %s)", tostring(ent), st.probes, cmd.fix == 1 and "blend" or "pin",
+        s0, s1, s2, speedOf(ent), want, tostring(st.speedHow)))
+    end
   end
   if cmd.fix == 3 and not st.snapLogged then
     st.snapLogged = true
@@ -430,8 +497,12 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
       if k then st.k = k end
     end
   end
+  RV.Engine(st, ent)
+  -- gears are not set: SetGear's argument is not known (docs/game-api.md 16); both cars' gears are in the trace
+  -- (LR / CR gear) to compare
+  st.steerIn = RV.SteerInput(cmd.steer, st.k)
   local good, err = pcall(function()
-    ent:SetSteer(RV.SteerInput(cmd.steer, st.k))
+    ent:SetSteer(st.steerIn)
     ent:SetPower(cmd.power)
     ent:SetBrake(cmd.brake)
     ent:SetHandbrake(cmd.hb)
@@ -569,6 +640,10 @@ function M.CarTick(c)
         c.rv = c.rv or {}
         RV.Drive(c.rv, c.ent, pp.vcmd, c.tx, c.ty, c.tz)
         M.events[#M.events + 1] = "VS " .. c.driver .. " " .. c.key .. " " .. RV.Report(c.rv, c.ent)
+        if mc_trace and M.now - (c.trT or -1) >= TRACE_PERIOD then
+          c.trT = M.now
+          pcall(M.TraceCar, c, pp)
+        end
       else
         setTransform(c)
       end
@@ -723,6 +798,10 @@ function M.Weapon(pp)
   try("InventorySelect", so.InventorySelect, so, w, false, true)
 end
 
+-- s an animated get-in may take before the puppet is seated at once (declared before M.Seat, which uses it: below
+-- it, it was an unset global there until 0.14.0 and every animated get-in was cut short after 1 s)
+local ANIM_WAIT = 4
+
 -- Hidden puppets have no collision (phys state 2 = DISABLED). forSeat: shown again to be seated, physics stays
 -- off (GetOnVehicle manages it; a puppet made DYNAMIC right before it is seated gets thrown out of the car).
 function M.Hide(pp, hide, forSeat)
@@ -752,6 +831,19 @@ function M.Seat(pp, c)
   end
   if pp.seated then  -- was seated, now is not: thrown out (happens while a fresh copy settles, see also M.Swap)
     pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
+    pp.ejectsLogged = (pp.ejectsLogged or 0) + 1
+    if pp.ejectsLogged <= 12 then
+      local g1, phys = pcall(so.GetPhysState, so)
+      local g2, sp = pcall(car.GetSpeedFloat, car)
+      local cmd = pp.vcmd or {}
+      local occ = car:GetSeatOwner(pp.seat)
+      log(string.format("puppet %s thrown out of car %s seat %d (#%d): %.1f s after seating, car %.1f m/s, car fix %s%s, "
+        .. "phys %s, owner now %s, seat now %s, animated %s, hidden %s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects,
+        M.now - (pp.seatT or M.now), g2 and (tonumber(sp) or -1) or -1, tostring(cmd.fix), cmd.pinned and " pinned" or "",
+        g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
+        not valid(occ) and "free" or (same(occ, so) and "ours" or "someone else"), tostring(pp.seatAnim),
+        tostring(pp.hidden)))
+    end
     -- A mission car of this game (adopted, M.FindLocalCar) does not keep an NPC at its wheel either: it is swapped
     -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice.
     if pp.ejects == 2 and pp.seat == 0 and c.adopted and not c.localIn and c.st == "ready" then
@@ -806,7 +898,6 @@ end
 --   DbgTesting_SemaphoreNextFrame()             its next update, so each press waits for this sync object
 -- Shots are real (bullets, muzzle flash, sound) but the puppet is not hostile to anyone; damage is phase A5.
 local AIM_HOLD = 1.0  -- keep aiming this long after a shot without aim input (hip fire)
-local ANIM_WAIT = 4   -- s an animated get-in may take before the puppet is seated at once
 
 local function cmdTick(pp)
   local c = pp.cb
@@ -974,33 +1065,72 @@ function M.SpeedMult(pp, so, m)
   pp.mult = m
 end
 
--- Dev (trace_pos = 1): our position and every puppet's, 10 times a second, for measuring the position error between
--- two games (tools/pos_error.py pairs one game's "trace L" lines with the other's "trace P" lines by log time).
--- L: x y z [car x y z]; P id: puppet x y z, tgt x y z (where the network says it is now) [car x y z ctgt x y z].
-function M.TraceTick(player)
-  if M.now - (M.traceT or -1) < 0.1 then return end
-  M.traceT = M.now
-  local p = player:GetPos()
-  local car = player:GetOwner()
-  local line = string.format("trace L %.2f %.2f %.2f", p.x, p.y, p.z)
-  if valid(car) then
-    local c = car:GetPos()
-    line = line .. string.format(" car %.2f %.2f %.2f", c.x, c.y, c.z)
+-- ---- sync trace readbacks (docs/sync-trace.md) ------------------------------------------------------------------
+local function f3(v) return v and string.format("%.3f,%.3f,%.3f", v.x, v.y, v.z) or "-" end
+
+-- the controls a car really has (its vehicle part, docs/re-notes.md 9): "steer,power,brake,hb,k,angle" or "-"
+local function controlsOf(car)
+  if not mc_car_controls then return "-" end
+  local id = tonumber(guidNum(car))
+  local s, pw, b, h, k, a = mc_car_controls(id)
+  if not s then return "-" end
+  return string.format("%.3f,%.3f,%.3f,%.3f,%.3f,%.4f", s, pw, b, h, k or -1, a or 0)
+end
+
+local function carState(car)
+  local g1, eng = pcall(car.IsEngineOn, car)
+  local g2, gear = pcall(car.GetGear, car)
+  local g3, spd = pcall(car.GetSpeedFloat, car)
+  local g4, fixed = pcall(car.IsCarPosFixed, car)
+  local g5, rpm = pcall(car.GetEngineRotations, car)
+  local g6, pwi = pcall(car.GetPowerInternal, car)
+  return string.format("eng=%s gear=%s spd=%.3f fixed=%s rpm=%.0f pwi=%.3f",
+    g1 and (eng and "1" or "0") or "-", g2 and tostring(gear) or "-", g3 and (tonumber(spd) or -1) or -1,
+    g4 and (fixed and "1" or "0") or "-", g5 and (tonumber(rpm) or -1) or -1, g6 and (tonumber(pwi) or -1) or -1)
+end
+
+-- CR: a car copy a remote player drives, after this tick's commands
+function M.TraceCar(c, pp)
+  local e, cmd = c.ent, pp.vcmd
+  local occ = e:GetSeatOwner(0)
+  local who = not valid(occ) and "none" or (same(occ, pp.so) and "puppet" or "other")
+  local st = c.rv or {}
+  trace("CR", string.format("key=%s drv=%s adopted=%d fix=%d pin=%d p=%s v=%s rb=%s %s cmd=%.3f,%.3f,%.3f,%.3f,%d "
+    .. "steerIn=%.3f vel=%.3f,%.3f,%.3f speedHow=%s seat0=%s locked=%d",
+    c.key, tostring(c.driver), c.adopted and 1 or 0, cmd.fix or -1, cmd.pinned and 1 or 0, f3(e:GetPos()),
+    f3(e:GetSpeed()), controlsOf(e), carState(e), cmd.steer or 0, cmd.power or 0, cmd.brake or 0, cmd.hb or 0,
+    cmd.gear or 0, st.steerIn or 0, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0, tostring(st.speedHow), who,
+    c.closed and 1 or 0))
+end
+
+-- PR: a puppet after this tick's commands
+function M.TracePuppet(pp)
+  local so = pp.so
+  if not valid(so) then return end
+  local own = so:GetOwner()
+  local g1, phys = pcall(so.GetPhysState, so)
+  local g2, spr = pcall(so.IsSprinting, so)
+  trace("PR", string.format("id=%s st=%s p=%s d=%.3f,%.3f hid=%d veh=%s seat=%s own=%s seated=%d ejects=%d tries=%d "
+    .. "anim=%s phys=%s spr=%s dead=%d hp=%.0f mv=%d mult=%.2f moves=%d snaps=%d",
+    pp.id, pp.st, f3(so:GetPos()), so:GetDir().x, so:GetDir().y, pp.hidden and 1 or 0, tostring(pp.vkey),
+    tostring(pp.seat), valid(own) and tostring(guidNum(own)) or "-", pp.seated and 1 or 0, pp.ejects or 0,
+    pp.seatTries or 0, tostring(pp.seatAnim), g1 and tostring(phys) or "-", g2 and (spr and "1" or "0") or "-",
+    so:IsDeath() and 1 or 0, tonumber(so.health) or -1, pp.moving and 1 or 0, pp.mult or 1, pp.moves or 0,
+    pp.snaps or 0))
+end
+
+-- LR: our own player (and the car we drive): what the others are sent, read back from the game
+function M.TraceLocal(p)
+  local car = p:GetOwner()
+  local g, spr = pcall(p.IsSprinting, p)
+  local line = string.format("p=%s d=%.3f,%.3f spr=%s hp=%.0f", f3(p:GetPos()), p:GetDir().x, p:GetDir().y,
+    g and (spr and "1" or "0") or "-", tonumber(p.health) or -1)
+  if valid(car) and car.GetVehicleModelName then
+    local my = M.my
+    line = line .. string.format(" car=%s seat=%s cp=%s cv=%s rb=%s %s", my and my.key or "-",
+      my and tostring(my.seat) or "-", f3(car:GetPos()), f3(car:GetSpeed()), controlsOf(car), carState(car))
   end
-  mc_log(line)
-  for id, pp in pairs(M.pup) do
-    if pp.st == "alive" and valid(pp.so) and pp.tx then
-      local q = pp.so:GetPos()
-      line = string.format("trace P %s %.2f %.2f %.2f tgt %.2f %.2f %.2f", id, q.x, q.y, q.z, pp.tx, pp.ty, pp.tz)
-      local c = pp.veh and pp.vkey and M.cars[pp.vkey]
-      if c and valid(c.ent) then
-        local e = c.ent:GetPos()
-        line = line .. string.format(" car %.2f %.2f %.2f ctgt %.2f %.2f %.2f", e.x, e.y, e.z, pp.cx or 0, pp.cy or 0,
-          pp.cz or 0)
-      end
-      mc_log(line)
-    end
-  end
+  trace("LR", line)
 end
 
 -- Enemies react to guests (host only; ini enemies_target_guests = 0 turns it off). The
@@ -1929,7 +2059,7 @@ function M.Update(dt, cmds)
       pp.vcmd = { fix = n(f[45]) or 2, nx = n(f[46]) or 0, ny = n(f[47]) or 0, nz = n(f[48]) or 0,
         qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
-        ctl = f[58] == "1", pinned = f[59] == "1" }
+        ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0 }
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
@@ -1955,8 +2085,6 @@ function M.Update(dt, cmds)
       enter = true
     elseif op == "A" then
       aimInput = true
-    elseif op == "Z" then
-      M.trace = true
     elseif op == "G" then
       M.tags, M.markers, M.allyOn = f[2] == "1", f[3] == "1", f[4] ~= "0"
     elseif op == "R" then
@@ -2033,7 +2161,13 @@ function M.Update(dt, cmds)
     pcall(M.RideTick, player)
   end
 
-  if M.trace and player then pcall(M.TraceTick, player) end
+  if mc_trace and active and player and M.now - (M.trT or -1) >= TRACE_PERIOD then
+    M.trT = M.now
+    pcall(M.TraceLocal, player)
+    for _, pp in pairs(M.pup) do
+      if pp.st == "alive" then pcall(M.TracePuppet, pp) end
+    end
+  end
   local st = {}
   for id, pp in pairs(M.pup) do
     local tag = ""

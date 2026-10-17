@@ -133,7 +133,9 @@ UNINSTALL
 
 PROBLEMS
 --------
-Logs and crash reports are written to the "logs" folder next to mafiacoop.dll. Report problems (with the log) at
+Logs and crash reports are written to the "logs" folder next to mafiacoop.dll. Each co-op session also writes a
+detailed sync record to logs\trace (about 250 MB an hour; only the newest 20 are kept). When something looks wrong
+in co-op, zip the whole "logs" folder on both PCs and send both. Report problems at
 https://github.com/JustAddMP/MafiaDE/issues
 
 Unofficial fan-made mod, not affiliated with or endorsed by 2K, Hangar 13 or Valve. You need your own copy of the

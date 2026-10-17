@@ -81,7 +81,7 @@ newer) are dropped, so loss and reordering need no reliability. The interpolated
 along its velocity by the same 50 ms (at most 1.5 m; player and car), so what is shown is where the player is now,
 not where he was 50 ms ago.
 
-**Measured (0.9.0, two games on one PC, `trace_pos = 1` and `tools/pos_error.py`, docs/README-dev.md):** the network
+**Measured (0.9.0, two games on one PC, with the position trace that docs/sync-trace.md replaced in 0.14.0):** the network
 part (the target the puppet is steered to vs. where the player really is) was 0.11 m on average and 0.47 m at most
 while running with 20 Hz / 100 ms, and 0.02-0.06 m on average (p95 0.10 m) with 60 Hz / 50 ms and the lead; a car at
 up to 20.6 m/s: 0.12 m average, 0.34 m max (before: 0.29 m average and 1.04 m max at only up to 9.7 m/s). The

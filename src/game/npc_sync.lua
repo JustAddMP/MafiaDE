@@ -35,7 +35,7 @@ MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
 M.Npc = M.Npc or {}
 local N = M.Npc
-N.version = 3
+N.version = 4
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
 local SEND_INTERVAL = 0.1   -- s between host state rounds (10 Hz; ~10 KB/s for 48 NPCs)
@@ -1066,7 +1066,43 @@ function N.Update(dt, cmds)
     N.stT = M.now
     ev[#ev + 1] = "ST " .. (N.status or "")
   end
+  if mc_trace and M.now - (N.trT or -10) >= 0.5 then
+    N.trT = M.now
+    pcall(N.Trace, host)
+  end
   return table.concat(ev, "\n")
+end
+
+-- Sync trace (docs/sync-trace.md), twice a second: host "NHS" (how many NPCs it sends); guest "NP" for every host
+-- NPC it has a state of (where the host's is, where ours is, how far apart) and "NGS" (totals).
+function N.Trace(host)
+  if host then
+    mc_trace("NHS", string.format("sending=%d hits=%d kills=%d", N.hostCount or 0, N.hitsIn or 0, N.guestKills or 0))
+    return
+  end
+  local matched, live, sumD, maxD = 0, 0, 0, 0
+  for key, s in pairs(N.host) do
+    if M.now - s.t <= STALE then
+      live = live + 1
+      local e = s.loc and (N.ents[s.loc] or (s.copy and N.copies[key] and N.copies[key].ent))
+      local h = e and e.h
+      local q = h and valid(h) and h:GetPos()
+      local d = q and math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2) or -1
+      if d >= 0 then
+        matched = matched + 1
+        sumD, maxD = sumD + d, math.max(maxD, d)
+      end
+      mc_trace("NP", string.format("key=%d loc=%s copy=%d ai=%s car=%d host=%.2f,%.2f,%.2f our=%s d=%.2f hp=%s/%s "
+        .. "dead=%d/%d age=%.2f", key, tostring(s.loc), s.copy and 1 or 0, tostring(s.ai), s.car and 1 or 0, s.x, s.y,
+        s.z, q and string.format("%.2f,%.2f,%.2f", q.x, q.y, q.z) or "-", d, tostring(s.hp),
+        h and valid(h) and string.format("%.0f", tonumber(h.health) or -1) or "-", s.dead and 1 or 0,
+        (h and valid(h) and h:IsDeath()) and 1 or 0, M.now - s.t))
+    end
+  end
+  local nc = 0
+  for _, c in pairs(N.copies) do if c.st == "alive" then nc = nc + 1 end end
+  mc_trace("NGS", string.format("live=%d matched=%d copies=%d avg=%.2f max=%.2f kills=%d pulls=%d", live, matched, nc,
+    matched > 0 and sumD / matched or 0, maxD, N.kills or 0, N.pulls or 0))
 end
 
 return N.version

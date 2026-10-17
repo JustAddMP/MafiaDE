@@ -3,6 +3,49 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.14.0 (2026-10-17), pre-release, fixes not yet tested in game
+
+Fixes from the first test of 0.13.0 on two PCs (Steam invite, Free Ride, about five minutes), and a sync trace on
+every session so the next tests can be measured instead of guessed. The fixes are built from those logs; not yet
+tried in game.
+
+Cars:
+- Car copies stood still under their own physics (0.2 m/s while the driver did 4.4 m/s) and fell back to being
+  moved every tick ("pinned") within seconds, on both games. Likely causes, all handled now: the copy's engine was
+  off (a car spawned from traffic stands with it off; it is started and kept running), and moving the copy may stop
+  its body (after every correction the copy is given the speed it should have). The log probes this three times per
+  car ("probe: speed .. after SetPos .. after SetSpeed").
+- A pinned copy gets its own physics back after 5 s (then 10, 20, 40 s after each new pin), so one bad moment no
+  longer pins it for the rest of the drive. The log says why it was pinned (too slow / ran off / stays off).
+
+On foot:
+- Running and sprinting players were up to 3 m ahead of their character on the other screen: the game's AI sprint is
+  only ~3.3 m/s. The character now runs up to 1.8x its normal speed (was 1.5x), learns a slow gait faster, and when
+  even that is too slow the missing speed is made up by small steps along the way, so it keeps up instead of being
+  put back every few seconds.
+
+Getting into cars:
+- The other player's character got into a car with the door animation but was put straight into the seat after
+  1 s, cutting it short (a script setting meant to give it 4 s was read before it was set). It now has the 4 s.
+- Every time a character is thrown out of a seat the log says how (car speed, how the car is being moved, physics
+  state, who holds the seat) - it still happens, the cause is not known yet.
+
+Logs:
+- **Sync trace:** every session writes `logs\trace\mafiacoop-<date>-<time>.trace` (core 0.10.0): every state sent
+  and received (60 a second), the clock and link to each player, what the motion controllers saw and decided for
+  every puppet and car copy each tick, readbacks of what the game really did (20 a second: the controls, engine,
+  gear and front wheel angle of each car copy and of our own car, each puppet's seat, physics and sprint state), the
+  NPCs' distances on the guest, and a copy of the main log. About 250 MB an hour; the newest 20 are kept.
+  docs/sync-trace.md.
+- `python tools/sync_compare.py <trace from one PC> <trace from the other>` lines the two games up (clock offset from
+  the states' timestamps and the round trip) and reports loss, latency, how far each character and car really was
+  from its player at the same moment (per gait), gait matches, pins, steering and wheel angles, seats, NPC distances
+  and the worst moments with wall-clock times. Replaces `trace_pos` and tools/pos_error.py.
+- The last five logs are kept (`mafiacoop.log.1` .. `.5`), not just one.
+- The F7 status shows a car copy's pins and speeds, and the speed a character wants and whether it is catching up.
+
+Compatible with 0.13.0 (same messages); both players should still use 0.14.0 for the fixes and the traces.
+
 ## 0.13.0 (2026-10-17), pre-release, not yet tested in game
 
 Other players look like players. Built from reading the game's code while the game could not be started: nothing

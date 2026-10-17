@@ -12,7 +12,7 @@ interest.md).
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
 | 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
-| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs untested; lobby: Free Ride, Story and chapter select |
+| 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs works (2026-10-17); lobby: Free Ride, Story and chapter select |
 | 4 Shared world | Weather/time, story (chapter, checkpoint, objectives), cutscenes and mission NPCs done (pairing, deaths and hits both ways, copies of host-only enemies; one chapter's fight checked); mission cars partly |
 | 6 polish | Not started |
 
@@ -96,10 +96,18 @@ Tick an item (`- [x]`) in the same commit that lands it.
    "Test checklist"): puppets walk/run/sprint with the game's locomotion at the remote player's speed (gait + speed
    multiplier calibrated on the puppet, walk point; small nudges, snaps when far off) instead of being pulled every
    tick (feet slid); stand turns rate-limited; walks with him to the car door and gets in animated. Gate: no sliding
-   feet, natural starts/stops/turns, error still ~0.5 m (`trace_pos`).
+   feet, natural starts/stops/turns, error still ~0.5 m (sync trace, docs/sync-trace.md).
+   First two-PC test of 0.13.0 (2026-10-17, Free Ride, ~5 min): walking stayed within 0.1-0.9 m, running and sprinting
+   fell 1.3-3.2 m behind (the AI sprint is ~3.3 m/s) - 0.14.0 carries the shortfall (multiplier up to 1.8); animated
+   get-in was cut after 1 s (ANIM_WAIT read before it was set) - fixed in 0.14.0; puppets are still thrown out of
+   seats (cause unknown, logged in detail since 0.14.0).
 - [ ] **Car controls sync** (0.13.0, same): the driver's steering, throttle, brake and handbrake applied to the car
    copies (wheels steer, brake lights), copies carried by their own physics with a blended correction (pinned as
    before when the physics does not follow). Gate: wheels show the driver's steering, no wobble, error as before.
+   First two-PC test of 0.13.0: every copy was pinned within ~4 s (0.2 m/s against 4.4) on both games; the steering
+   values arrived. 0.14.0: engine started and kept on, the wanted speed given back after every correction (in case
+   moving the car stops it; probed and logged), a pinned copy's physics retried after 5-40 s, readbacks of the copy's
+   real controls, engine, gear and wheel angle in the sync trace.
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
@@ -318,8 +326,11 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   lobby (host pad, guest mouse); real window mouse messages (PostMessage) selected and clicked a row too. The panels
   were opened through the test input, not the pause menu's CO-OP entry (that entry was checked with the keyboard in
   0.5.0). A physical gamepad needs a human.
-- [ ] JOIN FRIEND and a real Steam invite with two accounts on two PCs (needs two Steam accounts and a human; joining
-  by IP and lobbies over UDP are what the automated tests use).
+- [x] A real Steam invite with two accounts on two PCs. Done 2026-10-17 (the user and a friend, 0.13.0, logs): the
+  friend joined the host's Steam lobby from Steam ("lobby join requested ... via friend"), connected over Steam P2P in
+  5 s (rtt ~30 ms, 0 % loss), went through the lobby (ready, FREE RIDE start) and played about five minutes; leaving
+  showed HOST LEFT at once.
+- [ ] JOIN FRIEND (the CO-OP menu entry) between two PCs: not tried yet (the invite above came through Steam).
 - [x] CO-OP page refreshes when a background join completes. Done 2026-10-15 (game-api.md 13 "Main menu live
   refresh"): the patched main menu polls us every frame (an enterFrame listener) and rebuilds the page when what it
   shows changed; checked in game: the host's page went to LOBBY (1 PLAYER) when hosting started and to LOBBY (2
@@ -407,7 +418,11 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 - [x] GitHub pre-release v0.12.0 (copies of enemies only the host's game spawned; NPC messages changed). Done
   2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.12.0.
 - [x] GitHub pre-release v0.13.0 (animation and car-control sync, Steam names; PlayerState v4; core v0.9.0), released
-  untested in game at the user's request. Done 2026-10-17: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.13.0.
+  untested in game at the user's request. First tested 2026-10-17 by the user and a friend on two PCs: Steam invite
+  between two accounts worked, Steam names shown, no crash; cars pinned, sprint lag, seat ejections (see A and B). Done 2026-10-17: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.13.0.
+- [x] GitHub pre-release v0.14.0 (fixes from that test: car engine, speed after corrections, pin retries, sprint
+  catch-up, animated get-in; sync trace + tools/sync_compare.py; core v0.10.0), fixes not yet tested in game. Done
+  2026-10-17: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.14.0.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

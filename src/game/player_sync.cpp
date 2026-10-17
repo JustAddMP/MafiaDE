@@ -4,8 +4,11 @@
 #include "core/config.h"
 #include "core/log.h"
 #include "core/mem.h"
+#include "core/trace.h"
 #include "game/characters.h"
 #include "game/lua.h"
+#include "mc/core_version.h"
+#include "mc/game_info.h"
 #include "net/remote_motion.h"
 #include "net/wire.h"
 
@@ -15,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <map>
@@ -34,7 +38,7 @@ constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time 
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
 // 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block.
 constexpr uint8_t kStateVersion = 4;
-// State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (tools/pos_error.py): at 20 Hz
+// State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (position traces): at 20 Hz
 // with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
 // ~4 KB/s per player. ini: net_state_hz (10..120, default 60), net_interp_ms (0..500, default 50).
 double SendInterval() {
@@ -108,6 +112,8 @@ struct Remote {
     motion::LocomotionCommand lastLoco;
     motion::VehicleCommand lastVeh;
     bool inCar = false;
+    double traceAt = 0;  // last PUP/VEH trace record (main thread)
+    uint32_t dropped = 0;  // states dropped as old or duplicate
 };
 
 // Where the Lua glue last saw a puppet (on foot, visible: "PS") or the car copy a remote player drives ("VS").
@@ -261,18 +267,12 @@ int McPlayerProfile(lua_State* L) {
 }
 
 bool FriendlyFire() { return core::Config::Get().GetInt("friendly_fire", 1) != 0; }
-// Dev/measurement: the Lua glue logs our position and every puppet's (real and target) 10 times a second ("trace L/P"
-// lines; tools/pos_error.py pairs two logs into the position error between the games).
 // Host: the guests' puppets get the friend brain so the host's enemies shoot at them (player_sync.lua M.Ally).
 // Only with the game-sectors guard in place (sectors_guard.h): a friend-brain human freed by the game crashed it.
 bool EnemiesTargetGuests() {
     return sectors_guard::Active() && core::Config::Get().GetInt("enemies_target_guests", 1) != 0;
 }
 
-bool TracePos() {
-    static const bool on = core::Config::Get().GetBool("trace_pos", false);
-    return on;
-}
 bool NameTagsOn() { return core::Config::Get().GetInt("name_tags", 1) != 0; }
 bool MapMarkersOn() { return core::Config::Get().GetInt("map_markers", 1) != 0; }
 
@@ -323,6 +323,26 @@ bool InRange(const float* v, int n, float lim) {
         if (!(std::fabs(v[i]) <= lim)) return false;
     return true;
 }
+
+// ---- sync trace (core/trace.h, docs/sync-trace.md) -------------------------------------------------------------------
+// The state fields of a TX / RX record: "p=x,y,z h=hx,hy v=vx,vy,vz m=mode f=flags hp=health sh=shots w=weapon"
+// plus, in a car, "car=key mdl=model seat=n cp=x,y,z q=qx,qy,qz,qw cv=x,y,z ctl=valid,steer,power,brake,hb,gear".
+std::string TraceFields(const PlayerState& s) {
+    char buf[640];
+    int n = std::snprintf(buf, sizeof buf, "p=%.3f,%.3f,%.3f h=%.4f,%.4f v=%.3f,%.3f,%.3f m=%u f=%u hp=%u sh=%u w=%s",
+                          s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1], s.vel[2], s.mode,
+                          s.flags, s.health, s.shots, s.weapon.empty() ? "-" : s.weapon.c_str());
+    if ((s.flags & kInVehicle) && n > 0 && n < static_cast<int>(sizeof buf))
+        std::snprintf(buf + n, sizeof buf - n,
+                      " car=%u:%u mdl=%s seat=%u cp=%.3f,%.3f,%.3f q=%.5f,%.5f,%.5f,%.5f cv=%.3f,%.3f,%.3f "
+                      "ctl=%d,%.3f,%.3f,%.3f,%.3f,%d",
+                      s.keyOwner, s.vehId, s.model.c_str(), s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0],
+                      s.quat[1], s.quat[2], s.quat[3], s.cvel[0], s.cvel[1], s.cvel[2], s.ctlValid ? 1 : 0, s.steer,
+                      s.power, s.brake, s.handbrake, static_cast<int>(s.gear));
+    return buf;
+}
+
+constexpr double kTraceInterval = 1.0 / 60;  // PUP / VEH records per remote player (more often on snaps and pins)
 
 // Appends a formatted command line, or nothing if it did not fit (a cut line would lose its '\n' and merge with the
 // next command) or out would grow past cap.
@@ -394,8 +414,14 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     } else {
         rem.offset += (off - rem.offset) * 0.01;  // follow clock drift / a lasting latency increase slowly
     }
-    if (!rem.snaps.empty() && t <= rem.snaps.back().t) return;  // old or duplicate
+    if (!rem.snaps.empty() && t <= rem.snaps.back().t) {  // old or duplicate
+        ++rem.dropped;
+        core::trace::Line("RXD", "from=%u sT=%u last=%.0f", from, timeMs, rem.snaps.back().t * 1000);
+        return;
+    }
     if (rem.recvCount == 0) MC_LOG_INFO("sync: first state from player %u", from);
+    if (core::trace::IsOpen())
+        core::trace::Line("RX", "from=%u sT=%u off=%.4f %s", from, timeMs, rem.offset, TraceFields(s).c_str());
     rem.snaps.push_back({t, std::move(s)});
     while (rem.snaps.size() > kMaxSnaps) rem.snaps.pop_front();
     rem.lastRecv = now;
@@ -492,7 +518,8 @@ PlayerState Present(const Remote& rem, double now) {
 }
 
 // One "T" line per remote player: his state, then what to do with his puppet (lc: the locomotion command) and with
-// the car copy he drives (vc: the vehicle command, applied with his controls). Field order: player_sync.lua M.Update.
+// the car copy he drives (vc: the vehicle command, applied with his controls, then its wanted velocity). Field order:
+// player_sync.lua M.Update.
 void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s,
                   const motion::LocomotionCommand& lc, const motion::VehicleCommand& vc) {
     char key[32] = "-";
@@ -502,7 +529,7 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
                   "%d %d %d %u %.3f %.3f %.3f %u "
                   "%d %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f "
-                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d\n",
+                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
@@ -515,7 +542,9 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   // 45..59: his car
                   static_cast<unsigned>(vc.fix), vc.nudge.x, vc.nudge.y, vc.nudge.z, vc.rot[0], vc.rot[1], vc.rot[2],
                   vc.rot[3], vc.power, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear), s.ctlValid ? 1 : 0,
-                  vc.pinned ? 1 : 0);
+                  vc.pinned ? 1 : 0,
+                  // 60..62: the velocity to give the copy after moving it
+                  vc.vel.x, vc.vel.y, vc.vel.z);
 }
 
 // Report lines from the Lua glue: "PS id x y z hx hy" (puppet on foot, after this tick's commands),
@@ -595,16 +624,55 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     for (int k = 0; k < 3; ++k) rem.lastCpos[k] = s.cpos[k];
     rem.haveCpos = inCar && s.seat == 0;
     vi.dt = dt;
-    const bool wasPinned = rem.veh.Pinned();
     vc = rem.veh.Update(vi);
-    if (vc.pinned && !wasPinned)
-        MC_LOG_INFO("sync: player %u's car %s: its physics does not follow here (copy %.1f m/s, target %.1f m/s, %.1f m "
-                    "off): pinned to his transform every tick",
-                    id, key, std::sqrt(vi.copyVel.x * vi.copyVel.x + vi.copyVel.y * vi.copyVel.y),
-                    std::sqrt(vi.targetVel.x * vi.targetVel.x + vi.targetVel.y * vi.targetVel.y), vc.error);
+    static const char* const kWhy[] = {"-", "too slow", "ran off", "stays off"};
+    if (vc.justPinned)
+        MC_LOG_INFO("sync: player %u's car %s: its physics does not follow here (%s: copy %.1f m/s, target %.1f m/s, "
+                    "%.1f m off, rotation %.0f deg off): pinned to his transform every tick (pin #%d, physics tried "
+                    "again later)",
+                    id, key, kWhy[static_cast<int>(vc.why) & 3], vc.cspeed, vc.tspeed, vc.error, vc.rotErrDeg,
+                    rem.veh.Pins());
+    if (vc.retried)
+        MC_LOG_INFO("sync: player %u's car %s: giving its physics another try (retry #%d)", id, key,
+                    rem.veh.Retries());
     rem.lastLoco = lc;
     rem.lastVeh = vc;
     rem.inCar = inCar;
+
+    // trace: what the controllers saw and decided (docs/sync-trace.md PUP / VEH)
+    const bool event = lc.fix == motion::LocomotionCommand::Fix::Snap || vc.justPinned || vc.retried ||
+                       vc.fix == motion::VehicleCommand::Fix::Snap;
+    if (!core::trace::IsOpen() || (now - rem.traceAt < kTraceInterval && !event)) return;
+    rem.traceAt = now;
+    const double rT = (now - rem.offset) * 1000.0;  // the remote clock time Present() stands for
+    const double age = pr != sh.pupReports.end() ? now - pr->second.at : -1;
+    if (!inCar) {
+        core::trace::Line("PUP",
+                          "id=%u rT=%.0f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f have=%d age=%.3f cp=%.3f,%.3f,%.3f "
+                          "ch=%.3f,%.3f err=%.3f g=%u mult=%.3f want=%.3f meas=%.3f carry=%.3f base=%.2f,%.2f,%.2f "
+                          "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u",
+                          id, rT, li.target.x, li.target.y, li.target.z, li.targetVel.x, li.targetVel.y,
+                          li.haveCopy ? 1 : 0, age, li.copy.x, li.copy.y, li.copy.z, li.copyHeading[0],
+                          li.copyHeading[1], lc.error, static_cast<unsigned>(lc.gait), lc.speedMult, lc.want,
+                          lc.measured, lc.carry, rem.loco.BaseSpeed(motion::Gait::Walk),
+                          rem.loco.BaseSpeed(motion::Gait::Run), rem.loco.BaseSpeed(motion::Gait::Sprint),
+                          static_cast<unsigned>(lc.fix), lc.nudge.x, lc.nudge.y, lc.reissue ? 1 : 0, lc.moveTo.x,
+                          lc.moveTo.y, lc.turn ? 1 : 0, s.mode, s.flags);
+    } else if (s.seat == 0) {
+        core::trace::Line("VEH",
+                          "id=%u key=%s rT=%.0f have=%d tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
+                          "cv=%.3f,%.3f,%.3f err=%.3f rot=%.2f fix=%u pin=%d why=%u jp=%d rt=%d pins=%d tsp=%.3f "
+                          "csp=%.3f vel=%.3f,%.3f,%.3f pw=%.3f ctl=%d st=%.3f br=%.3f hb=%.3f gear=%d",
+                          id, key, rT, vi.haveCopy ? 1 : 0, vi.target.x, vi.target.y, vi.target.z, vi.targetVel.x,
+                          vi.targetVel.y, vi.targetVel.z, vi.copy.x, vi.copy.y, vi.copy.z, vi.copyVel.x,
+                          vi.copyVel.y, vi.copyVel.z, vc.error, vc.rotErrDeg, static_cast<unsigned>(vc.fix),
+                          vc.pinned ? 1 : 0, static_cast<unsigned>(vc.why), vc.justPinned ? 1 : 0,
+                          vc.retried ? 1 : 0, rem.veh.Pins(), vc.tspeed, vc.cspeed, vc.vel.x, vc.vel.y, vc.vel.z,
+                          vc.power, s.ctlValid ? 1 : 0, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear));
+    } else {
+        core::trace::Line("PAS", "id=%u key=%s rT=%.0f seat=%u cp=%.3f,%.3f,%.3f", id, key, rT, s.seat, s.cpos[0],
+                          s.cpos[1], s.cpos[2]);
+    }
 }
 
 // "o:g" -> car key; false for "-" or garbage.
@@ -834,6 +902,21 @@ std::wstring DllDir() {
     return slash == std::wstring::npos ? L"." : s.substr(0, slash);
 }
 
+// mc_trace(type, text): one record in the sync trace (core/trace.h) from the Lua glue ("PR", "CR", "LR", "NP", ...;
+// docs/sync-trace.md). type: 1-8 upper-case letters. A no-op while no trace is open.
+int McTrace(lua_State* L) {
+    if (!core::trace::IsOpen()) return 0;
+    const char* type = lua::ToString(L, 1);
+    const char* text = lua::ToString(L, 2);
+    if (!type || !text) return 0;
+    const size_t n = std::strlen(type);
+    if (n < 1 || n > 8) return 0;
+    for (size_t i = 0; i < n; ++i)
+        if (type[i] < 'A' || type[i] > 'Z') return 0;
+    core::trace::Line(type, "%s", text);
+    return 0;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -851,6 +934,7 @@ bool LoadModule(lua_State* L) {
     }
     MC_LOG_INFO("sync: Lua glue loaded (%s, version %s)", origin, lua::ToDisplay(L, -1).c_str());
     lua::RegisterGlobal(L, "mc_player_profile", &McPlayerProfile);
+    lua::RegisterGlobal(L, "mc_trace", &McTrace);
     return true;
 }
 
@@ -879,7 +963,6 @@ void MainTick(lua_State* L, float dt) {
             cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
             cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1 " : "0 ") +
                     (EnemiesTargetGuests() ? "1\n" : "0\n");
-            if (TracePos()) cmds += "Z\n";  // dev: log positions 10 times a second (trace_pos = 1)
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
@@ -985,6 +1068,27 @@ void MainTick(lua_State* L, float dt) {
     lua::SetTop(L, top);
 }
 
+// A new sync trace for this session (render thread, under the lock): docs/sync-trace.md "H".
+void OpenTrace(const Shared& sh) {
+    const GameInfo& gi = GetGameInfo();
+    std::string built = __DATE__ "_" __TIME__;
+    std::replace(built.begin(), built.end(), ' ', '_');  // one field
+    char header[512];
+    std::snprintf(header, sizeof header,
+                  "game=%s mod=%s core=%s proto=%u state=%u role=%s local=%u hz=%d interp=%d built=%s", gi.modName,
+                  gi.modVersion, kCoreVersion, net::kProtocolVersion, kStateVersion,
+                  sh.localId == net::kHostPlayer ? "host" : "guest", sh.localId,
+                  static_cast<int>(1.0 / SendInterval() + 0.5), static_cast<int>(InterpDelay() * 1000), built.c_str());
+    if (core::trace::Open(header, "")) {
+        const std::wstring path = core::trace::Path();
+        char narrow[MAX_PATH * 3] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, narrow, sizeof narrow, nullptr, nullptr);
+        MC_LOG_INFO("sync: trace %s", narrow);
+    } else {
+        MC_LOG_WARN("sync: no trace file (logs\\trace not writable?)");
+    }
+}
+
 }  // namespace
 
 // ---- public ------------------------------------------------------------------------------------------------------------
@@ -1040,6 +1144,10 @@ void PlayerSync::Detach() {
     sh.tags.clear();
     sh.pupReports.clear();
     sh.carReports.clear();
+    if (core::trace::IsOpen()) {
+        core::trace::Line("END", "why=session-detached");
+        core::trace::Close();
+    }
 }
 
 void PlayerSync::OnPlayerLeft(net::PlayerId id) {
@@ -1054,6 +1162,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.carReports.erase(id);
     sh.removed.push_back(id);
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
+    core::trace::Line("PLX", "id=%u", id);
 }
 
 void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
@@ -1084,6 +1193,12 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             if (!active) {
                 sh.removeAll = true;
                 sh.remotes.clear();
+                if (core::trace::IsOpen()) {
+                    core::trace::Line("END", "why=session-inactive");
+                    core::trace::Close();
+                }
+            } else {
+                OpenTrace(sh);
             }
         }
         if (active) {
@@ -1092,6 +1207,9 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             sh.names.clear();
             sh.models.clear();
             for (const auto& p : _session->Players()) {
+                if (!_seenPlayers.count(p.id))  // new in the session (us too, at the start): name it in the trace
+                    core::trace::Line("PL", "id=%u model=%s name=%s", p.id, p.model.empty() ? "-" : p.model.c_str(),
+                                      p.name.c_str());
                 if (p.id != sh.localId && !_seenPlayers.count(p.id)) sh.sendModel = true;
                 sh.names[p.id] = p.name;
                 sh.models[p.id] = p.model;
@@ -1111,6 +1229,19 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                 } else {
                     ++it;
                 }
+            }
+        }
+        // trace: clock and link per remote player, once a second
+        static double clockAt = 0;
+        if (active && core::trace::IsOpen() && Now() - clockAt >= 1.0) {
+            clockAt = Now();
+            for (const auto& [id, rem] : sh.remotes) {
+                const net::PlayerInfo* pi = _session->FindPlayer(id);
+                const double ahead = rem.snaps.empty() ? 0 : (rem.snaps.back().t - (clockAt - rem.offset)) * 1000;
+                core::trace::Line("CLK", "id=%u off=%.4f rtt=%.1f hz=%.1f snaps=%zu newest=%.1f recv=%u drop=%u "
+                                  "last=%.3f",
+                                  id, rem.offset, pi ? pi->rttMs : -1.0f, rem.rateHz, rem.snaps.size(), ahead,
+                                  rem.recvCount, rem.dropped, clockAt - rem.lastRecv);
             }
         }
         _sendAccum += dt;
@@ -1155,7 +1286,9 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     }
     if (!send) return;
     net::ByteWriter w(128);
-    Write(w, local, NowMs());
+    const uint32_t sentMs = NowMs();
+    Write(w, local, sentMs);
+    if (core::trace::IsOpen()) core::trace::Line("TX", "sT=%u %s", sentMs, TraceFields(local).c_str());
     // TODO(interest): players and their cars are always relevant (Kind::Player/PlayerCar, Critical), so PlayerState
     // stays a plain 20 Hz Broadcast. Phase-4 host-mirrored NPCs/vehicles go through net/interest.h instead: register
     // them with an InterestManager, Tick it here at the send rate, spawn/despawn on Enter/Leave and send each peer
@@ -1270,15 +1403,19 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
         out.push_back({buf, 0xFFC8C8C8});
         static const char* const kGaits[] = {"stand", "walk", "run", "sprint"};
         if (rem.inCar && !rem.vehKey.empty()) {
-            std::snprintf(buf, sizeof(buf), "    car %s: %s, %.2f m off, steer %+.2f, power %.2f, brake %.2f%s",
-                          rem.vehKey.c_str(), rem.lastVeh.pinned ? "pinned" : "own physics", rem.lastVeh.error,
-                          last ? last->steer : 0.0f, rem.lastVeh.power, last ? last->brake : 0.0f,
+            std::snprintf(buf, sizeof(buf),
+                          "    car %s: %s (pins %d), %.2f m off, %.1f/%.1f m/s, steer %+.2f, power %.2f, brake %.2f%s",
+                          rem.vehKey.c_str(), rem.lastVeh.pinned ? "pinned" : "own physics", rem.veh.Pins(),
+                          rem.lastVeh.error, rem.lastVeh.cspeed, rem.lastVeh.tspeed, last ? last->steer : 0.0f,
+                          rem.lastVeh.power, last ? last->brake : 0.0f,
                           last && !last->ctlValid ? " (no controls from his game)" : "");
         } else {
-            std::snprintf(buf, sizeof(buf), "    on foot: %s x%.2f (walk %.1f, run %.1f, sprint %.1f m/s), %.2f m off",
+            std::snprintf(buf, sizeof(buf),
+                          "    on foot: %s x%.2f (walk %.1f, run %.1f, sprint %.1f m/s), %.2f m off, wants %.1f m/s%s",
                           kGaits[static_cast<int>(rem.lastLoco.gait) & 3], rem.lastLoco.speedMult,
                           rem.loco.BaseSpeed(motion::Gait::Walk), rem.loco.BaseSpeed(motion::Gait::Run),
-                          rem.loco.BaseSpeed(motion::Gait::Sprint), rem.lastLoco.error);
+                          rem.loco.BaseSpeed(motion::Gait::Sprint), rem.lastLoco.error, rem.lastLoco.want,
+                          rem.lastLoco.carry > 0 ? ", catching up" : "");
         }
         out.push_back({buf, 0xFFA0A0A0});
     }
