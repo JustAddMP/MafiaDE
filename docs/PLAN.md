@@ -406,6 +406,8 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    https://github.com/JustAddMP/MafiaDE/releases/tag/v0.11.0.
 - [x] GitHub pre-release v0.12.0 (copies of enemies only the host's game spawned; NPC messages changed). Done
   2026-10-16: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.12.0.
+- [x] GitHub pre-release v0.13.0 (animation and car-control sync, Steam names; PlayerState v4; core v0.9.0), released
+  untested in game at the user's request. Done 2026-10-17: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.13.0.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

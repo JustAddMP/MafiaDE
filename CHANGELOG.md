@@ -3,7 +3,7 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
-## 0.13.0 (unreleased, needs in-game testing)
+## 0.13.0 (2026-10-17), pre-release, not yet tested in game
 
 Other players look like players. Built from reading the game's code while the game could not be started: nothing
 here has been tried in game yet (README-dev.md "Test checklist: animation and car controls").
