@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -439,6 +440,36 @@ uint8_t* EntityById(uint32_t id) {
     }
 }
 
+// mc_car_controls(id) -> steer, power, brake, handbrake, steerLinearity, steerAngle of car entity `id`, or nil.
+// The car's vehicle part sits at entity + 0xF8 (the Lua setters C_WrapperCar::SetSteer/SetPower/SetBrake/
+// SetHandbrake all call into [wrapper + 0x10] + 0xF8, and GetPowerWish reads entity + 0xACC = vehicle + 0x9D4); the
+// fields are what those setters write (docs/re-notes.md 9, found statically, not checked in game): steering wish
+// -1..1 at +0xA40 (after the setter's response curve, whose linearity is +0xA80), throttle 0..1 at +0x9D4, brake 0..1
+// at +0x9C8, handbrake 0..1 at +0x9D0, and the wheels' current steering angle (radians, filtered toward the wish by
+// the vehicle update) at +0xA24. Read with ReadProcessMemory: a wrong guess only fails the read.
+constexpr uintptr_t kVehiclePart = 0xF8;
+constexpr uintptr_t kCarSteerWish = 0xA40, kCarPower = 0x9D4, kCarBrake = 0x9C8, kCarHandbrake = 0x9D0,
+                    kCarSteerLinearity = 0xA80, kCarSteerAngle = 0xA24;
+
+int McCarControls(lua_State* L) {
+    const double id = TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1;
+    uint8_t* e = (_ent.find && id > 0 && (static_cast<uint32_t>(id) & 0xFF) == 10) ? EntityById(static_cast<uint32_t>(id))
+                                                                                     : nullptr;
+    float v[6] = {};
+    const uintptr_t offs[6] = {kCarSteerWish, kCarPower, kCarBrake, kCarHandbrake, kCarSteerLinearity, kCarSteerAngle};
+    bool ok = e != nullptr;
+    for (int i = 0; ok && i < 6; ++i) ok = ReadMem(e + kVehiclePart + offs[i], &v[i], sizeof(float)) && std::isfinite(v[i]);
+    // plausibility: a layout that is not the one we found gives garbage here, not a value in these ranges
+    ok = ok && std::fabs(v[0]) <= 1.01f && v[1] >= -1.01f && v[1] <= 1.01f && v[2] >= -0.01f && v[2] <= 1.01f &&
+         v[3] >= -0.01f && v[3] <= 1.01f && v[4] >= -0.01f && v[4] <= 1.01f && std::fabs(v[5]) <= 3.2f;
+    if (!ok) {
+        PushNil(L);
+        return 1;
+    }
+    for (float f : v) PushNumber(L, f);
+    return 6;
+}
+
 // mc_fnv(text) -> the game's 64-bit name hash of `text` (FNV-1, the hash behind spawn profile names) as a decimal string
 int McFnv(lua_State* L) {
     const char* s = ToString(L, 1);
@@ -773,10 +804,11 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
             RegisterGlobal(L, "mc_memfind", &McMemFind);
             RegisterGlobal(L, "mc_memread", &McMemRead);
             RegisterGlobal(L, "mc_memdump", &McMemDump);
+            RegisterGlobal(L, "mc_car_controls", &McCarControls);
         }
         if (_ray.cast) RegisterGlobal(L, "mc_raycast", &McRayCast);
         MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s",
-                    _ent.push ? ", mc_entity, mc_entity_ids" : "", _ray.cast ? ", mc_raycast" : "");
+                    _ent.push ? ", mc_entity, mc_entity_ids, mc_car_controls" : "", _ray.cast ? ", mc_raycast" : "");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
                 Narrow(_dllDir).c_str(), Narrow(_dllDir).c_str(), _tag.c_str());

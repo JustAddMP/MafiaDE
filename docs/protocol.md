@@ -14,7 +14,8 @@ startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x020
 (0x0211), NpcHit (0x0410); shared cars take a standing car of the same model as the driver's car. 0.9.0: PlayerState
 at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet). 0.12.0:
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
-partner on their game.
+partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
+ends with the driver's controls (6 bytes).
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -37,17 +38,19 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103-0x01FF | reserved (phase 3 events) | | | |
 
-PlayerState body (54 bytes on foot + weapon name, ~130 bytes in a car):
+PlayerState body (54 bytes on foot + weapon name, ~136 bytes in a car):
 
 ```
-u8  version (3)
+u8  version (4; 0.13.0, was 3)
 u32 senderTimeMs          sender's monotonic clock (QueryPerformanceCounter), for interpolation only
 f32 x, y, z               player position (world metres)
 f32 hx, hy                heading, unit vector in the ground plane
 f32 vx, vy, vz            velocity (m/s; on foot differentiated from positions, in a car the car's GetSpeed())
 u8  mode                  0 idle, 1 walk, 2 run, 3 sprint (from the speed; sprint also when IsSprinting())
 u8  flags                 bit0 in vehicle, bit1 crouch, bit2 sprint, bit3 aim (aim input held with a gun in hand),
-                          bit4 reload (IsReloading(), or for 1 s after the clip was refilled)
+                          bit4 reload (IsReloading(), or for 1 s after the clip was refilled),
+                          bit5 in the air (vertical speed above 2 m/s: jumping, falling; 0.13.0),
+                          bit6 in cover (IsInCover(); 0.13.0)
 u8  health                p.health (0..100)
 str weapon                weapon in hand (InventoryGetSelected), "" = none
 u8  shots                 shots fired so far, mod 256 (from drops of the ammo in the clip); a change = new shots
@@ -60,6 +63,12 @@ u32 vehId                 car key, part 2: the car's entity GUID on keyOwner's g
 f32 cx, cy, cz            car position
 f32 qx, qy, qz, qw        car rotation (quaternion, GetRot: v.x v.y v.z s)
 f32 cvx, cvy, cvz         car velocity
+u8  ctlValid              0.13.0: bit0 = the controls below were read (seat 0 only; docs/re-notes.md 9)
+i8  steer                 steering wish -1..1 (x127), as the car stores it (after SetSteer's response curve)
+u8  power                 throttle 0..1 (x255)
+u8  brake                 brake 0..1 (x255)
+u8  handbrake             handbrake 0..1 (x255)
+i8  gear                  GetGear() (< 0 taken as reverse)
 ```
 
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
@@ -81,9 +90,37 @@ player and sometimes does not move at all, so a host running around was shown 2.
 off (stuck until the 2 s "blocked" snap). Since 0.9.0 the puppet is pulled toward the target every tick (30 x dt of
 the gap above 0.3 m, put there at once above 1.5 m) and its walk is re-aimed at once when the player turns sharply:
 0.3-0.5 m on average, p95 0.4-0.7 m, in Free Ride and in Taxi, right after a lobby CHAPTER start and after a
-checkpoint reload. Traffic for two players in Taxi with NPC sync: host -> guest 15.4 KB/s (NpcStates 10.8, PlayerState
+checkpoint reload. **0.13.0 replaces the pull** (it slid the puppet's feet: the body was moved while the walk
+animation played at its own pace), see "Driving the puppet and the car copy" below. Traffic for two players in Taxi with NPC sync: host -> guest 15.4 KB/s (NpcStates 10.8, PlayerState
 3.5), guest -> host 4.4 KB/s, no loss, no resends, no relay drops; the checkpoint save (HostSave, ~36 KB) goes out only
 when the file changed.
+
+### Driving the puppet and the car copy (0.13.0; not yet checked in game)
+
+The receiver turns the interpolated state into commands with core's controllers (`external/core/src/net/
+remote_motion.h`, unit-tested in core's `net_motion`), one pair per remote player, in `player_sync.cpp`; the Lua glue
+carries them out and reports back where the puppet / car copy is after each tick ("PS" / "VS" lines).
+
+- **On foot** (`LocomotionController`): a gait from his speed (stand / walk / run / sprint, with hysteresis; his sprint
+  flag allows sprint from 3.5 m/s), a speed multiplier for that gait (`SetMovementSpeedMult`, given right before each
+  `MoveVec` so a walk is never interrupted by it), and a walk point ahead along the wanted velocity (his velocity plus
+  1.2/s of the error, at most 2.5 m/s of correction), re-aimed every 0.35 s, on a gait change or a turn of more than
+  12 degrees. The walk/run/sprint speed at multiplier 1 is measured on the puppet itself (0.25 s windows while gait
+  and multiplier are steady, nudges not counted), so the multiplier makes the game's own animation run at his speed.
+  Position fixes stay small: only the error beyond 0.9 m is nudged (2/s); a snap beyond 3.5 m (or 3 m height, 6 m while
+  he is in the air), when he stands and the puppet is more than 0.5 m off for 2 s, or when it walks but does not get
+  anywhere for 1.5 s while more than 0.9 m off. Standing, it turns to his heading at up to 400 degrees/s; when he
+  stops it walks the last bit to his spot. While he gets in or out of a car (seat 9) his puppet stays on foot and
+  walks with him to the door; next to a standing car it gets in with the game's animation (`GetOnVehicle(..., true)`,
+  4 s, then seated at once as before).
+- **His car** (`VehicleController`): his controls are applied to the copy every tick (`SetSteer` with the response
+  curve inverted, `SetPower`, `SetBrake`, `SetHandbrake`), so its wheels steer, brake lights and engine react and its
+  own physics drives it; the transform is corrected toward his (8/s for position and rotation) only as far as needed,
+  and nothing is set while it is on target. If its physics does not keep up (the copy slower than 35 % of his speed for
+  1 s above 3 m/s, more than 8 m/s faster, or more than 1.5 m off for 1.5 s) the copy is pinned to his transform every
+  tick from then on (the pre-0.13.0 way, logged "pinned to his transform every tick"). Snap on a teleport (> 20 m
+  between snapshots) or > 4 m off. No throttle while the copy is faster than him (+1.5 m/s) or he reverses. When he
+  gets out the controls are released (power, brake, handbrake, steering 0).
 
 ### Shared cars, seats and ownership
 

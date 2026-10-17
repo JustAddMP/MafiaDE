@@ -3,6 +3,37 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.13.0 (unreleased, needs in-game testing)
+
+Other players look like players. Built from reading the game's code while the game could not be started: nothing
+here has been tried in game yet (README-dev.md "Test checklist: animation and car controls").
+
+On foot:
+- The other players' characters no longer slide across the ground. Before, they were pulled toward the player's
+  position every frame while their walk animation played at its own pace. Now they walk, run and sprint with the
+  game's own animation at the player's speed: the speed of each gait is measured on the character and adjusted to
+  match, the walk is re-aimed when he turns, and his position is only corrected when he is clearly off (gently,
+  beyond 0.9 m) or put in place when far off or stuck.
+- Starting, stopping and turning on the spot follow the player smoothly; sprinting shows the sprint (his sprint
+  key), jumps and falls no longer count as being stuck.
+- Getting into a car: the character walks with the player to the door and gets in with the game's animation (when
+  the car stands), instead of vanishing and appearing in the seat.
+
+Cars:
+- A car another player drives shows his steering: its front wheels turn with his. His throttle, brake and handbrake
+  are applied too (brake lights, engine), and the car is moved by its own physics with a small correction, so its
+  wheels roll. If a car's physics does not keep up on your game it is moved exactly as before (logged).
+- Not synced: lights, horn, siren and indicators (the game has no way to read them that we found).
+
+Names:
+- Name tags, the lobby and the panels show the Steam name. They said HOST / GUEST in tests because the test commands
+  started the games with `--name Host` / `--name Guest`; those are gone from the docs. A `--name` from the command
+  line is now for that run only: CO-OP SETTINGS > NAME shows (and saves) your own saved name, never the test name
+  (core 0.9.0).
+
+Under the hood: PlayerState version 4 (in the air / in cover flags, the driver's controls), core 0.9.0 (remote
+motion controllers, unit-tested). Everyone needs 0.13.0 (0.12.x cannot join it).
+
 ## 0.12.0 (2026-10-16), pre-release
 
 Fights:

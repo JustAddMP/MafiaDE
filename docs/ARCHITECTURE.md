@@ -30,7 +30,9 @@ src/game/
   characters.{h,cpp}     the character list (aliases -> spawn profiles), defaults by player id, fallbacks
   player_sync.{h,cpp}    phase 3: local player sampling, puppets, copy cars, weather/time (C++ side; wire format in
   player_sync.lua        docs/protocol.md); the .lua is embedded at build time. Also the CHARACTER/OUTFIT
-                         rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel
+                         rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel. The
+                         puppets' walk and the car copies' controls/corrections come from core's net/remote_motion
+                         controllers (one pair per remote player), fed by the glue's "PS"/"VS" reports (0.13.0)
   mission_sync.{h,cpp}   phase 4 story: the host's chapter/checkpoint/objective/cutscene and checkpoint save to the
   mission_sync.lua       guests, guests load and follow it (lobby STORY / CHAPTER); the chapter loader hooks;
                          deaths / failed missions in chapter loads reload the checkpoint (never a save outside the session)

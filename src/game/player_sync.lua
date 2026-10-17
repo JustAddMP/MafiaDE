@@ -8,9 +8,15 @@
 --   Q id profile                                                                 a remote player is in the session
 --                                                                                (load his model before he shows up)
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
+--     inair gait mult reissue mx my mz fix nx ny turn fx fy
+--     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
---                                                                                "tommy" = story Tommy; M.Profile)
+--                                                                                "tommy" = story Tommy; M.Profile),
+--                                                                                then what to do with his puppet on
+--                                                                                foot and with the car he drives
+--                                                                                (src/game/player_sync.cpp, core
+--                                                                                net/remote_motion.h)
 --   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
 --   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
@@ -25,12 +31,14 @@
 --   X                                                                            remove everything
 -- Output: sample, status, events
 --   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
---             aim reload shots ax ay az" or ""
+--             aim reload shots ax ay az cover ctl steer power brake handbrake gear" or ""
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
+--            for the C++ side's controllers: "PS id x y z hx hy" (puppet of player id on foot, after this tick's
+--            commands), "VS id vkey x y z vx vy vz qx qy qz qw" (the car copy player id drives);
 --            not for the network: "NT id x y dist" (name tag: the puppet's head on screen, x/y -1..1 with y up, dist
 --            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
 --
@@ -40,7 +48,7 @@
 -- the car stays (parked); whoever gets in next drives it (owner = last driver, docs/protocol.md).
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
-M.version = 7
+M.version = 8
 M.pup = M.pup or {}
 M.fac = M.fac or { st = "none", t = 0 }
 M.now = M.now or 0
@@ -53,7 +61,7 @@ M.hitq = M.hitq or {}   -- hits on puppets by the local player, filled by the DA
 
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
-local MODES = { [0] = "WALK", [1] = "WALK", [2] = "RUN", [3] = "SPRINT" }
+local GAITS = { [1] = "WALK", [2] = "RUN", [3] = "SPRINT" }  -- LocomotionCommand gait -> MoveVec mode
 local MAX_CARS = 12  -- shared car copies kept on this machine (the oldest unused parked copy goes first)
 -- Damage (docs/game-api.md 11). Puppets are NOT demigods: a demigod human gets no DAMAGE events. They take damage
 -- like any NPC, so their own hit reactions play, and their health is topped up so they never die from it.
@@ -262,6 +270,7 @@ function M.SpawnTick()
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
     pp.seatTries, pp.exitSo = 0, nil
     pp.cb = nil
+    pp.mult, pp.noMult = nil, nil  -- a fresh human: its speed multiplier is 1
     pp.ally, pp.spawnT = nil, M.now
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
       pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
@@ -306,6 +315,7 @@ end
 -- keepOrig: an adopted mission car (M.FindLocalCar) is kept, hidden, and comes back where the copy is parked
 -- (M.Restore), so this game's own mission still has its car afterwards.
 function M.Swap(c, keepOrig)
+  c.rv = nil  -- a fresh copy: its own steering linearity, controls applied anew
   if c.qid then
     pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
   elseif valid(c.ent) then
@@ -361,6 +371,96 @@ function M.EnsureCar(key, model, x, y, z, qx, qy, qz, qw)
   c.tx, c.ty, c.tz, c.qx, c.qy, c.qz, c.qw = x, y, z, qx, qy, qz, qw
   c.used = M.now
   return c
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Remote vehicle: a car copy that shows a car of another game (the remote driver's here; traffic copies can use the
+-- same). The driver's controls are applied to it every tick, so its front wheels steer, its brake lights and engine
+-- react and its own physics drives it (C_WrapperCar SetSteer / SetPower / SetBrake / SetHandbrake, docs/game-api.md
+-- 7), and its transform is kept on the remote one the way the C++ side's VehicleController says (core
+-- net/remote_motion.h): a blended correction while its own physics carries it, its transform set every tick
+-- ("pinned", the old way) when its physics does not keep up, a snap when far off. Nothing is set while it sits on its
+-- target (a standing car is left alone, so getting in and out animates).
+--   RV.Drive(st, ent, cmd, tx, ty, tz)  cmd: fix (0 none, 1 blend, 2 pin, 3 snap), nx ny nz (blend: added to its
+--                                       position), qx qy qz qw (rotation), power steer brake hb ctl (controls;
+--                                       ctl false = none known); st: a table kept with this copy
+--   RV.Report(st, ent)                  -> "x y z vx vy vz qx qy qz qw" for the controller
+--   RV.Idle(st, ent)                    nobody drives it any more: controls released
+-- ---------------------------------------------------------------------------------------------------------------
+local RV = {}
+M.RV = RV
+
+-- SetSteer puts the value through a response curve before it stores the wish, |x| (1 - (1 - |x|) k) with k the
+-- car's steering linearity (docs/re-notes.md 9). The driver's game reports the stored wish, so it is inverted here
+-- with this car's k (the same model has the same k).
+function RV.SteerInput(y, k)
+  local a = math.min(math.abs(y or 0), 1)
+  if k and k > 1e-3 then a = (-(1 - k) + math.sqrt((1 - k) ^ 2 + 4 * k * a)) / (2 * k) end
+  a = math.min(a, 1)
+  return (y or 0) < 0 and -a or a
+end
+
+local function entId(ent)
+  return tonumber(tostring(ent:GetGUID()):match("(%d+)%s*$"))
+end
+
+function RV.Drive(st, ent, cmd, tx, ty, tz)
+  if cmd.fix == 2 or cmd.fix == 3 then
+    ent:SetPos(V(tx, ty, tz))
+  elseif cmd.fix == 1 then
+    local p = ent:GetPos()
+    ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
+  end
+  if cmd.fix ~= 0 then
+    local q = Math:newQuat()
+    q.v = V(cmd.qx, cmd.qy, cmd.qz)
+    q.s = cmd.qw
+    ent:SetRot(q)
+  end
+  if cmd.fix == 3 and not st.snapLogged then
+    st.snapLogged = true
+    log("remote car " .. tostring(ent) .. ": snapped to the driver's car (far off)")
+  end
+  if not cmd.ctl or st.broken then return end
+  if st.k == nil then
+    st.k = 0
+    local id = entId(ent)
+    if mc_car_controls and id then
+      local s, p, b, h, k = mc_car_controls(id)
+      if k then st.k = k end
+    end
+  end
+  local good, err = pcall(function()
+    ent:SetSteer(RV.SteerInput(cmd.steer, st.k))
+    ent:SetPower(cmd.power)
+    ent:SetBrake(cmd.brake)
+    ent:SetHandbrake(cmd.hb)
+  end)
+  if not good then
+    st.broken = true  -- this car takes no controls: it is still moved
+    log("remote car " .. tostring(ent) .. ": its controls cannot be set (" .. tostring(err) .. ")")
+  elseif not st.driven then
+    st.driven = true
+    log(string.format("remote car %s: driven with the remote driver's controls (steering linearity %.2f)",
+      tostring(ent), st.k))
+  end
+end
+
+function RV.Report(st, ent)
+  local p, v, q = ent:GetPos(), ent:GetSpeed(), ent:GetRot()
+  return string.format("%.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f", p.x, p.y, p.z, v.x, v.y, v.z, q.v.x, q.v.y,
+    q.v.z, q.s)
+end
+
+function RV.Idle(st, ent)
+  if not st or not st.driven or not valid(ent) then return end
+  st.driven = nil
+  pcall(function()
+    ent:SetPower(0)
+    ent:SetBrake(0)
+    ent:SetHandbrake(0)
+    ent:SetSteer(0)
+  end)
 end
 
 local function setTransform(c)
@@ -464,9 +564,17 @@ function M.CarTick(c)
       setLock(c, false)
     elseif c.driver then
       setLock(c, true)
-      setTransform(c)
+      local pp = M.pup[c.driver]
+      if pp and pp.vcmd and pp.vkey == c.key then
+        c.rv = c.rv or {}
+        RV.Drive(c.rv, c.ent, pp.vcmd, c.tx, c.ty, c.tz)
+        M.events[#M.events + 1] = "VS " .. c.driver .. " " .. c.key .. " " .. RV.Report(c.rv, c.ent)
+      else
+        setTransform(c)
+      end
     else  -- parked: a normal car, open for anyone
       setLock(c, false)
+      if c.rv and c.rv.driven then RV.Idle(c.rv, c.ent) end
       if c.parkApply then  -- final resting transform from the last driver
         c.parkApply = nil
         setTransform(c)
@@ -531,6 +639,7 @@ function M.CarsUpdate(p)
       if not pp or not pp.veh or pp.vkey ~= key or pp.seat ~= 0 then
         log("car " .. key .. ": player " .. c.driver .. " got out, parked")
         c.driver = nil  -- the copy stays at the last transform until the CarParked message
+        if c.rv then RV.Idle(c.rv, c.ent) end
       end
     end
     -- We were the last driver: once the car has stopped, tell everyone where it rests.
@@ -663,11 +772,24 @@ function M.Seat(pp, c)
   pp.exitSo = nil
   local occ = car:GetSeatOwner(pp.seat)
   if valid(occ) and not same(occ, so) then return false end
-  if M.now - (pp.seatT or -10) >= 1 then
+  -- The puppet walked up to a standing car (its player was getting in, docs/protocol.md seat 9): it gets in with the
+  -- game's own animation, once; it is given ANIM_WAIT to finish, then seated at once like any other time.
+  local wait = pp.seatAnim and ANIM_WAIT or 1
+  if M.now - (pp.seatT or -10) >= wait then
+    local animate = false
+    if not pp.hidden and not pp.animTried then
+      local q, cp = so:GetPos(), car:GetPos()
+      local good, sp = pcall(car.GetSpeedFloat, car)
+      animate = good and math.abs(tonumber(sp) or 9) < 1 and (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 < 4 * 4
+    end
     if pp.hidden then M.Hide(pp, false, true) end
+    pp.seatAnim = animate
+    if animate then pp.animTried = true end
     pp.seatT, pp.seatTries = M.now, (pp.seatTries or 0) + 1
-    try("GetOnVehicle", so.GetOnVehicle, so, car, pp.seat + 1, false, "WALK")
-    if same(so:GetOwner(), car) then
+    try("GetOnVehicle", so.GetOnVehicle, so, car, pp.seat + 1, animate, "WALK")
+    if animate then
+      log("puppet " .. pp.id .. " gets into car " .. pp.vkey .. " seat " .. pp.seat .. " (animated)")
+    elseif same(so:GetOwner(), car) then
       if (pp.ejects or 0) < 3 then log("puppet " .. pp.id .. " seated in car " .. pp.vkey .. " seat " .. pp.seat) end
     elseif pp.seatTries == 6 then
       log("puppet " .. pp.id .. " could not be seated in car " .. pp.vkey .. ", retrying slower")
@@ -684,6 +806,7 @@ end
 --   DbgTesting_SemaphoreNextFrame()             its next update, so each press waits for this sync object
 -- Shots are real (bullets, muzzle flash, sound) but the puppet is not hostile to anyone; damage is phase A5.
 local AIM_HOLD = 1.0  -- keep aiming this long after a shot without aim input (hip fire)
+local ANIM_WAIT = 4   -- s an animated get-in may take before the puppet is seated at once
 
 local function cmdTick(pp)
   local c = pp.cb
@@ -764,10 +887,12 @@ function M.Drive(pp)
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
   if M.isHost and M.allyOn and not pp.ally then M.Ally(pp, so) end
-  if pp.veh then
+  if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
-    if pp.seatKey ~= sk then pp.seatKey, pp.seatTries, pp.ejects, pp.seated = sk, 0, 0, false end
+    if pp.seatKey ~= sk then
+      pp.seatKey, pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = sk, 0, 0, false, nil, nil
+    end
     local c = pp.vkey and M.cars[pp.vkey]
     pp.dist = 0
     if pp.seat <= 3 and c and c.st == "ready" and valid(c.ent) and M.Seat(pp, c) then return end
@@ -791,59 +916,62 @@ function M.Drive(pp)
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
     so:SetDir(V(pp.hx, pp.hy, 0))
   end
-  local pos = so:GetPos()
-  local dx, dy, dz = pp.tx - pos.x, pp.ty - pos.y, pp.tz - pos.z
-  local d2 = dx * dx + dy * dy
-  pp.dist = math.sqrt(d2)
-  if d2 > 100 or dz > 5 or dz < -5 then
-    so:SetPos(V(pp.tx, pp.ty, pp.tz))
-    so:SetDir(V(pp.hx, pp.hy, 0))
-    pp.moving, pp.lastMove = false, M.now
-    pp.snaps = (pp.snaps or 0) + 1
-    return
-  end
-  local spd2 = pp.vx * pp.vx + pp.vy * pp.vy
-  -- The remote player stands still but the puppet cannot reach the spot (blocked; MoveVec keeps failing): after
-  -- 2 s put it there. A puppet that keeps walking on the spot also cannot crouch or settle.
-  if spd2 <= 0.16 and d2 > 1.0 then
-    pp.stuckT = pp.stuckT or M.now
-    if M.now - pp.stuckT > 2 then
-      so:SetPos(V(pp.tx, pp.ty, pp.tz))
-      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
-      pp.stuckT, pp.moving, d2 = nil, false, 0
-    end
-  else
-    pp.stuckT = nil
-  end
-  if spd2 > 0.16 or d2 > 1.0 then
-    -- a sharp turn of the player re-aims the walk at once (otherwise the AI kept walking the old way for up to 0.3 s
-    -- and overshot by 2-4 m before M.Pull brought it back)
-    local turned = false
-    if spd2 > 0.16 and pp.mvx then
-      local l = math.sqrt(spd2 * (pp.mvx * pp.mvx + pp.mvy * pp.mvy))
-      turned = l > 0 and (pp.vx * pp.mvx + pp.vy * pp.mvy) / l < 0.7
-    end
-    if M.now - pp.lastMove > 0.3 or pp.lastMode ~= pp.mode or turned then
-      local mode = MODES[pp.mode] or "RUN"
-      if d2 > 9 and pp.mode < 2 then mode = "RUN" end
-      if d2 > 25 then mode = "SPRINT" end
-      local la = 0.3
-      so:MoveVec(V(pp.tx + pp.vx * la, pp.ty + pp.vy * la, pp.tz), mode)
-      pp.lastMove, pp.lastMode, pp.moving = M.now, pp.mode, true
-      pp.mvx, pp.mvy = pp.vx, pp.vy
-      pp.moves = (pp.moves or 0) + 1
-    end
-  else
-    if pp.moving then
-      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
-      pp.moving = false
-    end
-    local d = so:GetDir()
-    if not (pp.cb and pp.cb.aim) and d.x * pp.hx + d.y * pp.hy < 0.97 then so:SetDir(V(pp.hx, pp.hy, 0)) end
-  end
-  M.Pull(pp, so)
+  M.Walk(pp, so)
   M.Weapon(pp)
   M.Combat(pp)
+  -- where it is now, for the C++ side's controller (measured speed, error, next walk point)
+  local q, d = so:GetPos(), so:GetDir()
+  M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f", pp.id, q.x, q.y, q.z, d.x, d.y)
+end
+
+-- On foot: the puppet walks with the game's own locomotion (MoveVec: AI path following with the walk/run/sprint
+-- animation) at the remote player's speed, so its feet do not slide. The C++ side's LocomotionController (core
+-- net/remote_motion.h) picks the gait from his speed, a speed multiplier for it (calibrated from how fast this puppet
+-- really walks), the point to walk toward and when to re-aim; its position is only corrected when it is clearly off
+-- (the part of the error beyond 0.9 m, gently) and snapped when far off or blocked. Before 0.13.0 the puppet was
+-- pulled toward the target every tick while its walk played at its own pace: the feet slid.
+-- SetMovementSpeedMult(m) (C_WrapperHuman, an AI command; docs/game-api.md 4, unverified) is given right before each
+-- walk command, so a walk is never interrupted by it.
+function M.Walk(pp, so)
+  local lc = pp.lc
+  if not lc then return end
+  local aiming = pp.cb and pp.cb.aim
+  local p0 = so:GetPos()
+  pp.dist = math.sqrt((pp.tx - p0.x) ^ 2 + (pp.ty - p0.y) ^ 2)
+  if lc.fix == 2 then
+    so:SetPos(V(pp.tx, pp.ty, pp.tz))
+    if not aiming then so:SetDir(V(pp.hx, pp.hy, 0)) end
+    pp.snaps = (pp.snaps or 0) + 1
+    if pp.snaps <= 5 or pp.snaps % 50 == 0 then log("puppet " .. pp.id .. " put at its player's spot (#" .. pp.snaps .. ")") end
+  elseif lc.fix == 1 then
+    local q = so:GetPos()
+    so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z))
+  end
+  if lc.reissue then
+    if lc.gait == 0 then  -- stop: walk the last bit to his spot and stand there
+      M.SpeedMult(pp, so, 1)
+      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
+      pp.moving = false
+    else
+      M.SpeedMult(pp, so, lc.mult)
+      so:MoveVec(V(lc.mx, lc.my, lc.mz), GAITS[lc.gait] or "RUN")
+      pp.moving = true
+      pp.moves = (pp.moves or 0) + 1
+    end
+  end
+  if lc.turn and not aiming then so:SetDir(V(lc.fx, lc.fy, 0)) end
+end
+
+function M.SpeedMult(pp, so, m)
+  if pp.noMult or math.abs(m - (pp.mult or 1)) < 0.02 then return end
+  local good, err = pcall(so.SetMovementSpeedMult, so, m)
+  if not good then
+    pp.noMult = true
+    log("puppet " .. pp.id .. ": SetMovementSpeedMult failed (" .. tostring(err) .. "): it walks at the game's speed")
+    return
+  end
+  if not pp.mult then log(string.format("puppet %s: walk speed x%.2f", pp.id, m)) end
+  pp.mult = m
 end
 
 -- Dev (trace_pos = 1): our position and every puppet's, 10 times a second, for measuring the position error between
@@ -892,10 +1020,9 @@ function M.Ally(pp, so)
     good and "set" or "FAILED", tostring(so:GetAIType())))
 end
 
--- The puppet's AI walk (MoveVec) starts late, is slower than a running player and sometimes does not move at all, so
--- on its own the puppet trailed its player by 2.5 m on average and up to 9 m (measured 2026-10-16, tools/pos_error.py).
--- Each tick it is pulled toward where its player is now (a fraction PULL_GAIN x dt of the gap); the walk animation
--- still comes from MoveVec. With it (and the walk re-aimed at sharp turns) the error was 0.34 m on average, 0.6 m p95.
+-- NPC copies (npc_sync.lua, 10 Hz states): their AI walk (MoveVec) starts late and is slower than a running NPC, so
+-- each tick they are pulled toward where the host's NPC is now (a fraction PULL_GAIN x dt of the gap). Player puppets
+-- no longer use this (M.Walk: it slid their feet); measured for them in 0.9.0: 0.34 m average error, 0.6 m p95.
 local PULL_GAIN = 30   -- 1/s
 local PULL_MIN = 0.3   -- m: closer than this the AI's own steps are left alone
 local PULL_SNAP = 1.5  -- m: farther than this (the AI walked off the wrong way) it is put there at once
@@ -1587,7 +1714,26 @@ function M.Sample(aimInput)
   local cam = game.cameramanager:GetPlayerCamera()
   local ad = cam and cam:GetDir() or d
   if type(M.testAim) == "table" then ad = V(M.testAim[1], M.testAim[2], M.testAim[3]) end  -- test: fixed direction
-  local tail = string.format(" %d %d %d %.3f %.3f %.3f", aim, reload, M.shots, ad.x, ad.y, ad.z)
+  -- the driver's controls (docs/re-notes.md 9: read from the car's vehicle part; nil when that read fails)
+  local cover = (not inCar and p:IsInCover()) and 1 or 0
+  local ctl, steer, power, brake, hb, gear = 0, 0, 0, 0, 0, 0
+  if inCar and my.seat == 0 and mc_car_controls then
+    local car = my.c.ent
+    local s, pw, b, h = mc_car_controls(tonumber(guidNum(car)))
+    if s then ctl, steer, power, brake, hb = 1, s, pw, b, h end
+    local good, g = pcall(car.GetGear, car)
+    if good and tonumber(g) then gear = math.floor(tonumber(g)) end
+    if ctl == 1 and not M.ctlLogged then
+      M.ctlLogged = true
+      log(string.format("our car's controls: steer %.2f power %.2f brake %.2f handbrake %.2f gear %d", steer, power,
+        brake, hb, gear))
+    elseif ctl == 0 and not M.noCtlLogged then
+      M.noCtlLogged = true
+      log("our car's controls cannot be read: the others see the car move, its wheels straight")
+    end
+  end
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d", aim, reload, M.shots, ad.x, ad.y,
+    ad.z, cover, ctl, steer, power, brake, hb, gear)
   if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
   if aim == 0 then M.aimLogged = nil end
   if inCar then
@@ -1775,6 +1921,15 @@ function M.Update(dt, cmds)
       pp.shots = tonumber(f[27]) or 0
       pp.ax, pp.ay, pp.az = tonumber(f[28]), tonumber(f[29]), tonumber(f[30])
       pp.health = tonumber(f[31]) or 100
+      pp.inAir = f[32] == "1"
+      local n = tonumber
+      pp.lc = { gait = n(f[33]) or 0, mult = n(f[34]) or 1, reissue = f[35] == "1", mx = n(f[36]) or pp.tx,
+        my = n(f[37]) or pp.ty, mz = n(f[38]) or pp.tz, fix = n(f[39]) or 0, nx = n(f[40]) or 0, ny = n(f[41]) or 0,
+        turn = f[42] == "1", fx = n(f[43]) or pp.hx, fy = n(f[44]) or pp.hy }
+      pp.vcmd = { fix = n(f[45]) or 2, nx = n(f[46]) or 0, ny = n(f[47]) or 0, nz = n(f[48]) or 0,
+        qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
+        power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
+        ctl = f[58] == "1", pinned = f[59] == "1" }
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead

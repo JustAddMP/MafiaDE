@@ -100,6 +100,9 @@ game.traffic:DespawnEntityImmediately(id)                          -- deletes th
 | `npc:ScriptControl(true, "DesireMainScript")` | 2 args; test scenes use it before scripted commands. Not needed for MoveVec |
 | `npc:SwitchBrain(n)` | changes `GetAIType()`; did not make a player-archetype human move |
 | `player:MoveVec(...)` | returns a done sync object immediately: the player is not AI-driven |
+| `npc:SetMovementSpeedMult(m)` | **UNVERIFIED (static, 2026-10-17)**: one number; the binding (exe+0x239D230) calls exe+0x2B9E8D0 on `[human + 0x130]`, which allocates a 0x48-byte AI command with `m` (a multiplier of the locomotion speed, by its name). Used by player puppets since 0.13.0, given right before each `MoveVec` |
+| `npc:OverrideMoveSpeed(v)` / `ResetMoveSpeed()` | **UNVERIFIED (static)**: a plain store of `v` at `[human + 0x130] + 0xB0` (exe+0x2B98A70); Reset stores -1.0. Units not known (m/s or a factor). Not used |
+| `npc:TurnAtDir(dir)`, `ClampMoveSpeed(...)`, `DbgTesting_Movement(...)`, `SetAnimationVariableFloat(name, v)` | exist (re-notes appendix); not tried. Puppets turn on the spot with `SetDir` (rate-limited by the controller) |
 
 The tests move the *local* player by small `SetPos` steps from a game script thread (`StartThread` + `Sleep(0)`),
 which the remote side sees as walking/running.
@@ -146,6 +149,13 @@ for a long time.
 | `h:GetOffVehicle()` | NPC: animated exit; does nothing while the car is fixed or moved by `SetPos` every tick (exit after the car stops). Player: no effect from a plain chunk (the test presses E) |
 | `h:GetOnVehicle(car, seat, animate [, moveStyle [, bool]])` | **seat is 1-based** (1 = driver, 2 = front passenger ...): the binding passes `seat - 1` to the engine, so seat 0 never works (that is why earlier tries failed). `animate = false` puts the human in the seat in the same tick. Works for our puppets and AI crew. For the **player** it only works with `player:LockControls(true)` first (unlock afterwards); used for "ride along" |
 | `h:MakeCarOwnership(car)` | accepted; made no difference to seating |
+| `car:SetSteer(x)`, `SetPower(x)`, `SetBrake(x)`, `SetHandbrake(x)` | **UNVERIFIED (static, 2026-10-17, docs/re-notes.md 9)**: one number each; they write the car's control wishes in its vehicle part (entity + 0xF8): steering -1..1 through a response curve, throttle 0..1 (below 0.02 = 0), brake 0..1 (below 0.04 = 0), handbrake 0..1 (below 0.02 = 0). Since 0.13.0 applied every tick to a remote driver's car copy |
+| `car:GetPowerWish()` | **UNVERIFIED (static)**: reads the throttle wish (entity + 0xACC). The other controls have no getter; `mc_car_controls(id)` (ours) reads them |
+| `car:GetGear()` / `SetGear(n)` | **UNVERIFIED (static)**: GetGear returns gearbox +0xB8 minus +0x19C (a gear relative to some base; negative taken as reverse). SetGear is not used (its meaning of `n` is not known) |
+| `car:SetAddSteer(deg)` | **UNVERIFIED (static)**: degrees (x pi/180 in the binding), an extra steering angle. Not used |
+| `car:SetImpulse(a, b[, part])` | **UNVERIFIED (static)**: two vectors (and a part index) to the vehicle part (exe+0x1C0A8B0); which is the impulse and which the point is not known. Not used |
+| `mc_car_controls(id)` (ours, src/game/lua.cpp) | **UNVERIFIED**: `steer, power, brake, handbrake, steerLinearity, steerAngle` of car entity `id` (the number in its GUID) read from the fields above, or nil when a read fails or a value is out of range. The driver's game sends them in PlayerState |
+| lights, horn, siren, indicators | `SetLightState`, `SetHornOn`, `SetSirenOn`, `SetBeaconLightOn` exist, but no getter was found for any of them, so they are not synced |
 | `h:ShowModel(bool)`, `h:SetPhysState(0\|2)` | hide/show a human; 2 = DISABLED (no collision while hidden) |
 
 **Seating (verified 2026-10-14, two instances, park in Omerta):**
@@ -415,6 +425,25 @@ docs/re-notes.md 6).
   played on the guest, host skip stopped it, guest skip held him until the host's ended; a late joiner (host already at Omerta cp_020) pressing JOIN GAME came in at cp_020 next to him;
   the guest reloading the host's checkpoint from the world (crashed 2 of 5 before the fix in re-notes 7; after it 9 of 9
   in a CHAPTER session and 11 of 11 in STORY sessions).
+
+## 16. Remote players' animation and car controls (0.13.0) - static only, NOT verified in game
+
+Found by reading the exe (docs/re-notes.md 9) while the game could not be started; everything here needs an
+in-game check (README-dev.md "Test checklist: animation and car controls").
+
+- Puppets on foot no longer get pulled every tick. The C++ side (core `net/remote_motion.h` LocomotionController)
+  picks gait, speed multiplier and walk point; the glue (`M.Walk`) issues `SetMovementSpeedMult(m)` then
+  `MoveVec(point, "WALK"|"RUN"|"SPRINT")`, nudges only the error beyond 0.9 m and snaps when far off. To check: that
+  `SetMovementSpeedMult` changes the walk speed and its animation together (the controller measures the result:
+  the debug status shows the calibrated walk/run/sprint speeds; if the multiplier does nothing they stay where they are
+  and the puppet is a little slower or faster than its player, corrected by nudges) and that it does not stop a
+  running walk.
+- A remote driver's car copy gets his controls (`SetSteer` / `SetPower` / `SetBrake` / `SetHandbrake`) and is moved
+  by its own physics with a blended correction. To check: the front wheels turn with his, brake lights show when he
+  brakes, the copy does not wobble or fight; whether `SetPos` on a dynamic car keeps its velocity (if not, the
+  controller pins the copy after a second, logged, and it behaves as before 0.13.0 with steering wheels).
+- The puppet driver is an AI human in the driver seat: if the game gives it an AI driving controller, that may write
+  the same controls; then the steering flickers between ours and its (not seen statically; `DestroyController` exists).
 
 ## 15. Mission NPCs and cars on two games, the entity table - checked 2026-10-15
 

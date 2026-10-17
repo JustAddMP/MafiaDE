@@ -737,6 +737,38 @@ ended in (docs/game-api.md 15) is one list:
 
 ---------------------------------------------------------------------------------------------------------------
 
+## 9. Car controls and human move speed [static, unverified: found 2026-10-17 without running the game]
+
+**Car wrapper -> entity -> vehicle part.** Every `C_WrapperCar` control binding fetches the wrapper with the adaptor
+(exe+0x3811340), checks it (`[vtbl+0x28]`), takes the entity at `[wrapper + 0x10]` and calls into `entity + 0xF8`
+(the vehicle part). `C_WrapperEntity::GetGUID` (exe+0x23A4D70) returns `[[wrapper + 0x10] + 0x18]`, the same id the
+entity table lookup behind `mc_entity` checks at `entity + 0x18`, so the entity `mc_entity`'s lookup finds is the one
+the bindings use. Bindings (luaL_Reg table 0x5AD4CB0): SetSteer 0x23B96F0, SetAddSteer 0x23BA020, SetBrake 0x23B8840,
+SetHandbrake 0x23B8370, SetPower 0x23B8A30, GetPowerWish 0x23B8D10, GetPowerInternal 0x23B9200, SetGear 0x23BAA10,
+GetGear 0x23BAF30, SetImpulse 0x23B7830 (overloads 0x23D9FF0 / 0x23DA0A0 -> exe+0x1C0A8B0).
+
+Vehicle part fields (offsets from `entity + 0xF8`):
+
+| field | offset | written by | notes |
+|---|---|---|---|
+| steering wish | +0xA40 | exe+0x1C0E950 (SetSteer) | x clamped to -1..1, stored as `sign(x) |x| (1 - (1 - |x|) k)`, k = +0xA80; also sets bit 0x20000000000 of +0x1188 when it moves the wheels noticeably |
+| steering linearity k | +0xA80 | (car data) | read by the setter |
+| current steering angle | +0xA24 | exe+0x1C2B11B / +0x1C2B16E (inside the update exe+0x1C2A92C) | moves toward wish x max angle (+0xA38, speed dependent); +0xA28 = SetAddSteer's extra angle |
+| throttle | +0x9D4 | exe+0x1C0D3A0 (SetPower) | clamped 0..1, below 0.02 = 0 (constants exe+0x4B24924 = 0.02, +0x4B24984 = 1.0); GetPowerWish reads entity + 0xACC = the same |
+| brake | +0x9C8 | exe+0x1C074F0 (SetBrake, r8b = 1: at once) | clamped 0..1, below 0.04 = 0; smoothed toward the value when r8b = 0 |
+| handbrake | +0x9D0 | exe+0x1C0A740 (SetHandbrake, r8b = 1) | clamped 0..1, below 0.02 = 0 |
+| gear | gearbox `[part + 0x360]`, +0xB8 minus +0x19C | SetGear -> exe+0x1C0A200 | GetGear's value; SetGear's argument meaning unknown |
+
+Callers of the steering setter include exe+0x2526420 and exe+0x26D8A51 (which also set brake, handbrake and power:
+"apply a controls struct") and a series at exe+0x2EC3580..0x2EC6666 (steer 0 / handbrake: enter/exit or reset paths).
+That the player's own input ends in +0xA40 / +0x9D4 / +0x9C8 / +0x9D0 is assumed from the update exe+0x1C2A92C
+reading those fields whoever drives; `mc_car_controls` reads them on the driver's game. Lights, horn, siren: setters
+exist (SetLightState 0x23AC850, SetHornOn 0x23A10F0, SetSirenOn 0x23A0B90), no getters found.
+
+**Human move speed.** `C_WrapperHuman::SetMovementSpeedMult` (0x239D230) -> exe+0x2B9E8D0(`[entity + 0x130]`, m):
+allocates a 0x48-byte AI command with m when m differs from a constant. `OverrideMoveSpeed` (0x23AC1B0) ->
+exe+0x2B98A70: `[[entity + 0x130] + 0xB0] = v`; `ResetMoveSpeed` (0x23AC670) stores -1.0 there.
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,

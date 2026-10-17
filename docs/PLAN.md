@@ -22,8 +22,9 @@ interest.md).
 - The game folder is read-only. Back up the save folder before in-world tests
   (`%TEMP%\claude\G--MafiaCoop\save-backup`), never start New Game, kill all game instances after a test,
   capture only game windows.
-- Two instances on one PC: `out\MafiaCoop.exe --host --name Host --log host --debug-overlay` and
-  `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --debug-overlay` (the status text is hidden without it). Live Lua: F8 / `tools\devlua.ps1`.
+- Two instances on one PC: `out\MafiaCoop.exe --host --log host --debug-overlay` and
+  `out\MafiaCoop.exe --join 127.0.0.1 --log guest --debug-overlay` (the status text is hidden without it). No `--name`:
+  players are shown with their Steam name (both instances share one account, so both show the same name). Live Lua: F8 / `tools\devlua.ps1`.
 - When a feature lands, also update the website (C:\AI\Claude\Projects\JS\justaddmp.com): tick the matching task
   in `app/lib/repos.ts` (Mafia entry, `progress.areas[].tasks`), add new tasks there when they're added here, refresh
   highlights / not-synced / known issues if they changed, run `npx tsc --noEmit` and `npm run build`, commit.
@@ -91,6 +92,14 @@ Tick an item (`- [x]`) in the same commit that lands it.
    sooner / prepare the factory at world load. Done: factory at world load, model preloaded, puppet 0.0-0.1 s after
    the other player's first state.
 - [x] Bug: at the main menu player-sync claims "in world" and queues puppets before a save is loaded.
+- [ ] **Animation sync** (0.13.0, built 2026-10-17 from static research only, needs the in-game check in README-dev.md
+   "Test checklist"): puppets walk/run/sprint with the game's locomotion at the remote player's speed (gait + speed
+   multiplier calibrated on the puppet, walk point; small nudges, snaps when far off) instead of being pulled every
+   tick (feet slid); stand turns rate-limited; walks with him to the car door and gets in animated. Gate: no sliding
+   feet, natural starts/stops/turns, error still ~0.5 m (`trace_pos`).
+- [ ] **Car controls sync** (0.13.0, same): the driver's steering, throttle, brake and handbrake applied to the car
+   copies (wheels steer, brake lights), copies carried by their own physics with a blended correction (pinned as
+   before when the physics does not follow). Gate: wheels show the driver's steering, no wobble, error as before.
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.

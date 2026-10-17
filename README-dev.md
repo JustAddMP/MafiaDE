@@ -171,7 +171,7 @@ scripts and still work.
   story: the host's current checkpoint). The host's host-menu flow and the lobby messages are core's (core
   docs/protocol.md "Lobby"); the story sync is ours (below, "Story").
 - **CO-OP SETTINGS** (main menu CO-OP page, lobby, pause CO-OP panel): NAME (text box; empty = Steam name; used from
-  the next session), DEBUG OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE; saved in MafiaCoop.ini.
+  the next session; the box shows the saved name, not a `--name` from the command line), DEBUG OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE; saved in MafiaCoop.ini.
 - **In the world:** every other player's name floats over his character (fades with distance, hidden behind walls:
   a ray from the camera, docs/game-api.md 13) and he is an orange marker on the minimap and map.
 - **Quitting:** when a game closes (window X, the game's quit) the others are told at once: guests see **HOST LEFT**,
@@ -202,7 +202,7 @@ the launcher arguments still work.
 | `--join <ip[:port]>` | Join a host over UDP. |
 | `--join-lobby <id>` | Join a Steam lobby (its owner is the host) over Steam P2P. `+connect_lobby <id>` on the game's command line does the same (Steam's "Join Game"). |
 | `--transport udp\|steam` | Host only on that transport. With `steam`, `--join <id>` is read as a lobby id. |
-| `--name <n>` | Player name. Default: Steam persona name, else the Windows user name. |
+| `--name <n>` | Player name for this run only (tests). Default: the NAME saved in CO-OP SETTINGS, else the Steam persona name, else the Windows user name. Never saved into MafiaCoop.ini (core 0.9). |
 | `--password <p>` | Host: guests must answer with this password (docs/protocol.md "Session password"). Guest: the password to join with. Never logged (the launcher log shows `(hidden)`). |
 | `--require-password-for-invites 1` | Host: Steam lobby members (invited friends) need the password too. Default: they skip it. |
 | `--log <tag>` | Log to `logs\mafiacoop-<tag>.log` / `logs\launcher-<tag>.log`. |
@@ -253,15 +253,17 @@ LEAVE CO-OP ends it (the other side gets a "Disconnected" banner).
 ### Two instances on one PC (gate test, launcher arguments)
 
 ```
-out\MafiaCoop.exe --host --name Host --log host --window left --debug-overlay
-out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right --debug-overlay      (after the first window is up)
+out\MafiaCoop.exe --host --log host --window left --debug-overlay
+out\MafiaCoop.exe --join 127.0.0.1 --log guest --window right --debug-overlay      (after the first window is up)
 ```
 
 `--window left|right` puts the two windows side by side (each on half of the monitor's work area; the dll moves the
 window as soon as it exists and puts it back whenever the game resets its size, checked twice a second; the swap chain
 follows through the ResizeBuffers hook). Both windows open; the games sit at the title screen. Check `out\logs\mafiacoop-host.log` for
-`coop: player 1 'Guest' joined` and `out\logs\mafiacoop-guest.log` for `coop: handshake complete`, and the
-`status:` lines for pings. Both instances share one SteamID, so they can only connect over UDP; Steam P2P needs
+`coop: player 1 '<your Steam name>' joined` and `out\logs\mafiacoop-guest.log` for `coop: handshake complete`, and the
+`status:` lines for pings. Leave out `--name`: it replaces the Steam name for that run (both instances share one
+Steam account, so both show the same name; that is expected). Before 0.13.0 these commands had `--name Host` /
+`--name Guest`, which is why name tags said HOST / GUEST in tests. Both instances share one SteamID, so they can only connect over UDP; Steam P2P needs
 two accounts on two PCs. Stop with `taskkill /IM mafiadefinitiveedition.exe /F`.
 
 ## Lua bridge and dev console
@@ -296,6 +298,50 @@ Dev console, to explore the API live:
   within 0.5 s, deletes it, runs it and writes `out\dev\<tag>.out.txt` (`ok` or `error`, then the result).
   `tools\devlua.ps1 -Tag host -Code 'return game.game:GetActivePlayer():GetPos()'` does the round trip.
 - What was found this way is in `docs/game-api.md`.
+
+## Test checklist: animation and car controls (0.13.0, not yet tested in game)
+
+Built from reading the exe only (docs/game-api.md 16, docs/re-notes.md 9). Two instances side by side
+(`--debug-overlay`, see "Two instances on one PC"), Free Ride or a story save, outside the Free Ride start zone if you
+want to sprint (Salieri's bar locks sprint). Watch the other window while you play one; F7 shows the status lines.
+
+On foot (watch the puppet of the player you move):
+- [ ] **Feet**: walking, running and sprinting straight: the feet stay planted, no ice-skating; the puppet keeps up
+  (the status line's error stays below ~0.5 m; `on foot: run x..` shows the multiplier; after a few seconds of each
+  gait the measured walk/run/sprint speeds settle).
+- [ ] **Start / stop**: from standing it starts with the player, stops where he stops (a step back at most), no
+  sliding into place.
+- [ ] **Turns**: a 90 and a 180 degree turn while running follow without a wide arc; turning on the spot turns the
+  puppet smoothly (not in one snap).
+- [ ] **Sprint**: holding sprint shows the sprint animation (not a fast run); releasing it goes back to a run.
+- [ ] **Crouch**: crouch-walk is shown crouched and at crouch speed.
+- [ ] **Aim**: aiming (right mouse button with a gun) while walking: the puppet aims in the camera direction and
+  still walks; firing shows shots.
+- [ ] **Jump / fall**: jumping a fence or dropping off a wall: the puppet ends up at the right spot (snap allowed),
+  no stuck puppet.
+- [ ] **Blocked**: walk the player where the puppet cannot follow (through a narrow gap / over a car): it is put at
+  his spot within ~2 s.
+- [ ] In the log: `lua: sync: puppet N: walk speed x...` (the multiplier was taken) and no
+  `SetMovementSpeedMult failed`.
+
+Cars (watch the copy of the car the other player drives):
+- [ ] **Steering**: the copy's front wheels turn left/right with the driver's, also standing still.
+- [ ] **Brake lights / reverse**: braking lights the brake lights; reversing moves the copy backwards smoothly.
+- [ ] **Handbrake**: a handbrake turn shows the rear wheels locking / the slide.
+- [ ] **Smooth**: no wobble, shaking or jumping of the copy at speed and in corners; it stays on the driver's
+  position (`car ...: own physics, X m off` below ~1 m). If the log says `pinned to his transform every tick`, its
+  physics did not follow: it then moves exactly as before 0.13.0 (wheels still steer) - please note when it happened.
+- [ ] **Getting in / out**: the other player walks to a standing car: his puppet walks with him and gets in with the
+  door animation (log `gets into car ... (animated)`); getting out plays the exit and the car stays parked there.
+- [ ] **Passenger**: ride along (E next to his car) still works.
+
+Name tags:
+- [ ] Without `--name`, tags, the lobby, the CO-OP panel and banners show the Steam name (the same on both instances
+  of one account). A name typed in CO-OP SETTINGS > NAME shows after the next session start; with `--name X` the log
+  says `name 'X' (from the command line, this run only ...)`.
+
+Measuring: `--trace_pos 1` on both and `python tools/pos_error.py out\logs\mafiacoop-host.log
+out\logs\mafiacoop-guest.log` as below (the 0.9.0 numbers are in docs/protocol.md "PlayerState").
 
 ## Network statistics and measuring desync
 
@@ -339,12 +385,17 @@ WM_LBUTTONDOWN to the game window) selected a row and clicked BACK too. Not chec
 Each game samples its player on GameMainThread, sends `PlayerState` (app id 0x0100, docs/protocol.md) at 60 Hz and
 shows every other player as a **puppet**: an AI human in that player's character (host = Tommy as the story dresses
 him, guest 1 = Paulie, guest 2 = Sam, guest 3 = Salieri, or the `model` he set) that walks/runs/sprints with the game's own locomotion (`MoveVec`) toward the interpolated position (50 ms
-buffer, moved forward by the velocity), is pulled toward it every tick (the AI walk alone trailed by metres), snaps when
-more than 10 m off, turns to the reported heading when standing and holds the reported weapon.
+buffer, moved forward by the velocity). Since 0.13.0 its gait and walk speed follow the player's (a speed multiplier
+calibrated on the puppet, so the animation matches the ground speed and the feet do not slide); its position is only
+nudged when it is more than 0.9 m off and snapped beyond 3.5 m (docs/protocol.md "Driving the puppet and the car
+copy"). Standing, it turns to the reported heading; it holds the reported weapon, walks with its player to a car door
+and gets in with the game's animation when the car stands.
 Puppets only appear once the local player is in a loaded world (not in the main menu).
 
 Cars: when a player drives, the others see the same car (their own copy of it) following the driver, with the
-driver's puppet in the driver seat. **E** (pad **Y**) next to a car another player drives puts you in its first free
+driver's puppet in the driver seat. Since 0.13.0 the copy gets the driver's steering, throttle, brake and handbrake
+(its front wheels steer, brake lights), and its own physics carries it with a small correction; when its physics does
+not keep up it is moved to the driver's transform every tick as before (logged "pinned"). **E** (pad **Y**) next to a car another player drives puts you in its first free
 passenger seat ("ride along"); the others see your puppet sitting there. When the driver gets out, the car stays
 where it was left on every game, and anyone can get in and drive it (owner = last driver). Details and message flow:
 docs/protocol.md "Shared cars, seats and ownership". Puppets are removed when their player leaves and all at once when
@@ -382,9 +433,12 @@ a player who is still loading is loaded ahead, so his puppet appears with his fi
 set (WorldEnv, docs/protocol.md) every 4 s and at once on a change; guests apply them.
 
 The debug status text (`--debug-overlay` or F7) shows `Sync: in world, puppet factory ready, 1 shared car(s)` and one line per remote player
-(`Guest: puppet alive:0.2, 20 Hz, last 0.0 s ago, health 100, crouch, aim` = state, metres off the target, receive
-rate, age of the newest snapshot, his health and stance; `alive/seat0` = sitting in seat 0 of a car,
-`alive/veh-hidden` = in a car but not seated). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
+(`AEastwood (PAULIE): puppet alive:0.2, 60 Hz, last 0.0 s ago, health 100, crouch, aim` = state, metres off the
+target, receive rate, age of the newest snapshot, his health and stance; `alive/seat0` = sitting in seat 0 of a car,
+`alive/veh-hidden` = in a car but not seated), and below it either `on foot: run x1.04 (walk 1.4, run 3.9, sprint
+6.3 m/s), 0.21 m off` (the puppet's gait and speed multiplier, the walk/run/sprint speeds measured on it, its error) or
+`car 0:24577: own physics, 0.12 m off, steer +0.35, power 0.80, brake 0.00` (`pinned` when its physics did not
+follow; `(no controls from his game)` when the driver's game could not read them). The log has `sync:` lines (C++) and `lua: sync:` lines (game side).
 
 **background_run** (default on): the game pauses its simulation when its window loses focus (`WM_ACTIVATEAPP`). The
 dll swallows that message so an unfocused game keeps running and sending (needed for co-op and for two instances on
@@ -429,9 +483,9 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
 
 1. Back up the save folder first (`%USERPROFILE%\Documents\My Games\Mafia Definitive Edition`, OneDrive-redirected
    on some PCs) and never pick "New Game".
-2. `out\MafiaCoop.exe --host --name Host --log host --window left --debug-overlay`; at the title press Enter, then Enter on **Continue**, then Enter
+2. `out\MafiaCoop.exe --host --log host --window left --debug-overlay`; at the title press Enter, then Enter on **Continue**, then Enter
    when the loading screen says "Continue".
-3. `out\MafiaCoop.exe --join 127.0.0.1 --name Guest --log guest --window right --debug-overlay`, same three Enters.
+3. `out\MafiaCoop.exe --join 127.0.0.1 --log guest --window right --debug-overlay`, same three Enters.
 4. Both stand at the save's spawn point; each sees the other's puppet next to them. Move one player and watch the
    other window (`tools\devlua.ps1` can teleport/step the player: see the test snippets below).
 5. `taskkill /IM mafiadefinitiveedition.exe /F`.

@@ -15,7 +15,7 @@ findstr /c:".modVersion = \"%VER%\"" "%ROOT%\src\game\game_info.cpp" >nul || (
 call "%ROOT%\build.cmd" || ( echo Build failed. & exit /b 1 )
 call "%CORE%\build.cmd" || ( echo Core build failed. & exit /b 1 )
 rem core's automated tests (steam_smoke is manual: it needs Steam and a steam_api64.dll copy)
-for %%T in (net_loopback net_password net_kick net_lobby net_interest net_fuzz pending_join crash_dump launcher_args config_set test_input proxy_test) do (
+for %%T in (net_loopback net_password net_kick net_lobby net_interest net_motion net_fuzz pending_join crash_dump launcher_args config_set test_input proxy_test) do (
     "%CORE%\out\%%T.exe" >nul 2>&1 || ( echo core test %%T failed. & exit /b 1 )
     echo core test %%T: ok
 )
@@ -32,6 +32,8 @@ copy /y "%ROOT%\out\MafiaCoop.exe" "%STAGE%\" >nul || exit /b 1
 copy /y "%ROOT%\out\mafiacoop.dll" "%STAGE%\" >nul || exit /b 1
 copy /y "%ROOT%\out\mafiacoop_proxy.dll" "%STAGE%\" >nul || exit /b 1
 copy /y "%ROOT%\tools\release-readme.txt" "%STAGE%\README.txt" >nul || exit /b 1
+rem never ship settings: a MafiaCoop.ini (a test's name, model, address) stays on the machine that made it
+if exist "%STAGE%\*.ini" ( echo A settings file ended up in the release folder. & exit /b 1 )
 copy /y "%CORE%\third_party\minhook\LICENSE.txt" "%STAGE%\licenses\MinHook-LICENSE.txt" >nul || exit /b 1
 copy /y "%ROOT%\out\MafiaCoop-launcher.pdb" "%SYMS%\" >nul || exit /b 1
 copy /y "%ROOT%\out\mafiacoop.pdb" "%SYMS%\" >nul || exit /b 1
