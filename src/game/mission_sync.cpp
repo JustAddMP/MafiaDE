@@ -275,7 +275,7 @@ Shared& S() {
 
 // render thread only
 net::Session* _session = nullptr;
-std::set<net::PlayerId> _seen;
+std::set<std::pair<net::PlayerId, uint32_t>> _seen;  // host: guests last tick by (id, joinSeq); a new pair = a newcomer
 double _scanAccum = kScanInterval;  // scan at once
 std::map<std::wstring, SaveFile> _files;
 // host: the save we sent last
@@ -1189,14 +1189,16 @@ void MissionSync::Tick(float dt) {
     if (!active) return;
     if (isHost) {
         // new players get the current state, save and cutscene at once
+        // (also a guest back after a lost connection: joinSeq is new, so he gets everything again; docs/protocol.md
+        // "Reconnect")
         std::vector<net::PlayerId> fresh;
-        std::set<net::PlayerId> now;
+        std::set<std::pair<net::PlayerId, uint32_t>> now;
         for (const auto& p : _session->Players()) {
             if (p.id == _session->LocalId()) continue;
-            now.insert(p.id);
-            if (!_seen.count(p.id)) fresh.push_back(p.id);
+            now.insert({p.id, p.joinSeq});
+            if (!_seen.count({p.id, p.joinSeq})) fresh.push_back(p.id);
         }
-        _seen = now;
+        _seen.swap(now);
         if ((_scanAccum += dt) >= kScanInterval) {
             _scanAccum = 0;
             HostScan();
@@ -1222,6 +1224,8 @@ void MissionSync::Tick(float dt) {
             SendCutscene(net::kNoPlayer, cs);
         }
         for (net::PlayerId id : fresh) {
+            MC_LOG_INFO("mission: player %u is new (joined or back after a lost connection): sending our state, save "
+                        "#%u and cutscene", id, _hostSeq);
             SendHostSave(id);
             SendMissionState(id, ms);
             SendCutscene(id, cs);
@@ -1280,6 +1284,26 @@ const std::vector<std::string>& MissionSync::Chapters() {
         "mm_150_boat", "mm_160_harbor", "mm_170_plane", "mm_180_sniper", "mm_190_cigars", "mm_200_bank",
         "mm_210_gallery"};
     return kChapters;
+}
+
+void MissionSync::OnConnectionLost() {
+    // Guest: the session stays and rejoins the host. We keep following his point (no reload when we come back to
+    // the same checkpoint); only his cutscene is forgotten, so our game is not held for one we may never hear end.
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    MC_LOG_INFO("mission: connection to the host lost: keeping his point %s %s (%s), our point %s %s%s",
+                sh.host.quest.c_str(), sh.host.cp.c_str(), sh.following ? "following" : "not following",
+                sh.local.quest.c_str(), sh.local.cp.c_str(), sh.host.cutscene.empty() ? "" : ", his cutscene dropped");
+    sh.host.cutscene.clear();
+    sh.notice.clear();
+}
+
+void MissionSync::OnReconnected() {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    MC_LOG_INFO("mission: back in the host's session: last known host point %s %s, ours %s %s; a load follows only "
+                "if he moved on meanwhile",
+                sh.host.quest.c_str(), sh.host.cp.c_str(), sh.local.quest.c_str(), sh.local.cp.c_str());
 }
 
 void MissionSync::StopFollowing() {

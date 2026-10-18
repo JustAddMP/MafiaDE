@@ -175,7 +175,9 @@ Shared& S() {
 
 // render-thread only
 net::Session* _session = nullptr;
-std::set<net::PlayerId> _seenPlayers;  // session players last tick (a new one gets our PlayerModel)
+// Session players last tick, by (id, joinSeq): a new one gets our PlayerModel. joinSeq makes a player who lost his
+// connection and came back (core "Reconnect") new again, even if that happened between two ticks.
+std::set<std::pair<net::PlayerId, uint32_t>> _seenPlayers;
 bool _enterWasDown = false;
 double _sendAccum = 0;
 uint32_t _sent = 0;
@@ -1193,10 +1195,17 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             if (!active) {
                 sh.removeAll = true;
                 sh.remotes.clear();
-                if (core::trace::IsOpen()) {
+                _seenPlayers.clear();  // everyone is new once we are back (they get our PlayerModel again)
+                if (_session->IsReconnecting()) {
+                    // guest lost the host: the session stays and rejoins; the trace stays open across the gap
+                    MC_LOG_INFO("sync: connection to the host lost: puppets removed until we are back");
+                    core::trace::Line("RCN", "ev=sync-paused");
+                } else if (core::trace::IsOpen()) {
                     core::trace::Line("END", "why=session-inactive");
                     core::trace::Close();
                 }
+            } else if (core::trace::IsOpen()) {
+                core::trace::Line("RCN", "ev=sync-resumed local=%u", sh.localId);  // back after a reconnect
             } else {
                 OpenTrace(sh);
             }
@@ -1206,16 +1215,18 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             sh.isHost = sh.localId == net::kHostPlayer;
             sh.names.clear();
             sh.models.clear();
+            std::set<std::pair<net::PlayerId, uint32_t>> seen;
             for (const auto& p : _session->Players()) {
-                if (!_seenPlayers.count(p.id))  // new in the session (us too, at the start): name it in the trace
-                    core::trace::Line("PL", "id=%u model=%s name=%s", p.id, p.model.empty() ? "-" : p.model.c_str(),
-                                      p.name.c_str());
-                if (p.id != sh.localId && !_seenPlayers.count(p.id)) sh.sendModel = true;
+                const bool fresh = !_seenPlayers.count({p.id, p.joinSeq});
+                if (fresh)  // new in the session (us too, at the start; or back after a lost connection)
+                    core::trace::Line("PL", "id=%u model=%s seq=%u name=%s", p.id, p.model.empty() ? "-" : p.model.c_str(),
+                                      p.joinSeq, p.name.c_str());
+                if (p.id != sh.localId && fresh) sh.sendModel = true;
                 sh.names[p.id] = p.name;
                 sh.models[p.id] = p.model;
+                seen.insert({p.id, p.joinSeq});
             }
-            _seenPlayers.clear();
-            for (const auto& [id, name] : sh.names) _seenPlayers.insert(id);
+            _seenPlayers.swap(seen);
             if (sh.sendModel) {  // a player joined, our pick changed, or our story look changed
                 sh.sendModel = false;
                 sendModel = true;

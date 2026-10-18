@@ -17,6 +17,9 @@ NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests s
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
 ends with the driver's controls (6 bytes).
 
+Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
+connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
+
 App id allocation (core reserves 0x0000-0x00FF):
 
 | Range | Owner |
@@ -340,3 +343,27 @@ scripts may change things in between; the next WorldEnv puts them back.
   the puppet drives the copy; when the remote driver parks it, the mission car comes back at the copy's place. No
   copy is looked for or spawned during a loading screen and for 4 s after it (a copy spawned before the mission had
   placed its car landed on it).
+
+## Reconnect (no messages of its own)
+
+Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,
+the guest rejoins with backoff for 60 s and his resume token, PeerDropped to the others, `PlayerInfo::joinSeq`). What
+the game layer does with it:
+
+| Who | When | What |
+|---|---|---|
+| host, other guests | a player is dropped (`GameModule::OnPlayerDropped`) | his puppet is removed (`PlayerSync::OnPlayerLeft`, as when he leaves); banner "<NAME> LOST THE CONNECTION - WAITING FOR THE PLAYER TO RECONNECT... 45 S" (`Session::DroppedPlayers`) |
+| lost guest | `OnConnectionLost` | the game keeps running (no menu, no load). The session is inactive: PlayerSync removes the puppets and stops sending (the trace stays open: `RCN ev=sync-paused`), MissionSync keeps the host's point and our `_followPoint` (nothing reloads by itself) and forgets the host's cutscene, NpcSync's Lua drops the copies it spawned (it does that whenever the session is inactive); banner "CONNECTION LOST - RECONNECTING... 12 S" |
+| host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
+| lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
+
+- Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`), so a drop and a resume
+  between two ticks (a guest's new Hello on the live Steam connection) still re-sends everything.
+- A guest that comes back after the 60 s hold is a new player for the host (maybe another id): the same re-send
+  happens; his characters default by the new id unless he picked one (`model =`, re-sent as PlayerModel).
+- Logs: `reconnect: ...` (module.cpp), `mission: connection to the host lost ...` / `back in the host's session ...`
+  / `player N is new (joined or back after a lost connection)`, `sync: connection to the host lost ...`. Trace
+  records `RCN` (docs/sync-trace.md).
+- UNVERIFIED in game: that the guest's world keeps running cleanly while inactive (puppets removed, NPC copies
+  dropped, the story Lua with `active = 0`), that his NPC copies re-pair after the rejoin, and Steam P2P reconnects
+  (lobby membership after a drop).

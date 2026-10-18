@@ -7,7 +7,7 @@ setting.
 
 - **Where:** `logs\trace\<log name>-<date>-<time>.trace` in the mod's folder (next to `MafiaCoop.exe`), e.g.
   `logs\trace\mafiacoop-20261017-150912.trace`. One file per session (opened when the session becomes active, closed
-  when it ends). The newest 20 are kept; one file stops at 1.5 GiB (about six hours).
+  when it ends; a guest's reconnect keeps it open, `RCN` lines mark the gap). The newest 20 are kept; one file stops at 1.5 GiB (about six hours).
 - **Size:** about 60-80 KB/s with one other player (~250 MB an hour). It is written twice a second, so a crash loses
   at most the last half second.
 - **Also kept now:** the last five main logs (`mafiacoop.log.1` newest .. `.5`), not just one.
@@ -49,6 +49,7 @@ on the other.
 | `NHS` | host | 2 Hz | `sending hits kills` |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id> copy ai car host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` |
 | `NGS` | guest | 2 Hz | `live matched copies avg max kills pulls` |
+| `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script

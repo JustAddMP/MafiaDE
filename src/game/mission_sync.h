@@ -40,6 +40,10 @@ public:
     static const std::vector<std::string>& Chapters();  // quest ids in story order ("mm_10_chase", ...)
     // A guest started Free Ride (or the session ended): stop following the host's story.
     static void StopFollowing();
+    // Guest lost the host / is back (core's reconnect, docs/protocol.md "Reconnect"): keeps following his point, so
+    // nothing reloads unless the host moved to another checkpoint meanwhile (his MissionState after the rejoin).
+    static void OnConnectionLost();
+    static void OnReconnected();
 
     // What the HUD shows over the game (render thread): "" or a line like "HOST IS WATCHING A CUTSCENE".
     static std::string HudNotice();
