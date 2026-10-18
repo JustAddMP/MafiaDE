@@ -741,7 +741,11 @@ function M.FindLocalCar(c)
   local best, bestD, block
   for s in string.gmatch(mc_entity_ids(10), "%d+") do
     local e = mc_entity(tonumber(s))
-    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) then  -- a hidden car is neither free nor in the way
+    -- a hidden car is neither free nor in the way: ours behind a copy (M.Swap), or one of our own traffic cars that
+    -- traffic_sync.lua hid (deactivated) while the host's traffic shows here (adopted, the other player's car would
+    -- be invisible on this game)
+    local th = M.Traffic and M.Traffic.hidden
+    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not (th and th[tonumber(s)]) then
       local q = e:GetPos()
       local d = (q.x - c.tx) ^ 2 + (q.y - c.ty) ^ 2 + (q.z - c.tz) ^ 2
       if d <= ADOPT_DIST * ADOPT_DIST then
