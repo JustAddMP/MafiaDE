@@ -1422,11 +1422,13 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
         static const char* const kGaits[] = {"stand", "walk", "run", "sprint"};
         if (rem.inCar && !rem.vehKey.empty()) {
             std::snprintf(buf, sizeof(buf),
-                          "    car %s: %s (pins %d), %.2f m off, %.1f/%.1f m/s, steer %+.2f, power %.2f, brake %.2f%s",
+                          "    car %s: %s (pins %d), %.2f m off, %.1f/%.1f m/s, steer %+.2f, power %.2f, brake %.2f%s, "
+                          "signals %s",
                           rem.vehKey.c_str(), rem.lastVeh.pinned ? "pinned" : "own physics", rem.veh.Pins(),
                           rem.lastVeh.error, rem.lastVeh.cspeed, rem.lastVeh.tspeed, last ? last->steer : 0.0f,
                           rem.lastVeh.power, last ? last->brake : 0.0f,
-                          last && !last->ctlValid ? " (no controls from his game)" : "");
+                          last && !last->ctlValid ? " (no controls from his game)" : "",
+                          car_signals::Describe(last ? last->signals : 0).c_str());
         } else {
             std::snprintf(buf, sizeof(buf),
                           "    on foot: %s x%.2f (walk %.1f, run %.1f, sprint %.1f m/s), %.2f m off, wants %.1f m/s%s",
