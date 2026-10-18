@@ -1057,13 +1057,46 @@ end
 -- our world loaded (the host's states and our pairing need that long).
 local OWN_RANGE = 100       -- m from our player
 local MAX_OWN_REPORT = 64   -- NPCs per round, nearest first
+
+-- Humans that are never our own NPCs, whatever pairing says: the crews of traffic_sync.lua's copies of the host's
+-- traffic and police cars (copies of host NPCs: sent back they would be mirrored onto the host's own drivers, and
+-- a dead one would kill a host cop of the same archetype nearby through a claim), and the traffic / police
+-- generators' humans (`behavior_object_prime-NN-`, empty suffix: every game makes its own, they are no mission's
+-- wave; the host could not show them anyway, they have no spawn profile). Cached per entity (names do not change).
+local function notOwnable(e, crews)
+  if crews[e.id] then return true end
+  if e.gen == nil then
+    local good, name = pcall(e.h.GetName, e.h)
+    e.gen = good and type(name) == "string" and name:match("^behavior_object_prime%-%x+%-$") ~= nil
+  end
+  return e.gen
+end
+
+local function trafficCrews()
+  local out = {}
+  local T = M.Traffic
+  for _, c in pairs(T and T.copies or {}) do
+    if c.ent and valid(c.ent) then
+      for s = 0, 3 do
+        local good, h = pcall(c.ent.GetSeatOwner, c.ent, s)
+        if good and valid(h) then
+          local id = idOf(h)
+          if id then out[id] = true end
+        end
+      end
+    end
+  end
+  return out
+end
+
 function N.OwnRound(p, ev)
   if M.now - (M.inWorldAt or M.now) <= COPY_AFTER_LOAD or M.cutscene then return end
   local q0 = p:GetPos()
   local list = {}
+  local crews = trafficCrews()
   for id, e in pairs(N.ents) do
     local h = e.h
-    if not N.copyIds[id] and valid(h) and active(h) then
+    if not N.copyIds[id] and valid(h) and active(h) and not notOwnable(e, crews) then
       local q = h:GetPos()
       local d2 = (q.x - q0.x) ^ 2 + (q.y - q0.y) ^ 2
       if d2 <= OWN_RANGE * OWN_RANGE and math.abs(q.z - q0.z) < 30 then
