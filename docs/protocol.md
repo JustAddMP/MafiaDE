@@ -38,7 +38,7 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103-0x01FF | reserved (phase 3 events) | | | |
 
-PlayerState body (54 bytes on foot + weapon name, ~136 bytes in a car):
+PlayerState body (54 bytes on foot + weapon name, ~137 bytes in a car):
 
 ```
 u8  version (4; 0.13.0, was 3)
@@ -69,6 +69,12 @@ u8  power                 throttle 0..1 (x255)
 u8  brake                 brake 0..1 (x255)
 u8  handbrake             handbrake 0..1 (x255)
 i8  gear                  GetGear() (< 0 taken as reverse)
+u8  signals               car signals (seat 0 only; src/game/car_signals.h; read from the car's vehicle part,
+                          docs/re-notes.md 9, NOT checked in game): bit0 park/side lights, bit1 headlights,
+                          bit2 indicator A, bit3 indicator B (both = hazard; which one is left is not known),
+                          bit4 beacon, bit5 siren, bit6 horn, bit7 valid (the driver's game could read them; 0 =
+                          unknown: the copy keeps its own). Last byte of the block, added without a version change:
+                          a block that ends at the gear reads as 0, and an older reader stops before it
 ```
 
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
@@ -121,6 +127,15 @@ carries them out and reports back where the puppet / car copy is after each tick
   tick from then on (the pre-0.13.0 way, logged "pinned to his transform every tick"). Snap on a teleport (> 20 m
   between snapshots) or > 4 m off. No throttle while the copy is faster than him (+1.5 m/s) or he reverses. When he
   gets out the controls are released (power, brake, handbrake, steering 0).
+- **His car's signals** (`signals` byte; `RV.Signals` in player_sync.lua, NOT checked in game): applied to the copy
+  when they change, each change logged on both sides ("player N's car signals: ..." from the C++ side when it arrives,
+  "remote car ...: signals A -> B" when it is applied, "our car's signals: ..." on the driver's game). Lights and
+  indicators are set with the game's own bit setters (`mc_car_set_signals`), horn, siren and beacon with `SetHornOn`
+  / `SetSirenOn` / `SetBeaconLightOn`; an on/off change of the lights also sets the script light override
+  (`SetLightState(true, on)`) so the game's automatic lights keep them. Every tick the copy is read back: lights and
+  indicators its own game changed back are set again at once, horn / siren / beacon at most once a second (counted,
+  CR `sigre`). Brake and reverse lights are not sent: the copy makes them from the brake and gear it gets. When he gets
+  out the copy's horn is switched off and its lights are given back to the game (`SetLightState(false, false)`).
 
 ### Shared cars, seats and ownership
 
