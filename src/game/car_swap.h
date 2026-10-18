@@ -16,8 +16,8 @@
 //         first), or without one the copy stood still for kStillTime once kParkFallback has passed (the message is
 //         lost, the driver left the session), at the latest after kHardCap.
 //     The session being over counts as parked (nobody will send one any more).
-//   - CarParked said the car was destroyed: restored, then blown up (RestoreWrecked) so this game's mission sees
-//     what the driver's game saw.
+//   - CarParked said the car was destroyed: restored, then set exploded (RestoreWrecked; the glue uses SetExploded,
+//     no second blast) so this game's mission sees what the driver's game saw.
 //   - The copy could not be spawned: the real car comes back at once (Restore at the last known transform).
 //   - A new world (checkpoint load, quit): the real car, if it still exists, is shown where it is (RestoreHere);
 //     otherwise it is forgotten (Forget). The real car being gone at any time is Forget too.

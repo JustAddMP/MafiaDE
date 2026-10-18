@@ -7,6 +7,7 @@
 #include "core/trace.h"
 #include "dll/ui_input.h"
 #include "game/characters.h"
+#include "game/explosion_sync.h"
 #include "game/item_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
@@ -200,6 +201,7 @@ public:
             PoliceSync::Install();  // after TrafficSync: traffic_sync.lua asks police_sync.lua
             ItemSync::Install();
             DoorSync::Install();
+            ExplosionSync::Install();  // last: its glue reads the others' tables
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -216,6 +218,7 @@ public:
         ItemSync::Attach(session);
         DoorSync::Attach(session);
         PoliceSync::Attach(session);
+        ExplosionSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
@@ -225,6 +228,7 @@ public:
         ItemSync::Detach();
         DoorSync::Detach();
         PoliceSync::Detach();
+        ExplosionSync::Detach();
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
@@ -232,6 +236,7 @@ public:
         NpcSync::OnPlayerLeft(id);
         TrafficSync::OnPlayerLeft(id);
         PoliceSync::OnPlayerLeft(id);
+        ExplosionSync::OnPlayerLeft(id);
     }
 
     // ---- reconnect (core: docs/protocol.md "Reconnect"; ours: docs/protocol.md "Reconnect") ----
@@ -244,6 +249,7 @@ public:
         NpcSync::OnPlayerLeft(id);      // his own NPCs' mirrors go; he sends them again when back
         TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
+        ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
     }
     // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
     // session turns inactive), the story keeps the host's point (MissionSync), our NPC copies are dropped (NpcSync).
@@ -272,6 +278,7 @@ public:
         ItemSync::Tick(dt);
         DoorSync::Tick(dt);
         PoliceSync::Tick(dt);
+        ExplosionSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -296,6 +303,8 @@ public:
         case 0x0231: return "DoorApply";
         case 0x0232: return "DoorSnapshot";
         case 0x0233: return "DoorSnapRequest";
+        case 0x0240: return "Explosion";
+        case 0x0241: return "CarExploded";
         case 0x0260: return "PoliceState";
         case 0x0261: return "PoliceEvent";
         case 0x0262: return "PoliceChase";
@@ -320,6 +329,7 @@ public:
         ItemSync::GetStatus(out);
         DoorSync::GetStatus(out);
         PoliceSync::GetStatus(out);
+        ExplosionSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }

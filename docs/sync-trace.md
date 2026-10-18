@@ -90,6 +90,18 @@ on the other.
 | `DR` | both | each door event (C++, docs/protocol.md "Doors") | `ev=local id door=<name hash> p old state ours act how verdict=<send/echo/kept/revert/same/unknown>` (our poll saw a door change), `ev=tx seq by=<p<id> or world> act state door p from sent` (we sent it: guest DoorEvent, host DoorApply), `ev=rx ... verdict=<accept/reject (host), applied/kept/own (guest)>`, `ev=fix ...` (host: the correction a refused guest gets), `ev=apply id act state by why=<remote/memory/snapshot/revert>` (we change our door), `ev=unmet id` (it did not get there in 3 s), `ev=snapreq reason p`, `ev=snaptx to reason p n open unlocked mem`, `ev=snaprx n applied`, `ev=world key doors mem` (a new world: table and memory forgotten) |
 | `DL` | both | each door message / door change (Lua) | `ev=msg id kind=<OPEN CLOSE KICK LOCKPICK TOGGLELOCK TOGGLEOPEN> sender=<GUID> ours known`; `ev=change id name p old state ours act how=<msg: its door message came from our player, act: our player's door action, near: he stood at it, -: our world> d=<m from our player> msg=<latest message kind@age>` |
 | `DA` | both | each change carried out on a door (Lua) | `id name act want cur by why calls=<calls made, ! = failed> ok` |
+| `XT` | both | each explosive throw of ours | `weapon=<the selected explosive, - unknown> p=<where we stood>` (docs/game-api.md 23) |
+| `XG` | both | on event | `ev=player_grenade_explosion`: PLAYER_GRENADE_EXPLOSION came to our player |
+| `XB` | both | on event | Lua: our grenade bounced (EXPLOSIVE_BOUNCE sound owned by us): `p` (points of its flight, not shown elsewhere) |
+| `XC` | both | each explosion seen here | the detector's decision (src/game/explosion_model.h): `seq=<0 not sent> kind=<grenade/molotov/dynamite/object/car/unknown> flags=<1 fire, 2 an NPC's> p weapon owner=<us/npc/other/unknown: the sound's owner> npc obj=<crash object> reports=<HEAR_SOUND reports merged> send=<1 sent> why=<ours: the reason, or why not>` |
+| `XO` | both | each Explosion sent | `seq kind flags p weapon npc obj` |
+| `XR` | both | each Explosion received | `from seq kind flags p weapon npc obj` (duplicates and malformed ones are not traced) |
+| `XV` | both | each received explosion handled | Lua: `from seq kind act=<shown/far/npc_here/failed> how=<script, or the error> d=<m from us> p fire` |
+| `XD` | both | each guard verdict other than keep | `victim=<local/puppet/npc/copy> enemy=<us/npc/puppet/copy/none/other> dtype=<1 explosion, 8 fire> amount verdict=<undo/ours> zone=<own:seq / remote:from:seq> p` |
+| `XU` | both | each NPC undo | Lua: `id act=<health: from to / died: could not be undone>` |
+| `XCS` | both | each CarExploded sent | `what=<shared/traffic> key p` |
+| `XCR` | both | each CarExploded received | `from what key p` |
+| `XCV` | both | each CarExploded handled | Lua: `from what key act=<set_exploded/already/no_car/failed:...>` |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -128,6 +140,8 @@ Per player as seen on the other game:
   receipts / snapshots.
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
+- **explosions:** none of the X records are read by the tool yet; grep them (`XC` on the thrower, `XR`/`XV`/`XD` on
+  the others: a sent explosion's `seq` pairs them).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.

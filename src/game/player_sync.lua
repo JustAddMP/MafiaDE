@@ -104,6 +104,7 @@ local REPLAY_WAIT = 0.3    -- s a replayed bullet has to land before the hit is 
 local REPLAY_OPEN = 0.15   -- s the shield stays down for a replayed bullet
 local SHOT_SCALE = 2.6     -- first guess of the game's damage scale for an NPC bullet on the player (learned live)
 local RAM_SUM = 0.25       -- s over which the collision damage of one ram is summed into one Hit
+local FIRE_SUM = 0.5       -- s over which fire damage (a molotov's flames, many small steps) is summed into one Hit
 local MODEL_RECHECK = 3    -- s between re-applications of our model override (mission scripts may clear it)
 -- Characters: the C++ side resolves every alias (src/game/characters.cpp) and hands us spawn profiles (paths or
 -- decimal hashes; both work for the player switches and the runtime spawner, docs/game-api.md 12), or "tommy" for
@@ -389,8 +390,8 @@ end
 -- Our hidden real car comes back (M.SwapTick decided when). how: "copy" = at the copy's place (it was just put at
 -- the last driver's final transform by his CarParked), or at the driver's last transform when there is no copy;
 -- "here" = where it was hidden (a new world: the copy is from the old one and is not touched). The copy goes first:
--- it stands exactly where our car is put. wrecked: the car was destroyed on the last driver's game: ours is blown
--- up (car:Explode, docs/game-api.md 14) so this game's mission sees the same. failed: the copy could not be spawned
+-- it stands exactly where our car is put. wrecked: the car was destroyed on the last driver's game: ours is set
+-- exploded (car:SetExploded, docs/game-api.md 23; no second blast) so this game's mission sees the same. failed: the copy could not be spawned
 -- (no further swaps of this car: its NPC driver is thrown out as before 0.9.0).
 function M.Restore(c, how, wrecked, why, failed)
   local orig = c.orig
@@ -435,8 +436,17 @@ function M.Restore(c, how, wrecked, why, failed)
     c.key, how, (from:gsub(" ", "_")), np.x, np.y, np.z, g2 and tostring(active) or "-", (copy:gsub(" ", "_")),
     wrecked and 1 or 0, (tostring(why):gsub(" ", "_"))))
   if wrecked then
-    local g3, e3 = pcall(orig.Explode, orig)
-    log("car " .. c.key .. ": destroyed on the last driver's game: ours blown up too" .. (g3 and "" or (" (failed: " .. tostring(e3) .. ")")))
+    -- set exploded (the wreck, no blast: SetExploded, docs/game-api.md 23, UNVERIFIED); the blast happened on the
+    -- driver's game and was shown here as a picture (CarExploded) or is shown now; a real Explode here would hurt
+    -- people a second time
+    pcall(orig.DisableExplosion, orig, false)
+    local g3, e3 = pcall(orig.SetExploded, orig)
+    if not c.boomShown and M.Boom and M.Boom.Picture then
+      local q = orig:GetPos()
+      pcall(M.Boom.Picture, q.x, q.y, q.z, "exp_grenade", false, 255, 0, 5)
+    end
+    c.boomShown = nil
+    log("car " .. c.key .. ": destroyed on the last driver's game: ours set exploded too" .. (g3 and "" or (" (failed: " .. tostring(e3) .. ")")))
   end
 end
 
@@ -1092,6 +1102,9 @@ function M.Wrecked(ent)
   local g2, md = pcall(ent.GetMotorDamage, ent)
   d = g1 and tonumber(d) or nil
   md = g2 and tonumber(md) or nil
+  -- it blew up here (CAR_HAVE_PROBLEM EXPLODE, explosion_sync.lua): destroyed, whatever GetDamage's scale is
+  local id = tonumber(guidNum(ent))
+  if id and M.Boom and M.Boom.exploded and M.Boom.exploded[id] then return true, d, md end
   return d ~= nil and d >= 100, d, md
 end
 
@@ -1875,6 +1888,7 @@ M.replays = M.replays or {}
 
 -- Is the entity with this GUID (tostring of a C_EntityGuid) the local player, or the car he sits in (rams)?
 function M.IsLocalAttacker(g)
+  if M.boomOurs then return true end  -- our explosion / fire whose damage names no attacker (M.OnDamageEvent)
   local p = game.game:GetActivePlayer()
   if not g or not p then return false end
   if g == guidStr(p) then return true end
@@ -1905,13 +1919,24 @@ function M.OnPuppetDamage(pp, m)
     pp.ram.amount = pp.ram.amount + amount
     return
   end
+  -- FIRE (8) burns in many small steps (a molotov, docs/game-api.md 23): summed over FIRE_SUM s into one Hit
+  if dtype == 8 then
+    if not pp.fire then pp.fire = { t = M.now, amount = 0, weapon = weapon } end
+    pp.fire.amount = pp.fire.amount + amount
+    return
+  end
   M.SendHit(pp, amount, dtype, zone, weapon)
 end
 
 -- Host: one of our NPCs hit guest pp's puppet: the guest takes it (M.HurtByNpc on his game). Not with
 -- enemies_target_guests = 0 (the puppet has the friend brain for its car seats anyway, M.Ally).
-function M.SendNpcHit(pp, amount, dtype, zone, weapon, npc)
+function M.SendNpcHit(pp, amount, dtype, zone, weapon, npc, summed)
   if amount <= 0 or not M.allyOn then return end
+  if dtype == 8 and not summed then  -- an NPC's fire: summed like ours (M.RamTick)
+    if not pp.npcFire then pp.npcFire = { t = M.now, amount = 0, weapon = weapon, npc = npc } end
+    pp.npcFire.amount = pp.npcFire.amount + amount
+    return
+  end
   M.hitq[#M.hitq + 1] = string.format("HT %s %.2f %d %d %.0f 0 0 0 1 %d", pp.id, amount, dtype, zone, weapon, npc or 0)
   M.npcHitsSent = (M.npcHitsSent or 0) + 1
   if M.npcHitsSent <= 30 or M.npcHitsSent % 50 == 0 then
@@ -1943,6 +1968,16 @@ function M.RamTick()
     elseif M.now - r.t >= RAM_SUM then
       pp.ram = nil
       if valid(pp.so) then M.SendHit(pp, r.amount, r.dtype, 0, 0) end
+    end
+    local f = pp.fire
+    if f and M.now - f.t >= FIRE_SUM then
+      pp.fire = nil
+      if valid(pp.so) then M.SendHit(pp, f.amount, 8, 0, f.weapon or 0) end
+    end
+    f = pp.npcFire
+    if f and M.now - f.t >= FIRE_SUM then
+      pp.npcFire = nil
+      if pp.st == "alive" then M.SendNpcHit(pp, f.amount, 8, 0, f.weapon or 0, f.npc, true) end
     end
   end
 end
@@ -1981,8 +2016,21 @@ function M.OnLocalDamage(m)
   end
 end
 
+-- Every DAMAGE goes through the explosion guard first (explosion_sync.lua B.OnDamage, docs/game-api.md 23): "undo"
+-- (a picture of another game's explosion or fire hurt someone here: given back there, nothing else happens with it),
+-- "ours" (our own explosion or fire, the message names no attacker: M.IsLocalAttacker says yes for this dispatch, so
+-- the hit paths below send it on like any hit of ours).
 function M.OnDamageEvent(m)
   local g = tostring(m:GetReceiverGUID())
+  local verdict = M.Boom and M.Boom.OnDamage and M.Boom.OnDamage(m, g)
+  if verdict == "undo" then return end
+  M.boomOurs = verdict == "ours"
+  local good, err = pcall(M.DamageDispatch, m, g)
+  M.boomOurs = false
+  if not good then error(err, 0) end
+end
+
+function M.DamageDispatch(m, g)
   if g == M.localGuid then return M.OnLocalDamage(m) end
   -- mission NPCs (npc_sync.lua): our hits on copies of the host's NPCs, replayed guest shots landing on the host's
   if M.Npc and M.Npc.OnDamage and M.Npc.OnDamage(m, tonumber(g:match("(%d+)%s*$"))) then return end
@@ -2531,6 +2579,8 @@ function M.HurtScript(p, from, amount, dtype, zone, how)
   if shielded then try("SetDemigod", p.SetDemigod, p, true) end
   local h1 = tonumber(p.health) or h0
   if raw > 0.5 and h0 - h1 > 0 then M.dmgScale = (h0 - h1) / raw end  -- the game scales damage (difficulty)
+  -- health about to be given back (a picture's damage, M.CopyUndoTick): not what this real hit took
+  if M.undoTo and h0 > h1 then M.undoTo = M.undoTo - (h0 - h1) end
   logHit(from, amount, dtype, zone, how or "DoDamage", h0, h1)
 end
 
