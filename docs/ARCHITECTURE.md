@@ -57,6 +57,8 @@ src/game/
                          happened (Explosion / CarExploded), shown elsewhere as visual-only explosions; the damage guard
                          that undoes a picture's damage (damage stays with the sender's hit paths)
   explosion_model.{h,cpp} the game-free part (wire, detector, zones, guard), tests/explosion_test.cpp
+  latency.{h,cpp}        lanes and send priorities of our messages, per-system latency (LAT trace records, log
+                         summary) from core's message stamps; tests/latency_test.cpp (protocol.md "Latency budget")
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)
