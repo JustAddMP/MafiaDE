@@ -19,7 +19,8 @@ ends with the driver's controls (6 bytes). 0.15.0 (core 0.11.0, `kProtocolVersio
 PeerDropped, core docs/protocol.md "Reconnect"): guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd (0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
 TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
 (0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
-its end (both always sent); CarParked with a trailing flags byte (wrecked).
+its end (both always sent); CarParked with a trailing flags byte (wrecked). Traversal (not yet in a release): action
+kinds 7..17 and the pose block (u8 [+ u32]) after the action block, both optional on the wire (see "PlayerState").
 
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
@@ -89,8 +90,15 @@ u8  signals               car signals (seat 0 only; src/game/car_signals.h; read
 -- action block (melee sync; after everything above, the vehicle block included; optional, see below):
 u8  actSeq                visible one-shot actions of the player so far, mod 256; a change = new action(s)
 u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charged) punch, 3 counter, 4 takedown,
-                          5 throw (grenade, molotov, knife), 6 melee hit reaction (an NPC punched him); other values
-                          read as none
+                          5 throw (grenade, molotov, knife), 6 melee hit reaction (an NPC punched him); traversal
+                          (0.15.x): 7 jump, 8 vault, 9 climb up a ledge, 10 drop down, 11 hard landing, 12 ladder up,
+                          13 ladder down, 14 slide into cover (7..14 are moves: the puppet changes place), 15 medkit,
+                          16 body picked up, 17 body dropped; other values read as none
+-- pose block (traversal; after the action block; optional, see below):
+u8  pose                  what he keeps doing: bit0 sneaking (IsStealthMove), bit1 carrying a body (IsCarryingBody),
+                          bit2 on a ladder (from USE_LADDER until he stops climbing); other bits are dropped
+u32 body                  only when pose bit1: the carried body's key as the host numbers its NPCs (npc_sync: the
+                          host's own entity id; a guest sends the host key his NPC is paired with), 0 = unknown
 ```
 
 **Action block** (src/game/player_actions.h, unit-tested in tests/player_actions_test.cpp). Punches and other
@@ -104,6 +112,18 @@ and an older build reading a state with it stops before the two bytes (its reade
 trailing bytes); so `version` stays 4. A state that ends after one of the two bytes is rejected. Where the actions
 come from and how the puppet plays them: docs/game-api.md 17. The punch's damage still comes only as a Hit (0x0400);
 the puppet's swing is a picture.
+
+**Traversal in the action block, and the pose block** (src/game/player_actions.h, src/game/traversal.h; unit-tested
+in tests/player_actions_test.cpp and tests/traversal_test.cpp; NOT checked in game). The kinds 7..17 ride in the
+same counter: the sender's C++ side detects the moves (game/traversal.h `LocalDetector`, from the HumanMessages the
+glue collected and the player's height and vertical speed) and `actions::Merger` adds them to the glue's own counter
+(one step per detected move, every step of the glue's counter kept; a punch and a move in the same sample: the move
+is the latest kind, the punch a missed step). A receiver without the traversal kinds reads 7..17 as unknown: its
+counter moves on, it plays nothing (as any build does with a kind beyond its own). The pose block (1 byte, 5 when
+carrying) follows the action block and is optional the same way: a state that ends after the action block reads as
+"no pose", an older reader stops before it; a state whose pose says "carrying" but ends before the body is rejected.
+`version` stays 4. A receiver drives the puppet from the pose (sneak walk, the body it carries, held on the ladder
+path) and plays the moves: docs/game-api.md 17.
 
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
 running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
