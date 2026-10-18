@@ -5,6 +5,7 @@
 #include "core/trace.h"
 #include "game/explosion_model.h"
 #include "game/lua.h"
+#include "game/throw_sync.h"
 #include "game/traffic_sync.h"
 #include "net/wire.h"
 
@@ -105,13 +106,16 @@ void OnExplosion(net::PlayerId from, net::ByteReader& r) {
     }
     ++_recv;
     if (core::trace::IsOpen())
-        core::trace::Line("XR", "from=%u seq=%u kind=%s flags=%u p=%.2f,%.2f,%.2f weapon=%s npc=%u obj=%s", from, e.seq,
-                          KindName(e.kind), e.flags, e.pos.x, e.pos.y, e.pos.z, e.weapon.empty() ? "-" : e.weapon.c_str(),
-                          e.npc, e.object.empty() ? "-" : e.object.c_str());
+        core::trace::Line("XR", "from=%u seq=%u kind=%s flags=%u p=%.2f,%.2f,%.2f weapon=%s npc=%u obj=%s throw=%u", from,
+                          e.seq, KindName(e.kind), e.flags, e.pos.x, e.pos.y, e.pos.z,
+                          e.weapon.empty() ? "-" : e.weapon.c_str(), e.npc, e.object.empty() ? "-" : e.object.c_str(),
+                          e.throwSeq);
     if (_recv <= 60 || _recv % 100 == 0)
         MC_LOG_INFO("boom: player %u's %s at %.1f %.1f %.1f (%s%s%s, seq %u)", from, KindName(e.kind), e.pos.x, e.pos.y,
                     e.pos.z, e.weapon.empty() ? "weapon unknown" : e.weapon.c_str(), (e.flags & kFire) ? ", fire" : "",
                     (e.flags & kNpcOwner) ? ", thrown by one of his NPCs" : "", e.seq);
+    if (!(e.flags & kNpcOwner))  // the flight of the player's throw it ends (if shown here) is over
+        ThrowSync::OnExplosion(from, e.throwSeq, e.pos);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (sh.inExplosions.size() < kMaxQueue) sh.inExplosions.push_back({from, std::move(e)});
@@ -165,18 +169,20 @@ int McBoomSound(lua_State* L) {
     return 0;
 }
 
-// mc_boom_throw(weapon, x, y, z): our player threw something explosive (WEAPON_THROWN; weapon "" = unknown)
+// mc_boom_throw(weapon, x, y, z, seq): our player threw something explosive (WEAPON_THROWN; weapon "" = unknown;
+// seq: its throw number from mc_arc_begin, a string, game/throw_model.h; the explosion sent for it names it)
 int McBoomThrow(lua_State* L) {
     Throw t;
     t.t = Now();
     const char* w = Str(L, 1);
     if (w && SafeName(w, 32)) t.weapon = w;
     if (!ReadPos(L, 2, t.pos)) return 0;
+    if (lua::TypeOf(L, 5) == lua::TString) t.seq = static_cast<uint32_t>(std::strtoul(lua::ToString(L, 5), nullptr, 10));
     ++G().throws;
     G().detector.OnThrow(t);
     if (core::trace::IsOpen())
-        core::trace::Line("XT", "weapon=%s p=%.2f,%.2f,%.2f", t.weapon.empty() ? "-" : t.weapon.c_str(), t.pos.x,
-                          t.pos.y, t.pos.z);
+        core::trace::Line("XT", "weapon=%s p=%.2f,%.2f,%.2f throw=%u", t.weapon.empty() ? "-" : t.weapon.c_str(),
+                          t.pos.x, t.pos.y, t.pos.z, t.seq);
     return 0;
 }
 
@@ -314,6 +320,14 @@ bool LoadModule(lua_State* L) {
 
 const char* Tok(const std::string& s) { return s.empty() ? "-" : s.c_str(); }
 
+// our explosions matched with a throw of ours (Decided, under the lock): told to ThrowSync after it
+struct OwnBoom {
+    uint32_t throwSeq;
+    Vec3 pos;
+    double since;
+};
+std::vector<OwnBoom> _ownBooms;
+
 void Decided(const Seen& s, Shared& sh) {
     Main& g = G();
     ++g.decided;
@@ -329,10 +343,12 @@ void Decided(const Seen& s, Shared& sh) {
     std::replace(why.begin(), why.end(), ' ', '_');
     if (core::trace::IsOpen())
         core::trace::Line("XC", "seq=%u kind=%s flags=%u p=%.2f,%.2f,%.2f weapon=%s owner=%s npc=%u obj=%s reports=%d "
-                                "send=%d why=%s",
+                                "send=%d why=%s throw=%u since=%.2f",
                           s.e.seq, KindName(s.e.kind), s.e.flags, s.e.pos.x, s.e.pos.y, s.e.pos.z, Tok(s.e.weapon),
-                          OwnerName(s.owner), s.e.npc, Tok(s.e.object), s.reports, s.send ? 1 : 0, Tok(why));
+                          OwnerName(s.owner), s.e.npc, Tok(s.e.object), s.reports, s.send ? 1 : 0, Tok(why),
+                          s.e.throwSeq, s.sinceThrow);
     if (s.send && sh.outExplosions.size() < kMaxQueue) sh.outExplosions.push_back(s.e);
+    if (s.send && s.e.throwSeq) _ownBooms.push_back({s.e.throwSeq, s.e.pos, s.sinceThrow});
 }
 
 void MainTick(lua_State* L, float dt) {
@@ -373,6 +389,8 @@ void MainTick(lua_State* L, float dt) {
         }
     }
     g.zones.Expire(now);
+    for (const OwnBoom& b : _ownBooms) ThrowSync::OnOwnExplosion(b.throwSeq, b.pos, b.since);
+    _ownBooms.clear();
     _wasActive = active;
     {
         char buf[200];
@@ -492,9 +510,9 @@ void ExplosionSync::Tick(float) {
         const auto buf = PackExplosion(e);
         if (_session->Broadcast(kMsgExplosion, buf, net::Reliability::Reliable)) ++_sent;
         if (core::trace::IsOpen())
-            core::trace::Line("XO", "seq=%u kind=%s flags=%u p=%.2f,%.2f,%.2f weapon=%s npc=%u obj=%s", e.seq,
+            core::trace::Line("XO", "seq=%u kind=%s flags=%u p=%.2f,%.2f,%.2f weapon=%s npc=%u obj=%s throw=%u", e.seq,
                               KindName(e.kind), e.flags, e.pos.x, e.pos.y, e.pos.z, Tok(e.weapon), e.npc,
-                              Tok(e.object));
+                              Tok(e.object), e.throwSeq);
     }
     for (auto& [c, ent] : cars) {
         if (c.what == CarWhat::Traffic) {

@@ -6,7 +6,8 @@
 -- Damage is decided by ONE game, the picture is shown on all (src/game/explosion_model.h):
 --   - Here, the game tells us about explosions with HEAR_SOUND messages (every human that hears one gets one, with
 --     the sound's position, type and owner: EXPLOSION 11, BURNING_FIRE 12, EXPLOSIVE_BOUNCE 10), our player's throws
---     (WEAPON_THROWN, already counted by player_sync.lua as action kind 5), PLAYER_GRENADE_EXPLOSION to our player and
+--     (WEAPON_THROWN, already counted by player_sync.lua as action kind 5; throw_arc.lua gives each a number and
+--     measures its launch), PLAYER_GRENADE_EXPLOSION to our player and
 --     our shots. The C++ detector (mc_boom_sound / mc_boom_throw / mc_boom_grenade / mc_boom_shot) decides which ones
 --     are ours (or, on the host, our NPCs') and sends them (Explosion 0x0240).
 --   - The others' explosions arrive as "E" commands: shown with game.shotmgr:CreateScriptExplosion(nil, pos, weapon,
@@ -218,8 +219,9 @@ function B.OnHear(m)
     end
   end
   if object == "-" then object = "" end
-  if st == 10 and owner == "us" then  -- our grenade bouncing: points of its flight (not shown elsewhere)
+  if st == 10 and owner == "us" then  -- our grenade bouncing: throw_arc.lua sends a ThrowFix for it
     trace("XB", string.format("p=%s", f3(x, y, z)))
+    if M.Arc and M.Arc.OnBounce then pcall(M.Arc.OnBounce, x, y, z) end
   end
   if st == 11 and B.stats.sounds <= 40 then
     log(string.format("explosion heard at %.1f %.1f %.1f, owner %s (%s), second %s%s", x, y, z, og, cls,
@@ -337,6 +339,12 @@ function B.OnRemote(f)
       if good and valid(o) then try("Hide " .. object, o.Hide, o) end
     end
   end
+  -- the cars whose damage we hold take its effect here (car_damage.lua D.Blast), far or near; not when our own copy of
+  -- his NPC threw it here (then that blast was real on our game and hit our cars already)
+  if act ~= "npc_here" and M.CarDamage and M.CarDamage.Blast then
+    local good, err = pcall(M.CarDamage.Blast, x, y, z, kind, from, seq)
+    if not good then log("car blast error: " .. tostring(err)) end
+  end
   local n = B.stats.shown + B.stats.failed + B.stats.far + B.stats.npcSkip
   if n <= 60 or n % 50 == 0 then
     log(string.format("player %s's %s at %.1f %.1f %.1f (%.0f m from us): %s%s", tostring(from),
@@ -387,6 +395,13 @@ function B.OnRemoteCar(f)
     B.Picture(x, y, z, "exp_grenade", false, from, 0, 5)  -- no car here: at least the blast
     act = "no_car"
   end
+  -- its blast reaches the cars we hold nearby (car_damage.lua D.Blast; the car itself is exploded already)
+  local bx, by, bz = x, y, z
+  if valid(ent) then
+    local good, q = pcall(ent.GetPos, ent)
+    if good and q then bx, by, bz = q.x, q.y, q.z end
+  end
+  if bx and M.CarDamage and M.CarDamage.Blast then pcall(M.CarDamage.Blast, bx, by, bz, 5, from, 0) end
   log(string.format("player %s's %s blew up: %s", tostring(from), label, act))
   trace("XCV", string.format("from=%s what=%d key=%s act=%s", tostring(from), what, tostring(key), act))
 end
@@ -492,8 +507,14 @@ function B.LocalTick(p)
     if not first and M.actKind == 5 then
       local w, raw = explosiveName(p)
       local q = p:GetPos()
+      -- throw_arc.lua: the throw's number (its flight is sent to the others; the explosion sent for it names it)
+      local seq = nil
+      if M.Arc and M.Arc.OnThrown then
+        local good, s = pcall(M.Arc.OnThrown, p, w)
+        if good then seq = s else log("arc throw error: " .. tostring(s)) end
+      end
       if w == "" or w:find("^exp_") then
-        mc_boom_throw(w:find("^exp_") and tok(w) or "", q.x, q.y, q.z)
+        mc_boom_throw(w:find("^exp_") and tok(w) or "", q.x, q.y, q.z, seq and tostring(seq) or nil)
         B.throws = (B.throws or 0) + 1
         if B.throws <= 30 then log(string.format("we threw %s at %.1f %.1f %.1f", w ~= "" and w or "something (" .. raw .. ")", q.x, q.y, q.z)) end
       elseif (B.knives or 0) < 5 then

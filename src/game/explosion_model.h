@@ -50,7 +50,9 @@ enum Flags : uint8_t {
 };
 
 // ---- wire -----------------------------------------------------------------------------------------------------------
-// Explosion (0x0240): u32 seq, u8 kind, u8 flags, f32 x y z, str weapon (<= 32), u32 npc, str object (<= 64)
+// Explosion (0x0240): u32 seq, u8 kind, u8 flags, f32 x y z, str weapon (<= 32), u32 npc, str object (<= 64),
+// [u32 throwSeq] (since the grenade arc: the Throw 0x0242 this explosion ends, 0 none; absent in older senders,
+// ignored by older readers)
 struct Explosion {
     uint32_t seq = 0;
     Kind kind = Kind::Unknown;
@@ -59,6 +61,7 @@ struct Explosion {
     std::string weapon;  // the weapon's name ("exp_grenade"); "" = unknown
     uint32_t npc = 0;    // kNpcOwner: the NPC's key on the sender's game
     std::string object;  // Kind::Object: the crash object's name (the same scene object on every game), "" = none
+    uint32_t throwSeq = 0;  // our throw (game/throw_model.h) it was matched with, 0 none
 };
 std::vector<uint8_t> PackExplosion(const Explosion& e);
 bool ReadExplosion(net::ByteReader& r, Explosion& out);  // false: malformed (bad kind, coordinates, names)
@@ -176,6 +179,7 @@ struct Throw {
     double t = 0;
     std::string weapon;  // what was selected ("" unknown)
     Vec3 pos;            // where we stood
+    uint32_t seq = 0;    // its throw number (game/throw_model.h, the Throw message 0x0242), 0 none
 };
 
 // One explosion as the detector saw it (sent or not, for the log and the trace).
@@ -185,6 +189,7 @@ struct Seen {
     Owner owner = Owner::Unknown;
     int reports = 0;      // sounds merged into it
     const char* why = "";  // why it is (not) ours
+    double sinceThrow = -1;  // s from the matched throw to the explosion (its fuse / flight), -1 no throw
 };
 
 constexpr double kSettle = 0.2;      // s after the first sound of an explosion before it is decided (more reports)

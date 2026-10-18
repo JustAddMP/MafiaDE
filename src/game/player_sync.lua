@@ -3633,6 +3633,7 @@ function M.Update(dt, cmds)
   local nc = 0
   for _, _ in pairs(M.cars) do nc = nc + 1 end
   local sample = ""
+  M.aimHeld = aimInput  -- throw_arc.lua: the aim input while an explosive is selected = lining up a throw
   if player then
     local good, s = pcall(M.Sample, aimInput)
     if good then sample = s else logErr("sample", s) end

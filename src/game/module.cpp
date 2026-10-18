@@ -18,6 +18,7 @@
 #include "game/player_sync.h"
 #include "game/save_guard.h"
 #include "game/sectors_guard.h"
+#include "game/throw_sync.h"
 #include "game/traffic_sync.h"
 #include "game/door_sync.h"
 #include "game/police_sync.h"
@@ -216,6 +217,7 @@ public:
             DoorSync::Install();
             CarDamageSync::Install();  // after traffic: its Lua reads player_sync's and traffic_sync's cars
             ExplosionSync::Install();  // last: its glue reads the others' tables
+            ThrowSync::Install();      // the flights of thrown explosives (its glue is called by the explosions')
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -235,6 +237,7 @@ public:
         PoliceSync::Attach(session);
         ExplosionSync::Attach(session);
         CarDamageSync::Attach(session);
+        ThrowSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
@@ -246,6 +249,7 @@ public:
         PoliceSync::Detach();
         ExplosionSync::Detach();
         CarDamageSync::Detach();
+        ThrowSync::Detach();
         latency::Attach(nullptr);
         _session = nullptr;
     }
@@ -256,6 +260,7 @@ public:
         PoliceSync::OnPlayerLeft(id);
         ExplosionSync::OnPlayerLeft(id);
         CarDamageSync::OnPlayerLeft(id);
+        ThrowSync::OnPlayerLeft(id);
     }
 
     // ---- reconnect (core: docs/protocol.md "Reconnect"; ours: docs/protocol.md "Reconnect") ----
@@ -270,6 +275,7 @@ public:
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
         ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
         CarDamageSync::OnPlayerLeft(id);  // his copies ask for the cars' damage again when back
+        ThrowSync::OnPlayerLeft(id);      // his flights shown here go, his throw numbers start anew
     }
     // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
     // session turns inactive), the story keeps the host's point (MissionSync), our NPC copies are dropped (NpcSync).
@@ -299,6 +305,7 @@ public:
         DoorSync::Tick(dt);
         PoliceSync::Tick(dt);
         ExplosionSync::Tick(dt);
+        ThrowSync::Tick(dt);
         CarDamageSync::Tick(dt);
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
@@ -343,6 +350,8 @@ public:
         case 0x0271: return "ItemTake";
         case 0x0272: return "ItemGone";
         case 0x0273: return "Collectible";
+        case 0x0242: return "Throw";
+        case 0x0243: return "ThrowFix";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
         case 0x0420: return "GuestNpcStates";
@@ -362,6 +371,7 @@ public:
         PoliceSync::GetStatus(out);
         ExplosionSync::GetStatus(out);
         CarDamageSync::GetStatus(out);
+        ThrowSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
@@ -401,6 +411,7 @@ public:
     std::string PlayerCharacter(net::PlayerId id) override { return PlayerSync::CharacterName(id); }
 
     void DrawHud(render::DrawList& d, float w, float h) override {
+        ThrowSync::Draw(d, w, h);  // under the name tags
         DrawTags(d, w, h);
         DrawNotice(d, w, h);
     }
