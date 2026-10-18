@@ -19,7 +19,8 @@ ends with the driver's controls (6 bytes). 0.15.0 (core 0.11.0, `kProtocolVersio
 PeerDropped, core docs/protocol.md "Reconnect"): guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd (0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
 TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
 (0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
-its end (both always sent); CarParked with a trailing flags byte (wrecked).
+its end (both always sent); CarParked with a trailing flags byte (wrecked). World items (not yet released): ItemStates (0x0270),
+ItemTake (0x0271), ItemGone (0x0272), Collectible (0x0273), additive (see "World items").
 
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
@@ -532,6 +533,54 @@ npc_sync.lua.
   there by itself. A copy knocked more than 3 m off its target (that was on it a moment before) is put back by the
   controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
   through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves is not shared.
+
+### World items (not yet checked in game)
+
+Things lying in the world: weapons on the ground (entity type 63 `C_ItemWeapon`, what a dead enemy drops) and the
+ground pickups of the item manager (type 66 `C_ItemInventory`, e.g. medkits; docs/game-api.md 20). Logic in
+src/game/world_items.h (unit-tested, tests/world_items_test.cpp), glue in src/game/item_sync.cpp / item_sync.lua.
+Additive: a peer without these messages ignores them (each game then keeps its own items, as before).
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0270 | ItemStates | host -> guests (`Broadcast`) | U, 2 Hz | u8 n (at most 16), then n x: u32 key, u8 type (63 weapon, 66 inventory item), f32 x y z, str name (the item's scene object name, at most 40 bytes of `[A-Za-z0-9_.-]`, "-" unknown) |
+| 0x0271 | ItemTake | guest -> host (`SendToHost`) | R | u32 key (the host's item), u8 type, f32 x y z (where the guest's copy lay) |
+| 0x0272 | ItemGone | host -> guests (`Broadcast`; `SendTo` one guest for a refused take) | R | u32 key, u8 by (who has it: player id, 255 nobody), u8 reason (0 taken, 1 forget) |
+| 0x0273 | Collectible | any -> everyone (`Broadcast`, relayed by the host) | R | str name (the game's `lh_pickup_...` name) |
+
+- key = the item's entity id on the host's game. The host sends the 96 items nearest to its player that lie within
+  100 m of it or of a guest's puppet, twice a second (several messages when more than 16).
+- **Pairing (guest):** each host item is paired with an item of the guest's world of the same type: the nearest within
+  1.5 m, or within 4 m when both have the same name (the guest's copy of an enemy died a few metres from the host's);
+  nearest pairs first, then kept. A paired item more than 0.3 m from the host's is put there (`SetPos`), again when
+  the host's item moves. A pairing is released after 5 s without a state (the guest's item stays, his own).
+- **The guest's own drops:** a weapon that appears on the guest's game more than 5 s after his world loaded (a new drop),
+  more than 2.5 m from his player (not his own weapon swap) and within 60 m of him, and that finds no host partner in
+  3 s while host states arrive, is hidden: the host's world has no such drop (his copy of an enemy dropped one that
+  the host's enemy did not, or the host's lies elsewhere). Items his world had from the start and inventory items are
+  never hidden this way. A host item without a partner on the guest's game is not shown there (no spawn; counted as
+  "not here" in the status and the trace).
+- **Taking:** an item that vanishes from a game (the entity gone or switched off) within 2.5 m of that game's player
+  was taken by him. On the host that is a take by the host at once; on a guest whose item was paired, an ItemTake to
+  the host. The host decides: the first take it learns of wins (its own, or the first ItemTake). The winner is named
+  in an ItemGone broadcast; every other game hides its copy (`Deactivate`; a weapon still lying there after that:
+  `ClearWeaponsInRadius(pos, 0.3)`). A later take of the same item (two players grabbed it at the same time) gets an
+  ItemGone sent to that guest only, naming the winner: his game takes away the weapons he gained in the 2 s before
+  (`InventoryRemoveWeapon`). A take of an item the host does not know (forgotten, or never in its world) is granted.
+  The host remembers taken items for 30 s (later takes refused, late states ignored on guests).
+- **Despawns:** an item that vanishes away from every player was removed by the game (dropped weapons despawn at a
+  distance, `ItemWeaponDespawnDistance`): no take. The host forgets it (ItemGone reason 1): the guests unpair theirs
+  and keep it. A guest's paired item that vanishes away from him is just unpaired.
+- **Ammo and health pickups are shared like weapons** (a medkit taken by one player is gone for all). The game's
+  wall first-aid boxes are mission-script interactions on each game, no item entities: they stay per player. Whether
+  the game respawns ground pickups is not known (UNVERIFIED); a respawned item is a new entity and simply a new item.
+- **Collectibles are per player:** each player collects his own copy for his own save; nothing is hidden on the other
+  games and no other game's save or collection is written. Collectible only tells the others (log, status line).
+  A guest's saves are redirected away from his real save folder during co-op, so what he collects is not kept in his
+  real save (docs/game-api.md 20).
+- Money: the game has no money items (the money and cash-loot bindings are unused in Mafia DE, UNVERIFIED); nothing
+  is sent. Physics props (crates, barrels) stay local.
+- A new world on either game (checkpoint, reload, following the host) starts the books over (ids are per world).
 
 ## Reconnect (no messages of its own)
 
