@@ -184,6 +184,46 @@ void TestNames2() {
 
 }  // namespace
 
+namespace {
+
+// ---- three other players (a session of four): one marker each, each on its own ----
+// Players 1 and 2 ride in the same car (both markers at the car), player 3 walks (his on his puppet); then player 2
+// gets out and walks (his goes onto his puppet), player 1 stays in the car. One icon per player throughout, made once.
+void TestThreeOthers() {
+    Marker m[4];
+    auto foot = [](float x, float y) {
+        Input in = At(x, y, 5);
+        in.puppet = true;
+        return in;
+    };
+    auto inCar = [](float x, float y) { return At(x, y, 5); };  // in a car: no puppet to carry it, the car's spot
+    for (int i = 0; i < 50; ++i) {
+        const float cx = 100.0f + i * 3.0f;  // the car drives along
+        Step(m[1], inCar(cx, 0));
+        Step(m[2], inCar(cx, 0));
+        Step(m[3], foot(-50, 20));
+    }
+    Check(m[1].icon == Icon::Pos && m[1].target == Target::Pos && m[2].icon == Icon::Pos && m[2].target == Target::Pos,
+          "3 others: both passengers' markers follow the car");
+    Check(m[1].lx == m[2].lx && m[1].moves > 10 && m[2].moves > 10, "3 others: the two car markers move with it");
+    Check(m[3].icon == Icon::Human && m[3].target == Target::Puppet && m[3].moves == 0,
+          "3 others: the walker's marker is on his puppet");
+    for (int i = 0; i < 20; ++i) {
+        Step(m[1], inCar(300, 0));
+        Step(m[2], foot(305, 4));  // player 2 got out next to it
+        Step(m[3], foot(-50, 20));
+    }
+    Check(m[2].icon == Icon::Human && m[2].target == Target::Puppet && m[1].target == Target::Pos,
+          "3 others: the one who got out has his marker on his puppet, the other's stays at the car");
+    bool once = true;
+    for (int p = 1; p <= 3; ++p) once &= m[p].creates - m[p].removes == 1;
+    Check(once, "3 others: one icon per player at any time");
+    Check(NameLine(1, "Paulie") != NameLine(2, "Paulie") && NameLine(3, "Sam") == "N 3 Sam\n",
+          "3 others: name lines keyed by player id (two players may share a name)");
+}
+
+}  // namespace
+
 int main() {
     TestFirstIcon();
     TestHumanIcon();
@@ -191,6 +231,7 @@ int main() {
     TestSession();
     TestNames();
     TestNames2();
+    TestThreeOthers();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

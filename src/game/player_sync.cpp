@@ -12,6 +12,7 @@
 #include "game/traversal.h"
 #include "game/lua.h"
 #include "game/map_markers.h"
+#include "game/seats.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
 #include "net/remote_motion.h"
@@ -1144,6 +1145,28 @@ int McCarSwap(lua_State* L) {
     return 4;
 }
 
+// mc_rideseat(seatCount, freeMask, claims) -> seat (0-based) or -1; mc_yieldseat(local, seat, seatCount, freeMask,
+// claims) -> seat to slide to, -1 stay, -2 no seat left. claims: "id:seat ..." of the other players whose states are in
+// this car (game/seats.h). GameMainThread only.
+int McRideSeat(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const char* claims = lua::TypeOf(L, 3) == lua::TString ? lua::ToString(L, 3) : "";
+    lua::PushNumber(L, static_cast<float>(seats::RideSeat(static_cast<int>(num(1)), static_cast<uint32_t>(num(2)),
+                                                          seats::ParseClaims(claims ? claims : ""))));
+    return 1;
+}
+
+int McYieldSeat(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const char* claims = lua::TypeOf(L, 5) == lua::TString ? lua::ToString(L, 5) : "";
+    const float local = num(1);
+    lua::PushNumber(L, static_cast<float>(seats::YieldSeat(
+                           static_cast<uint8_t>(std::clamp(local, 0.0f, 255.0f)), static_cast<int>(num(2)),
+                           static_cast<int>(num(3)), static_cast<uint32_t>(num(4)),
+                           seats::ParseClaims(claims ? claims : ""))));
+    return 1;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1164,6 +1187,8 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_trace", &McTrace);
     lua::RegisterGlobal(L, "mc_carswap", &McCarSwap);
     lua::RegisterGlobal(L, "mc_mapmark", &McMapMark);
+    lua::RegisterGlobal(L, "mc_rideseat", &McRideSeat);
+    lua::RegisterGlobal(L, "mc_yieldseat", &McYieldSeat);
     return true;
 }
 

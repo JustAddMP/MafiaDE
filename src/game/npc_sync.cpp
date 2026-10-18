@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -62,6 +63,10 @@ double Now() {
 net::Session* _session = nullptr;  // render thread
 uint32_t _statesSent = 0, _statesRecv = 0, _hitsSent = 0, _hitsRecv = 0, _deathsSent = 0;
 uint32_t _gStatesSent = 0, _gStatesRecv = 0, _gEnds = 0, _gHits = 0, _gClaims = 0;
+// relay of the guests' own NPCs to the other guests (npc_owner.h "relay"): host: states sent, hits forwarded
+uint32_t _relayMsgs = 0, _relayFwd = 0, _relayRecv = 0;
+double _relayAccum = 0;
+std::map<net::PlayerId, size_t> _relayLast;  // host: NPCs relayed to each guest last round (logged on a change)
 bool _moduleLoaded = false, _moduleFailed = false;  // main thread
 uint32_t _luaErrors = 0;
 
@@ -105,6 +110,39 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     const uint32_t weapon = r.U32();
     const uint8_t hitFlags = r.U8();
     if (r.Failed() || !std::isfinite(amount) || amount < 0 || amount > 10000) return;
+    net::PlayerId owner = 0;
+    uint32_t ownerKey = 0;
+    if (npcown::DecodeRelayKey(key, owner, ownerKey)) {
+        // a hit on another guest's own NPC that we relayed to him: it goes to that guest (HostNpcHit, attacker `from`)
+        bool known = false;
+        {
+            Shared& sh = S();
+            std::lock_guard lock(sh.mu);
+            known = sh.mirrors.Has(owner, ownerKey);
+        }
+        if (!known || owner == from || !_session->FindPlayer(owner)) {
+            MC_LOG_INFO("npc: player %u hit relayed NPC %u (guest %u's %u), which is gone: dropped", from, key, owner,
+                        ownerKey);
+            return;
+        }
+        net::ByteWriter w;
+        w.U32(ownerKey);
+        w.F32(amount);
+        w.U8(dtype);
+        w.U8(zone);
+        w.U32(weapon);
+        w.U8(hitFlags & 1u);
+        w.U8(from);  // the attacker: his puppet fires the replayed shot on the owner's game
+        _session->SendTo(owner, kMsgHostNpcHit, w.Span(), net::Reliability::Reliable);
+        ++_relayFwd;
+        if (_relayFwd <= 40 || _relayFwd % 50 == 0)
+            MC_LOG_INFO("npc: player %u hit guest %u's own NPC %u (relayed as %u): %.1f type %u%s, forwarded to him (#%u)",
+                        from, owner, ownerKey, key, amount, dtype, (hitFlags & 1u) ? ", lethal" : "", _relayFwd);
+        if (core::trace::IsOpen())
+            core::trace::Line("NRH", "from=%u owner=%u key=%u amount=%.2f type=%u lethal=%u", from, owner, ownerKey,
+                              amount, dtype, hitFlags & 1u);
+        return;
+    }
     char buf[128];
     std::snprintf(buf, sizeof buf, "H %u %u %.2f %u %u %u %u\n", static_cast<unsigned>(from), key, amount, dtype, zone,
                   weapon, hitFlags & 1u);
@@ -153,7 +191,8 @@ void OnGuestEnd(net::PlayerId from, net::ByteReader& r) {
 }
 
 // HostNpcHit (guest): u32 key (our NPC), f32 amount, u8 dtype, u8 zone, u32 weapon, u8 flags (1 lethal: the host's
-// copy died of it)
+// copy died of it), u8 attacker (several guests: the player whose hit it was, the host or another guest who saw our NPC
+// relayed; missing = the host)
 void OnHostNpcHit(net::PlayerId from, net::ByteReader& r) {
     if (!_session || _session->IsHost() || from != 0) return;
     const uint32_t key = r.U32();
@@ -162,9 +201,15 @@ void OnHostNpcHit(net::PlayerId from, net::ByteReader& r) {
     const uint32_t weapon = r.U32();
     const uint8_t hitFlags = r.U8();
     if (r.Failed() || !std::isfinite(amount) || amount < 0 || amount > 10000) return;
+    uint8_t attacker = r.AtEnd() ? 0 : r.U8();
+    if (r.Failed() || attacker >= net::kMaxPlayers || attacker == _session->LocalId()) attacker = 0;
     char buf[128];
-    std::snprintf(buf, sizeof buf, "X %u %.2f %u %u %u %u\n", key, amount, dtype, zone, weapon, hitFlags & 1u);
+    std::snprintf(buf, sizeof buf, "X %u %.2f %u %u %u %u %u\n", key, amount, dtype, zone, weapon, hitFlags & 1u,
+                  static_cast<unsigned>(attacker));
     ++_gHits;
+    if (attacker != 0 && (++_relayRecv <= 40 || _relayRecv % 50 == 0))
+        MC_LOG_INFO("npc: player %u hit our own NPC %u on his game (the host relayed it to him): %.1f type %u%s (#%u)",
+                    attacker, key, amount, dtype, (hitFlags & 1u) ? ", lethal" : "", _relayRecv);
     {
         Shared& sh = S();
         std::lock_guard lock(sh.mu);
@@ -210,6 +255,36 @@ void SendHostStates(const std::vector<std::string>& lines) {
     }
     for (auto& buf : npcown::PackStates(states))
         if (_session->Broadcast(kMsgNpcStates, buf, net::Reliability::Unreliable)) ++_statesSent;
+}
+
+// Host, 10 times a second: every guest gets the other guests' own NPCs (our mirrors of them) in NpcStates, keyed by
+// their relay keys (npc_owner.h "relay"), so with three or four players every game sees every guest's own NPCs. With
+// one guest there is nothing to relay.
+constexpr double kRelayInterval = 0.1;
+
+void RelayTick(float dt) {
+    _relayAccum += dt;
+    if (_relayAccum < kRelayInterval) return;
+    _relayAccum = std::fmod(_relayAccum, kRelayInterval);
+    const double now = Now();
+    Shared& sh = S();
+    for (const auto& p : _session->Players()) {
+        if (p.id == net::kHostPlayer) continue;
+        std::vector<NpcState> states;
+        {
+            std::lock_guard lock(sh.mu);
+            states = sh.mirrors.RelayStates(p.id, now);
+        }
+        size_t& last = _relayLast[p.id];
+        if (states.size() != last) {
+            MC_LOG_INFO("npc: relaying %zu of the other guests' own NPCs to guest %u (was %zu)", states.size(), p.id,
+                        last);
+            if (core::trace::IsOpen()) core::trace::Line("NRL", "to=%u n=%zu was=%zu", p.id, states.size(), last);
+            last = states.size();
+        }
+        for (auto& buf : npcown::PackStates(states))
+            if (_session->SendTo(p.id, kMsgNpcStates, buf, net::Reliability::Unreliable)) ++_relayMsgs;
+    }
 }
 
 // ---- Lua ------------------------------------------------------------------------------------------------------------------
@@ -272,7 +347,16 @@ void MirrorCommands(Shared& sh, std::string& cmds) {
             std::snprintf(buf, sizeof buf, "GX %u %u %u %u\n", c.mid, static_cast<unsigned>(c.reason), c.hostKey,
                           static_cast<unsigned>(c.hp));
             cmds += buf;
-            MC_LOG_INFO("npc: mirror %u ends: %s (our NPC %u)", c.mid, npcown::EndName(c.reason), c.hostKey);
+            {
+                net::PlayerId rf = 0;
+                uint32_t rk = 0;
+                if (npcown::DecodeRelayKey(c.hostKey, rf, rk))  // the guest paired it with another guest's (relayed)
+                    MC_LOG_INFO("npc: mirror %u ends: %s (it is guest %u's own NPC %u, which we relay to him: one "
+                                "owner, not two)",
+                                c.mid, npcown::EndName(c.reason), rf, rk);
+                else
+                    MC_LOG_INFO("npc: mirror %u ends: %s (our NPC %u)", c.mid, npcown::EndName(c.reason), c.hostKey);
+            }
             if (core::trace::IsOpen())
                 core::trace::Line("NMX", "mid=%u why=%u host=%u hp=%u", c.mid, static_cast<unsigned>(c.reason),
                                   c.hostKey, static_cast<unsigned>(c.hp));
@@ -401,6 +485,8 @@ void NpcSync::Attach(net::Session& session) {
     std::lock_guard lock(sh.mu);
     sh.guest.Reset();
     sh.mirrors.Reset();
+    _relayLast.clear();
+    _relayAccum = 0;
 }
 
 void NpcSync::Detach() {
@@ -426,10 +512,11 @@ void NpcSync::Detach() {
 void NpcSync::OnPlayerLeft(net::PlayerId id) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    if (sh.isHost) sh.mirrors.OnPlayerLeft(id);
+    if (sh.isHost) sh.mirrors.OnPlayerLeft(id);  // his mirrors go, and with them their relay to the other guests
+    _relayLast.erase(id);
 }
 
-void NpcSync::Tick(float) {
+void NpcSync::Tick(float dt) {
     if (!_session) return;
     Shared& sh = S();
     std::vector<std::string> states, deaths, hits, mirrorHits;
@@ -498,9 +585,11 @@ void NpcSync::Tick(float) {
             w.U8(static_cast<uint8_t>(zone));
             w.U32(weapon >= 0 && weapon <= 4294967295.0 ? static_cast<uint32_t>(weapon) : 0u);
             w.U8(static_cast<uint8_t>(hitFlags & 1u));
+            w.U8(net::kHostPlayer);  // the attacker: we
             _session->SendTo(to, kMsgHostNpcHit, w.Span(), net::Reliability::Reliable);
             ++_gHits;
         }
+        RelayTick(dt);
         return;
     }
     for (const auto& h : hits) {  // "NH key amount dtype zone weapon flags"
@@ -551,12 +640,13 @@ void NpcSync::GetStatus(std::vector<render::OverlayLine>& out) {
         mirrorCount = sh.mirrors.LiveCount();
     }
     const bool host = _session->IsHost();
-    char buf[320];
+    char buf[400];
     std::snprintf(buf, sizeof buf,
-                  "%s (states %u/%u, hits %u/%u, deaths %u; %s %zu, their states %u/%u, ends %u, hits %u, claims %u)",
+                  "%s (states %u/%u, hits %u/%u, deaths %u; %s %zu, their states %u/%u, ends %u, hits %u, claims %u; "
+                  "relay msgs %u, hits %u/%u)",
                   st.empty() ? "NPCs: -" : st.c_str(), _statesSent, _statesRecv, _hitsSent, _hitsRecv, _deathsSent,
                   host ? "guests' own" : "our own", host ? mirrorCount : ownCount, _gStatesSent, _gStatesRecv, _gEnds,
-                  _gHits, _gClaims);
+                  _gHits, _gClaims, _relayMsgs, _relayFwd, _relayRecv);
     out.push_back({buf, 0xFFB0C4DE});
 }
 

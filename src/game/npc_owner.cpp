@@ -117,6 +117,21 @@ float Dist(const NpcState& a, const NpcState& b) {
 }
 }  // namespace
 
+// ---- relay keys -----------------------------------------------------------------------------------------------------------
+uint32_t RelayKey(PlayerId from, uint32_t key) {
+    if ((key & 0xFFu) != kHumanType || key >= (1u << 24) || from < 1 || from > 0x0F) return 0;
+    return (key & ~0xFFu) | (kRelayTypeBase + from);
+}
+
+bool IsRelayKey(uint32_t k) { return k < (1u << 24) && (k & 0xFFu) > kRelayTypeBase; }
+
+bool DecodeRelayKey(uint32_t k, PlayerId& from, uint32_t& key) {
+    if (!IsRelayKey(k)) return false;
+    from = static_cast<PlayerId>((k & 0xFFu) - kRelayTypeBase);
+    key = (k & ~0xFFu) | kHumanType;
+    return true;
+}
+
 // ---- guest --------------------------------------------------------------------------------------------------------------
 void GuestOwner::SetCopies(std::vector<uint32_t> ids) {
     copies_ = std::set<uint32_t>(ids.begin(), ids.end());
@@ -426,6 +441,62 @@ bool HostMirrors::Lookup(uint32_t mid, PlayerId& from, uint32_t& key) const {
     from = it->second.from;
     key = it->second.key;
     return true;
+}
+
+std::set<uint32_t> HostMirrors::Duplicates(PlayerId lo, PlayerId hi) const {
+    struct Cand {
+        float d;
+        bool sameSpot;
+        uint32_t a, b;  // lo's mid, hi's mid
+    };
+    std::vector<Cand> cands;
+    for (const auto& [ma, a] : byMid_) {
+        if (a.from != lo) continue;
+        for (const auto& [mb, b] : byMid_) {
+            if (b.from != hi) continue;
+            const float d = Dist(a.last, b.last);
+            const bool kindOk = a.last.tag == 0 || b.last.tag == 0 || a.last.tag == b.last.tag;
+            const bool sameTag = a.last.tag != 0 && a.last.tag == b.last.tag;
+            if (d <= 2 * kMatchDist && kindOk)
+                cands.push_back({d, true, ma, mb});
+            else if (sameTag && d <= kClaimDist && std::fabs(a.last.z - b.last.z) < kClaimDz)
+                cands.push_back({d, false, ma, mb});
+        }
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
+        if (x.sameSpot != y.sameSpot) return x.sameSpot;
+        if (x.d != y.d) return x.d < y.d;
+        return x.a < y.a || (x.a == y.a && x.b < y.b);
+    });
+    std::set<uint32_t> usedA, out;
+    for (const Cand& c : cands) {
+        if (usedA.count(c.a) || out.count(c.b)) continue;
+        usedA.insert(c.a);
+        out.insert(c.b);
+    }
+    return out;
+}
+
+std::vector<NpcState> HostMirrors::RelayStates(PlayerId to, double now) const {
+    std::map<PlayerId, std::set<uint32_t>> dupes;  // guest F > to: F's mirrors that are one of to's own
+    std::vector<NpcState> out;
+    for (const auto& [mid, m] : byMid_) {
+        if (out.size() >= kMaxRelay) break;
+        if (m.from == to || m.pendingHost) continue;
+        const bool dead = m.deadAt >= 0;
+        if (!dead && now - m.t > kRelayFresh) continue;
+        if (m.from > to) {
+            auto it = dupes.find(m.from);
+            if (it == dupes.end()) it = dupes.emplace(m.from, Duplicates(to, m.from)).first;
+            if (it->second.count(mid)) continue;
+        }
+        const uint32_t rk = RelayKey(m.from, m.key);
+        if (!rk) continue;
+        NpcState s = m.last;
+        s.key = rk;
+        out.push_back(std::move(s));
+    }
+    return out;
 }
 
 size_t HostMirrors::LiveCount() const {

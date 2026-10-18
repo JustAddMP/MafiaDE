@@ -452,9 +452,40 @@ end
 
 function M.DropCar(c)
   if c.orig then M.Restore(c, "copy", false, "its record is dropped") end  -- never leave our real car hidden
-  if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
+  if c.qid then
+    pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
+  elseif c.wasTraffic and valid(c.ent) then
+    pcall(c.ent.SetDespawnImmunity, c.ent, false)  -- our ambient traffic car again
+  end
   M.cars[c.key] = nil
-  log("car " .. c.key .. " removed")
+  log("car " .. c.key .. " removed" .. (c.fromTraffic and (" (a host traffic car's copy, " .. tostring(c.fromTraffic)
+    .. ", that a player took: despawned)") or (c.wasTraffic and " (our traffic car: despawn immunity off)" or "")))
+end
+
+-- Session over (or a lost connection) while the local player sits in a car player_sync made immune: a copy (ours, or
+-- a host traffic car's copy handed over by traffic_sync.lua) or an adopted traffic car of ours. It stays while he is
+-- in it, then goes back to the game: a copy is despawned when unseen (DespawnEntity), a traffic car loses its despawn
+-- immunity. Before, both stayed in the world with despawn immunity for the rest of the game.
+M.leftCopies = M.leftCopies or {}
+
+function M.LeftCopiesTick(p)
+  if next(M.leftCopies) == nil then return end
+  local own = p and p:GetOwner()
+  for k, lc in pairs(M.leftCopies) do
+    if not valid(lc.ent) then
+      M.leftCopies[k] = nil
+    elseif not (own and same(own, lc.ent)) then
+      if lc.qid then
+        local good = pcall(game.traffic.DespawnEntity, game.traffic, lc.qid)
+        log("car " .. tostring(lc.key) .. ": we got out of the copy left from the session: despawned when unseen ("
+          .. (good and "ok" or "failed") .. ")")
+      else
+        pcall(lc.ent.SetDespawnImmunity, lc.ent, false)
+        log("car " .. tostring(lc.key) .. ": we got out of our traffic car left from the session: despawn immunity off")
+      end
+      M.leftCopies[k] = nil
+    end
+  end
 end
 
 -- Make room: drop the oldest copy nobody drives and the local player is not in (not one with our car hidden behind).
@@ -804,8 +835,12 @@ function M.CarTick(c)
     if not c.noAdopt then own, dist, block = M.FindLocalCar(c) end
     if own then
       c.ent, c.st, c.adopted = own, "ready", true
+      -- ambient traffic of ours (a host traffic car a guest jacked on his copy of it): its despawn immunity goes off
+      -- again when we are done with it (M.ReleaseCar); a mission car keeps it (its mission may have set it)
+      c.wasTraffic = M.Traffic and M.Traffic.IsTraffic and M.Traffic.IsTraffic(own) or nil
       try("SetDespawnImmunity", own.SetDespawnImmunity, own, true)
-      log(string.format("car %s: our own %s stands there (%.1f m): it is this car here", c.key, c.model, dist))
+      log(string.format("car %s: our own %s stands there (%.1f m): it is this car here%s", c.key, c.model, dist,
+        c.wasTraffic and " (ambient traffic)" or ""))
       return
     end
     if block then  -- wait until the other player's car has moved off it (his puppet stays hidden meanwhile)
@@ -1018,7 +1053,15 @@ function M.CarsUpdate(p)
       key = M.localId .. ":" .. guidNum(car)
       c = { key = key, model = car:GetVehicleModelName(), st = "ready", ent = car, used = M.now }
       M.cars[key] = c
-      log("car " .. key .. ": ours, " .. c.model)
+      -- the copy we sat in when the last session ended (or the connection was lost) is a copy again, not ours
+      for k, lc in pairs(M.leftCopies) do
+        if same(lc.ent, car) then
+          c.qid, c.wasTraffic, c.fromTraffic = lc.qid, lc.wasTraffic, lc.fromTraffic
+          M.leftCopies[k] = nil
+          log("car " .. key .. ": the car we sat in when the session went (" .. tostring(lc.key) .. ") is in it again")
+        end
+      end
+      log("car " .. key .. ": ours, " .. c.model .. (c.qid and " (a copy)" or ""))
     end
     -- a ride along into this car is under way and the game slid us to the wheel (M.RideTick moves us over): we are
     -- still getting in (seat 9) for the others and do not take the car from its driver
@@ -1044,8 +1087,19 @@ function M.CarsUpdate(p)
       if c and c.driver == "local" then
         if pp.conflict ~= pp.vkey then log("car " .. pp.vkey .. ": player " .. id .. " drives it too; we keep it") end
         pp.conflict = pp.vkey
+      elseif c and c.driver and c.driver ~= "local" and c.driver ~= id and M.pup[c.driver]
+        and M.pup[c.driver].veh and M.pup[c.driver].vkey == pp.vkey and M.pup[c.driver].seat == 0 then
+        -- two other players claim its wheel at once (three or more players; they got in at the same moment): the one
+        -- who has it here keeps it until his state leaves the wheel (before, the claim flipped every tick: a "drives
+        -- it" line per tick and a fresh copy swap each time)
+        if pp.conflict ~= pp.vkey then
+          log("car " .. pp.vkey .. ": player " .. id .. " claims its wheel too; player " .. c.driver .. " keeps it here")
+          trace("DRV", string.format("key=%s keeps=%s claims=%s", pp.vkey, tostring(c.driver), tostring(id)))
+        end
+        pp.conflict = pp.vkey
       else
         c = M.EnsureCar(pp.vkey, pp.veh, pp.cx, pp.cy, pp.cz, pp.qx, pp.qy, pp.qz, pp.qw)
+        pp.conflict = nil
         if c.driver ~= id then
           log("car " .. pp.vkey .. ": player " .. id .. " drives it")
           -- noNpc: a real car of ours that came back from a swap (it threw his puppet out before): a copy at once
@@ -1140,11 +1194,23 @@ function M.RideAlong(p)
     end
   end
   if not best then return end
+  -- A passenger seat that is free here and that no other player's state names (src/game/seats.h): with three or four
+  -- players the seat of another passenger whose puppet is not seated here yet looked free (both would sit in it).
+  local count, free, claims = M.SeatView(best)
   local seat
-  for s = 1, (best.ent:GetSeatCount() or 1) - 1 do
-    if not valid(best.ent:GetSeatOwner(s)) then seat = s break end
+  if mc_rideseat then
+    seat = tonumber(mc_rideseat(count, free, claims))
+    if seat and seat < 1 then seat = nil end
+  else  -- an older dll with this file as a dev override: the first free seat here
+    for s = 1, count - 1 do
+      if not valid(best.ent:GetSeatOwner(s)) then seat = s break end
+    end
   end
-  if not seat then log("ride along: no free seat in " .. best.key); return end
+  if not seat then
+    log("ride along: no free seat in " .. best.key .. " (" .. count .. " seats, free here " .. M.SeatBits(free, count)
+      .. ", the others' seats: " .. (claims ~= "" and claims or "none") .. ")")
+    return
+  end
   -- The game slides a player who gets in beside an empty driver seat over to the wheel (0.13.0 two-PC test: the
   -- guest got in while the host's puppet had just been thrown out, and sat at the wheel of the host's car: "we took the
   -- wheel while player 0 drove it"). The driver's puppet is put in its seat first; if that does not work, no ride.
@@ -1163,7 +1229,89 @@ function M.RideAlong(p)
   try("LockControls", p.LockControls, p, true)  -- a scripted enter only works for the player with controls locked
   local so = try("GetOnVehicle", p.GetOnVehicle, p, best.ent, seat + 1, false, "WALK")
   M.ride = { so = so, t = M.now, key = best.key, seat = seat, c = best }
-  log("ride along: seat " .. seat .. " of car " .. best.key .. " (at the wheel: " .. h0 .. ")")
+  log("ride along: seat " .. seat .. " of car " .. best.key .. " (at the wheel: " .. h0 .. "; the others' seats: "
+    .. (claims ~= "" and claims or "none") .. ")")
+end
+
+-- Car record c as the seat rules see it (src/game/seats.h): its seat count, a bit mask of the seats free on this game,
+-- and "id:seat ..." for every other player whose state is in this car.
+function M.SeatView(c)
+  local g, n = pcall(c.ent.GetSeatCount, c.ent)
+  n = math.min((g and tonumber(n)) or 4, 8)
+  local free, bit = 0, 1
+  for s = 0, n - 1 do
+    local good, o = pcall(c.ent.GetSeatOwner, c.ent, s)
+    if good and not valid(o) then free = free + bit end
+    bit = bit * 2
+  end
+  local claims = {}
+  for id, pp in pairs(M.pup) do
+    if pp.veh and pp.vkey == c.key and pp.seat then claims[#claims + 1] = id .. ":" .. tostring(pp.seat) end
+  end
+  table.sort(claims)
+  return n, free, table.concat(claims, " ")
+end
+
+function M.SeatBits(free, n)
+  local t = {}
+  for s = 0, n - 1 do
+    if free % 2 == 1 then t[#t + 1] = tostring(s) end
+    free = math.floor(free / 2)
+  end
+  return #t > 0 and table.concat(t, ",") or "none"
+end
+
+-- Two players in the same passenger seat (they got in at the same moment, each game saw it free): the lower player
+-- id keeps it, we (the higher) slide to a seat that is free and unclaimed (src/game/seats.h). Checked twice a second
+-- while we ride; one slide at a time.
+function M.SeatTick(p)
+  local my = M.my
+  if not my or not my.c or my.seat == 0 or my.seat == 9 or M.ride or not mc_yieldseat then
+    M.seatYield = nil
+    return
+  end
+  local c = my.c
+  if not (c.ent and valid(c.ent)) then return end
+  if M.now - (M.seatYieldT or -10) < 0.5 then return end
+  M.seatYieldT = M.now
+  local y = M.seatYield
+  if y and y.key == my.key and y.from == my.seat and M.now - y.t < 2.5 then return end  -- a slide under way
+  local count, free, claims = M.SeatView(c)
+  local to = tonumber(mc_yieldseat(tonumber(M.localId) or 0, my.seat, count, free, claims))
+  if not to or to == -1 then
+    if y and y.key == my.key then
+      log("seats: we keep seat " .. my.seat .. " of car " .. my.key .. " (the others' seats: "
+        .. (claims ~= "" and claims or "none") .. ")")
+    end
+    M.seatYield = nil
+    return
+  end
+  if to == -2 then
+    if not (y and y.none == my.key) then
+      log("seats: a player with a lower id sits in our seat " .. my.seat .. " of car " .. my.key .. " too, and no "
+        .. "other seat is free (free here " .. M.SeatBits(free, count) .. ", the others' seats: " .. claims
+        .. "): we stay; his puppet is hidden on our game, ours on the others'")
+    end
+    M.seatYield = { key = my.key, from = my.seat, t = M.now, none = my.key }
+    return
+  end
+  -- SlideToSeat is UNVERIFIED (docs/game-api.md 18): after three slides that did not move us, we stay
+  local tries = (y and y.key == my.key and y.from == my.seat and y.tries or 0) + 1
+  if tries > 3 then
+    if not y.gaveUp then
+      y.gaveUp = true
+      log("seats: three slides out of seat " .. my.seat .. " of car " .. my.key .. " did not move us: we stay")
+    end
+    y.t = M.now
+    return
+  end
+  local good, err = pcall(p.SlideToSeat, p, to + 1)
+  M.seatYield = { key = my.key, from = my.seat, t = M.now, tries = tries }
+  log(string.format("seats: player with a lower id sits in our seat %d of car %s too (the others' seats: %s): we "
+    .. "slide to seat %d (%s, try %d)", my.seat, my.key, claims, to, good and "sent" or ("failed: " .. tostring(err)),
+    tries))
+  trace("SEA", string.format("key=%s from=%d to=%d claims=%s ok=%d", my.key, my.seat, to, (claims:gsub(" ", ",")),
+    good and 1 or 0))
 end
 
 -- Ride along under way: where the game put us is checked once we are in the car; at the wheel instead of the chosen
@@ -1849,11 +1997,17 @@ function M.RemoveAll()
       end
     end
     if c.orig then  -- kept in M.leftCars
-    elseif c.qid and not c.localIn then
-      M.DropCar(c)
+    elseif (c.qid or c.wasTraffic) and not c.localIn then
+      M.DropCar(c)  -- a copy (ours, or a host traffic car's that a player took) goes; our traffic car loses its immunity
     elseif c.ent and valid(c.ent) then  -- ours, or the copy we sit in: back to a normal car
       pcall(c.ent.Unlock, c.ent)
       pcall(c.ent.UnlockPlayerEntryPoints, c.ent)
+      if c.qid or c.wasTraffic then  -- we sit in it: it goes back to the game once we are out (M.LeftCopiesTick)
+        M.leftCopies[c.key] = { ent = c.ent, qid = c.qid, wasTraffic = c.wasTraffic, fromTraffic = c.fromTraffic,
+          key = c.key }
+        log("car " .. c.key .. ": session over while we sit in it (" .. (c.qid and "a copy" or "our traffic car")
+          .. "): it goes back to the game once we are out")
+      end
     end
   end
   M.cars = {}
@@ -2565,7 +2719,8 @@ end
 function M.HurtByNpc(p, from, amount, dtype, zone)
   local want = dtype == 0 and amount * (M.shotScale or SHOT_SCALE) or amount
   M.npcHits = (M.npcHits or 0) + 1
-  M.HurtScript(p, from, want / (M.dmgScale or 0.65), dtype, zone, "host NPC #" .. M.npcHits)
+  M.HurtScript(p, from, want / (M.dmgScale or 0.65), dtype, zone,
+    (tostring(from) == "0" and "host NPC #" or ("an own NPC of player " .. tostring(from) .. ", #")) .. M.npcHits)
 end
 
 function M.HurtScript(p, from, amount, dtype, zone, how)
@@ -2632,10 +2787,14 @@ end
 function M.ApplyHit(p, from, amount, dtype, zone, byNpc, npc)
   if M.down or p:IsDeath() then return end
   if byNpc then
-    -- our own copy of that NPC is hostile and fights us here (its hits are already ours): not twice
-    if M.Npc and M.Npc.FightsUs and M.Npc.FightsUs(npc) then
+    -- our own copy of that NPC is hostile and fights us here (its hits are already ours): not twice. from: whose
+    -- game's NPC it is (the host's, or another guest's own NPC, known here by its relay key: npc_sync.lua N.FightsUs)
+    if M.Npc and M.Npc.FightsUs and M.Npc.FightsUs(npc, from) then
       M.npcHitsCovered = (M.npcHitsCovered or 0) + 1
-      if M.npcHitsCovered <= 10 then log("host NPC " .. tostring(npc) .. " hit our puppet there: our copy fights us here, not applied") end
+      if M.npcHitsCovered <= 10 then
+        log("NPC " .. tostring(npc) .. " of player " .. tostring(from) .. "'s game hit our puppet there: our copy "
+          .. "fights us here, not applied")
+      end
       return
     end
     return M.HurtByNpc(p, from, amount, dtype, zone)
@@ -3287,6 +3446,7 @@ function M.Update(dt, cmds)
   if player and not M.inWorldAt then
     M.inWorldAt = M.now
     M.grave = {}  -- a new world: the old one's entities are gone
+    M.leftCopies = {}
     log("local player in world")
     local good, err = pcall(M.CarsNewWorld)  -- hidden real cars: shown again or forgotten
     if not good then logErr("cars new world", err) end
@@ -3439,8 +3599,14 @@ function M.Update(dt, cmds)
       if not good then logErr("ride along", err) end
     end
     pcall(M.RideTick, player)
+    if active then
+      good, err = pcall(M.SeatTick, player)
+      if not good then logErr("seats", err) end
+    end
     good, err = pcall(M.LeftCarsTick, player)
     if not good then logErr("left cars", err) end
+    good, err = pcall(M.LeftCopiesTick, player)
+    if not good then logErr("left copies", err) end
   end
 
   if mc_trace and active and player and M.now - (M.trT or -1) >= TRACE_PERIOD then

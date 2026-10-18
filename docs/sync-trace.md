@@ -70,6 +70,10 @@ on the other.
 | `NGC` | guest | per NpcClaim | `key host dead ours` (C++) |
 | `NMC` | host | per claim sent | `mid to key host dead` (C++) |
 | `NMX` | host | mirror end | `mid why host hp` (C++) |
+| `NRL` | host | when the count changes | several guests: `to n=<other guests' own NPCs relayed to him this round> was` (C++; npc_owner.h "relay") |
+| `NRH` | host | per forwarded hit | several guests: a guest hit another guest's own NPC (its relay key): `from owner key=<the owner's id of it> amount type lethal` (C++; sent to the owner as HostNpcHit with `from` as the attacker) |
+| `SEA` | both | per seat yield | several players in one car: `key from=<our seat> to=<seat we slide to> claims=<id:seat of the others' states> ok` (Lua, src/game/seats.h) |
+| `DRV` | both | once per conflict | two other players claim the wheel of one car: `key keeps=<the driver here> claims=<the other one>` (Lua) |
 | `TRH` | host | 2 Hz | traffic totals: `cars=<host traffic cars near guests> spawnMsgs stateMsgs despawnMsgs bytes=<all traffic bytes sent> bumps=<TrafficBump received>` |
 | `TRP` | host | 2 Hz per guest | `id relevant=<host cars in his range> admitted=<cars he has copies of> spawned despawned states skipped=<unchanged, not sent> bytes deferred=<due but over the budget, this tick>` |
 | `TRG` | guest | 2 Hz | `mode=<1 host traffic here, 0 our own> known live copies avg max=<copy vs target, m> pins snaps bumps states spawns despawns old=<states dropped as older>` |

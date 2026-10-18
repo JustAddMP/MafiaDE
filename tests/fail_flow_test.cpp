@@ -382,6 +382,90 @@ void Timeouts() {
 
 }  // namespace
 
+namespace {
+
+// ---- several guests (host + 3): each guest's failure is his own; the host's failure is everyone's ----
+// Guest 1 fails alone: he alone is asked back and loads the host's point; guests 2 and 3 play on untouched.
+void ThreeGuestsOneFails() {
+    Game h(FailRole::HostChapter), g1(FailRole::Guest), g2(FailRole::Guest), g3(FailRole::Guest);
+    Game* gs[] = {&g1, &g2, &g3};
+    h.Tick(0);
+    for (Game* g : gs) g->Tick(0);
+    g1.Fail(42, 1);
+    const FailVerdict v = h.flow.Decide(true, true);  // the host plays on: REJOIN for guest 1 only (SendTo him)
+    g1.flow.OnVerdict(v, g1.lastReportSeq, 42, 1.3);
+    g1.Apply();
+    for (double t = 1.5; t < 30; t += 0.5) {
+        if (t >= 2.5) g1.inWorld = t < 2.5 || t >= 10;  // out of the failed world, back in the host's point at 10
+        h.Tick(t);
+        for (Game* g : gs) g->Tick(t);
+    }
+    Check(g1.loads == 1 && g1.quits == 1 && g1.flow.GetState() == State::Idle, "3 guests: the failed guest loads once");
+    Check(g2.loads == 0 && g2.quits == 0 && g3.loads == 0 && g3.quits == 0 && !g2.flow.Busy() && !g3.flow.Busy(),
+          "3 guests: the others play on (no quit, no load, idle)");
+    Check(h.loads == 0 && h.hostFailedSent == 0, "3 guests: the host plays on");
+}
+
+// Two guests fail one after the other (the same timer ran out on both games): each report gets its own REJOIN, each
+// loads once; a stale answer meant for one never moves the other.
+void ThreeGuestsTwoFail() {
+    Game h(FailRole::HostChapter), g1(FailRole::Guest), g2(FailRole::Guest), g3(FailRole::Guest);
+    h.Tick(0);
+    g1.Tick(0), g2.Tick(0), g3.Tick(0);
+    g1.Fail(7, 1);
+    g2.Fail(7, 1.2);
+    // the host answers each report with its own seq (SendFailVerdict to the reporter)
+    g1.flow.OnVerdict(h.flow.Decide(true, true), g1.lastReportSeq, 7, 1.3);
+    g1.Apply();
+    g3.flow.OnVerdict(FailVerdict::Rejoin, 1, 7, 1.3);  // a misrouted answer to a guest who never asked: ignored
+    g3.Apply();
+    g2.flow.OnVerdict(h.flow.Decide(true, true), g2.lastReportSeq, 7, 1.5);
+    g2.Apply();
+    Check(g1.flow.GetState() == State::GuestRejoin && g2.flow.GetState() == State::GuestRejoin && !g3.flow.Busy(),
+          "3 guests, 2 fail: both rejoin, the third ignores an unasked answer");
+    for (double t = 2; t < 40; t += 0.5) {
+        g1.inWorld = g2.inWorld = t >= 12;
+        h.Tick(t);
+        g1.Tick(t), g2.Tick(t), g3.Tick(t);
+    }
+    Check(g1.loads == 1 && g2.loads == 1 && g3.loads == 0 && !g1.flow.Busy() && !g2.flow.Busy(),
+          "3 guests, 2 fail: one load each for the two, none for the third");
+}
+
+// The host fails: HostFailed goes to every guest (Broadcast); all three wait for him and load his checkpoint once
+// each when he is back, guest 3 having failed himself a moment before (his WAIT answer and the notice agree).
+void ThreeGuestsHostFails() {
+    Game h(FailRole::HostChapter), g1(FailRole::Guest), g2(FailRole::Guest), g3(FailRole::Guest);
+    Game* gs[] = {&g1, &g2, &g3};
+    h.Tick(0);
+    for (Game* g : gs) g->Tick(0);
+    g3.Fail(5, 0.9);
+    h.Fail(5, 1);
+    Check(h.hostFailedSent == 1, "3 guests, host fails: one notice (a broadcast to all)");
+    g3.flow.OnVerdict(h.flow.Decide(true, true), g3.lastReportSeq, 5, 1.05);  // the host is reloading: WAIT
+    g3.Apply();
+    for (Game* g : gs) {
+        g->flow.OnVerdict(FailVerdict::HostFailed, 0, 5, 1.1);
+        g->Apply();
+    }
+    bool allWait = true;
+    for (Game* g : gs) allWait &= g->flow.GetState() == State::GuestWaitHost;
+    Check(allWait && g1.quits == 1 && g2.quits == 1 && g3.quits == 1, "3 guests, host fails: all wait, each left once");
+    for (double t = 1.5; t < 60; t += 0.5) {
+        const bool hostBack = t >= 20;
+        h.inWorld = t < 2 || hostBack;
+        for (Game* g : gs) g->inWorld = t < 2 || t >= 25;
+        h.Tick(t);
+        for (Game* g : gs) g->Tick(t, h.inWorld, hostBack);
+    }
+    bool once = true, idle = true;
+    for (Game* g : gs) once &= g->loads == 1, idle &= !g->flow.Busy();
+    Check(once && idle && h.loads == 1, "3 guests, host fails: one load on every game",
+          std::to_string(g1.loads) + "/" + std::to_string(g2.loads) + "/" + std::to_string(g3.loads));
+}
+
+}  // namespace
+
 int main() {
     HostChapterFails();
     HostChapterWithoutCheckpoint();
@@ -402,6 +486,9 @@ int main() {
     BusyAndReset();
     Notices();
     Timeouts();
+    ThreeGuestsOneFails();
+    ThreeGuestsTwoFail();
+    ThreeGuestsHostFails();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "all passed", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }
