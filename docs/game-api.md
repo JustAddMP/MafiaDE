@@ -363,6 +363,53 @@ lobby (src/game/player_sync.lua "Name tags and map markers", src/game/module.cpp
 | `game.navigation:RegisterHumanEntityDirect(human, 1, 1)` | **minimap/map marker on a human**: returns an id (11, 12, ...); an orange marker appeared on the minimap at the human's position and followed it (also on the guest's map for the host's puppet in Free Ride). `RegisterHumanEntity(name, type, state)` wants the entity **name** (string) as 2nd argument. Types 0, 2-6 (state 1) and states 0, 2, 3 (type 1) showed nothing, but they were tried on a human that had had an icon before: after `UnregisterId(id)` the **same entity never gets a second icon** (every later register returns a new id and shows nothing; a fresh human gets one at once). The game's own node `Game.Hud.CreateHumanIcon` uses this call (`inEntity`, `inHumanNavType`, `inHumanNavState`); other icons: `RegisterIconEntityDirect(entity, icon, textId, desc, showText, showIcon, picture[, color])` (`Game.Hud.CreateMapIconOnEntity`), not used |
 | `game.navigation:UnregisterId(id)` | removes the marker |
 
+**Every other player on the map (static only, NOT verified in game).** Since this change every other player in the
+session has exactly one navigation icon while we are in a world, whatever he does (src/game/player_sync.lua "Map
+markers", the decision in src/game/map_markers.h, unit-tested by tests/map_markers_test.cpp):
+
+| his state | his icon |
+|---|---|
+| puppet alive, shown, on foot | the human icon on the puppet (`RegisterHumanEntityDirect(puppet, 1, 1)`, verified above), it follows the entity |
+| driving or riding (seat 0-3) | the same icon at his car's spot from his latest state (`cx cy cz` of the `T` command), moved with `ChangeIconTargetToPos` when he is more than 1 m from it, at most 5 times a second |
+| puppet hidden (cutscene, no car copy yet), dead and respawning, re-created, model swapped, factory reset, puppet never spawned, far away | the same icon at his position from his latest state (the C++ side sends every remote player's state every tick, near or far) |
+| no puppet yet in this world (just joined, far away, his model still loading) | a position icon (`RegisterIconPos`, type `freeride-generic`, UNVERIFIED look), replaced by the human icon once his puppet exists |
+| left / session over / map markers off / our world goes (loading screen, mission_sync's quit) | `UnregisterId` |
+
+The icon is moved off a puppet (to his position) **before** the puppet is released (`M.Unmark`: the factory reset and
+`M.PuppetLife`'s respawn; `M.Remove` unregisters it), so the navigation module never reads a released puppet through
+an icon (the crash in section 15). Because the game gives an entity no second human icon after `UnregisterId`, the
+icon is kept and moved (`ChangeIconTargetToEntityDirect` onto a new puppet) instead of being made again; a puppet
+whose icon was unregistered is remembered (`pp.mkBurnt`) and only gets an icon moved onto it. The name of the player
+(the `N id name` command, once a second from player_sync.cpp) is set with `SetIconTextByNavId`; every icon of ours gets
+`SetIconFarVisibility(id, true)`. Log: `sync: player <id>: map marker <nav id> made on his puppet / at his position /
+off his puppet / on his puppet / removed (<why>)`; trace `MK` (counts, 1 Hz) and `MKE` (each change), sync-trace.md.
+
+What the exe and the game's own scripts say about `game.navigation` (`C_NavigationScriptW`, method table RVA
+0x5AF9720: 106 methods plus __gc and __eq; re-notes lists the first 88; the argument types are read from the classic binding's checks:
+`isnumber` 0x785B30, `isstring` 0x1254DD0, `isboolean` 0x1AC6B10, entity 0x1ABD980, vehicle 0x1ABD570, vector
+0x3810FF0, self adaptor 0x3811340; usage from the game's compiled scripts in `sds_retail/tables/scripts.sds` and
+`script/vi_flownodes.sds`, unpacked with the game's own `oo2core_8_win64.dll`):
+
+| call | arguments (static) | notes |
+|---|---|---|
+| `RegisterHumanEntityDirect(human, type, state)` | entity (must be a human: entity type byte 8), number, number -> id | looks the entity up first (map by GUID at manager +0x170): a human icon already on it is **updated and its id returned**; `type` is `script_enums.HumanNavType` (names SQUEALER, BOSS, UNFRIENDLY, FRIEND, POLICE, WINGMAN; the numbers are not in the data we read; 1 = the orange one we use, likely SQUEALER), `state` `HumanNavState` (DEFAULT, SEARCH, RECOGNIZE, ANGRY) |
+| `RegisterIconPos(...)` | 5 to 11 arguments: `(x, y, icon, text, showText)`, `(x, y, icon, text, showText, desc)`, `(+ picture)`, `(+ colour number)`, `(x, y, icon, text, showText, desc, picture, colour, s, s)`, `(x, y, z, icon, text, showText, desc, picture, colour, s, s)` -> id | the shorter forms put z = 0, colour 0xFFFFFF, desc "0". The game calls e.g. `RegisterIconPos(x, y, "relay_collectable", "UI_Text_home", .., "UI_Text_homeDescription", "/gui/pop/home.dds")` and `RegisterIconPos(x, y, z, "race_checkpoint", "racing_checkpoint", .., tonumber("FFFFFF", 16), ..)`. `icon` is a name from the navigation config in `ingame_gui.sds` (e.g. `freeride-generic`, `freeride-challenge`, `car_player`, `car_hostile`, `race_checkpoint`, `relay_collectable`, `collectable_*`, `health_station`, `objective_warning`, `informant`); `text`/`desc` are string table ids |
+| `RegisterIconEntityDirect(entity, ...)` | same overload scheme with an entity first | used by the game for informants, pickups (`grow_house_pickup`), health stations |
+| `RegisterVehicleDirect(car, type)` | vehicle, string -> id | `type` from the vehicle list `enemy police_car taxi_car enemy_squeeler enemy_enforcer enemy_boat police_boat player_car player_boat vehicle taxi_target`; the game uses `"enemy"` (node `Game.Hud.CreateVehicleIcon`, default `enemy`). Not used: a car copy is despawned in many places (M.Swap, M.Restore, M.DropCar), and an icon on a released car is the same crash risk as on a puppet |
+| `ChangeIconTargetToPos(id, vector)` | number, C_Vector -> bool | moves an icon (any kind) to a position; unlinks it from its entity (0x305FBC0) first. The game's objective scripts switch icons between entities and positions with this pair |
+| `ChangeIconTargetToEntityDirect(id, entity)` | number, entity -> bool | puts an icon on an entity (false when the entity is not usable or the id unknown) |
+| `SetIconTextByNavId(id, text)` | number, string | the game sets e.g. `"%\nDEFENSE"` texts with it; where the full map shows it (hover popup?) is UNVERIFIED |
+| `SetIconFarVisibility(id, bool)` | number, boolean | the flow node `Game:Hud` icon nodes feed it from their `inRadarEdge` input: most likely "stay on the minimap's edge when out of range" (UNVERIFIED) |
+| `SetIconMapVisibilityByNavId(id, bool)` / `SetIconRadarVisibilityByNavId(id, bool)` | number, boolean | map / minimap visibility of one icon (not used) |
+| `SetIndicatorHideRange(id, m)` | number, number | (not used) |
+| `SetIconFakeGPSPositionOnEntity(id, vector)`, `SetIconOverrideIndicatorPosition(id, vector)`, `SelectIcon(id)` | | (not used) |
+
+UNVERIFIED (needs the in-game test): that a human icon moved with `ChangeIconTargetToPos` is still drawn (on the
+minimap and the full map) and moves when moved again; that `freeride-generic` gives a visible icon; that
+`ChangeIconTargetToEntityDirect` puts a moved icon back on a (new) puppet; where the name shows; what
+`SetIconFarVisibility` does; whether the navigation module keeps or drops icons across a world load (we unregister
+ours on the first tick without a world, and forget, without unregistering, any id made in an earlier world).
+
 **Starting Free Ride / Continue from the main menu.** The main menu's AS3 (`pages::main_menu_page_main`) starts a
 game with `menu_parent.LoadGame(name)` (`main_menu` class): `"free_ride"` (the FREE RIDE entry, and the Free Ride
 info page's START), `"free_ride_extreme"`, `"continue_game"` (CONTINUE), `"new_game"`. `LoadGame` fades to black and
