@@ -15,6 +15,7 @@
 #include "game/save_guard.h"
 #include "game/sectors_guard.h"
 #include "game/traffic_sync.h"
+#include "game/police_sync.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -194,6 +195,7 @@ public:
             MissionSync::Install();
             NpcSync::Install();
             TrafficSync::Install();
+            PoliceSync::Install();  // after TrafficSync: traffic_sync.lua asks police_sync.lua
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -207,18 +209,21 @@ public:
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
+        PoliceSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        PoliceSync::Detach();
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);
         TrafficSync::OnPlayerLeft(id);
+        PoliceSync::OnPlayerLeft(id);
     }
 
     // ---- reconnect (core: docs/protocol.md "Reconnect"; ours: docs/protocol.md "Reconnect") ----
@@ -230,6 +235,7 @@ public:
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);      // his own NPCs' mirrors go; he sends them again when back
         TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
+        PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
     }
     // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
     // session turns inactive), the story keeps the host's point (MissionSync), our NPC copies are dropped (NpcSync).
@@ -254,6 +260,7 @@ public:
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
+        PoliceSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -274,6 +281,9 @@ public:
         case 0x0221: return "TrafficDespawn";
         case 0x0222: return "TrafficStates";
         case 0x0223: return "TrafficBump";
+        case 0x0260: return "PoliceState";
+        case 0x0261: return "PoliceEvent";
+        case 0x0262: return "PoliceChase";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
         case 0x0420: return "GuestNpcStates";
@@ -288,6 +298,7 @@ public:
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);
+        PoliceSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }

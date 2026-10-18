@@ -44,6 +44,10 @@ src/game/
                          InterestManager, net ids, spawn/despawn/packed states); a guest near the host turns his
                          own traffic off and drives crewed copies with core's VehicleController
   traffic_model.{h,cpp}  the game-free part of it (wire format, host tracking, guest table), tests/traffic_test.cpp
+  police_sync.{h,cpp,lua} police: every player's wanted state (his own game's) broadcast; a wanted guest near the
+                         host is a target of the host's police (his puppet), and his game holds its level while they
+                         chase him
+  police_model.{h,cpp}   the game-free part of it (wire format, targets, chase answer), tests/police_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)

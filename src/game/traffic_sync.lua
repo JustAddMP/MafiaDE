@@ -25,8 +25,8 @@
 --                                              guest: drive that copy (VehicleCommand, the host car's controls)
 -- Output (events, one per line):
 --   TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags
---                                              host: one traffic car (flags: 2 siren, 4 no driver, 8 controls known,
---                                              16 reversing); then
+--                                              host: one traffic car (flags: 2 siren (police: read, else a guess),
+--                                              4 no driver, 8 controls known, 16 reversing); then
 --   TE                                         host: end of the round
 --   TV id x y z                                host: where guest `id` is (his puppet / his car here)
 --   TP x y z known hx hy hz                    guest: where we are and the host is (known 0: not seen)
@@ -43,7 +43,7 @@ T.version = 1
 local SCAN_INTERVAL = 1.0   -- s between scans of the car table (host)
 local SEND_INTERVAL = 0.05  -- s between host rounds
 local RANGE = 380           -- m from a guest: host cars reported (the C++ side admits within 260 m)
-local SIREN_SPEED = 14      -- m/s: a police car this fast has its siren on (no siren getter: a guess)
+local SIREN_SPEED = 14      -- m/s: a police car this fast has its siren on (when its signals cannot be read)
 local SIREN_HOLD = 8        -- s the siren stays on after that
 local ORPHAN_KEEP = 20      -- s a traffic car that lost its driver is still shared
 local MAX_OBTAINS = 3       -- copies loading at once (guest)
@@ -225,8 +225,17 @@ function T.HostSend(ev)
             if good and d and (d.x * s.x + d.y * s.y + d.z * s.z) / spd < -0.5 then flags = flags + 16 end
           end
           if c.kind == 1 then
-            if spd > SIREN_SPEED then c.sirenT = M.now end
-            if c.sirenT and M.now - c.sirenT < SIREN_HOLD then flags = flags + 2 end
+            -- the car's own siren / beacon when its signals can be read (car_signals.h: 128 valid, 32 siren, 16
+            -- beacon); else a guess: fast, or near a player our police hunt (police_sync.lua)
+            local sig = mc_car_signals and mc_car_signals(id)
+            sig = sig and math.floor(sig) or 0
+            if sig >= 128 then
+              if math.floor(sig / 32) % 2 == 1 or math.floor(sig / 16) % 2 == 1 then flags = flags + 2 end
+            else
+              local P = M.Police
+              if spd > SIREN_SPEED or (P and P.ChaseNear and P.ChaseNear(q.x, q.y, q.z)) then c.sirenT = M.now end
+              if c.sirenT and M.now - c.sirenT < SIREN_HOLD then flags = flags + 2 end
+            end
           end
           if c.orphanT then flags = flags + 4 end
           ev[#ev + 1] = string.format("TC %d %d %s %d %d %s %.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f "

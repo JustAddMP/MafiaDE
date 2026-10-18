@@ -828,7 +828,65 @@ each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
 | `car:Deactivate()` / `Activate()` on a traffic car and its crew | the guest's own moving traffic cars farther than 70 m are hidden this way while the host's traffic shows, shown again afterwards. **UNVERIFIED** for crewed traffic cars (verified only for an empty mission car, section 7) |
 | `ObtainCarWithCrew(model, {profile})` for a copy | crew profile: the first profile path found in `data_traffic.crew_presets.civilian_white_crew` (police: `police_lvl1`), else `visuals/hero/game_main_tommy_gangster_trenchcoat`. **UNVERIFIED** layout of the presets (the log names the profile used); `ObtainSpecificCar(model)` (no crew) when it is refused |
 | crew `LockControls(true)` | so the copy's own AI driver does not steer against the host car's controls. **UNVERIFIED** that it stops a traffic AI (if not, the VehicleController pins the copy, as for player car copies) |
-| `car:SetSirenOn(b)`, `car:SetBeaconLightOn(b)` | police copies, from the host's siren flag. There is no siren getter, so the host's flag is a guess: on while a police car goes faster than 14 m/s and 8 s after |
+| `car:SetSirenOn(b)`, `car:SetBeaconLightOn(b)` | police copies, from the host's siren flag: the host reads its police car's siren / beacon bits (`mc_car_signals`, section 20); only when they cannot be read the flag is a guess: on while a police car goes faster than 14 m/s (or is near a hunted player) and 8 s after |
 | `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on |
 | `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7) |
 | `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |
+
+## 20. Police and wanted levels on two games - static only, NOT verified in game
+
+Used by src/game/police_sync.* (messages in docs/protocol.md "Police", the pure logic in src/game/police_model.h,
+tests/police_test.cpp). Found statically (docs/re-notes.md 10, the game's flow scripts in scripts.sds); nothing here
+has been run in the game yet. Each call is wrapped in `pcall` and its failure logged (`police: ... failed`).
+
+How the game's police work (from the bindings): **one police zone for the player** (`game.police` keeps it): a
+SEARCH (blue) or HUNT (red) zone with a centre and an escalation level. It is the wanted state: wanted = a zone
+exists; "lose the cops" = leave it until it decays (`BLUEZONE_DECAY`, `POLICE_ZONE_DECAYED`); the HUD shows it.
+Fines and arrests are police activities with their own events. There is no wanted-level getter and no bribe API.
+
+| call | notes |
+|---|---|
+| `game.police:GetActiveZones()` | varargs: `0` when our player has a zone, nothing otherwise (re-notes 10). Read 5 times a second |
+| `game.police:GetZoneInfo(id)` | `pos, level, zone_type` (vector, number, number; zone_type `enums.PoliceZoneType` SEARCH 0 / HUNT 1). **UNVERIFIED**: the level scale (logged: `police: zone 0: GetZoneInfo -> ...`) |
+| `p:IsSeenByPolice()` | bool, our player only |
+| `game.police:AreOffencesDisabled()` | bool (a mission switched offences off); reported as a flag |
+| `game.police:RegisterForPoliceEvent(ctx, {enums.PoliceEventType.X}, fn)` / `UnregisterForPoliceEvent(id)` | one subscription per event type (so the callback knows which one fired), once per world. **UNVERIFIED**: what `fn` gets (logged for the first 20 events) and that every event listed in police_sync.lua fires for the player |
+| `game.game:RegisterBlanketEvent(ctx, fn, enums.EventType.HUMAN, enums.HumanMessages.X)` | OFFENDER, OFFENDER_UPDATE, RECOGNIZED_BY_POLICE, POLICE_SEARCH, ARRESTED (`GetArrestFinished()`) on our player are reported; on a guest's puppet (host) they are logged (`guest N's puppet got OFFENDER on our game`): that shows whether AnnouncePoliceOffence made the puppet an offender. SEE_ENEMY (`GetEnemyGUID`) counts the cops that saw a targeted puppet |
+| `puppet:AnnouncePoliceOffence(enums.OffenceType.X)` | host: an offence by a wanted guest's puppet, when he becomes a target and when his level or zone type goes up or his game reports a new offence (at most every 5 s): FISTFIGHT on foot / RECKLESS_DRIVING in a car (search), RUNNING_FROM_POLICE (hunt), SHOOT_AT_DISCIPLINARY (level >= 3). The native path takes any human as the offender (re-notes 10). **UNVERIFIED**: that the host's police then go after the puppet, and what they do (fine / arrest attempt on a puppet: not handled) |
+| `cop:Attack(puppet)` | host: police humans (`GetAIType() == 4`, alive) within 90 m of a guest's puppet who is hunted at level >= 3: the nearest 6, again every 8 s. **UNVERIFIED**: the level that means "shoot" (ATTACK_LEVEL = 3 in police_sync.lua, a guess); their hits on the puppet reach the guest like any NPC's (docs/protocol.md "Phase 6") |
+| `cop:Forget()` | host: the cops we set on a guest when he is no target any more; not while the host is wanted himself (Forget drops every target) |
+| `game.police:ForceMinEscalationLevel(n)` | guest: while the host's police chase him, his own level is held at least at the chase's level; `0` when the chase is over (4 s later) and when the session ends. **UNVERIFIED**: that 0 is "no minimum" and whether forcing a level without a zone does anything |
+| `game.police:ZoneCreate(pos, type, level)` | guest: the host's police see him (SEE_ENEMY of a host cop on his puppet) and his game has no zone: one at his position (HUNT or SEARCH as the host's chase says), at most every 5 s. Never used for another player (the zone is always the player's own) |
+| `car:SetSirenOn(b)` / `SetBeaconLightOn(b)` on police copies | the host now reads its police cars' real siren and beacon (`mc_car_signals`, car_signals.h bits 32 / 16) for the copies' flag 2; only when that cannot be read the old guess stays (faster than 14 m/s), plus "near a hunted player" (`MafiaCoop.Police.ChaseNear`) |
+
+Who decides what:
+
+- **Every player's wanted state is his own game's**: his crimes raise it on his game (his pedestrians, his police
+  and - near the host - the police copies' crews, which are police humans on his game), he loses it, is fined or
+  arrested there. A guest's arrest in a co-op story is his failed mission (`mm_000_go_arrest`, docs/protocol.md
+  "Failed missions"); in Free Ride the game's own answer. Fines take his own money. Nothing of this is copied.
+- **Near the host (250 m, released beyond 400 m: the same ranges as the traffic)** the guest's game spawns no police
+  of its own (docs/game-api.md 19), so the host's police are the ones that react to him: his puppet on the host's game
+  becomes their target (above), and the host tells him (PoliceChase) while some of them are near his puppet, how many
+  and how many saw it; the police NPCs and cars he sees are the host's (npc_sync / traffic_sync), so they chase where
+  the host's chase his puppet.
+- **Far from the host** nothing is touched: his own police spawn and work as always; the host's police ignore his
+  puppet.
+- The host's own wanted state is his; the guests' games do not make their police go after the host's puppet.
+
+Dev console checks (host or guest; each returns a string):
+
+```lua
+-- our police state as the glue reads it
+local pol, p = game.police, game.game:GetActivePlayer()
+local z = { pcall(pol.GetActiveZones, pol) }
+local s = "zones " .. tostring(z[1]) .. " n=" .. (#z - 1)
+if z[2] ~= nil then local ok, pos, lvl, zt = pcall(pol.GetZoneInfo, pol, z[2]); s = s .. string.format(" info %s %s %s %s", tostring(ok), tostring(pos), tostring(lvl), tostring(zt)) end
+return s .. " seen=" .. tostring(select(2, pcall(p.IsSeenByPolice, p))) .. " off=" .. tostring(select(2, pcall(pol.AreOffencesDisabled, pol)))
+```
+
+```lua
+-- host: make guest 1's puppet an offender and see what our police do (watch the log for "puppet got OFFENDER")
+local pp = MafiaCoop.pup["1"]
+return tostring(pcall(pp.so.AnnouncePoliceOffence, pp.so, enums.OffenceType.STREET_SHOOTING))
+```

@@ -498,7 +498,7 @@ npc_sync.lua.
 - **Host:** the Lua glue (`traffic_sync.lua`) scans the car table once a second and reports the traffic cars within
   380 m of any guest (his puppet, or his car) 20 times a second: transform, velocity, the driver's controls
   (`mc_car_controls`, flag 8), reversing (velocity against the car's heading, flag 16), handbrake (flag 1), siren
-  (flag 2, police only: no siren getter exists, so it is on while the car goes faster than 14 m/s and 8 s after). The
+  (flag 2, police only: the car's own siren / beacon bits via `mc_car_signals`; when they cannot be read, on while the car goes faster than 14 m/s or is near a hunted player, and 8 s after; see "Police"). The
   dll (`game/traffic_model.h` HostTraffic) gives each car a net id (u16, never reused while a guest has it) and keeps
   core's InterestManager (Kind::Vehicle: enter 260 m / leave 320 m from the guest, every tick up to 60 m, every 0.4 s
   at 260 m, x4 for cars below 0.3 m/s, at most every 2 s; 40 KB/s per guest). Each guest gets the **nearest 24**
@@ -533,6 +533,37 @@ npc_sync.lua.
   controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
   through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves is not shared.
 
+### Police (unreleased; not yet checked in game)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0260 | PoliceState | every player -> everyone (`Broadcast`) | R on change (at most 5/s), U heartbeat (1 s wanted, 3 s clean) | u8 version (1), u16 seq, u8 flags (1 wanted, 2 hunt, 4 seen by police, 8 zone decaying, 16 fine going on, 32 arrest going on, 64 offences disabled, 128 in a world), u8 level (0-16), f32 zone centre x y z. Readers ignore bytes after these |
+| 0x0261 | PoliceEvent | every player -> everyone (`Broadcast`) | R | u8 kind (police_model.h `Event`: the game's police events PLAYER_ENTER_BLUEZONE 1 .. POLICE_BLUEZONE_STARTED 18, the human messages OFFENDER 19 .. ARRESTED 23, LOST 24, WANTED 25), u32 arg (ARRESTED: GetArrestFinished) |
+| 0x0262 | PoliceChase | host -> one guest (`SendTo`) | R when it starts / ends, U every 0.5 s while it goes on | u8 flags (1 active, 2 hunt), u8 level, u8 cops (host police within 90 m of his puppet), u8 seers (of them, those that saw it in the last 5 s), f32 nearest (m) |
+| 0x0263 | - | - | - | reserved for police (not sent) |
+
+- **Each player's wanted state is his own game's** (docs/game-api.md 20): his game's police zone (search / hunt, its
+  level and centre), seen by police, fines, arrests. It is read 5 times a second and broadcast; every game logs the
+  others' changes (`police: player 1 is wanted hunt level 2 ...`) and shows them in the overlay. Nothing of it is
+  copied into another game's police: arrests, fines and losing the police stay per player.
+- **Host:** a guest is a target of the host's police while his state is fresh (6 s), says wanted and in a world, and
+  his puppet is within 250 m of the host (kept to 400 m; released 3 s after he is clean again, at once when far,
+  stale or gone). For a target the Lua glue announces an offence from his puppet (when he becomes a target, when his
+  level or zone type goes up, at most every 5 s for a new offence event of his: OFFENDER, a zone entered / started,
+  a witness), sets the nearest police humans on his puppet when he is hunted at level 3 or more (`Attack`), counts
+  the police near it and those that saw it (SEE_ENEMY) once a second, and the dll sends him PoliceChase while police
+  are near it (none for 3 s: an inactive PoliceChase, reliable). When he is no target any more the cops set on him
+  `Forget` (not while the host himself is wanted).
+- **Guest:** while a PoliceChase says active (and for 4 s after it ended or went silent for 3 s), his game holds his
+  wanted level at least at the chase's level (`ForceMinEscalationLevel`; 0 releases it, also when the session ends);
+  when the host's police see him and his game has no zone, it starts one at his position (`ZoneCreate`, at most every
+  5 s). Far from the host no chase comes: his own police work as always (traffic sync turns his police spawning off
+  only near the host).
+- **Police copies** (traffic): the host reads the real siren / beacon of its police cars (`mc_car_signals`) for the
+  copies' flag 2 (TrafficStates); the speed guess is only the fallback, now also "near a hunted player".
+- Additive: a peer without these messages ignores them. Logs `police: ...`; trace records POL / POE / POR / POT /
+  POC (docs/sync-trace.md).
+
 ## Reconnect (no messages of its own)
 
 Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,
@@ -546,7 +577,7 @@ the game layer does with it:
 | host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
 
-| host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
+| host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again), PoliceSync forgets his wanted state (his puppet is no target; he sends it again when back) |
 | lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
 - Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`), so a drop and a resume
