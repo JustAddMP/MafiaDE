@@ -6,6 +6,7 @@
 #include <string>
 
 #include "game/car_signals.h"
+#include "game/player_actions.h"
 #include "net/wire.h"
 
 using namespace mc::game;
@@ -96,6 +97,54 @@ void TestWire() {
     }
 }
 
+// The tail of a PlayerState in a car as player_sync.cpp writes and reads it: ... gear, signals, then the action block
+// (player_actions.h) that ends every state. Both optional parts are read "if anything is left", so this build must
+// always write both: then each comes back as written.
+void TestRealTail() {
+    namespace act = mc::game::actions;
+    for (int sig : {0, int(cs::kValid), int(cs::kValid | cs::kHead | cs::kHorn), 0xFF}) {
+        for (int seq : {0, 1, 200}) {
+            mc::net::ByteWriter w;
+            w.U8(0xFE);  // gear -2
+            cs::Write(w, static_cast<uint8_t>(sig));
+            act::Write(w, {static_cast<uint8_t>(seq), act::Action::Takedown});
+            mc::net::ByteReader r(w.Span());
+            const uint8_t gear = r.U8();
+            const uint8_t gotSig = cs::Read(r);
+            act::State got;
+            act::Read(r, got);
+            const bool ok = gear == 0xFE && gotSig == cs::Sanitize(static_cast<uint8_t>(sig)) && got.seq == seq &&
+                            got.last == act::Action::Takedown && r.Ok() && r.AtEnd();
+            if (!ok) {
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "sig %d seq %d -> sig %u seq %u kind %u", sig, seq, gotSig, got.seq,
+                              static_cast<unsigned>(got.last));
+                Check(false, "real tail: gear, signals, action block", buf);
+                return;
+            }
+        }
+    }
+    Check(true, "real tail: gear, signals, action block");
+    {
+        mc::net::ByteWriter w;  // on foot: the action block follows the aim directly (no vehicle block)
+        act::Write(w, {7, act::Action::Throw});
+        mc::net::ByteReader r(w.Span());
+        act::State got;
+        act::Read(r, got);
+        Check(got.seq == 7 && got.last == act::Action::Throw && r.Ok() && r.AtEnd(), "on foot: action block alone");
+    }
+    {
+        mc::net::ByteWriter w;  // a car state that ends at the gear (neither part): unknown signals, no action
+        w.U8(1);
+        mc::net::ByteReader r(w.Span());
+        r.U8();
+        const uint8_t gotSig = cs::Read(r);
+        act::State got;
+        act::Read(r, got);
+        Check(gotSig == 0 && got.seq == 0 && got.last == act::Action::None && r.Ok(), "neither part: unknown, none");
+    }
+}
+
 void TestTexts() {
     Check(cs::Describe(0) == "unknown", "describe unknown", cs::Describe(0));
     Check(cs::Describe(cs::kValid) == "off", "describe off", cs::Describe(cs::kValid));
@@ -118,6 +167,7 @@ int main() {
     TestGameLights();
     TestSanitize();
     TestWire();
+    TestRealTail();
     TestTexts();
     std::printf("%s (%d failure(s))\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
     return g_failures ? 1 : 0;

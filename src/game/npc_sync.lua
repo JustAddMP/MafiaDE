@@ -121,6 +121,7 @@ N.shots = N.shots or {}    -- host: NPC id -> shots fired (mod 256), from the ON
 N.spawners = N.spawners or {}  -- host: spawner name -> { {x, y, z, prof}, ... } (mission spawners, entity type 65)
 N.badProfiles = N.badProfiles or {}
 N.owned = N.owned or {}    -- guest: local id -> true while it is our own NPC (sent to the host)
+N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sync.lua): never our own NPCs
 
 -- Who a pairing key stands for in the log: on a guest a host NPC; on the host a guest's own NPC (its mirror id).
 function N.Who(key)
@@ -1057,13 +1058,38 @@ end
 -- our world loaded (the host's states and our pairing need that long).
 local OWN_RANGE = 100       -- m from our player
 local MAX_OWN_REPORT = 64   -- NPCs per round, nearest first
+
+-- The crews of traffic_sync.lua's copies of the host's traffic and police cars are copies of host NPCs, never our
+-- own: reported (police crews have a job, AI type 4) they were mirrored onto the host next to his own drivers, and a
+-- dead one could kill a host cop of the same archetype nearby through a claim. Every human seen in a copy's seat is
+-- remembered for this world (N.tcrew), so one that got out (its host car lost its driver) stays excluded.
+function N.TrafficCrews()
+  local T = M.Traffic
+  for _, c in pairs(T and T.copies or {}) do
+    if c.ent and valid(c.ent) then
+      for s = 0, 3 do
+        local good, h = pcall(c.ent.GetSeatOwner, c.ent, s)
+        if good and valid(h) then
+          local id = idOf(h)
+          if id and not N.tcrew[id] then
+            N.tcrew[id] = true
+            N.tcrewN = (N.tcrewN or 0) + 1
+            if N.tcrewN <= 20 then log("human " .. id .. " is a traffic copy's crew: never one of our own NPCs") end
+          end
+        end
+      end
+    end
+  end
+end
+
 function N.OwnRound(p, ev)
   if M.now - (M.inWorldAt or M.now) <= COPY_AFTER_LOAD or M.cutscene then return end
   local q0 = p:GetPos()
   local list = {}
+  pcall(N.TrafficCrews)
   for id, e in pairs(N.ents) do
     local h = e.h
-    if not N.copyIds[id] and valid(h) and active(h) then
+    if not N.copyIds[id] and not N.tcrew[id] and valid(h) and active(h) then
       local q = h:GetPos()
       local d2 = (q.x - q0.x) ^ 2 + (q.y - q0.y) ^ 2
       if d2 <= OWN_RANGE * OWN_RANGE and math.abs(q.z - q0.z) < 30 then
@@ -1273,7 +1299,7 @@ function N.Update(dt, cmds)
     if n > 0 then log(n .. " spawned copies went with the old world") end
     N.ents, N.host, N.byLocal, N.sent, N.replays, N.lethal = {}, {}, {}, {}, {}, {}
     N.copies, N.copyIds, N.cgrave, N.shots, N.spawners = {}, {}, {}, {}, {}
-    N.owned = {}
+    N.owned, N.tcrew = {}, {}
     N.cfac = { st = "none", t = 0 }  -- its car went with the world
     N.shotWatch, N.spT = nil, nil
     N.scanT = -10

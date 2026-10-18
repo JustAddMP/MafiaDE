@@ -16,7 +16,10 @@ at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of t
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
 ends with the driver's controls (6 bytes). After 0.14.0: guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd
-(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs").
+(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
+TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
+(0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
+its end (both always sent); CarParked with a trailing flags byte (wrecked).
 
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
@@ -79,8 +82,10 @@ u8  signals               car signals (seat 0 only; src/game/car_signals.h; read
                           docs/re-notes.md 9, NOT checked in game): bit0 park/side lights, bit1 headlights,
                           bit2 indicator A, bit3 indicator B (both = hazard; which one is left is not known),
                           bit4 beacon, bit5 siren, bit6 horn, bit7 valid (the driver's game could read them; 0 =
-                          unknown: the copy keeps its own). Last byte of the block, added without a version change:
-                          a block that ends at the gear reads as 0, and an older reader stops before it
+                          unknown: the copy keeps its own). Last byte of the block, added without a version change
+                          (with the action block below: a state without both reads as 0 / no action; the two are
+                          only unambiguous together, so a build must send both or neither, and builds that differ
+                          are kept apart by modVersion anyway)
 -- action block (melee sync; after everything above, the vehicle block included; optional, see below):
 u8  actSeq                visible one-shot actions of the player so far, mod 256; a change = new action(s)
 u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charged) punch, 3 counter, 4 takedown,
@@ -540,6 +545,9 @@ the game layer does with it:
 | lost guest | `OnConnectionLost` | the game keeps running (no menu, no load). The session is inactive: PlayerSync removes the puppets and stops sending (the trace stays open: `RCN ev=sync-paused`), MissionSync keeps the host's point and our `_followPoint` (nothing reloads by itself) and forgets the host's cutscene, NpcSync's Lua drops the copies it spawned (it does that whenever the session is inactive); banner "CONNECTION LOST - RECONNECTING... 12 S" |
 | host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
+
+| host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
+| lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
 - Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`), so a drop and a resume
   between two ticks (a guest's new Hello on the live Steam connection) still re-sends everything.

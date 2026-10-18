@@ -477,6 +477,27 @@ def traffic(host, guest):
         print("  note: %s" % s.split("traffic: ", 1)[-1][:160])
 
 
+def reconnects(tr):
+    """Lost connections and rejoins on this game (RCN, docs/sync-trace.md; docs/protocol.md "Reconnect")."""
+    ev = tr.records["RCN"]
+    if not ev:
+        return
+    section("Reconnects on %s's game (%s)" % (tr.name, tr.role))
+    lost = None
+    for t, f in ev[:40]:
+        kind = f.get("ev", "?")
+        extra = " ".join("%s=%s" % (k, v) for k, v in f.items() if k != "ev")
+        gap = ""
+        if kind == "lost":
+            lost = t
+        elif kind == "back" and lost is not None:
+            gap = " (%.1f s without the host)" % (t - lost)
+            lost = None
+        print("  %s %s %s%s" % (tr.wall(t), kind, extra, gap))
+    if lost is not None:
+        print("  (not back by the end of the trace)")
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -523,6 +544,8 @@ def main():
         own_npcs(guest, b if guest is a else a)
     for tr in (a, b):
         swapped_cars(tr)
+    for tr in (a, b):
+        reconnects(tr)
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
     if worst:

@@ -1649,7 +1649,20 @@ void MissionSync::Tick(float dt) {
         sh.active = active;
         sh.isHost = isHost;
     }
-    if (!active) return;
+    if (!active) {
+        // Not in an active session (a guest whose connection is lost while core rejoins the host): FailTick does not
+        // run, so the hooks must not take a failure over now. With the role of the last active tick kept (Guest),
+        // a failure in the gap skipped the game's answer and queued a report and a quit nobody carried out: the
+        // guest sat in the failed world until he was back (and for good if the rejoin gave up). Without a role the
+        // game's own answer runs (the free roam load; GuestFollow takes over once we are back, as before FailFlow).
+        std::lock_guard lock(_failMu);
+        if (_failRole != FailRole::None) {
+            MC_LOG_INFO("mission: session not active (%s): failed missions take the game's own way until it is back",
+                        _session->IsReconnecting() ? "reconnecting" : "inactive");
+            _failRole = FailRole::None;
+        }
+        return;
+    }
     FailTick(isHost);
     if (isHost) {
         // new players get the current state, save and cutscene at once
