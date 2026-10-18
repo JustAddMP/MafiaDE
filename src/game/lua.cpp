@@ -5,6 +5,7 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "dll/ui_input.h"
+#include "game/car_signals.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -470,6 +471,116 @@ int McCarControls(lua_State* L) {
     return 6;
 }
 
+// ---- car signals: lights, indicators, horn, siren, beacon (docs/re-notes.md 9, game/car_signals.h) -------------------
+// Found statically (2026-10-18), NOT checked in game. Vehicle part fields: lights dword +0xD00 (the lights block at
+// +0xCF0, its field +0x10), horn byte +0xA88, siren bit 0x2000000 of +0x119C. The patterns are the game's own setters;
+// their bytes contain those offsets, so finding them confirms the layout of this build:
+//   light group setter (exe+0x1C0D640, part, on, group1): group1 = bit 0x01, else bit 0x02 (the one with a listener)
+//   indicator setter (exe+0x1C0AB60, part, on, a): a = bit 0x08, else bit 0x10 (plain bit writes)
+//   horn (exe+0x1C0A820, ends with mov [rcx+0xA88], r10b) and siren (exe+0x1C0DFC0) part setters: offsets only
+// Horn, siren and beacon are set on a copy through the script bindings (SetHornOn plays the horn sound through the
+// entity, SetSirenOn / SetBeaconLightOn); the lights and indicators through the setters here.
+constexpr const char* kPatCarLightGroup =
+    "48 81 C1 F0 0C 00 00 E9 04 00 00 00 CC CC CC CC 48 83 EC 28 4C 8B C9 84 D2 74 24 45 84 C0 74 0D";
+constexpr const char* kPatCarIndicator =
+    "B8 08 00 00 00 45 84 C0 41 B9 10 00 00 00 44 0F 45 C8 0F B6 C2 F7 D8 41 23 C1 41 F7 D1 44 23 89 00 0D 00 00";
+constexpr const char* kPatCarHorn = "44 0F B6 D2 B8 00 00 80 00 41 B8 FF FF 7F FF 84 D2 74 08 09 81 9C 11 00 00";
+constexpr const char* kPatCarSiren = "44 0F B6 D2 B8 00 00 00 02 41 B8 FF FF FF FD 84 D2 74 08 09 81 9C 11 00 00";
+constexpr uintptr_t kCarLights = 0xD00, kCarHorn = 0xA88, kCarFlags = 0x119C;
+using CarBitSetterFn = void (*)(void* part, bool on, bool which);
+struct {
+    CarBitSetterFn lightGroup = nullptr;
+    CarBitSetterFn indicator = nullptr;
+    bool read = false;  // the lights, horn and siren offsets are confirmed
+} _sig;
+
+void InstallCarSignals() {
+    const uintptr_t lg = core::mem::FindPattern(kPatCarLightGroup);
+    const uintptr_t ind = core::mem::FindPattern(kPatCarIndicator);
+    const uintptr_t horn = core::mem::FindPattern(kPatCarHorn);
+    const uintptr_t siren = core::mem::FindPattern(kPatCarSiren);
+    _sig.read = lg && horn && siren &&
+                std::memcmp(reinterpret_cast<const void*>(horn + 0x85), "\x44\x88\x91\x88\x0A\x00\x00", 7) == 0;
+    if (lg) _sig.lightGroup = reinterpret_cast<CarBitSetterFn>(lg);
+    if (ind) _sig.indicator = reinterpret_cast<CarBitSetterFn>(ind);
+    if (!_sig.read)
+        MC_LOG_WARN("lua: car signals not found (lights %d, indicators %d, horn %d, siren %d): lights, horn and siren of "
+                    "remote players' cars are not synced",
+                    lg ? 1 : 0, ind ? 1 : 0, horn ? 1 : 0, siren ? 1 : 0);
+    else
+        MC_LOG_INFO("lua: car signals: light setter exe+0x%llx, indicator setter exe+0x%llx",
+                    static_cast<unsigned long long>(lg - core::mem::MainModule().base),
+                    static_cast<unsigned long long>(ind ? ind - core::mem::MainModule().base : 0));
+}
+
+uint8_t* CarById(double id) {
+    return (_ent.find && id > 0 && (static_cast<uint32_t>(id) & 0xFF) == 10) ? EntityById(static_cast<uint32_t>(id))
+                                                                              : nullptr;
+}
+
+// The signals byte of car entity e (car_signals::kValid set), or 0 when a read fails.
+uint8_t ReadSignals(uint8_t* e) {
+    uint32_t lights = 0, flags = 0;
+    uint8_t horn = 0;
+    uint8_t* part = e + kVehiclePart;
+    if (!ReadMem(part + kCarLights, &lights, 4) || !ReadMem(part + kCarHorn, &horn, 1) ||
+        !ReadMem(part + kCarFlags, &flags, 4) || horn > 1)
+        return 0;
+    return car_signals::FromGame(lights, horn, flags);
+}
+
+// mc_car_signals(id) -> the signals byte of car entity `id` (game/car_signals.h: 128 + bits), or nil.
+int McCarSignals(lua_State* L) {
+    uint8_t* e = _sig.read ? CarById(TypeOf(L, 1) == TNumber ? static_cast<double>(ToNumber(L, 1)) : -1) : nullptr;
+    const uint8_t s = e ? ReadSignals(e) : 0;
+    if (!s) {
+        PushNil(L);
+        return 1;
+    }
+    PushNumber(L, s);
+    return 1;
+}
+
+bool SetCarBitGuarded(CarBitSetterFn f, uint8_t* part, bool on, bool which) {
+    __try {
+        f(part, on, which);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// mc_car_set_signals(id, sig, mask) -> the signals byte read back after setting the light bits of `mask` (park, head,
+// indicators: car_signals::kLightBits) to those of `sig` on car entity `id`; nil when the car or the setters are not
+// there. Only bits that differ are set. Main thread (script tick).
+int McCarSetSignals(lua_State* L) {
+    auto num = [L](int i) { return TypeOf(L, i) == TNumber ? static_cast<double>(ToNumber(L, i)) : -1.0; };
+    uint8_t* e = (_sig.read && _sig.lightGroup) ? CarById(num(1)) : nullptr;
+    const double sigArg = num(2), maskArg = num(3);
+    const uint8_t have = e ? ReadSignals(e) : 0;
+    if (!have || sigArg < 0 || sigArg > 255 || maskArg < 0 || maskArg > 255) {
+        PushNil(L);
+        return 1;
+    }
+    const uint8_t want = static_cast<uint8_t>(sigArg);
+    const uint8_t diff = static_cast<uint8_t>((want ^ have) & static_cast<uint8_t>(maskArg) & car_signals::kLightBits);
+    uint8_t* part = e + kVehiclePart;
+    bool ok = true;
+    if (diff & car_signals::kPark) ok &= SetCarBitGuarded(_sig.lightGroup, part, (want & car_signals::kPark) != 0, true);
+    if (diff & car_signals::kHead) ok &= SetCarBitGuarded(_sig.lightGroup, part, (want & car_signals::kHead) != 0, false);
+    if (_sig.indicator) {
+        if (diff & car_signals::kIndA) ok &= SetCarBitGuarded(_sig.indicator, part, (want & car_signals::kIndA) != 0, true);
+        if (diff & car_signals::kIndB) ok &= SetCarBitGuarded(_sig.indicator, part, (want & car_signals::kIndB) != 0, false);
+    }
+    const uint8_t now = ok ? ReadSignals(e) : 0;
+    if (!now) {
+        PushNil(L);
+        return 1;
+    }
+    PushNumber(L, now);
+    return 1;
+}
+
 // mc_fnv(text) -> the game's 64-bit name hash of `text` (FNV-1, the hash behind spawn profile names) as a decimal string
 int McFnv(lua_State* L) {
     const char* s = ToString(L, 1);
@@ -790,6 +901,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         MC_LOG_WARN("lua: GetEntityByGUID not found: mc_entity unavailable (NPCs and mission cars are not matched by id)");
     }
     InstallRayCast();
+    if (_ent.find) InstallCarSignals();
     _available = true;
     // Our helpers for scripts; registered on the first tick.
     Post([](lua_State* L) {
@@ -805,10 +917,13 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
             RegisterGlobal(L, "mc_memread", &McMemRead);
             RegisterGlobal(L, "mc_memdump", &McMemDump);
             RegisterGlobal(L, "mc_car_controls", &McCarControls);
+            if (_sig.read) RegisterGlobal(L, "mc_car_signals", &McCarSignals);
+            if (_sig.read && _sig.lightGroup) RegisterGlobal(L, "mc_car_set_signals", &McCarSetSignals);
         }
         if (_ray.cast) RegisterGlobal(L, "mc_raycast", &McRayCast);
-        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s",
-                    _ent.push ? ", mc_entity, mc_entity_ids, mc_car_controls" : "", _ray.cast ? ", mc_raycast" : "");
+        MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s%s",
+                    _ent.push ? ", mc_entity, mc_entity_ids, mc_car_controls" : "",
+                    _ent.push && _sig.read ? ", mc_car_signals, mc_car_set_signals" : "", _ray.cast ? ", mc_raycast" : "");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
                 Narrow(_dllDir).c_str(), Narrow(_dllDir).c_str(), _tag.c_str());

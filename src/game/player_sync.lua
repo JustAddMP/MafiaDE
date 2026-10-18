@@ -9,7 +9,7 @@
 --                                                                                (load his model before he shows up)
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
 --     inair gait mult reissue mx my mz fix nx ny turn fx fy
---     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act
+--     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act sig
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
 --                                                                                "tommy" = story Tommy; M.Profile),
@@ -39,8 +39,9 @@
 --   X                                                                            remove everything
 -- Output: sample, status, events
 --   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
---             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind" or ""
---            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction)
+--             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind sig" or ""
+--            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction;
+--             sig: our car's signals byte, src/game/car_signals.h, 0 = unknown or not the driver)
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
@@ -53,7 +54,7 @@
 --            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
 -- Sync trace (docs/sync-trace.md): mc_trace(type, text) writes readbacks of what the game really did, 20 times a
 -- second while a session runs: "LR" (our player and the car we drive), "PR" (each puppet), "CR" (each car copy a
--- remote player drives: the controls it really has, engine, gear, wheel angle).
+-- remote player drives: the controls it really has, engine, gear, wheel angle, signals).
 --
 -- Shared cars: every car somebody drives has a network key "o:g" (o = id of the player who first drove it, g = its
 -- entity GUID on that player's game). M.cars[key] is this game's entity for it: the real car on the machine of
@@ -403,11 +404,40 @@ end
 --   RV.Drive(st, ent, cmd, tx, ty, tz)  cmd: fix (0 none, 1 blend, 2 pin, 3 snap), nx ny nz (blend: added to its
 --                                       position), qx qy qz qw (rotation), power steer brake hb ctl (controls;
 --                                       ctl false = none known); st: a table kept with this copy
+--   RV.Signals(st, ent, sig)            the driver's car signals (lights, indicators, horn, siren, beacon) on it
 --   RV.Report(st, ent)                  -> "x y z vx vy vz qx qy qz qw" for the controller
---   RV.Idle(st, ent)                    nobody drives it any more: controls released
+--   RV.Idle(st, ent)                    nobody drives it any more: controls released, horn off, lights back to
+--                                       the game
 -- ---------------------------------------------------------------------------------------------------------------
 local RV = {}
 M.RV = RV
+
+-- Car signals byte (src/game/car_signals.h; read with mc_car_signals, docs/game-api.md 7). Found statically, NOT
+-- checked in game: which light group is which and which indicator is left are guesses.
+local SIG = { PARK = 1, HEAD = 2, INDA = 4, INDB = 8, BEACON = 16, SIREN = 32, HORN = 64, VALID = 128 }
+RV.SIG = SIG
+local SIG_LIGHTS = 15  -- park, head, both indicators: set with mc_car_set_signals
+-- horn, siren, beacon: set through the bindings (SetHornOn also plays the horn sound)
+local SIG_API = { { SIG.HORN, "SetHornOn", "horn" }, { SIG.SIREN, "SetSirenOn", "siren" },
+  { SIG.BEACON, "SetBeaconLightOn", "beacon" } }
+local function has(v, b) return (v or 0) % (b + b) >= b end
+RV.has = has
+
+-- "park+head+hazard+horn", "off", "unknown" (his game could not read them) or "?" (nil)
+function RV.SigText(s)
+  if not s then return "?" end
+  if not has(s, SIG.VALID) then return "unknown" end
+  local t = {}
+  if has(s, SIG.PARK) then t[#t + 1] = "park" end
+  if has(s, SIG.HEAD) then t[#t + 1] = "head" end
+  if has(s, SIG.INDA) and has(s, SIG.INDB) then t[#t + 1] = "hazard"
+  elseif has(s, SIG.INDA) then t[#t + 1] = "indA"
+  elseif has(s, SIG.INDB) then t[#t + 1] = "indB" end
+  if has(s, SIG.HORN) then t[#t + 1] = "horn" end
+  if has(s, SIG.SIREN) then t[#t + 1] = "siren" end
+  if has(s, SIG.BEACON) then t[#t + 1] = "beacon" end
+  return #t > 0 and table.concat(t, "+") or "off"
+end
 
 -- SetSteer puts the value through a response curve before it stores the wish, |x| (1 - (1 - |x|) k) with k the
 -- car's steering linearity (docs/re-notes.md 9). The driver's game reports the stored wish, so it is inverted here
@@ -531,6 +561,68 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
   end
 end
 
+-- The driver's car signals on the copy. Applied when they change (each change logged); then the copy is read back
+-- every tick and whatever its own game logic changed back is set again (counted in st.sigRe, logged a few times):
+-- lights and indicators through mc_car_set_signals (the game's own bit setters, cheap), horn / siren / beacon through
+-- the bindings at most once a second each. The light override (SetLightState(true, on)) is set on every on/off
+-- change so the game's automatic lights do not switch them back. A byte without the valid bit (his game could not
+-- read them) leaves the copy alone.
+function RV.Signals(st, ent, want)
+  want = math.floor(tonumber(want) or 0)
+  if not has(want, SIG.VALID) then return end
+  local id = entId(ent)
+  local function readback() return (mc_car_signals and id) and mc_car_signals(id) or nil end
+  local prev = st.sigWant
+  local changed = want ~= prev
+  if changed then
+    st.sigChanges = (st.sigChanges or 0) + 1
+    log(string.format("remote car %s: signals %s -> %s (copy has %s, change #%d)", tostring(ent), RV.SigText(prev),
+      RV.SigText(want), RV.SigText(readback()), st.sigChanges))
+    local on = has(want, SIG.PARK) or has(want, SIG.HEAD)
+    if prev == nil or on ~= (has(prev, SIG.PARK) or has(prev, SIG.HEAD)) then
+      local good, err = pcall(ent.SetLightState, ent, true, on)
+      if not good and not st.lightStateLogged then
+        st.lightStateLogged = true
+        log("remote car " .. tostring(ent) .. ": SetLightState failed (" .. tostring(err) .. ")")
+      end
+    end
+  end
+  local have = readback()
+  if have and mc_car_set_signals and have % 16 ~= want % 16 then
+    local after = mc_car_set_signals(id, want, SIG_LIGHTS)
+    if not changed then
+      st.sigRe = (st.sigRe or 0) + 1
+      if st.sigRe <= 3 or st.sigRe % 200 == 0 then
+        log(string.format("remote car %s: its game changed the lights to %s (want %s): set again (#%d)",
+          tostring(ent), RV.SigText(have), RV.SigText(want), st.sigRe))
+      end
+    end
+    have = after or readback()
+  end
+  for _, a in ipairs(SIG_API) do
+    local w = has(want, a[1])
+    local due = changed and (prev == nil or has(prev, a[1]) ~= w)
+    local lost = not changed and have and has(have, a[1]) ~= w and M.now - (st[a[3] .. "T"] or -10) >= 1
+    if due or lost then
+      st[a[3] .. "T"] = M.now
+      local good, err = pcall(function() ent[a[2]](ent, w) end)
+      if not good then
+        if not st[a[3] .. "Err"] then
+          st[a[3] .. "Err"] = true
+          log("remote car " .. tostring(ent) .. ": " .. a[2] .. " failed (" .. tostring(err) .. ")")
+        end
+      elseif lost then
+        st.sigRe = (st.sigRe or 0) + 1
+        if st.sigRe <= 3 or st.sigRe % 200 == 0 then
+          log(string.format("remote car %s: its %s was %s, want %s: set again (#%d)", tostring(ent), a[3],
+            w and "off" or "on", w and "on" or "off", st.sigRe))
+        end
+      end
+    end
+  end
+  st.sigWant = want
+end
+
 function RV.Report(st, ent)
   local p, v, q = ent:GetPos(), ent:GetSpeed(), ent:GetRot()
   return string.format("%.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f", p.x, p.y, p.z, v.x, v.y, v.z, q.v.x, q.v.y,
@@ -538,6 +630,12 @@ function RV.Report(st, ent)
 end
 
 function RV.Idle(st, ent)
+  if st and st.sigWant and valid(ent) then  -- horn off, lights back to the game's own logic
+    st.sigWant = nil
+    pcall(function() ent:SetHornOn(false) end)
+    pcall(function() ent:SetLightState(false, false) end)
+    log("remote car " .. tostring(ent) .. ": nobody drives it: horn off, lights back to the game")
+  end
   if not st or not st.driven or not valid(ent) then return end
   st.driven = nil
   pcall(function()
@@ -653,6 +751,11 @@ function M.CarTick(c)
       if pp and pp.vcmd and pp.vkey == c.key then
         c.rv = c.rv or {}
         RV.Drive(c.rv, c.ent, pp.vcmd, c.tx, c.ty, c.tz)
+        local good, err = pcall(RV.Signals, c.rv, c.ent, pp.vcmd.sig)
+        if not good and not c.rv.sigErr then
+          c.rv.sigErr = true
+          log("car " .. c.key .. ": signals error: " .. tostring(err))
+        end
         M.events[#M.events + 1] = "VS " .. c.driver .. " " .. c.key .. " " .. RV.Report(c.rv, c.ent)
         if mc_trace and M.now - (c.trT or -1) >= TRACE_PERIOD then
           c.trT = M.now
@@ -1292,9 +1395,12 @@ local function carState(car)
   local g4, fixed = pcall(car.IsCarPosFixed, car)
   local g5, rpm = pcall(car.GetEngineRotations, car)
   local g6, pwi = pcall(car.GetPowerInternal, car)
-  return string.format("eng=%s gear=%s spd=%.3f fixed=%s rpm=%.0f pwi=%.3f",
+  -- the car signals it really has (src/game/car_signals.h byte, -1 = not readable)
+  local sig = mc_car_signals and mc_car_signals(tonumber(guidNum(car))) or -1
+  return string.format("eng=%s gear=%s spd=%.3f fixed=%s rpm=%.0f pwi=%.3f sig=%d",
     g1 and (eng and "1" or "0") or "-", g2 and tostring(gear) or "-", g3 and (tonumber(spd) or -1) or -1,
-    g4 and (fixed and "1" or "0") or "-", g5 and (tonumber(rpm) or -1) or -1, g6 and (tonumber(pwi) or -1) or -1)
+    g4 and (fixed and "1" or "0") or "-", g5 and (tonumber(rpm) or -1) or -1, g6 and (tonumber(pwi) or -1) or -1,
+    math.floor(sig))
 end
 
 -- CR: a car copy a remote player drives, after this tick's commands
@@ -1304,11 +1410,11 @@ function M.TraceCar(c, pp)
   local who = not valid(occ) and "none" or (same(occ, pp.so) and "puppet" or "other")
   local st = c.rv or {}
   trace("CR", string.format("key=%s drv=%s adopted=%d fix=%d pin=%d p=%s v=%s rb=%s %s cmd=%.3f,%.3f,%.3f,%.3f,%d "
-    .. "steerIn=%.3f vel=%.3f,%.3f,%.3f speedHow=%s seat0=%s locked=%d",
+    .. "steerIn=%.3f vel=%.3f,%.3f,%.3f speedHow=%s seat0=%s locked=%d sigw=%d sigch=%d sigre=%d",
     c.key, tostring(c.driver), c.adopted and 1 or 0, cmd.fix or -1, cmd.pinned and 1 or 0, f3(e:GetPos()),
     f3(e:GetSpeed()), controlsOf(e), carState(e), cmd.steer or 0, cmd.power or 0, cmd.brake or 0, cmd.hb or 0,
     cmd.gear or 0, st.steerIn or 0, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0, tostring(st.speedHow), who,
-    c.closed and 1 or 0))
+    c.closed and 1 or 0, math.floor(cmd.sig or 0), st.sigChanges or 0, st.sigRe or 0))
 end
 
 -- PR: a puppet after this tick's commands
@@ -2292,8 +2398,19 @@ function M.Sample(aimInput)
       log("our car's controls cannot be read: the others see the car move, its wheels straight")
     end
   end
-  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d", aim, reload, M.shots, ad.x,
-    ad.y, ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind)
+  -- our car's signals (lights, indicators, horn, siren, beacon: src/game/car_signals.h), every change logged
+  local sig = 0
+  if inCar and my.seat == 0 and mc_car_signals then
+    sig = math.floor(mc_car_signals(tonumber(guidNum(my.c.ent))) or 0)
+    if sig ~= M.sigLocal then
+      log("our car's signals: " .. RV.SigText(sig) .. " (" .. sig .. ")")
+      M.sigLocal = sig
+    end
+  else
+    M.sigLocal = nil
+  end
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d %d", aim, reload, M.shots, ad.x, ad.y,
+    ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind, sig)
   if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
   if aim == 0 then M.aimLogged = nil end
   if inCar then
@@ -2489,7 +2606,8 @@ function M.Update(dt, cmds)
       pp.vcmd = { fix = n(f[45]) or 2, nx = n(f[46]) or 0, ny = n(f[47]) or 0, nz = n(f[48]) or 0,
         qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
-        ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0 }
+        ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0,
+        sig = n(f[64]) or 0 }
       local act = n(f[63]) or 0
       if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now

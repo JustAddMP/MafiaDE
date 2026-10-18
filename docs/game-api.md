@@ -158,7 +158,8 @@ for a long time.
 | `car:SetAddSteer(deg)` | **UNVERIFIED (static)**: degrees (x pi/180 in the binding), an extra steering angle. Not used |
 | `car:SetImpulse(a, b[, part])` | **UNVERIFIED (static)**: two vectors (and a part index) to the vehicle part (exe+0x1C0A8B0); which is the impulse and which the point is not known. Not used |
 | `mc_car_controls(id)` (ours, src/game/lua.cpp) | **UNVERIFIED**: `steer, power, brake, handbrake, steerLinearity, steerAngle` of car entity `id` (the number in its GUID) read from the fields above, or nil when a read fails or a value is out of range. The driver's game sends them in PlayerState |
-| lights, horn, siren, indicators | `SetLightState`, `SetHornOn`, `SetSirenOn`, `SetBeaconLightOn` exist, but no getter was found for any of them, so they are not synced |
+| lights, horn, siren, indicators, beacon | **UNVERIFIED (static, 2026-10-18, docs/re-notes.md 9)**: no script getter exists; `mc_car_signals(id)` (ours) reads them from the car's vehicle part. Setters: `car:SetHornOn(on)` (horn byte; through the entity, which also plays the horn sound, at most one new sound per 2 s), `car:SetSirenOn(on)`, `car:SetBeaconLightOn(on)` (one bool each), `car:SetLightState(force, on)`: `(true, true)` forces both light groups on, `(true, false)` forces them off, `(false, x)` gives them back to the game (off, or the game's automatic mode). `SetSearchlightOn` sets light bit 0x400 (not synced). The player has no light or indicator key (no `E_CTRL_` for them; `E_CTRL_HORN` exists), so a player's lights are whatever the game switches (time of day, police car); the horn and a police car's siren are what remote players hear. Since this change the driver's game sends them in PlayerState (`signals`) and the copy gets them on change |
+| `mc_car_signals(id)` / `mc_car_set_signals(id, sig, mask)` (ours, src/game/lua.cpp) | **UNVERIFIED**: the car signals byte of car entity `id` (src/game/car_signals.h: 1 park/side lights, 2 headlights, 4 indicator A, 8 indicator B, 16 beacon, 32 siren, 64 horn, +128 valid), or nil. `mc_car_set_signals` sets the light bits of `mask` (park, head, indicators) to those of `sig` with the game's own setters and returns the byte read back. Registered only when the game's setter patterns are found (their bytes confirm the field offsets) |
 | `h:ShowModel(bool)`, `h:SetPhysState(0\|2)` | hide/show a human; 2 = DISABLED (no collision while hidden) |
 
 **Seating (verified 2026-10-14, two instances, park in Omerta):**
@@ -451,6 +452,13 @@ in-game check (README-dev.md "Test checklist: animation and car controls").
   controller pins the copy after a second, logged, and it behaves as before 0.13.0 with steering wheels).
 - The puppet driver is an AI human in the driver seat: if the game gives it an AI driving controller, that may write
   the same controls; then the steering flickers between ours and its (not seen statically; `DestroyController` exists).
+- **Car signals** (static, 2026-10-18): the driver's lights (two light groups, taken to be side lights and
+  headlights), indicators, horn, police siren and beacon are read from his car (`mc_car_signals`) and set on the copy
+  when they change (`RV.Signals`). To check: honk (the copy honks on the other game: the sound comes from
+  `SetHornOn`), drive a police car and switch its siren on, drive at night (the copy's headlights follow his, also
+  when the copy's own game would switch them differently: CR `sigre` counts how often it had to set them again), and
+  read LR `sig` against CR `sig` in the two traces. If the light bits turn out to be something else, the copy shows
+  the same bits anyway (they are copied as they are); only the names in the logs would be wrong.
 - **First test (0.13.0, two PCs, 2026-10-17):** every car copy was pinned within ~4 s on both games (copy 0.2 m/s,
   target 4.4 m/s), with the driver's steering and throttle arriving. 0.14.0 starts the copy's engine, gives it its
   wanted speed after each correction (SetSpeed, probed), retries its physics after 5-40 s, and traces what the copy

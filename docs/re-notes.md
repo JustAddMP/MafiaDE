@@ -762,8 +762,29 @@ Vehicle part fields (offsets from `entity + 0xF8`):
 Callers of the steering setter include exe+0x2526420 and exe+0x26D8A51 (which also set brake, handbrake and power:
 "apply a controls struct") and a series at exe+0x2EC3580..0x2EC6666 (steer 0 / handbrake: enter/exit or reset paths).
 That the player's own input ends in +0xA40 / +0x9D4 / +0x9C8 / +0x9D0 is assumed from the update exe+0x1C2A92C
-reading those fields whoever drives; `mc_car_controls` reads them on the driver's game. Lights, horn, siren: setters
-exist (SetLightState 0x23AC850, SetHornOn 0x23A10F0, SetSirenOn 0x23A0B90), no getters found.
+reading those fields whoever drives; `mc_car_controls` reads them on the driver's game.
+
+**Lights, indicators, horn, siren, beacon** [static, unverified: found 2026-10-18]. No script getter; the setters show
+where the state lives (`mc_car_signals` reads it, src/game/car_signals.h):
+
+| what | field (from the vehicle part, entity + 0xF8) | written by | notes |
+|---|---|---|---|
+| light group 1 | +0xD00 bit 0x01 | exe+0x1C0D640(part, on, 1) (`add rcx,0xCF0`: the lights block, field +0x10) | set with group 2 by SetLightState(true, true); kept when the car is parked (exe+0x1BF40DB clears 0x3C and 0x02 only): taken to be the side / parking lights. Reader exe+0x1C20DBA fades a light in/out with it |
+| light group 2 | +0xD00 bit 0x02 | exe+0x1C0D640(part, on, 0) | on a change the setter calls a listener ([lights + 0xE0], vtable +0x10): taken to be the headlights |
+| indicators | +0xD00 bits 0x08, 0x10 | exe+0x1C0AB60(part, on, a): a = 0x08, else 0x10 (plain bit writes) | the controls applicator exe+0x2524010 sets them from a controls struct byte (+0x339: (b & 5) == 5 -> 0x08, (b & 0xA) == 0xA -> 0x10); exe+0x1C34950 copies 0x04, 0x08, 0x10, 0x20 and 0x02 from one car to another (a trailer from its tractor). Which one is left is not known |
+| brake / reverse light (?) | +0xD00 bits 0x04, 0x20 | (computed) | cleared with the indicators when parked, copied to a trailer; not synced (the copy makes them from its controls) |
+| beacon | +0xD00 bit 0x40 | exe+0x1C074D0 (SetBeaconLightOn 0x23A0580) | |
+| searchlight | +0xD00 bit 0x400 | exe+0x1C0DED0 (SetSearchlightOn 0x23A1890) | not synced |
+| other light bits | +0xD00 bits 0x80, 0x100 | exe+0x1C0ECD0, near exe+0x1C1FDC9 | not identified, not synced |
+| script light override | entity +0x1EF0 bits 40 / 55, mode byte entity +0x21A0, +0xD00 bit 0x1000000 | SetLightState 0x23AC850 -> exe+0x23EE570 -> exe+0x25878B0(entity, mode) | (force, on): (true, true) = bit 55 = mode 1 = both groups on; (true, false) = bit 40 = mode 2 = both off; (false) = mode 0 = off, or bit 0x1000000 of +0xD00 when entity +0x21A1 is set (the game's automatic mode?) |
+| horn | +0xA88 byte (and +0x119C bit 0x800000) | exe+0x1C0A820, called by the entity's exe+0x2586A30(entity, on, 1, 0) | SetHornOn 0x23A10F0 and the driver's controls (exe+0x2526420) both go through exe+0x2586A30, which also starts the horn sound (once per 2 s, entity +0x2228 = next allowed time) |
+| siren | +0x119C bit 0x2000000 | exe+0x1C0DFC0 (SetSirenOn 0x23A0B90) | +0x1198 holds request bits (0x2000000 on / 0x4000000 off; horn 0x800000 / 0x1000000) |
+
+The controls applicator exe+0x2524010 also writes the light groups from its struct (+0x2D9 bit 0 -> group 1, bit 1 ->
+group 2, when +0x2B8 is set) after SetLightState's mode: if the copy's driver (an AI puppet) runs it, it can switch a
+copy's lights back; the glue then sets them again (CR `sigre`). The player has no key for lights or indicators.
+Strings: `ue::game::vehicle::E_VehicleLightType`, `E_VehicleLightColor`, `C_CarAction_Blink`, `C_CarCommand_Blink`
+(AI indicators), `E_CTRL_HORN`.
 
 **Human move speed.** `C_WrapperHuman::SetMovementSpeedMult` (0x239D230) -> exe+0x2B9E8D0(`[entity + 0x130]`, m):
 allocates a 0x48-byte AI command with m when m differs from a constant. `OverrideMoveSpeed` (0x23AC1B0) ->
@@ -845,6 +866,10 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | FlashValue_GetString | 0x183EEB0 | `40 57 48 83 EC 20 83 79 10 06 75 4B 48 8B 79 08 48 85 FF 74 42` |
 | FlashValue_Assign | 0x37B6220 | `48 89 5C 24 08 57 48 83 EC 20 48 8B DA 48 8B F9 33 D2 E8 ?? ?? ?? ?? 48 8B 43 08 48 89 47 08 8B 43 10 89 47 10` |
 | FlashValue_Dtor | 0x37B31C0 | `40 53 48 83 EC 20 48 8D 05 ?? ?? ?? ?? 33 D2 48 89 01 48 8B D9 E8 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 03 48 83 C4 20` |
+| CarLights_SetGroup (section 9) | 0x1C0D640 | `48 81 C1 F0 0C 00 00 E9 04 00 00 00 CC CC CC CC 48 83 EC 28 4C 8B C9 84 D2 74 24 45 84 C0 74 0D` |
+| CarIndicator_Set (section 9) | 0x1C0AB60 | `B8 08 00 00 00 45 84 C0 41 B9 10 00 00 00 44 0F 45 C8 0F B6 C2 F7 D8 41 23 C1 41 F7 D1 44 23 89 00 0D 00 00` |
+| CarHorn_PartSet (section 9; +0x85 = `mov [rcx+0xA88], r10b`) | 0x1C0A820 | `44 0F B6 D2 B8 00 00 80 00 41 B8 FF FF 7F FF 84 D2 74 08 09 81 9C 11 00 00` |
+| CarSiren_PartSet (section 9) | 0x1C0DFC0 | `44 0F B6 D2 B8 00 00 00 02 41 B8 FF FF FF FD 84 D2 74 08 09 81 9C 11 00 00` |
 | RayCast (PhysicsPointBelow) | 0x23E83F0 | `48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC E0 00 00 00 F2 41 0F 10 00 48 8D 05 ?? ?? ?? ?? F2 0F 11 45 EF 49 8B F8 F3 0F 10 4D F3`: query vtable lea at +0x1C, filter 0x404DA386 at +0x55, physics getter call +0x9B (world = [ret+0x58]), cast call +0xAC (exe+0x1A68E50), result release call +0x1C0 |
 
 Rip/call operand offsets used above: `C_GameScriptModule_Tick` +3 (disp) / +7 (end) gives g_ScriptGameMachine; `Steam_MemLoadApi` +9/+0xD gives g_SteamApiTable; `Steam_Init` +0x2F/+0x33 gives the SteamAPI_Init slot, +0x39/+0x3D SteamUser slot, +0x60/+0x64 SteamClient slot; `Lua_Game_GetActivePlayer` E8 rel32 at +0x14 gives the C_Game getter; `ScriptGameMachine_Create` mov [rip+disp],rax at +0x2B (disp +0x2E, end +0x32) also gives g_ScriptGameMachine.
