@@ -475,8 +475,10 @@ npc_sync.lua.
   game it came from).
 - **Other guests (several guests, 0.15 multi-guest; not yet checked in game):** the host relays its mirrors of guest
   A's own NPCs to every other guest in its NpcStates (SendTo per guest, 10 Hz, at most 48 per guest and round; never
-  to A himself), keyed by a **relay key** `2^31 + A x 2^24 + A's entity id` (`npcown::RelayKey`; entity ids are below
-  2^24, so it never collides with a host NPC; an id that does not fit is not relayed). Guest B treats it like any host
+  to A himself), keyed by a **relay key**: A's entity id for it with its type byte (8, a human: an id is `slot << 8 |
+  type`, docs/game-api.md `mc_entity_ids`) replaced by `0xF0 + A` (`npcown::RelayKey`). No entity id has such a type
+  byte, so it never collides with a host NPC, and it stays below 2^24, so the game's Lua (32-bit float numbers) holds
+  it exactly; an id that does not fit (slot >= 65536) is not relayed. Guest B treats it like any host
   NPC: his own version of that NPC (his game spawned the same wave) pairs with it, so it never becomes B's own as well,
   or he shows a spawned copy of it. Live mirrors with a state of the last second and dead ones (so B's copy dies) are
   relayed; none with a claim under way. B's hits on it come to the host as NpcHit for the relay key; the host forwards

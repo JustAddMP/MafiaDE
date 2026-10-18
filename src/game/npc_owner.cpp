@@ -119,17 +119,17 @@ float Dist(const NpcState& a, const NpcState& b) {
 
 // ---- relay keys -----------------------------------------------------------------------------------------------------------
 uint32_t RelayKey(PlayerId from, uint32_t key) {
-    if (key == 0 || key >= (1u << kRelayKeyBits) || from >= 128) return 0;
-    return kRelayBit | (static_cast<uint32_t>(from) << kRelayKeyBits) | key;
+    if ((key & 0xFFu) != kHumanType || key >= (1u << 24) || from < 1 || from > 0x0F) return 0;
+    return (key & ~0xFFu) | (kRelayTypeBase + from);
 }
 
-bool IsRelayKey(uint32_t k) { return (k & kRelayBit) != 0; }
+bool IsRelayKey(uint32_t k) { return k < (1u << 24) && (k & 0xFFu) > kRelayTypeBase; }
 
 bool DecodeRelayKey(uint32_t k, PlayerId& from, uint32_t& key) {
     if (!IsRelayKey(k)) return false;
-    from = static_cast<PlayerId>((k >> kRelayKeyBits) & 0x7Fu);
-    key = k & ((1u << kRelayKeyBits) - 1);
-    return key != 0;
+    from = static_cast<PlayerId>((k & 0xFFu) - kRelayTypeBase);
+    key = (k & ~0xFFu) | kHumanType;
+    return true;
 }
 
 // ---- guest --------------------------------------------------------------------------------------------------------------

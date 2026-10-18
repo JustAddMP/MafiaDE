@@ -124,20 +124,20 @@ N.owned = N.owned or {}    -- guest: local id -> true while it is our own NPC (s
 N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sync.lua): never our own NPCs
 
 -- Relay keys (several guests, src/game/npc_owner.h "relay"): the host sends a guest the other guests' own NPCs in its
--- NpcStates under the key 2^31 + owner x 2^24 + the owner's entity id (always above any entity id). They are host NPCs
--- here like any other (paired, copied, hit: the host forwards hits to the owner). Keys are written with %.0f, never %d
--- (a relay key does not fit a 32-bit signed integer).
-local RELAY_BIT, RELAY_SHIFT = 2147483648, 16777216
+-- NpcStates under a relay key: the owner's entity id with its type byte (8, a human) replaced by 240 + the owner's
+-- player id, a value no entity id has, so it never is a host NPC's key, and below 2^24, so our 32-bit float numbers
+-- hold it exactly. They are host NPCs here like any other (paired, copied, hit: the host forwards hits to the owner).
+local RELAY_TYPE, TYPE_HUMAN, BYTE, MAXKEY = 240, 8, 256, 16777216
 function N.RelayKey(from, key)
   local f, k = tonumber(from), tonumber(key)
-  if not f or not k or k <= 0 or k >= RELAY_SHIFT or f < 0 or f >= 128 then return nil end
-  return RELAY_BIT + f * RELAY_SHIFT + k
+  if not f or not k or k < 0 or k >= MAXKEY or k % BYTE ~= TYPE_HUMAN or f < 1 or f > 15 then return nil end
+  return k - TYPE_HUMAN + RELAY_TYPE + f
 end
 function N.FromRelay(key)  -- -> owner id (string), his key; nil for a plain host key
   key = tonumber(key)
-  if not key or key < RELAY_BIT then return nil end
-  local r = key - RELAY_BIT
-  return tostring(math.floor(r / RELAY_SHIFT)), r % RELAY_SHIFT
+  if not key or key >= MAXKEY or key % BYTE <= RELAY_TYPE then return nil end
+  local t = key % BYTE
+  return tostring(t - RELAY_TYPE), key - t + TYPE_HUMAN
 end
 
 -- Who a pairing key stands for in the log: on a guest a host NPC (or another guest's, relayed); on the host a guest's

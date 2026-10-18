@@ -126,14 +126,17 @@ private:
 // or B's own game spawned it too and both guests own the same NPC). The host sends B its mirrors of A's NPCs in the
 // usual NpcStates, keyed by a relay key that encodes (A, A's key): B treats it like any host NPC (pairs his own version
 // with it, so he does not own it as well, or shows a spawned copy), his hits on it come back to the host as an NpcHit
-// for the relay key and the host forwards them to A (HostNpcHit, with B as the attacker). The relay key lies above
-// every entity id (bit 31 set; ids are < 2^24, docs/game-api.md "mc_entity_ids"): it never collides with a host NPC.
-constexpr uint32_t kRelayBit = 0x80000000u;
-constexpr uint32_t kRelayKeyBits = 24;
-// 0 when it cannot be encoded (key >= 2^24, or from >= 128).
+// for the relay key and the host forwards them to A (HostNpcHit, with B as the attacker).
+// The relay key must survive the game's Lua, whose numbers are 32-bit floats (docs/re-notes.md: exact integers only
+// below 2^24), and must never be a host NPC's key. An entity id is (table slot << 8) | its type byte (8 = human,
+// docs/game-api.md "mc_entity_ids"), so a human's id always ends in 8: the relay key keeps A's slot and puts
+// 0xF0 + A's player id into the type byte, a value no entity id has. Exact in a float while the slot is below 2^16.
+constexpr uint32_t kHumanType = 8;
+constexpr uint32_t kRelayTypeBase = 0xF0;
+// 0 when it cannot be encoded (not a human's id, slot >= 2^16, or from not 1..15).
 uint32_t RelayKey(PlayerId from, uint32_t key);
 bool IsRelayKey(uint32_t k);
-bool DecodeRelayKey(uint32_t k, PlayerId& from, uint32_t& key);  // false for a key without the relay bit
+bool DecodeRelayKey(uint32_t k, PlayerId& from, uint32_t& key);  // false for anything that is no relay key
 
 // ---- host ---------------------------------------------------------------------------------------------------------------
 struct MirrorCmd {  // for the Lua side
