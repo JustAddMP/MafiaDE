@@ -961,8 +961,10 @@ void MainTick(lua_State* L, float dt) {
             const double now = Now();
             cmds += "L " + std::to_string(sh.localId) + (sh.isHost ? " 1" : " 0") + (FriendlyFire() ? " 1\n" : " 0\n");
             cmds += "M " + characters::Resolve(LocalModelSetting(), sh.localId) + "\n";
+            // last field: the game-sectors guard is in, so every game's puppets may get the friend brain, which keeps
+            // them in car seats (player_sync.lua M.Seat / M.Ally)
             cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1 " : "0 ") +
-                    (EnemiesTargetGuests() ? "1\n" : "0\n");
+                    (EnemiesTargetGuests() ? "1 " : "0 ") + (sectors_guard::Active() ? "1\n" : "0\n");
             cmds += sh.inCmds;
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";

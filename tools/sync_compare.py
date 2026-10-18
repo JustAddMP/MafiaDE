@@ -342,6 +342,18 @@ def compare(sender, receiver, args, worst):
         print("  seats: %d thrown-out lines, first ones:" % len(ejects))
         for t, s in ejects[:4]:
             print("    %s %s" % (receiver.wall(t), s.split("sync: ", 1)[-1][:150]))
+    # 0.15: the puppet's brain, put-backs inside the car (seat given up while still in it), seat taken by others
+    seatnotes = [(t, s) for t, s in receiver.logs if ("puppet %d: friend brain" % sid) in s or
+                 ("puppet %d is in car" % sid) in s or ("puppet %d: seat" % sid) in s or
+                 ("puppet %d: no friend brain" % sid) in s]
+    backs = sum(1 for _, s in seatnotes if ("puppet %d is in car" % sid) in s)
+    if seatnotes:
+        print("  seat notes: %d (put-backs inside the car: %d), first ones:" % (len(seatnotes), backs))
+        for t, s in seatnotes[:4]:
+            print("    %s %s" % (receiver.wall(t), s.split("sync: ", 1)[-1][:150]))
+    rides = [(t, s) for t, s in receiver.logs if "ride along:" in s]
+    for t, s in rides[:4]:
+        print("  ride along: %s %s" % (receiver.wall(t), s.split("ride along: ", 1)[-1][:150]))
     probes = [s for _, s in receiver.logs if "probe:" in s or "SetSpeed" in s or "engine was" in s]
     for s in probes[:6]:
         print("  car note: %s" % s.split("sync: ", 1)[-1][:160])

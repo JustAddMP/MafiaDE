@@ -24,9 +24,12 @@
 --                                                                                story dresses him)
 --   E                                                                            enter key pressed (ride along)
 --   A                                                                            aim input held (RMB / left trigger)
---   G tags markers                                                               settings: 1/0 name tags (send NT
+--   G tags markers ally brain                                                    settings: 1/0 name tags (send NT
 --                                                                                events), 1/0 map markers (minimap
---                                                                                icons on puppets)
+--                                                                                icons on puppets), 1/0 host: enemies
+--                                                                                target guests, 1/0 the game-sectors
+--                                                                                guard is in (puppets may get the
+--                                                                                friend brain: M.Ally, M.Seat)
 --   R id                                                                         remove that puppet
 --   X                                                                            remove everything
 -- Output: sample, status, events
@@ -277,6 +280,7 @@ function M.SpawnTick()
     pp.cb = nil
     pp.mult, pp.noMult = nil, nil  -- a fresh human: its speed multiplier is 1
     pp.ally, pp.spawnT = nil, M.now
+    pp.calm, pp.brainT, pp.seated, pp.leaving = nil, nil, false, nil  -- a fresh human: brain and seat state anew (M.Seat)
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
       pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
     return
@@ -679,7 +683,8 @@ function M.CarsUpdate(p)
     end
     M.my = { key = key, seat = seat, c = c }
     c.used = M.now
-    if seat == 0 and c.driver ~= "local" then
+    -- (not while a ride along into this car is under way: the game may have slid us to the wheel, M.RideTick)
+    if seat == 0 and c.driver ~= "local" and not (c.driver and M.ride and M.ride.key == key) then
       if c.driver then log("car " .. key .. ": we took the wheel while player " .. c.driver .. " drove it") end
       c.driver, c.parkPending, c.parkApply, c.localDriven = "local", nil, nil, true
       log("car " .. key .. ": we drive it")
@@ -762,17 +767,55 @@ function M.RideAlong(p)
     if not valid(best.ent:GetSeatOwner(s)) then seat = s break end
   end
   if not seat then log("ride along: no free seat in " .. best.key); return end
+  -- The game slides a player who gets in beside an empty driver seat over to the wheel (0.13.0 two-PC test: the
+  -- guest got in while the host's puppet had just been thrown out, and sat at the wheel of the host's car: "we took the
+  -- wheel while player 0 drove it"). The driver's puppet is put in its seat first; if that does not work, no ride.
+  local drv = M.pup[best.driver]
+  local h0
+  if drv and valid(drv.so) then h0 = M.SeatHolder(best.ent, 0, drv.so)
+  else h0 = valid(best.ent:GetSeatOwner(0)) and "other" or "free" end
+  if h0 == "free" then
+    if not M.SeatDriverNow(drv, best) then
+      log("ride along: nobody sits at the wheel of " .. best.key .. " here (player " .. tostring(best.driver)
+        .. "'s puppet is not seated yet): not getting in (the game would put us at the wheel), press again")
+      return
+    end
+    h0 = "his puppet, put there first"
+  end
   try("LockControls", p.LockControls, p, true)  -- a scripted enter only works for the player with controls locked
   local so = try("GetOnVehicle", p.GetOnVehicle, p, best.ent, seat + 1, false, "WALK")
-  M.ride = { so = so, t = M.now }
-  log("ride along: seat " .. seat .. " of car " .. best.key)
+  M.ride = { so = so, t = M.now, key = best.key, seat = seat, c = best }
+  log("ride along: seat " .. seat .. " of car " .. best.key .. " (at the wheel: " .. h0 .. ")")
 end
 
+-- Ride along under way: where the game put us is checked once we are in the car; at the wheel instead of the chosen
+-- seat we slide over (SlideToSeat, 1-based like GetOnVehicle, UNVERIFIED). Meanwhile M.CarsUpdate does not take the
+-- car from its driver; if we still sit at the wheel when the ride ends, it does (as before 0.15).
 function M.RideTick(p)
   local r = M.ride
   if not r then return end
-  if (r.so and r.so:IsDone()) or M.now - r.t > 2 then
+  local car = r.c and r.c.ent
+  if not r.at and valid(car) and same(p:GetOwner(), car) then
+    for s = 0, 3 do if same(car:GetSeatOwner(s), p) then r.at = s break end end
+    if r.at == 0 and r.seat ~= 0 then
+      local good, err = pcall(p.SlideToSeat, p, r.seat + 1)
+      r.slide, r.t = good and "sent" or ("failed: " .. tostring(err)), M.now
+      log("ride along: the game put us at the wheel of " .. r.key .. " instead of seat " .. r.seat
+        .. ": sliding over (" .. r.slide .. ")")
+    elseif r.at then
+      log("ride along: we sit in seat " .. r.at .. " of car " .. r.key)
+    end
+  end
+  if (r.so and r.so:IsDone() and not r.slide) or M.now - r.t > 2 then
     try("LockControls", p.LockControls, p, false)
+    if r.slide and valid(car) then
+      local at
+      for s = 0, 3 do if same(car:GetSeatOwner(s), p) then at = s break end end
+      log("ride along: after sliding over we sit in seat " .. tostring(at) .. " of car " .. r.key
+        .. (at == 0 and " (still at the wheel: we drive it from now on)" or ""))
+    elseif not r.at then
+      log("ride along: not in car " .. r.key .. " after " .. string.format("%.1f", M.now - r.t) .. " s")
+    end
     M.ride = nil
   end
 end
@@ -819,57 +862,176 @@ function M.GetOut(pp)
   log("puppet " .. pp.id .. " getting out")
 end
 
--- Seat the puppet in car record `c`. GetOnVehicle(car, seat, animate, moveStyle): the seat is 1-based (1 = driver) and
--- animate = false places the human in the seat at once. Returns false when it cannot be seated (seat taken by
--- someone else, gave up): the caller hides the puppet instead.
+-- Seat keeping (docs/game-api.md 7 "Seating" and 17). Why puppets were thrown out of car seats: the puppet factory
+-- makes civilians (a traffic crew's archetype), and a civilian brain does not stay in a car it does not drive itself:
+-- its own desires (the exe has C_DesireUseCar, C_DesirePanicInCar, C_DesireCivilPlayerReaction, ...) take it out of a
+-- car that the player drives or drove, or that our controls and corrections move. The 0.13.0 two-PC test showed it
+-- plainly: on the host the guest's puppet (switched to the FRIEND brain, M.Ally) sat at the wheel of three copies for
+-- minutes (own physics, pinned, a swapped copy) and never left; on the guest the host's puppet (still a civilian) was
+-- thrown out 0.1-1 s after every GetOnVehicle, at the wheel of fresh copies and in the passenger seat of the guest's
+-- own car. So every puppet gets the friend brain before it is seated (on every game where the game-sectors guard
+-- makes the switch safe, M.brainOk), and a seat is checked every tick: a puppet whose seat is given up while it is
+-- still in the car (the start of an exit, UNVERIFIED) is put back at once, and one that got out is put back on the
+-- same tick (no wait, no visible stand next to the car) for the first RESEAT_FAST times. Without the guard the
+-- civilian is kept calm instead (no sound reactions, no civil wander), which is all a civilian brain allows.
+local RESEAT_FAST = 3       -- ejections put back at once before the slower retries
+local PUTBACK_GAP = 0.5     -- s between two put-backs of a puppet that gives up its seat inside the car
+local BRAIN_SETTLE = 0.3    -- s after the brain switch before the puppet is seated
+local SEAT_LOG = 12         -- seat lines logged per puppet in full (then every 25th)
+
+local function seatLogOk(pp)
+  pp.seatLogs = (pp.seatLogs or 0) + 1
+  return pp.seatLogs <= SEAT_LOG or pp.seatLogs % 25 == 0
+end
+
+-- "ours" / "free" / "other": who holds seat `seat` (0-based) of `car` from this puppet's view
+local function seatHolder(car, seat, so)
+  local good, occ = pcall(car.GetSeatOwner, car, seat)
+  if not good then return "?" end
+  if not valid(occ) then return "free" end
+  return same(occ, so) and "ours" or "other"
+end
+M.SeatHolder = seatHolder
+
+-- Does this game switch puppets to the friend brain (keeps them in car seats; the host's enemies then target them)?
+function M.WantsBrain()
+  return M.brainOk or (M.isHost and M.allyOn) or false
+end
+
+-- What a civilian brain allows (no friend brain here): no reactions to gunfire, no civil wander. Once per puppet.
+function M.Calm(pp, so)
+  if pp.calm then return end
+  pp.calm = true
+  local a = pcall(so.SetReactionOnSound, so, false)
+  local b = pcall(so.InterruptCivilWander, so)
+  log(string.format("puppet %s: no friend brain on this game: kept calm for its seat (sound reactions off %s, civil "
+    .. "wander interrupted %s)", pp.id, a and "ok" or "failed", b and "ok" or "failed"))
+end
+
+-- GetOnVehicle(car, seat, animate, moveStyle) on the puppet; the seat is 1-based (1 = driver), animate = false puts it
+-- in the seat in the same tick. Returns the seat holder right after.
+local function seatCmd(pp, so, car, animate)
+  try("GetOnVehicle", so.GetOnVehicle, so, car, pp.seat + 1, animate, "WALK")
+  return seatHolder(car, pp.seat, so)
+end
+
+-- Seat the puppet in car record `c`. Returns false when it cannot be seated (seat taken by someone else, gave up):
+-- the caller hides the puppet instead.
 function M.Seat(pp, c)
   local so, car = pp.so, c.ent
   local own = so:GetOwner()
   if own and same(own, car) then
-    pp.seatTries, pp.seated = 0, true
+    local h = seatHolder(car, pp.seat, so)
+    if h == "ours" or h == "?" or pp.seatCheckOff then
+      if not pp.seated then
+        pp.seated, pp.seatedT = true, M.now
+        if seatLogOk(pp) then
+          log(string.format("puppet %s sits in car %s seat %d (%.1f s after the seat command, friend brain %s)",
+            pp.id, tostring(pp.vkey), pp.seat, M.now - (pp.seatT or M.now), pp.ally and "yes" or "no"))
+        end
+      end
+      pp.seatTries, pp.leaving = 0, nil
+      return true
+    end
+    -- in this car but not in its seat: an animated get-in on its way, another seat of the car, or the AI leaving
+    if pp.seatAnim and M.now - (pp.seatT or -10) < ANIM_WAIT then return true end
+    local other
+    for s = 0, 3 do
+      if s ~= pp.seat and seatHolder(car, s, so) == "ours" then other = s break end
+    end
+    if not pp.leaving then
+      pp.leaving = M.now
+      pp.putBacks = (pp.putBacks or 0) + 1
+      if seatLogOk(pp) then
+        local g, phys = pcall(so.GetPhysState, so)
+        local g2, sp = pcall(car.GetSpeedFloat, car)
+        log(string.format("puppet %s is in car %s but not in seat %d (seat %s, %s, phys %s, car %.1f m/s, %.1f s after "
+          .. "seating): put back at once (#%d)", pp.id, tostring(pp.vkey), pp.seat, h,
+          other and ("sits in seat " .. other) or "leaving", g and tostring(phys) or "?",
+          g2 and (tonumber(sp) or -1) or -1, M.now - (pp.seatedT or pp.seatT or M.now), pp.putBacks))
+      end
+    end
+    if M.now - (pp.backT or -10) >= PUTBACK_GAP then
+      pp.backT = M.now
+      local now = seatCmd(pp, so, car, false)
+      if now == "ours" then
+        pp.leaving = nil
+        if seatLogOk(pp) then log("puppet " .. pp.id .. " put back into seat " .. pp.seat .. " of car " .. pp.vkey) end
+      elseif M.now - pp.leaving > 2.5 then
+        -- the seat getter and GetOwner disagree for good (a car whose seats read differently?): trust GetOwner from
+        -- now on for this seat, as before 0.15
+        pp.seatCheckOff = true
+        log(string.format("puppet %s: seat %d of car %s still reads %s after 2.5 s of put-backs: seat check off for it",
+          pp.id, pp.seat, tostring(pp.vkey), now))
+      end
+    end
     return true
   end
-  if pp.seated then  -- was seated, now is not: thrown out (happens while a fresh copy settles, see also M.Swap)
+  pp.leaving = nil
+  if pp.seated then  -- was seated, now is not: thrown out
     pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
-    pp.ejectsLogged = (pp.ejectsLogged or 0) + 1
-    if pp.ejectsLogged <= 12 then
+    pp.ejectsAll = (pp.ejectsAll or 0) + 1
+    if seatLogOk(pp) then
       local g1, phys = pcall(so.GetPhysState, so)
       local g2, sp = pcall(car.GetSpeedFloat, car)
       local cmd = pp.vcmd or {}
-      local occ = car:GetSeatOwner(pp.seat)
-      log(string.format("puppet %s thrown out of car %s seat %d (#%d): %.1f s after seating, car %.1f m/s, car fix %s%s, "
-        .. "phys %s, owner now %s, seat now %s, animated %s, hidden %s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects,
-        M.now - (pp.seatT or M.now), g2 and (tonumber(sp) or -1) or -1, tostring(cmd.fix), cmd.pinned and " pinned" or "",
-        g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
-        not valid(occ) and "free" or (same(occ, so) and "ours" or "someone else"), tostring(pp.seatAnim),
-        tostring(pp.hidden)))
+      local q, cp = so:GetPos(), car:GetPos()
+      log(string.format("puppet %s thrown out of car %s seat %d (#%d, %d this session): %.1f s after seating, car %.1f "
+        .. "m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, put-backs "
+        .. "%d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects, pp.ejectsAll,
+        M.now - (pp.seatedT or pp.seatT or M.now), g2 and (tonumber(sp) or -1) or -1, tostring(cmd.fix),
+        cmd.pinned and " pinned" or "", g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
+        seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.ally and "yes" or "no",
+        pp.putBacks or 0, math.sqrt((q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 + (q.z - cp.z) ^ 2), tostring(c.driver),
+        c.adopted and ", our mission car" or (c.localDriven and ", we drove it" or "")))
     end
-    -- A mission car of this game (adopted, M.FindLocalCar) does not keep an NPC at its wheel either: it is swapped
-    -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice.
+    -- A mission car of this game (adopted, M.FindLocalCar) that does not keep the remote driver's puppet at its wheel
+    -- even so is swapped for a copy (ours hidden until the copy is parked, M.Restore) the moment it throws him out
+    -- twice.
     if pp.ejects == 2 and pp.seat == 0 and c.adopted and not c.localIn and c.st == "ready" then
       log("puppet " .. pp.id .. " is thrown out of our mission car " .. c.key .. ": a copy takes its place")
       M.Swap(c, true)
       pp.ejects, pp.seatTries = 0, 0
       return false
     end
-    if pp.ejects == 3 then log("puppet " .. pp.id .. " keeps getting thrown out of car " .. pp.vkey .. ", retrying slower") end
+    if pp.ejects == RESEAT_FAST + 1 then
+      log("puppet " .. pp.id .. " keeps getting thrown out of car " .. pp.vkey .. ", retrying slower")
+    end
   end
-  -- Retry once a second; after repeated failures every 4 s with the puppet hidden in between.
-  local slow = (pp.ejects or 0) >= 3 or (pp.seatTries or 0) >= 6
+  -- Put back at once for the first RESEAT_FAST ejections, then once a second; after repeated failures every 4 s with
+  -- the puppet hidden in between.
+  local slow = (pp.ejects or 0) > RESEAT_FAST or (pp.seatTries or 0) >= 6
   if slow and M.now - (pp.seatT or -10) < 4 then return false end
   if own then  -- still in another car: out first
     M.GetOut(pp)
     return M.now - pp.exitT < 3
   end
   pp.exitSo = nil
-  local occ = car:GetSeatOwner(pp.seat)
-  if valid(occ) and not same(occ, so) then return false end
+  local holder = seatHolder(car, pp.seat, so)
+  if holder == "other" then
+    if pp.takenKey ~= pp.seatKey then
+      pp.takenKey = pp.seatKey
+      local occ = car:GetSeatOwner(pp.seat)
+      log(string.format("puppet %s: seat %d of car %s is taken here by %s: hidden until it is free", pp.id, pp.seat,
+        tostring(pp.vkey), tostring(occ)))
+    end
+    return false
+  end
+  -- the friend brain first (it keeps the seat); a puppet that spawned a moment ago waits for it (M.Ally: 2 s)
+  if M.WantsBrain() and not pp.ally then
+    if M.Ally(pp, so) then pp.brainT = M.now; return true end
+    if M.now - (pp.spawnT or M.now) < 2.5 then return false end
+  end
+  if pp.brainT and M.now - pp.brainT < BRAIN_SETTLE then return true end
+  if not pp.ally then M.Calm(pp, so) end
   -- The puppet walked up to a standing car (its player was getting in, docs/protocol.md seat 9): it gets in with the
-  -- game's own animation, once; it is given ANIM_WAIT to finish, then seated at once like any other time.
+  -- game's own animation, once; it is given ANIM_WAIT to finish, then seated at once like any other time. A puppet
+  -- just thrown out is put back at once (fast), else once a second.
+  local fast = pp.ejects and pp.ejects > 0 and pp.ejects <= RESEAT_FAST and M.now - (pp.seatT or -10) >= 0.2
   local wait = pp.seatAnim and ANIM_WAIT or 1
-  if M.now - (pp.seatT or -10) >= wait then
+  if fast or M.now - (pp.seatT or -10) >= wait then
     local animate = false
-    if not pp.hidden and not pp.animTried then
+    if not pp.hidden and not pp.animTried and not fast then
       local q, cp = so:GetPos(), car:GetPos()
       local good, sp = pcall(car.GetSpeedFloat, car)
       animate = good and math.abs(tonumber(sp) or 9) < 1 and (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 < 4 * 4
@@ -878,16 +1040,35 @@ function M.Seat(pp, c)
     pp.seatAnim = animate
     if animate then pp.animTried = true end
     pp.seatT, pp.seatTries = M.now, (pp.seatTries or 0) + 1
-    try("GetOnVehicle", so.GetOnVehicle, so, car, pp.seat + 1, animate, "WALK")
+    local now = seatCmd(pp, so, car, animate)
     if animate then
       log("puppet " .. pp.id .. " gets into car " .. pp.vkey .. " seat " .. pp.seat .. " (animated)")
     elseif same(so:GetOwner(), car) then
-      if (pp.ejects or 0) < 3 then log("puppet " .. pp.id .. " seated in car " .. pp.vkey .. " seat " .. pp.seat) end
+      if seatLogOk(pp) then
+        log(string.format("puppet %s seated in car %s seat %d%s (seat reads %s)", pp.id, pp.vkey, pp.seat,
+          fast and " again at once" or "", now))
+      end
     elseif pp.seatTries == 6 then
-      log("puppet " .. pp.id .. " could not be seated in car " .. pp.vkey .. ", retrying slower")
+      log("puppet " .. pp.id .. " could not be seated in car " .. pp.vkey .. " (seat reads " .. now .. "), retrying slower")
     end
   end
   return true
+end
+
+-- Puts the remote driver's puppet into the driver seat of car record c right now, if it is free (M.RideAlong: the
+-- game slides a player who gets in beside an empty driver seat over to the wheel). True when it sits there.
+function M.SeatDriverNow(pp, c)
+  if not (pp and valid(pp.so) and pp.st == "alive" and pp.seat == 0 and pp.vkey == c.key) then return false end
+  local so, car = pp.so, c.ent
+  local h = seatHolder(car, 0, so)
+  if h == "ours" then return true end
+  if h ~= "free" or valid(so:GetOwner()) then return false end
+  if M.WantsBrain() and not pp.ally and M.Ally(pp, so) then pp.brainT = M.now end
+  if pp.hidden then M.Hide(pp, false, true) end
+  pp.seatT, pp.seatAnim = M.now, false
+  local now = seatCmd(pp, so, car, false)
+  log("ride along: put player " .. pp.id .. "'s puppet at the wheel of " .. c.key .. " first (seat reads " .. now .. ")")
+  return now == "ours"
 end
 
 -- Crouch, aim, shots and reload on a puppet (on foot only). The puppet is an AI civilian; these are the human
@@ -977,12 +1158,13 @@ function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
-  if M.isHost and M.allyOn and not pp.ally then M.Ally(pp, so) end
+  if not pp.ally and M.WantsBrain() then M.Ally(pp, so) end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
     if pp.seatKey ~= sk then
       pp.seatKey, pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = sk, 0, 0, false, nil, nil
+      pp.leaving, pp.seatCheckOff, pp.seatedT = nil, nil, nil
     end
     local c = pp.vkey and M.cars[pp.vkey]
     pp.dist = 0
@@ -1110,13 +1292,19 @@ function M.TracePuppet(pp)
   local own = so:GetOwner()
   local g1, phys = pcall(so.GetPhysState, so)
   local g2, spr = pcall(so.IsSprinting, so)
+  -- seat state (0.15): who holds the puppet's seat in its car here, its brain, put-backs, ejections this session
+  local c = pp.vkey and M.cars[pp.vkey]
+  local sown = (pp.veh and pp.seat and pp.seat <= 3 and c and valid(c.ent)) and M.SeatHolder(c.ent, pp.seat, so) or "-"
+  local g3, ai = pcall(so.GetAIType, so)
   trace("PR", string.format("id=%s st=%s p=%s d=%.3f,%.3f hid=%d veh=%s seat=%s own=%s seated=%d ejects=%d tries=%d "
-    .. "anim=%s phys=%s spr=%s dead=%d hp=%.0f mv=%d mult=%.2f moves=%d snaps=%d",
+    .. "anim=%s phys=%s spr=%s dead=%d hp=%.0f mv=%d mult=%.2f moves=%d snaps=%d sown=%s brain=%d ai=%s back=%d "
+    .. "leaving=%d ejAll=%d",
     pp.id, pp.st, f3(so:GetPos()), so:GetDir().x, so:GetDir().y, pp.hidden and 1 or 0, tostring(pp.vkey),
     tostring(pp.seat), valid(own) and tostring(guidNum(own)) or "-", pp.seated and 1 or 0, pp.ejects or 0,
     pp.seatTries or 0, tostring(pp.seatAnim), g1 and tostring(phys) or "-", g2 and (spr and "1" or "0") or "-",
     so:IsDeath() and 1 or 0, tonumber(so.health) or -1, pp.moving and 1 or 0, pp.mult or 1, pp.moves or 0,
-    pp.snaps or 0))
+    pp.snaps or 0, sown, pp.ally and 1 or 0, g3 and tostring(ai) or "-", pp.putBacks or 0, pp.leaving and 1 or 0,
+    pp.ejectsAll or 0))
 end
 
 -- LR: our own player (and the car we drive): what the others are sent, read back from the game
@@ -1142,12 +1330,19 @@ end
 -- leaving it (a puppet released alive, the factory despawned), and the module's once-a-second walk read it
 -- (exe+0x243A915). The dll's guard (src/game/sectors_guard.cpp) drops such stale entries before each walk; without
 -- the guard (another game build) the C++ side turns this off. Civilian NPCs are never switched (npc_sync.lua).
+-- Since 0.15 the switch is also what keeps a puppet in its car seat (M.Seat: a civilian brain leaves cars), so it is
+-- done on every game where the guard is in (M.brainOk), the guests' too, and at any time the puppet is not in a car
+-- (hidden included), before it is first seated. With enemies_target_guests = 0 the host's enemies' hits on it are not
+-- sent (M.SendNpcHit). Returns true when the brain was switched now.
 function M.Ally(pp, so)
-  if pp.veh or pp.hidden or M.now - (pp.spawnT or M.now) < 2 or so:IsDeath() then return end
+  if pp.ally or valid(so:GetOwner()) or M.now - (pp.spawnT or M.now) < 2 or so:IsDeath() then return false end
   pp.ally = true
-  local good = pcall(so.SwitchBrain, so, 1)
-  log(string.format("puppet %s: friend brain %s (AI type %s): the host's enemies target it", pp.id,
-    good and "set" or "FAILED", tostring(so:GetAIType())))
+  local before = tostring(so:GetAIType())
+  local good, err = pcall(so.SwitchBrain, so, 1)
+  log(string.format("puppet %s: friend brain %s (AI type %s -> %s%s): it keeps its car seats, enemies target it%s",
+    pp.id, good and "set" or "FAILED", before, tostring(so:GetAIType()), good and "" or (", " .. tostring(err)),
+    (M.isHost and not M.allyOn) and " (their hits are not sent: enemies_target_guests = 0)" or ""))
+  return good
 end
 
 -- NPC copies (npc_sync.lua, 10 Hz states): their AI walk (MoveVec) starts late and is slower than a running NPC, so
@@ -1294,9 +1489,10 @@ function M.OnPuppetDamage(pp, m)
   M.SendHit(pp, amount, dtype, zone, weapon)
 end
 
--- Host: one of our NPCs hit guest pp's puppet: the guest takes it (M.HurtByNpc on his game).
+-- Host: one of our NPCs hit guest pp's puppet: the guest takes it (M.HurtByNpc on his game). Not with
+-- enemies_target_guests = 0 (the puppet has the friend brain for its car seats anyway, M.Ally).
 function M.SendNpcHit(pp, amount, dtype, zone, weapon, npc)
-  if amount <= 0 then return end
+  if amount <= 0 or not M.allyOn then return end
   M.hitq[#M.hitq + 1] = string.format("HT %s %.2f %d %d %.0f 0 0 0 1 %d", pp.id, amount, dtype, zone, weapon, npc or 0)
   M.npcHitsSent = (M.npcHitsSent or 0) + 1
   if M.npcHitsSent <= 30 or M.npcHitsSent % 50 == 0 then
@@ -2087,6 +2283,7 @@ function M.Update(dt, cmds)
       aimInput = true
     elseif op == "G" then
       M.tags, M.markers, M.allyOn = f[2] == "1", f[3] == "1", f[4] ~= "0"
+      M.brainOk = f[5] == "1"
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
