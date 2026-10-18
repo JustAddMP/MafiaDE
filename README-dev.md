@@ -43,6 +43,8 @@ tools\make_release.cmd 0.8.0      build, run every core test and proxy_test, wri
     Steam" below.
   - `proxy_test.exe`: core's `tests\proxy_test.cpp` built against our descriptor (tests our launcher and proxy
     without the game; see below).
+  - Our own unit tests of game logic that runs without the game (`tests\*.cpp`, run by `tools\make_release.cmd`):
+    `fail_flow_test.exe` (the co-op answer to a failed mission, `src\game\fail_flow.h`: one load on every game).
   - Object files go to `out\obj\game\`, core's to `out\obj\core\`.
 - Core's own tests (net_loopback, net_password, net_kick, net_interest, net_fuzz, proxy_test with a made-up game, ...):
   `external\core\build.cmd`, then the exes in `external\core\out\` (see core's README.md).

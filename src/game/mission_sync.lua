@@ -7,7 +7,7 @@
 --   H quest cp obj override inWorld  the host's chapter, checkpoint, objective and override objective ("-" = none)
 --   C name                            the cutscene playing on the host ("-" = none)
 --   Q                                 guest: quit to the main menu (the host reached a checkpoint we load next)
---   B                                 keep the screen black (the Free Ride stop of a failed mission, left at once)
+--   B                                 fade the screen to black (a failed mission: this world is left at once)
 --   T quest cp [x y z dx dy]          the chapter and checkpoint our last chapter load is for (guest following the
 --                                     host, or the host's lobby chapter start): its quest is started once in the world,
 --                                     after the player was put where the save has him (x y z, heading dx dy)
@@ -292,10 +292,11 @@ function MS.Update(dt, cmds)
     end
   end
   if blackout and MS.blackKey ~= tostring(M.inWorldAt) then
-    -- the Free Ride stop of a failed mission: the player is not meant to see it (we leave it in a moment)
+    -- a failed mission (the world we leave in a moment: the failed one, or the Free Ride stop of the game's own
+    -- fail load): the player is not meant to see more of it
     MS.blackKey = tostring(M.inWorldAt)
     local good, err = pcall(HUD_FaderFadeOut, 0.2)
-    log("Free Ride stop: screen faded out" .. (good and "" or (" failed: " .. tostring(err))))
+    log("failed mission: screen faded out" .. (good and "" or (" failed: " .. tostring(err))))
   end
   if quit and not MS.quitAt then
     -- Leave the world clean first: puppets, their map markers, the puppet factory's car and our car copies are

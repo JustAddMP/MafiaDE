@@ -68,6 +68,14 @@ link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\proxy_test.exe" /PDB:"%OUT%\pro
   "%OBJ%\tests\proxy_test.obj" %INFO% "%CB%\mc_core.lib" %MC_SYSLIBS%
 if errorlevel 1 ( echo [build] ERROR: linking proxy_test.exe failed & goto :fail )
 
+rem ---- our own unit tests (game logic that runs without the game) ---------------------------------------------
+echo [build] fail_flow_test.exe
+cl %CXXFLAGS% /Fd"%OBJ%\tests\vc.pdb" /Fo"%OBJ%\tests\fail_flow_test.obj" "%ROOT%\tests\fail_flow_test.cpp"
+if errorlevel 1 ( echo [build] ERROR: compiling fail_flow_test failed & goto :fail )
+link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\fail_flow_test.exe" /PDB:"%OUT%\fail_flow_test.pdb" ^
+  "%OBJ%\tests\fail_flow_test.obj" "%OBJ%\game\fail_flow.obj" kernel32.lib
+if errorlevel 1 ( echo [build] ERROR: linking fail_flow_test.exe failed & goto :fail )
+
 echo [build] OK -^> %OUT%
 endlocal
 exit /b 0
