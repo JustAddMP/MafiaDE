@@ -4,6 +4,7 @@
 
 #include "core/config.h"
 #include "core/log.h"
+#include "core/trace.h"
 #include "dll/ui_input.h"
 #include "game/characters.h"
 #include "game/lua.h"
@@ -149,10 +150,32 @@ void DrawTags(render::DrawList& d, float w, float h) {
     }
 }
 
+net::Session* _session = nullptr;  // render thread: the current session (OnSessionStart .. OnSessionEnd)
+
+// The reconnect banner (docs/protocol.md "Reconnect"): guest: we lost the host and core rejoins him; everyone else: a
+// player lost his connection and his slot is held. "" = none.
+std::string ReconnectNotice() {
+    if (!_session) return {};
+    char buf[160];
+    if (_session->IsReconnecting()) {
+        std::snprintf(buf, sizeof buf, "CONNECTION LOST - RECONNECTING... %d S",
+                      static_cast<int>(std::ceil(_session->ReconnectLeftS())));
+        return buf;
+    }
+    const auto dropped = _session->DroppedPlayers();
+    if (dropped.empty()) return {};
+    std::string name = dropped[0].info.name;
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    std::snprintf(buf, sizeof buf, "%s LOST THE CONNECTION - WAITING FOR %s TO RECONNECT... %d S", name.c_str(),
+                  dropped.size() > 1 ? "THEM" : "THE PLAYER", static_cast<int>(std::ceil(dropped[0].leftS)));
+    return buf;
+}
+
 // A line over the game while the story sync needs a moment (guest: held during the host's cutscene, loading his
-// checkpoint).
+// checkpoint), or while a connection is being re-established.
 void DrawNotice(render::DrawList& d, float w, float h) {
-    std::string text = MissionSync::HudNotice();
+    std::string text = ReconnectNotice();
+    if (text.empty()) text = MissionSync::HudNotice();
     if (text.empty()) return;
     const float s = h / 1080.0f, px = 26.0f * s;
     const float tw = render::DrawList::TextWidth(text, px);
@@ -179,6 +202,7 @@ public:
     void RenderTick(float dt) override { lua::PollRender(dt); }
 
     void OnSessionStart(net::Session& session) override {
+        _session = &session;
         PlayerSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
@@ -189,11 +213,41 @@ public:
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);
         TrafficSync::OnPlayerLeft(id);
+    }
+
+    // ---- reconnect (core: docs/protocol.md "Reconnect"; ours: docs/protocol.md "Reconnect") ----
+    // A player lost his connection: his puppet goes (as when he leaves) until he is back; the
+    // host's syncs see him as new then (joinSeq) and send him the world again.
+    void OnPlayerDropped(net::PlayerId id) override {
+        MC_LOG_INFO("reconnect: player %u lost the connection: his puppet is removed while his slot is held", id);
+        core::trace::Line("RCN", "ev=dropped id=%u", id);
+        PlayerSync::OnPlayerLeft(id);
+        NpcSync::OnPlayerLeft(id);      // his own NPCs' mirrors go; he sends them again when back
+        TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
+    }
+    // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
+    // session turns inactive), the story keeps the host's point (MissionSync), our NPC copies are dropped (NpcSync).
+    void OnConnectionLost() override {
+        MC_LOG_WARN("reconnect: connection to the host lost (%s): the game keeps running, rejoining for %.0f s",
+                    _session ? _session->ReconnectReason().c_str() : "?",
+                    _session ? _session->ReconnectLeftS() : 0.0);
+        core::trace::Line("RCN", "ev=lost why=%s", _session ? _session->ReconnectReason().c_str() : "?");
+        MissionSync::OnConnectionLost();
+    }
+    void OnReconnected(bool sameSlot) override {
+        MC_LOG_INFO("reconnect: back in the host's session as player %u (%s) after %d attempt(s); the host re-sends "
+                    "the world, our puppets come back",
+                    _session ? _session->LocalId() : 0, sameSlot ? "same slot" : "new slot",
+                    _session ? _session->ReconnectAttempts() : 0);
+        core::trace::Line("RCN", "ev=back same=%d local=%u attempts=%d", sameSlot ? 1 : 0,
+                          _session ? _session->LocalId() : 0, _session ? _session->ReconnectAttempts() : 0);
+        MissionSync::OnReconnected();
     }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());

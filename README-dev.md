@@ -47,7 +47,7 @@ tools\make_release.cmd 0.8.0      build, run every core test and proxy_test, wri
     (`src\game\car_swap.*`: when a mission car hidden behind a copy comes back); prints PASS/FAIL per check, exit
     code 0 when all pass. `tools\make_release.cmd` runs it.
   - Object files go to `out\obj\game\`, core's to `out\obj\core\`.
-- Core's own tests (net_loopback, net_password, net_kick, net_interest, net_fuzz, proxy_test with a made-up game, ...):
+- Core's own tests (net_loopback, net_password, net_kick, net_reconnect, net_interest, net_fuzz, proxy_test with a made-up game, ...):
   `external\core\build.cmd`, then the exes in `external\core\out\` (see core's README.md).
 - Any compile or link error stops the build with exit code 1.
 
@@ -188,7 +188,9 @@ scripts and still work.
 - **Quitting:** when a game closes (window X, the game's quit) the others are told at once: guests see **HOST LEFT**,
   the host sees "<name> left the game". Killing the process from outside makes them wait for the timeout: `net_timeout_s` (default 4 s over UDP;
   `net_steam_timeout_s` 6 s over Steam P2P), measured 4.6 s (guest killed) and 4.7 s (host killed). A game that is only
-  busy keeps its peers from the transport's keepalive thread (core v0.8.0).
+  busy keeps its peers from the transport's keepalive thread (core v0.8.0). A timeout counts as a lost connection
+  (see "Disconnects and reconnect" below): a killed guest's slot is held for 60 s before the others see that he did
+  not come back; the guests of a killed host try to rejoin him for 60 s.
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only (JOIN FRIEND's
@@ -240,8 +242,18 @@ the dll `LoadLibrary`s the game folder's `steam_api64.dll` (read-only) itself, c
 pipe to the same Steam client, the game's own Steam keeps working) and calls its `SteamAPI_RunCallbacks` every
 frame. If that fails, Steam features are off and UDP still works.
 
-**Disconnects:** no automatic reconnect. The reason is logged (`coop: disconnected: ...`), shown in a banner (and
-for 20 s in the debug status text), and the mod goes back to idle.
+**Disconnects and reconnect:** when a guest's connection is lost (timeout after `net_timeout_s` /
+`net_steam_timeout_s`, a Steam P2P failure, the host's network blip) - not when the host left cleanly, kicked or banned
+him, or he left himself - the guest's game keeps running and core rejoins the same host (same address or SteamID)
+with backoff for 60 s; a line over the game says **CONNECTION LOST - RECONNECTING... 12 S** (and the CO-OP panels
+"CONNECTION LOST - RECONNECTING TO <HOST>... 12 S"; LEAVE CO-OP stops it). The host keeps his slot (same player id)
+for 60 s, removes his puppet meanwhile and shows **<NAME> LOST THE CONNECTION - WAITING FOR THE PLAYER TO
+RECONNECT... 45 S** (the other guests too). Back in, the host sends him what a newcomer gets (his PlayerModel, story
+state, checkpoint save, cutscene, NPC states) and the puppets come back; the guest is not reloaded unless the host
+moved to another checkpoint meanwhile (then he follows as usual). Core docs/protocol.md "Reconnect", ours
+docs/protocol.md "Reconnect". If the 60 s run out, the reason is logged (`coop: disconnected: ...`), shown in a
+banner (and for 20 s in the debug status text), and the mod goes back to idle. Log lines: `session: ... reconnect
+...`, `coop: reconnect: ...`, `reconnect: ...`; trace records `RCN`.
 
 **Debug status text:** hidden by default for players; **F7** shows/hides it, `--debug-overlay` / `debug_overlay = 1`
 shows it from the start. Banners and the co-op panels are drawn either way. Top-left of the game window, drawn by the dll's own D3D11 renderer (`external/core/src/render/overlay.cpp`,
