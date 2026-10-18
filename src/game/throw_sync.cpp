@@ -26,7 +26,7 @@ namespace {
 using namespace arc;
 using boom::KindName;
 
-constexpr size_t kMaxQueue = 128;
+constexpr size_t kMaxQueue = 32;
 constexpr float kMaxCoord = 100000.0f;
 constexpr double kAimInterval = 0.2;  // s between two GA records while aiming (the log gets start / end only)
 constexpr double kDotsFresh = 0.25;   // s: dots older than this (no tick: loading, paused) are not drawn
@@ -51,17 +51,13 @@ struct Dot {
     float alpha = 1, x = 0, y = 0, dist = 0;  // x, y: -1..1, y up (ProjectPointToScreen)
 };
 
-struct OutMsg {
-    Out o;
-};
-
 struct Shared {
     std::mutex mu;
     bool active = false, isHost = false;
     uint32_t localId = 0;
-    Book book;                    // other games' flights (render thread adds, main thread reads)
+    Book book;                    // other games' flights (render thread adds / ends, main thread simulates)
     std::vector<Ended> ended;     // flights over since the last main tick (for the Lua glue and the log)
-    std::vector<Out> outbox;      // main thread -> network
+    std::vector<ThrowMsg> outbox; // main thread -> network
     std::vector<Dot> dots;        // Lua -> overlay
     double dotsAt = 0;
     std::string luaStatus, mainStatus;
@@ -75,17 +71,16 @@ Shared& S() {
 // render thread
 net::Session* _session = nullptr;
 boom::Inbox _inbox;
-uint64_t _throwsSent = 0, _pointMsgsSent = 0, _throwsRecv = 0, _pointMsgsRecv = 0, _dropped = 0, _endedByBoom = 0;
+uint64_t _throwsSent = 0, _throwsRecv = 0, _dropped = 0, _endedByBoom = 0;
 
 // main thread
 struct Main {
     Tracker tracker;
     AimLog aim;
     bool aimThisTick = false;
-    AimSample lastAim;
     // throw numbers start somewhere new each session (receivers keep the last ones they saw); kept below 2^24
     uint32_t nextSeq = ((GetTickCount() & 0x3FFu) << 12) | 1u;
-    uint64_t throws = 0, found = 0, modelOnly = 0, aims = 0, summaries = 0;
+    uint64_t throws = 0, measured = 0, modelOnly = 0, aims = 0, summaries = 0;
 };
 Main& G() {
     static Main* m = new Main;
@@ -96,6 +91,15 @@ uint32_t _luaErrors = 0;
 bool _wasActive = false;
 
 const char* Tok(const std::string& s) { return s.empty() ? "-" : s.c_str(); }
+
+// the game's ray cast for the receivers' simulation (GameMainThread)
+int Ray(const Vec3& a, const Vec3& b, Vec3& hit) {
+    const float from[3] = {a.x, a.y, a.z}, to[3] = {b.x, b.y, b.z};
+    float h[3] = {};
+    const int r = lua::RayCast(from, to, h);
+    if (r == 1) hit = {h[0], h[1], h[2]};
+    return r;
+}
 
 // ---- messages (render thread) ------------------------------------------------------------------------------------------
 void OnThrowMsg(net::PlayerId from, net::ByteReader& r) {
@@ -118,37 +122,13 @@ void OnThrowMsg(net::PlayerId from, net::ByteReader& r) {
     YawPitch(t.vel, yaw, pitch);
     if (core::trace::IsOpen())
         core::trace::Line("GR", "from=%u seq=%u kind=%s flags=%u o=%.2f,%.2f,%.2f v=%.2f,%.2f,%.2f speed=%.2f yaw=%.1f "
-                                "pitch=%.1f g=%.2f delay=%u flight=%u land=%.2f,%.2f,%.2f weapon=%s added=%d",
+                                "pitch=%.1f g=%.2f delay=%u fuse=%u weapon=%s added=%d",
                           from, t.seq, KindName(t.kind), t.flags, t.origin.x, t.origin.y, t.origin.z, t.vel.x, t.vel.y,
-                          t.vel.z, speed, yaw, pitch, t.gravity, t.delayMs, t.flightMs, t.landing.x, t.landing.y,
-                          t.landing.z, Tok(t.weapon), added ? 1 : 0);
+                          t.vel.z, speed, yaw, pitch, t.gravity, t.delayMs, t.fuseMs, Tok(t.weapon), added ? 1 : 0);
     if (_throwsRecv <= 60 || _throwsRecv % 100 == 0)
-        MC_LOG_INFO("arc: player %u threw a %s (#%u) from %.1f %.1f %.1f at %.1f m/s, pitch %.0f deg (%s)%s", from,
-                    KindName(t.kind), t.seq, t.origin.x, t.origin.y, t.origin.z, speed, pitch,
-                    (t.flags & kFromEntity) ? "measured on his projectile" : "his aim model's guess",
-                    (t.flags & kHasLanding) ? "" : ", no landing predicted");
-}
-
-void OnFlightMsg(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || from == _session->LocalId()) return;
-    FlightMsg f;
-    if (!ReadFlight(r, f)) {
-        ++_dropped;
-        return;
-    }
-    ++_pointMsgsRecv;
-    bool known;
-    {
-        Shared& sh = S();
-        std::lock_guard lock(sh.mu);
-        known = sh.book.Find(from, f.seq) != nullptr;
-        sh.book.AddPoints(from, f, Now());
-    }
-    if (core::trace::IsOpen()) {
-        const Point& p = f.points.back();
-        core::trace::Line("GF", "dir=in from=%u seq=%u n=%zu t=%u flags=%u p=%.2f,%.2f,%.2f known=%d", from, f.seq,
-                          f.points.size(), p.tMs, p.flags, p.pos.x, p.pos.y, p.pos.z, known ? 1 : 0);
-    }
+        MC_LOG_INFO("arc: player %u threw a %s (#%u) from %.1f %.1f %.1f at %.1f m/s, pitch %.0f deg (%s): simulated here",
+                    from, KindName(t.kind), t.seq, t.origin.x, t.origin.y, t.origin.z, speed, pitch,
+                    (t.flags & kFromEntity) ? "measured on his projectile" : "his aim model's guess");
 }
 
 // ---- Lua functions (GameMainThread) ------------------------------------------------------------------------------------
@@ -184,7 +164,7 @@ void Queue(std::vector<Out>& outs) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     for (Out& o : outs)
-        if (sh.outbox.size() < kMaxQueue) sh.outbox.push_back(std::move(o));
+        if (sh.outbox.size() < kMaxQueue) sh.outbox.push_back(std::move(o.t));
     outs.clear();
 }
 
@@ -192,22 +172,23 @@ void LogSummaries(const std::vector<Summary>& done) {
     Main& g = G();
     for (const Summary& s : done) {
         ++g.summaries;
-        if (s.sent && s.fromEntity) ++g.found;
+        if (s.sent && s.fromEntity) ++g.measured;
         else if (s.sent) ++g.modelOnly;
-        if (g.summaries <= 60 || g.summaries % 50 == 0)
-            MC_LOG_INFO("arc: our throw #%u (%s) over (%s): %s, %zu sample(s), %zu point(s) sent, %zu bounce(s), "
-                        "flight %.2f s, launch %.1f m/s pitch %.0f deg (aim model: %.1f m/s, %.0f deg), gravity %s",
-                        s.seq, Tok(s.weapon), s.why,
-                        !s.sent ? "nothing sent" : s.fromEntity ? "the real projectile followed" : "aim model only",
-                        s.samples, s.points, s.bounces, s.flight, s.speed, s.realPitch, s.modelSpeed, s.modelPitch,
-                        s.gravity > 0 ? (std::to_string(s.gravity) + " m/s2 measured").c_str() : "not measured");
+        if (g.summaries <= 60 || g.summaries % 50 == 0) {
+            char grav[48] = "not measured";
+            if (s.gravity > 0) std::snprintf(grav, sizeof grav, "%.2f m/s2 measured", s.gravity);
+            MC_LOG_INFO("arc: our throw #%u (%s): %s after %.2f s from %zu sample(s): launch %.1f m/s pitch %.0f deg "
+                        "(aim model: %.1f m/s, %.0f deg), gravity %s",
+                        s.seq, Tok(s.weapon),
+                        !s.sent ? "nothing sent" : s.fromEntity ? "measured on the projectile, sent" : "aim model sent",
+                        s.after, s.samples, s.speed, s.realPitch, s.modelSpeed, s.modelPitch, grav);
+        }
         if (core::trace::IsOpen())
-            core::trace::Line("GE", "dir=out seq=%u weapon=%s why=%s sent=%d entity=%d samples=%zu points=%zu "
-                                    "bounces=%zu flight=%.3f speed=%.2f pitch=%.1f model_speed=%.2f model_pitch=%.1f "
-                                    "g=%.2f o=%.2f,%.2f,%.2f last=%.2f,%.2f,%.2f",
-                              s.seq, Tok(s.weapon), s.why, s.sent ? 1 : 0, s.fromEntity ? 1 : 0, s.samples, s.points,
-                              s.bounces, s.flight, s.speed, s.realPitch, s.modelSpeed, s.modelPitch, s.gravity,
-                              s.origin.x, s.origin.y, s.origin.z, s.last.x, s.last.y, s.last.z);
+            core::trace::Line("GE", "dir=out seq=%u weapon=%s why=%s sent=%d entity=%d samples=%zu after=%.3f speed=%.2f "
+                                    "pitch=%.1f model_speed=%.2f model_pitch=%.1f g=%.2f o=%.2f,%.2f,%.2f",
+                              s.seq, Tok(s.weapon), s.why, s.sent ? 1 : 0, s.fromEntity ? 1 : 0, s.samples, s.after,
+                              s.speed, s.realPitch, s.modelSpeed, s.modelPitch, s.gravity, s.origin.x, s.origin.y,
+                              s.origin.z);
     }
 }
 
@@ -227,7 +208,6 @@ int McArcAim(lua_State* L) {
     Main& g = G();
     const bool first = !g.aim.On();
     g.aimThisTick = true;
-    g.lastAim = s;
     if (first) {
         ++g.aims;
         if (g.aims <= 40 || g.aims % 50 == 0)
@@ -266,8 +246,7 @@ int McArcBegin(lua_State* L) {
     ++g.throws;
     const double aimFor = g.aim.On() ? now - g.aim.Since() : -1;
     if (g.throws <= 60 || g.throws % 50 == 0)
-        MC_LOG_INFO("arc: we threw %s (#%u) at %.1f %.1f %.1f%s", Tok(weapon), seq, p.x, p.y, p.z,
-                    aimFor >= 0 ? (", after aiming " + std::to_string(aimFor).substr(0, 4) + " s").c_str() : "");
+        MC_LOG_INFO("arc: we threw %s (#%u) at %.1f %.1f %.1f (aimed %.2f s)", Tok(weapon), seq, p.x, p.y, p.z, aimFor);
     if (core::trace::IsOpen())
         core::trace::Line("GT", "ev=release seq=%u weapon=%s kind=%s p=%.2f,%.2f,%.2f aimed=%.2f", seq, Tok(weapon),
                           KindName(kind), p.x, p.y, p.z, aimFor);
@@ -277,65 +256,36 @@ int McArcBegin(lua_State* L) {
     return 1;
 }
 
-// mc_arc_model(seq, ox,oy,oz, vx,vy,vz, landed, lx,ly,lz, flightS): the aim model's launch for throw seq
+// mc_arc_model(seq, ox,oy,oz, vx,vy,vz): the aim model's launch for throw seq (sent if the projectile is not read)
 int McArcModel(lua_State* L) {
     const uint32_t seq = SeqArg(L, 1);
-    Vec3 o, v, l;
+    Vec3 o, v;
     if (!ReadPos(L, 2, o) || !ReadPos(L, 5, v)) return 0;
-    const bool landed = Num(L, 8) != 0 && ReadPos(L, 9, l);
-    const float fl = Num(L, 12);
-    const uint16_t ms = fl > 0 && fl < 60 ? static_cast<uint16_t>(fl * 1000.0f + 0.5f) : 0;
-    G().tracker.Model(seq, o, v, landed, l, ms);
+    G().tracker.Model(seq, o, v);
     return 0;
 }
 
-// mc_arc_sample(seq, x, y, z, entity): the real projectile's position now (entity: its id, for the trace)
+// mc_arc_sample(seq, x, y, z): the real projectile's position now (read until mc_arc_active says no)
 int McArcSample(lua_State* L) {
     const uint32_t seq = SeqArg(L, 1);
     Vec3 p;
     if (!ReadPos(L, 2, p)) return 0;
     std::vector<Out> outs;
-    G().tracker.Sample(seq, Now(), p, outs);
-    Queue(outs);
-    return 0;
-}
-
-// mc_arc_bounce(seq, x, y, z): an EXPLOSIVE_BOUNCE sound of ours while throw seq flies
-int McArcBounce(lua_State* L) {
-    const uint32_t seq = SeqArg(L, 1);
-    Vec3 p;
-    if (!ReadPos(L, 2, p)) return 0;
-    std::vector<Out> outs;
-    G().tracker.Bounce(seq, Now(), p, outs);
-    Queue(outs);
-    if (core::trace::IsOpen()) core::trace::Line("GF", "dir=bounce seq=%u p=%.2f,%.2f,%.2f", seq, p.x, p.y, p.z);
-    return 0;
-}
-
-// mc_arc_end(seq, why, x, y, z): the projectile is gone (why: "gone", "lost", ...); x y z its last position
-int McArcEnd(lua_State* L) {
-    const uint32_t seq = SeqArg(L, 1);
-    const std::string why = SafeTok(Str(L, 2), 24);
-    Vec3 p;
-    const bool hasPos = ReadPos(L, 3, p);
-    std::vector<Out> outs;
     std::vector<Summary> done;
-    static std::string whyKeep;  // Summary keeps a const char*: the last one stays valid until logged below
-    whyKeep = why.empty() ? "gone" : why;
-    G().tracker.End(seq, Now(), hasPos ? &p : nullptr, whyKeep.c_str(), outs, done);
+    G().tracker.Sample(seq, Now(), p, outs, done);
     Queue(outs);
     LogSummaries(done);
     return 0;
 }
 
-// mc_arc_active(seq) -> bool: is throw seq still followed (sent or waiting for its projectile)
+// mc_arc_active(seq) -> bool: is throw seq still being measured (the glue reads its projectile while true)
 int McArcActive(lua_State* L) {
     lua::PushBool(L, G().tracker.Active(SeqArg(L, 1)));
     return 1;
 }
 
-// mc_arc_test_flight(ox,oy,oz, vx,vy,vz, kind) -> seq: dev console only: shows a made-up flight of "player 254"
-// here as if his Throw had arrived (it ends by timeout or MafiaCoop.Arc.TestEnd()), to look at the overlay alone
+// mc_arc_test_flight(ox,oy,oz, vx,vy,vz, kind) -> seq: dev console only: simulates and shows a made-up throw of
+// "player 254" here as if his Throw had arrived (it ends by timeout or MafiaCoop.Arc.TestEnd())
 int McArcTestFlight(lua_State* L) {
     ThrowMsg t;
     if (!ReadPos(L, 1, t.origin) || !ReadPos(L, 4, t.vel)) return 0;
@@ -369,8 +319,6 @@ void Register(lua_State* L) {
     lua::RegisterGlobal(L, "mc_arc_begin", &McArcBegin);
     lua::RegisterGlobal(L, "mc_arc_model", &McArcModel);
     lua::RegisterGlobal(L, "mc_arc_sample", &McArcSample);
-    lua::RegisterGlobal(L, "mc_arc_bounce", &McArcBounce);
-    lua::RegisterGlobal(L, "mc_arc_end", &McArcEnd);
     lua::RegisterGlobal(L, "mc_arc_active", &McArcActive);
 }
 
@@ -418,7 +366,8 @@ void ParseEvents(const char* events, Shared& sh) {
             float a = 0, x = 0, y = 0, d = 0;
             if (std::sscanf(line.c_str() + 2, "%u %u %f %f %f %f", &kind, &head, &a, &x, &y, &d) != 6) continue;
             if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(a) || !std::isfinite(d) || kind > 5) continue;
-            if (dots.size() < 256) dots.push_back({static_cast<uint8_t>(kind), head != 0, std::clamp(a, 0.0f, 1.0f), x, y, d});
+            if (dots.size() < 256)
+                dots.push_back({static_cast<uint8_t>(kind), head != 0, std::clamp(a, 0.0f, 1.0f), x, y, d});
         } else if (line.rfind("ST ", 0) == 0) {
             status = line.substr(3);
             haveStatus = true;
@@ -441,14 +390,14 @@ void MainTick(lua_State* L, float dt) {
     {
         std::lock_guard lock(sh.mu);
         active = sh.active;
+        if (active) sh.book.Step(now, &Ray);  // one ray-cast segment per moving flight (+ a probe on a hit)
         sh.book.Tick(now, sh.ended);
         ended.swap(sh.ended);
         if (active) sh.book.Visuals(now, vis);
         else if (_wasActive) sh.book.Clear();
     }
     _wasActive = active;
-    // the thrower: deadlines (the aim model's launch when no projectile was found), timeouts
-    {
+    {  // the thrower: the measure window's end (the aim model's launch when no projectile was read)
         std::vector<Out> outs;
         std::vector<Summary> done;
         if (active) g.tracker.Tick(now, outs, done);
@@ -456,29 +405,27 @@ void MainTick(lua_State* L, float dt) {
         Queue(outs);
         LogSummaries(done);
     }
-    // the aim: no sample this tick = it is over
-    if (!g.aimThisTick) {
+    if (!g.aimThisTick) {  // no aim sample this tick: the aim is over
         double lasted = 0;
         size_t n = 0;
         if (g.aim.Stop(now, lasted, n)) {
-            if (g.aims <= 40 || g.aims % 50 == 0)
-                MC_LOG_INFO("arc: aim over after %.2f s (%zu samples)", lasted, n);
+            if (g.aims <= 40 || g.aims % 50 == 0) MC_LOG_INFO("arc: aim over after %.2f s (%zu samples)", lasted, n);
             if (core::trace::IsOpen()) core::trace::Line("GA", "ev=end lasted=%.2f samples=%zu", lasted, n);
         }
     }
     g.aimThisTick = false;
     for (const Ended& e : ended) {
         if (core::trace::IsOpen())
-            core::trace::Line("GE", "dir=in from=%u seq=%u why=%s age=%.2f points=%zu p=%.2f,%.2f,%.2f", e.from, e.seq,
-                              EndWhyName(e.why), e.age, e.points, e.pos.x, e.pos.y, e.pos.z);
-        if (e.why != EndWhy::Explosion)  // explosions are logged where they arrive
-            MC_LOG_INFO("arc: player %u's throw #%u no longer shown (%s after %.1f s, %zu points)", e.from, e.seq,
-                        EndWhyName(e.why), e.age, e.points);
+            core::trace::Line("GE", "dir=in from=%u seq=%u why=%s age=%.2f bounces=%d casts=%zu settled=%d p=%.2f,%.2f,%.2f",
+                              e.from, e.seq, EndWhyName(e.why), e.age, e.bounces, e.casts, e.settled ? 1 : 0, e.pos.x,
+                              e.pos.y, e.pos.z);
+        MC_LOG_INFO("arc: player %u's throw #%u no longer shown (%s after %.1f s, no explosion came for it)", e.from,
+                    e.seq, EndWhyName(e.why), e.age);
     }
     {
         char buf[200];
-        std::snprintf(buf, sizeof buf, "ours %llu (projectile found %llu, model only %llu), aims %llu",
-                      static_cast<unsigned long long>(g.throws), static_cast<unsigned long long>(g.found),
+        std::snprintf(buf, sizeof buf, "ours %llu (measured %llu, model %llu), aims %llu",
+                      static_cast<unsigned long long>(g.throws), static_cast<unsigned long long>(g.measured),
                       static_cast<unsigned long long>(g.modelOnly), static_cast<unsigned long long>(g.aims));
         std::lock_guard lock(sh.mu);
         sh.mainStatus = buf;
@@ -550,21 +497,17 @@ uint32_t KindColor(uint8_t kind) {
 
 void ThrowSync::Install() {
     lua::AddTickCallback(&MainTick);
-    MC_LOG_INFO("arc: installed (messages 0x%04x-0x%04x)", kMsgThrow, kMsgThrowFlight);
+    MC_LOG_INFO("arc: installed (message 0x%04x)", kMsgThrow);
 }
 
 void ThrowSync::Attach(net::Session& session) {
     _session = &session;
     _inbox.Clear();
     session.On(kMsgThrow, &OnThrowMsg);
-    session.On(kMsgThrowFlight, &OnFlightMsg);
 }
 
 void ThrowSync::Detach() {
-    if (_session) {
-        _session->Off(kMsgThrow);
-        _session->Off(kMsgThrowFlight);
-    }
+    if (_session) _session->Off(kMsgThrow);
     _session = nullptr;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
@@ -590,7 +533,6 @@ void ThrowSync::OnExplosion(uint32_t from, uint32_t throwSeq, const boom::Vec3& 
         Shared& sh = S();
         std::lock_guard lock(sh.mu);
         ended = sh.book.EndByExplosion(from, throwSeq, pos, Now(), e);
-        if (ended) sh.ended.push_back(e);
     }
     if (!ended) {
         if (throwSeq && core::trace::IsOpen())
@@ -599,23 +541,28 @@ void ThrowSync::OnExplosion(uint32_t from, uint32_t throwSeq, const boom::Vec3& 
         return;
     }
     ++_endedByBoom;
-    const float off = boom::Dist(e.pos, pos);
+    if (core::trace::IsOpen())
+        core::trace::Line("GE", "dir=in from=%u seq=%u why=explosion age=%.2f bounces=%d casts=%zu settled=%d "
+                                "p=%.2f,%.2f,%.2f boom=%.2f,%.2f,%.2f off=%.2f named=%d",
+                          from, e.seq, e.age, e.bounces, e.casts, e.settled ? 1 : 0, e.pos.x, e.pos.y, e.pos.z, pos.x,
+                          pos.y, pos.z, e.off, throwSeq ? 1 : 0);
     if (_endedByBoom <= 60 || _endedByBoom % 100 == 0)
-        MC_LOG_INFO("arc: player %u's throw #%u exploded %.1f s after it was thrown, %.1f m from where we showed it "
-                    "(%s, %zu points)",
-                    from, e.seq, e.age, off, throwSeq ? "named by the explosion" : "nearest flight", e.points);
+        MC_LOG_INFO("arc: player %u's throw #%u exploded %.1f s after it was thrown, %.1f m from where our simulation "
+                    "had it (%d bounce(s), %zu ray casts, %s; %s)",
+                    from, e.seq, e.age, e.off, e.bounces, e.casts, e.settled ? "settled" : "still moving",
+                    throwSeq ? "named by the explosion" : "nearest flight");
 }
 
 void ThrowSync::OnOwnExplosion(uint32_t throwSeq, const boom::Vec3& pos, double sinceThrow) {
     if (!throwSeq) return;
     Main& g = G();
     if (core::trace::IsOpen())
-        core::trace::Line("GE", "dir=boom seq=%u fuse=%.3f p=%.2f,%.2f,%.2f tracked=%d", throwSeq, sinceThrow, pos.x,
+        core::trace::Line("GE", "dir=boom seq=%u fuse=%.3f p=%.2f,%.2f,%.2f measuring=%d", throwSeq, sinceThrow, pos.x,
                           pos.y, pos.z, g.tracker.Active(throwSeq) ? 1 : 0);
     MC_LOG_INFO("arc: our throw #%u exploded %.2f s after the release", throwSeq, sinceThrow);
     std::vector<Out> outs;
     std::vector<Summary> done;
-    g.tracker.End(throwSeq, Now(), &pos, "explosion", outs, done);
+    g.tracker.End(throwSeq, Now(), outs, done);  // still measuring (an impact within 0.3 s): sent from what there is
     Queue(outs);
     LogSummaries(done);
 }
@@ -623,7 +570,7 @@ void ThrowSync::OnOwnExplosion(uint32_t throwSeq, const boom::Vec3& pos, double 
 void ThrowSync::Tick(float) {
     if (!_session) return;
     Shared& sh = S();
-    std::vector<Out> out;
+    std::vector<ThrowMsg> out;
     {
         std::lock_guard lock(sh.mu);
         sh.active = _session->IsActive();
@@ -632,34 +579,20 @@ void ThrowSync::Tick(float) {
         out.swap(sh.outbox);
     }
     if (!_session->IsActive()) return;
-    for (const Out& o : out) {
-        if (o.type == Out::Type::Throw) {
-            const auto buf = PackThrow(o.t);
-            if (_session->Broadcast(kMsgThrow, buf, net::Reliability::Reliable)) ++_throwsSent;
-            const ThrowMsg& t = o.t;
-            float yaw = 0, pitch = 0;
-            YawPitch(t.vel, yaw, pitch);
-            if (core::trace::IsOpen())
-                core::trace::Line("GT", "ev=sent seq=%u kind=%s flags=%u o=%.2f,%.2f,%.2f v=%.2f,%.2f,%.2f yaw=%.1f "
-                                        "pitch=%.1f g=%.2f delay=%u flight=%u land=%.2f,%.2f,%.2f weapon=%s",
-                                  t.seq, KindName(t.kind), t.flags, t.origin.x, t.origin.y, t.origin.z, t.vel.x, t.vel.y,
-                                  t.vel.z, yaw, pitch, t.gravity, t.delayMs, t.flightMs, t.landing.x, t.landing.y,
-                                  t.landing.z, Tok(t.weapon));
-            if (_throwsSent <= 60 || _throwsSent % 50 == 0)
-                MC_LOG_INFO("arc: throw #%u sent (%s): from %.1f %.1f %.1f, pitch %.0f deg", t.seq,
-                            (t.flags & kFromEntity) ? "measured on the projectile" : "aim model", t.origin.x,
-                            t.origin.y, t.origin.z, pitch);
-        } else {
-            const auto buf = PackFlight(o.f);
-            if (_session->Broadcast(kMsgThrowFlight, buf,
-                                    o.reliable ? net::Reliability::Reliable : net::Reliability::Unreliable))
-                ++_pointMsgsSent;
-            if (core::trace::IsOpen() && !o.f.points.empty()) {
-                const Point& p = o.f.points.back();
-                core::trace::Line("GF", "dir=out seq=%u n=%zu t=%u flags=%u p=%.2f,%.2f,%.2f rel=%d", o.f.seq,
-                                  o.f.points.size(), p.tMs, p.flags, p.pos.x, p.pos.y, p.pos.z, o.reliable ? 1 : 0);
-            }
-        }
+    for (const ThrowMsg& t : out) {
+        const auto buf = PackThrow(t);
+        if (_session->Broadcast(kMsgThrow, buf, net::Reliability::Reliable)) ++_throwsSent;
+        float yaw = 0, pitch = 0;
+        YawPitch(t.vel, yaw, pitch);
+        if (core::trace::IsOpen())
+            core::trace::Line("GT", "ev=sent seq=%u kind=%s flags=%u o=%.2f,%.2f,%.2f v=%.2f,%.2f,%.2f yaw=%.1f pitch=%.1f "
+                                    "g=%.2f delay=%u fuse=%u weapon=%s bytes=%zu",
+                              t.seq, KindName(t.kind), t.flags, t.origin.x, t.origin.y, t.origin.z, t.vel.x, t.vel.y,
+                              t.vel.z, yaw, pitch, t.gravity, t.delayMs, t.fuseMs, Tok(t.weapon), buf.size());
+        if (_throwsSent <= 60 || _throwsSent % 50 == 0)
+            MC_LOG_INFO("arc: throw #%u sent (%s): from %.1f %.1f %.1f, pitch %.0f deg", t.seq,
+                        (t.flags & kFromEntity) ? "measured on the projectile" : "aim model", t.origin.x, t.origin.y,
+                        t.origin.z, pitch);
     }
 }
 
@@ -675,9 +608,8 @@ void ThrowSync::GetStatus(std::vector<render::OverlayLine>& out) {
         flights = sh.book.Count();
     }
     char buf[512];
-    std::snprintf(buf, sizeof buf, "Throws: sent %llu (%llu point msgs), received %llu (%llu), shown now %zu%s%s%s%s",
-                  static_cast<unsigned long long>(_throwsSent), static_cast<unsigned long long>(_pointMsgsSent),
-                  static_cast<unsigned long long>(_throwsRecv), static_cast<unsigned long long>(_pointMsgsRecv), flights,
+    std::snprintf(buf, sizeof buf, "Throws: sent %llu, received %llu, simulated now %zu%s%s%s%s",
+                  static_cast<unsigned long long>(_throwsSent), static_cast<unsigned long long>(_throwsRecv), flights,
                   main.empty() ? "" : "; ", main.c_str(), lua.empty() ? "" : " | ", lua.c_str());
     out.push_back({buf, 0xFFE0B080});
 }

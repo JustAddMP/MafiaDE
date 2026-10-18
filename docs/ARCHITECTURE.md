@@ -49,9 +49,10 @@ src/game/
                          that undoes a picture's damage (damage stays with the sender's hit paths)
   explosion_model.{h,cpp} the game-free part (wire, detector, zones, guard), tests/explosion_test.cpp
   throw_sync.{h,cpp}, throw_arc.lua  the flight of thrown explosives: the thrower's game logs the aim, follows the
-                         real projectile and sends its launch and flight (Throw / ThrowFlight); the others draw it
-                         with our overlay (marker + trail) until the Explosion naming the throw arrives
-  throw_model.{h,cpp}    the game-free part (wire, arc playback, Book, Tracker, aim log), tests/throw_arc_test.cpp
+                         real projectile's launch and sends it once (Throw); the others simulate the flight against
+                         their world (ray casts, bounces, rolling) and draw it with our overlay (marker + trail) until
+                         the Explosion naming the throw arrives
+  throw_model.{h,cpp}    the game-free part (wire, Sim, Book, Tracker, aim log), tests/throw_arc_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)

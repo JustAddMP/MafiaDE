@@ -1,11 +1,12 @@
 #pragma once
 // The flight of thrown explosives on every game (0.16 "grenade arc"; docs/game-api.md 20 "The flight",
-// docs/protocol.md "Explosions": Throw 0x0242, ThrowFlight 0x0243). The thrower's game logs the aim while its player
-// lines up a throw, then follows the real projectile from the release and sends its launch and its flight; the
-// others draw it (a marker and a fading trail over the game, from our overlay: nothing is spawned in their world, so
-// it cannot hurt anyone) until the Explosion (0x0240) naming the throw arrives. Logic: game/throw_model.h
-// (unit-tested); game side: throw_arc.lua (MafiaCoop.Arc).
-// Threads: messages, sending and drawing on the render thread; Lua and the tracker on GameMainThread; a mutex between.
+// docs/protocol.md "Explosions": Throw 0x0242). The thrower's game logs the aim while its player
+// lines up a throw, then measures the real projectile's launch in the first 0.3 s and sends it once; the others
+// simulate the flight against their own world (ray casts, bounces, rolling) and draw it (a marker and a fading trail
+// over the game, from our overlay: nothing is spawned in their world, so it cannot hurt anyone) until the Explosion
+// (0x0240) naming the throw arrives. Logic: game/throw_model.h (unit-tested); game side: throw_arc.lua (MafiaCoop.Arc).
+// Threads: messages, sending and drawing on the render thread; Lua, the tracker and the simulation (ray casts) on
+// GameMainThread; a mutex between.
 #include "game/explosion_model.h"
 #include "net/session.h"
 #include "render/overlay.h"

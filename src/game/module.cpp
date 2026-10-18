@@ -291,7 +291,6 @@ public:
         case 0x0240: return "Explosion";
         case 0x0241: return "CarExploded";
         case 0x0242: return "Throw";
-        case 0x0243: return "ThrowFlight";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
         case 0x0420: return "GuestNpcStates";

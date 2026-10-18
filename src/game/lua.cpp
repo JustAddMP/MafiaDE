@@ -985,6 +985,13 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
 }
 
 bool Available() { return _available.load() && !_disabled.load(); }
+
+int RayCast(const float from[3], const float to[3], float hit[3]) {
+    if (!_ray.cast || !Available()) return -1;
+    bool ok = false;
+    const bool got = RayCastGuarded(from, to, hit, ok);
+    return ok ? (got ? 1 : 0) : -1;
+}
 bool Disabled() { return _disabled.load(); }
 uint32_t MainThreadId() { return _mainThread.load(); }
 uint64_t TickCount() { return _ticks.load(); }

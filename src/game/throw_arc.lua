@@ -1,7 +1,7 @@
 -- MafiaCoop throw glue (0.16 "grenade arc": the flight of a thrown grenade / molotov / dynamite on every game). Runs in
 -- the game's Lua state on GameMainThread, called once per script tick by src/game/throw_sync.cpp
 -- (MafiaCoop.Arc.Update). Embedded into the dll; a copy at <dll dir>\throw_arc.lua overrides it.
--- docs/game-api.md 20 "The flight", docs/protocol.md "Explosions" (Throw 0x0242, ThrowFlight 0x0243).
+-- docs/game-api.md 20 "The flight", docs/protocol.md "Explosions" (Throw 0x0242).
 --
 -- Here (the thrower):
 --   - while our player lines up a throw (an explosive in hand, or the aim input held / PLAYER_AIM_ENTER with an
@@ -13,11 +13,12 @@
 --     number (the explosion detector gets it with the throw: the Explosion sent for it names it), mc_arc_model the
 --     aim model's launch; then the real projectile is looked for (mc_entity_ids_of PROJ_TYPES: a grenade 25, molotov
 --     26, projectile explosive 88 or satchel charge 90 entity within SEARCH_REACH of our hand, new since the aim
---     started or moved since) and, once found, its position goes to mc_arc_sample every tick until it is gone
---     (mc_arc_end) or our explosion for it was decided (mc_arc_active false). Our EXPLOSIVE_BOUNCE sounds
---     (explosion_sync.lua B.OnHear) go to mc_arc_bounce.
+--     started or moved since) for SEARCH_TIME and, once found, its position goes to mc_arc_sample every tick only
+--     while the C++ side still measures the launch (mc_arc_active: 3 positions or 0.3 s). Then it is let go: the one
+--     Throw message carries the launch, the others simulate the rest.
 -- On the other games:
---   - "F" commands: each flight of another game, where it is now (the C++ Book: arc + streamed points). Shown with a
+--   - "F" commands: each flight of another game, where it is now (the C++ Book simulates it: arc, ray casts against
+--     this world, bounces, rolling, settled; at the explosion's true position once that came). Shown with a
 --     marker and a fading trail that our overlay draws ("D" events: kind, head, alpha, screen x y, distance) at
 --     game.game:ProjectPointToScreen of those points. Nothing is spawned in the world: it cannot hit or hurt anyone.
 --     The explosion itself is explosion_sync.lua's picture when the Explosion arrives (the flight ends then, "X").
@@ -25,9 +26,9 @@
 -- Input (cmds, one line per command):
 --   S active                                        session running
 --   F from seq kind flags x y z held age src        a flight of player `from` (kind as Explosion: 1 grenade 2 molotov
---                                                   3 dynamite; flags 1 fire 2 measured 4 landing; src what the
---                                                   position comes from)
---   X from seq why                                  that flight is over (explosion, end_point, timeout, left)
+--                                                   3 dynamite; flags 1 fire 2 measured; src sim / roll /
+--                                                   settled / boom / arc)
+--   X from seq why                                  that flight is over without an explosion (fuse, timeout, left)
 -- Output (events, one per line):
 --   D kind head alpha x y dist                      one overlay dot (head 1: the marker, 0: a trail point)
 --   ST text                                         status for the overlay (once a second)
@@ -48,11 +49,9 @@ local HAND_BONES = { "RightHand", "R_Hand", "Bip01 R Hand", "Bip01_R_Hand", "han
   "RightHandMiddle1" }
 local PROJ_TYPES = "25 26 88 90"
 local SEARCH_INTERVAL = 0.1  -- s between two projectile searches after the release
-local SEARCH_TIME = 1.2      -- s after the release the projectile is looked for
+local SEARCH_TIME = 0.3      -- s after the release the projectile is looked for (the launch is measured by then)
 local SEARCH_REACH = 8       -- m from our hand
 local MOVED = 0.3            -- m: an entity that was there already counts if it moved this much (a pooled one)
-local STILL_TIME = 2.0       -- s: a followed projectile that does not move for this long is let go (a dud, a wreck)
-local TRACK_MAX = 15
 local TRAIL_STEP = 0.05      -- s between two trail points
 local TRAIL_N = 14
 local FAR = 250              -- m from the camera: not drawn beyond
@@ -270,19 +269,11 @@ function A.OnThrown(p, w)
   local cam = game.cameramanager:GetPlayerCamera()
   local cd = cam and cam:GetDir() or p:GetDir()
   local v = A.ModelLaunch(cd)
-  local l, lt = A.Predict(hand, v)
-  mc_arc_model(seq, hand.x, hand.y, hand.z, v.x, v.y, v.z, l and 1 or 0, l and l.x or 0, l and l.y or 0,
-    l and l.z or 0, lt or 0)
+  mc_arc_model(seq, hand.x, hand.y, hand.z, v.x, v.y, v.z)
   local base = A.aimOn and A.base or A.Scan()
   A.cur = { seq = seq, t0 = M.now, hand = hand, base = base or {}, nextScan = M.now, scans = 0, w = w }
   A.stats.throws = A.stats.throws + 1
   return seq
-end
-
--- an EXPLOSIVE_BOUNCE sound of ours (explosion_sync.lua B.OnHear)
-function A.OnBounce(x, y, z)
-  local c = A.cur
-  if c and mc_arc_active(c.seq) then mc_arc_bounce(c.seq, x, y, z) end
 end
 
 function A.SearchTick()
@@ -292,7 +283,7 @@ function A.SearchTick()
     c.gaveUp = true
     A.stats.notFound = A.stats.notFound + 1
     if A.stats.notFound <= 20 then
-      log(string.format("throw #%s: no projectile entity found near our hand (%d scans, %d candidates seen); the aim model's launch is sent",
+      log(string.format("throw #%s: no projectile entity found near our hand (%d scans, %d candidates seen); the aim model's launch is sent if it was not measured",
         c.seq, c.scans, c.seen or 0))
     end
     trace("GS", string.format("seq=%s found=0 scans=%d seen=%d", c.seq, c.scans, c.seen or 0))
@@ -311,7 +302,7 @@ function A.SearchTick()
   end
   c.seen = math.max(c.seen or 0, seen)
   if not best then return end
-  c.id, c.type, c.last, c.lastMove = best, best % 256, bestP, M.now
+  c.id, c.type = best, best % 256
   A.stats.found = A.stats.found + 1
   if A.stats.found <= 30 then
     log(string.format("throw #%s: projectile entity %d (type %d) found %.1f m from our hand, %.2f s after the release",
@@ -319,37 +310,26 @@ function A.SearchTick()
   end
   trace("GS", string.format("seq=%s found=1 id=%d type=%d d=%.2f after=%.3f scans=%d p=%s", c.seq, best, best % 256,
     bestD, M.now - c.t0, c.scans, f3(bestP.x, bestP.y, bestP.z)))
-  mc_arc_sample(c.seq, bestP.x, bestP.y, bestP.z, best)
+  mc_arc_sample(c.seq, bestP.x, bestP.y, bestP.z)
 end
 
 function A.TrackTick()
   local c = A.cur
   if not c then return end
-  if not mc_arc_active(c.seq) then  -- over on the C++ side (our explosion for it, a timeout)
+  if not mc_arc_active(c.seq) then  -- the launch is measured (or the model sent): the projectile is let go
     A.cur = nil
     return
   end
-  if not c.id then return end
+  if not c.id or c.sampledAt == M.now then return end
   local e = mc_entity(c.id)
-  local alive = valid(e)
-  if alive then
-    local good, act = pcall(e.IsActive, e)
-    if good and act == false then alive = false end
-  end
-  local q = alive and try("projectile GetPos", e.GetPos, e)
-  if not q then
-    mc_arc_end(c.seq, alive and "no_pos" or "gone", c.last.x, c.last.y, c.last.z)
+  local q = valid(e) and try("projectile GetPos", e.GetPos, e)
+  if not q then  -- gone already (an impact): the C++ side sends from what it has when the window is over
     if A.stats.found <= 30 then log(string.format("throw #%s: projectile gone after %.2f s", c.seq, M.now - c.t0)) end
     A.cur = nil
     return
   end
-  if dist(q, c.last) > 0.02 then c.lastMove = M.now end
-  c.last = q
-  mc_arc_sample(c.seq, q.x, q.y, q.z, c.id)
-  if M.now - c.lastMove > STILL_TIME or M.now - c.t0 > TRACK_MAX then
-    mc_arc_end(c.seq, M.now - c.t0 > TRACK_MAX and "timeout" or "still", q.x, q.y, q.z)
-    A.cur = nil
-  end
+  c.sampledAt = M.now
+  mc_arc_sample(c.seq, q.x, q.y, q.z)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------

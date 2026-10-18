@@ -85,12 +85,11 @@ on the other.
 | `XCR` | both | each CarExploded received | `from what key p` |
 | `XCV` | both | each CarExploded handled | Lua: `from what key act=<set_exploded/already/no_car/failed:...>` |
 | `GA` | both | while our player lines up a throw, 5 Hz | `ev=<start/aim> weapon how=<what said we aim: hand (explosive in hand), input (aim input), msg (PLAYER_AIM_ENTER), joined by +> p=<standing> head hand bone=<1 a hand bone, 0 head + offset> cam dir yaw pitch land=<the aim model's landing, none:...> flight=<s to it>`; `ev=end lasted samples` when it stops (C++, throw_sync.cpp) |
-| `GT` | both | each throw of ours | `ev=release seq weapon kind p aimed=<s aimed before, -1 none>` (WEAPON_THROWN); `ev=sent seq kind flags=<1 fire 2 measured on the projectile 4 landing> o v yaw pitch g delay flight land weapon` (the Throw 0x0242) |
-| `GS` | both | each throw of ours | Lua: the projectile search: `seq found=1 id type d=<m from the hand> after=<s after the release> scans p` or `found=0 scans seen=<projectile entities seen at most>` |
-| `GF` | both | each flight message | `dir=out seq n t=<ms since the origin, last point> flags=<1 bounce 2 end> p rel=<1 reliable>` (sent), `dir=in from seq n t flags p known=<0: came before its Throw>` (received), `dir=bounce seq p` (our bounce sound) |
-| `GR` | both | each Throw received | `from seq kind flags o v speed yaw pitch g delay flight land weapon added` |
-| `GV` | both | 2 Hz per flight shown | Lua: `from seq p src=<arc/points/extrapolated/landing/end> held age d=<m from the camera> screen=<1 on screen>` |
-| `GE` | both | each throw over | `dir=out seq weapon why sent entity samples points bounces flight speed pitch model_speed model_pitch g=<gravity measured, 0 not> o last` (ours), `dir=boom seq fuse=<s release -> explosion> p tracked` (our explosion for it decided), `dir=in from seq why=<explosion/end_point/timeout/left/explosion_no_flight> age points p` (another game's) |
+| `GT` | both | each throw of ours | `ev=release seq weapon kind p aimed=<s aimed before, -1 none>` (WEAPON_THROWN); `ev=sent seq kind flags=<1 fire 2 measured on the projectile> o v yaw pitch g delay fuse weapon bytes` (the one Throw 0x0242) |
+| `GS` | both | each throw of ours | Lua: the projectile search (0.3 s at most): `seq found=1 id type d=<m from the hand> after=<s after the release> scans p` or `found=0 scans seen=<projectile entities seen at most>` |
+| `GR` | both | each Throw received | `from seq kind flags o v speed yaw pitch g delay fuse weapon added` (its simulation starts) |
+| `GV` | both | 2 Hz per flight shown | Lua: `from seq p src=<sim (flying) / roll / settled / boom (at the explosion's true position) / arc (no ray cast)> held age d=<m from the camera> screen=<1 on screen>` |
+| `GE` | both | each throw over | `dir=out seq weapon why=<measured/model/no_projectile_no_model> sent entity samples after=<s release -> sent> speed pitch model_speed model_pitch g=<gravity measured, 0 not> o` (ours), `dir=boom seq fuse=<s release -> explosion> p measuring` (our explosion for it decided), `dir=in from seq why=explosion age bounces casts settled p=<simulated> boom=<true> off=<m between> named=<1 by seq>` / `why=<fuse/timeout/left> age bounces casts settled p` / `why=explosion_no_flight` (another game's) |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -127,8 +126,8 @@ Per player as seen on the other game:
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
 - **explosions:** none of the X records are read by the tool yet; grep them (`XC` on the thrower, `XR`/`XV`/`XD` on
-  the others: a sent explosion's `seq` pairs them). Throws (G records, not read by the tool either): `GT`/`GF out`
-  on the thrower and `GR`/`GF in`/`GV`/`GE in` on the others pair by `seq`; the explosion that ends a throw names it
+  the others: a sent explosion's `seq` pairs them). Throws (G records, not read by the tool either): `GT`/`GE out`
+  on the thrower and `GR`/`GV`/`GE in` on the others pair by `seq`; the explosion that ends a throw names it
   (`XO`/`XR throw=`).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 

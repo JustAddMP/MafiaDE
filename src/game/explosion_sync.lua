@@ -7,7 +7,7 @@
 --   - Here, the game tells us about explosions with HEAR_SOUND messages (every human that hears one gets one, with
 --     the sound's position, type and owner: EXPLOSION 11, BURNING_FIRE 12, EXPLOSIVE_BOUNCE 10), our player's throws
 --     (WEAPON_THROWN, already counted by player_sync.lua as action kind 5; throw_arc.lua gives each a number and
---     follows its flight), PLAYER_GRENADE_EXPLOSION to our player and
+--     measures its launch), PLAYER_GRENADE_EXPLOSION to our player and
 --     our shots. The C++ detector (mc_boom_sound / mc_boom_throw / mc_boom_grenade / mc_boom_shot) decides which ones
 --     are ours (or, on the host, our NPCs') and sends them (Explosion 0x0240).
 --   - The others' explosions arrive as "E" commands: shown with game.shotmgr:CreateScriptExplosion(nil, pos, weapon,
@@ -212,9 +212,8 @@ function B.OnHear(m)
     end
   end
   if object == "-" then object = "" end
-  if st == 10 and owner == "us" then  -- our grenade bouncing: points of its flight (throw_arc.lua sends them on)
+  if st == 10 and owner == "us" then  -- our grenade bouncing: points of its flight (logged only; the others simulate it)
     trace("XB", string.format("p=%s", f3(x, y, z)))
-    if M.Arc and M.Arc.OnBounce then pcall(M.Arc.OnBounce, x, y, z) end
   end
   if st == 11 and B.stats.sounds <= 40 then
     log(string.format("explosion heard at %.1f %.1f %.1f, owner %s (%s), second %s%s", x, y, z, og, cls,

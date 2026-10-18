@@ -17,11 +17,10 @@ bool Finite(const Vec3& v) {
 }
 
 float Len(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
-
+float Dot(const Vec3& a, const Vec3& b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 Vec3 Add(const Vec3& a, const Vec3& b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 Vec3 Sub(const Vec3& a, const Vec3& b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 Vec3 Mul(const Vec3& a, float s) { return {a.x * s, a.y * s, a.z * s}; }
-Vec3 Lerp(const Vec3& a, const Vec3& b, float t) { return Add(a, Mul(Sub(b, a), t)); }
 
 void WriteVec(net::ByteWriter& w, const Vec3& v) {
     w.F32(v.x);
@@ -47,7 +46,7 @@ uint16_t Ms(double s) {
 
 // ---- wire -----------------------------------------------------------------------------------------------------------
 std::vector<uint8_t> PackThrow(const ThrowMsg& t) {
-    net::ByteWriter w(96);
+    net::ByteWriter w(80);
     w.U32(t.seq);
     w.U8(static_cast<uint8_t>(t.kind));
     w.U8(t.flags);
@@ -55,8 +54,7 @@ std::vector<uint8_t> PackThrow(const ThrowMsg& t) {
     WriteVec(w, t.vel);
     w.F32(t.gravity);
     w.U16(t.delayMs);
-    w.U16(t.flightMs);
-    WriteVec(w, t.landing);
+    w.U16(t.fuseMs);
     w.Str(boom::SafeName(t.weapon, 32) ? t.weapon : std::string());
     return std::vector<uint8_t>(w.Span().begin(), w.Span().end());
 }
@@ -70,46 +68,14 @@ bool ReadThrow(net::ByteReader& r, ThrowMsg& out) {
     t.vel = ReadVec(r);
     t.gravity = r.F32();
     t.delayMs = r.U16();
-    t.flightMs = r.U16();
-    t.landing = ReadVec(r);
+    t.fuseMs = r.U16();
     t.weapon = r.Str(32);
-    if (r.Failed() || kind > boom::kMaxKind || !Finite(t.origin) || !Finite(t.vel) || !Finite(t.landing)) return false;
+    if (r.Failed() || kind > boom::kMaxKind || !Finite(t.origin) || !Finite(t.vel)) return false;
     if (Len(t.vel) > kMaxSpeed || !std::isfinite(t.gravity) || t.gravity < 0.5f || t.gravity > 50.0f) return false;
     if (!t.weapon.empty() && !boom::SafeName(t.weapon, 32)) return false;
     t.kind = static_cast<Kind>(kind);
-    t.flags &= (kFire | kFromEntity | kHasLanding);
-    if (!(t.flags & kHasLanding)) t.flightMs = 0;
+    t.flags &= (kFire | kFromEntity);
     out = std::move(t);
-    return true;
-}
-
-std::vector<uint8_t> PackFlight(const FlightMsg& f) {
-    const size_t n = std::min(f.points.size(), kMaxPointsPerMsg);
-    net::ByteWriter w(8 + n * 15);
-    w.U32(f.seq);
-    w.U8(static_cast<uint8_t>(n));
-    for (size_t i = 0; i < n; ++i) {
-        w.U16(f.points[i].tMs);
-        w.U8(f.points[i].flags);
-        WriteVec(w, f.points[i].pos);
-    }
-    return std::vector<uint8_t>(w.Span().begin(), w.Span().end());
-}
-
-bool ReadFlight(net::ByteReader& r, FlightMsg& out) {
-    FlightMsg f;
-    f.seq = r.U32();
-    const uint8_t n = r.U8();
-    if (r.Failed() || n == 0 || n > kMaxPointsPerMsg) return false;
-    for (uint8_t i = 0; i < n; ++i) {
-        Point p;
-        p.tMs = r.U16();
-        p.flags = r.U8() & (kBounce | kEnd);
-        p.pos = ReadVec(r);
-        if (r.Failed() || !Finite(p.pos)) return false;
-        f.points.push_back(p);
-    }
-    out = std::move(f);
     return true;
 }
 
@@ -124,8 +90,7 @@ Vec3 BallisticVel(const Vec3& v, float g, double t) { return {v.x, v.y, v.z - g 
 Vec3 EstimateLaunch(const Vec3& p1, double t1, const Vec3& p2, double t2, float g) {
     const double dt = t2 - t1;
     if (!(dt > 1e-4)) return {};
-    const float inv = static_cast<float>(1.0 / dt);
-    Vec3 v = Mul(Sub(p2, p1), inv);
+    Vec3 v = Mul(Sub(p2, p1), static_cast<float>(1.0 / dt));
     v.z += 0.5f * g * static_cast<float>(dt);
     return v;
 }
@@ -134,8 +99,7 @@ bool FitGravity(const Vec3& p1, double t1, const Vec3& p2, double t2, const Vec3
     const double d1 = t2 - t1, d2 = t3 - t2;
     if (!(d1 > 0.01) || !(d2 > 0.01)) return false;
     const double v1 = (p2.z - p1.z) / d1, v2 = (p3.z - p2.z) / d2;  // vertical speed at the two midpoints
-    const double a = (v2 - v1) / ((d1 + d2) * 0.5);
-    const double fit = -a;
+    const double fit = -(v2 - v1) / ((d1 + d2) * 0.5);
     if (!std::isfinite(fit) || fit < 2.0 || fit > 30.0) return false;
     g = static_cast<float>(fit);
     return true;
@@ -157,88 +121,110 @@ void YawPitch(const Vec3& d, float& yaw, float& pitch) {
     pitch = static_cast<float>(std::atan2(d.z, h) * 180.0 / kPi);
 }
 
-// ---- receiver ---------------------------------------------------------------------------------------------------------
+// ---- the receivers' simulation -----------------------------------------------------------------------------------------
+void Sim::Start(const Vec3& o, const Vec3& v, float g, bool molotov) {
+    *this = Sim();
+    origin = pos = o;
+    vel = v;
+    gravity = g;
+    stopAtHit = molotov;
+}
+
+void Sim::Step(double toT, const RayFn& ray) {
+    if (settled || !(toT > t)) return;
+    const double dt = std::min(toT - t, kMaxStep);
+    const float dtf = static_cast<float>(dt);
+    if (rolling) {
+        const Vec3 vh{vel.x, vel.y, 0};
+        const float speed = Len(vh);
+        const float after = std::max(0.0f, speed - kRollDecel * dtf);
+        if (after < kSettleSpeed || speed < 1e-4f) {
+            vel = {};
+            settled = true;
+            t += dt;
+            return;
+        }
+        const Vec3 dir = Mul(vh, 1.0f / speed);
+        const Vec3 next = Add(pos, Mul(dir, (speed + after) * 0.5f * dtf));
+        Vec3 hit;
+        int r = 0;
+        if (!noRay && ray) {
+            ++casts;
+            const Vec3 up{0, 0, 0.1f};
+            r = ray(Add(pos, up), Add(next, up), hit);
+            if (r < 0) noRay = true;
+        }
+        if (r == 1) {  // a wall while rolling: back off it
+            pos = {hit.x - dir.x * kSkin, hit.y - dir.y * kSkin, pos.z};
+            vel = Mul(dir, -after * kRestitution);
+            ++bounces;
+        } else {
+            pos = next;
+            vel = Mul(dir, after);
+        }
+        t += dt;
+        return;
+    }
+    const Vec3 next = Ballistic(pos, vel, gravity, dt);
+    const Vec3 nvel = BallisticVel(vel, gravity, dt);
+    Vec3 hit;
+    int r = 0;
+    if (!noRay && ray) {
+        ++casts;
+        r = ray(pos, next, hit);
+        if (r < 0) noRay = true;
+        if (r == 1 && t < kIgnoreTime && boom::Dist(hit, origin) < kIgnoreNear) r = 0;  // the thrower's own body
+    }
+    if (r != 1) {
+        pos = next;
+        vel = nvel;
+        t += dt;
+        if (noRay && pos.z < origin.z - 50.0f) settled = true;  // no world to land on: not carried further
+        if (t > kMaxFlight) settled = true;
+        return;
+    }
+    // a hit: how far along the step, the velocity there
+    const Vec3 seg = Sub(next, pos);
+    const float segLen = Len(seg);
+    const float frac = segLen > 1e-5f ? std::clamp(boom::Dist(pos, hit) / segLen, 0.0f, 1.0f) : 0.0f;
+    const Vec3 v = BallisticVel(vel, gravity, dt * frac);
+    // ground or wall: a short probe straight down just in front of the hit (toward where it came from) finds the
+    // same height on a floor, nothing that high in front of a wall
+    const Vec3 dir = segLen > 1e-5f ? Mul(seg, 1.0f / segLen) : Vec3{0, 0, -1};
+    const float dh = std::sqrt(dir.x * dir.x + dir.y * dir.y);
+    bool ground = true;
+    Vec3 n{0, 0, 1};
+    if (dh > 0.2f && !(dir.z < -0.95f)) {
+        const Vec3 back{hit.x - dir.x / dh * 0.1f, hit.y - dir.y / dh * 0.1f, hit.z};
+        Vec3 ph;
+        ++casts;
+        const int pr = ray({back.x, back.y, back.z + kProbe}, {back.x, back.y, back.z - kProbe}, ph);
+        ground = pr == 1 && std::fabs(ph.z - hit.z) <= 0.12f;
+        if (!ground) n = {-dir.x / dh, -dir.y / dh, 0};
+    }
+    const float into = Dot(v, n);  // negative: moving into the surface
+    const Vec3 vn = Mul(n, into), vt = Sub(v, vn);
+    vel = Sub(Mul(vt, 1.0f - kFriction), Mul(vn, kRestitution));
+    pos = Add(hit, Mul(n, kSkin));
+    ++bounces;
+    t += std::max(dt * frac, 0.005);
+    if (stopAtHit) {
+        vel = {};
+        settled = true;
+    } else if (ground && -into < kRollSpeed) {
+        rolling = true;
+        vel.z = 0;
+    }
+}
+
 const char* EndWhyName(EndWhy w) {
     switch (w) {
         case EndWhy::Explosion: return "explosion";
-        case EndWhy::EndPoint: return "end_point";
+        case EndWhy::Fuse: return "fuse";
         case EndWhy::Timeout: return "timeout";
         case EndWhy::Left: return "left";
-        case EndWhy::Replaced: return "replaced";
     }
     return "?";
-}
-
-Visual PositionAt(const Flight& f, double age) {
-    Visual v;
-    v.from = f.from;
-    v.seq = f.t.seq;
-    v.kind = f.t.kind;
-    v.flags = f.t.flags;
-    v.age = age;
-    if (age < 0) age = 0;
-    const float g = f.t.gravity;
-    const auto& pts = f.points;
-    if (pts.empty()) {
-        if ((f.t.flags & kHasLanding) && f.t.flightMs > 0 && age >= f.t.flightMs / 1000.0) {
-            v.pos = f.t.landing;
-            v.held = true;
-            v.src = "landing";
-            return v;
-        }
-        constexpr double kMaxArc = 3.0;  // s: an arc with no landing and no points is not carried further
-        if (f.ended) {
-            v.pos = Ballistic(f.t.origin, f.t.vel, g, std::min(age, kMaxArc));
-            v.held = true;
-            v.src = "end";
-            return v;
-        }
-        v.held = age >= kMaxArc;
-        v.pos = Ballistic(f.t.origin, f.t.vel, g, std::min(age, kMaxArc));
-        return v;
-    }
-    const double tFirst = pts.front().tMs / 1000.0;
-    if (age <= tFirst) {  // before the first point: the arc, bent toward that point
-        const Vec3 at = Ballistic(f.t.origin, f.t.vel, g, age);
-        const Vec3 off = Sub(pts.front().pos, Ballistic(f.t.origin, f.t.vel, g, tFirst));
-        const float k = tFirst > 1e-4 ? static_cast<float>(age / tFirst) : 1.0f;
-        v.pos = Add(at, Mul(off, k));
-        v.src = "points";
-        return v;
-    }
-    size_t k = 0;
-    while (k + 1 < pts.size() && pts[k + 1].tMs / 1000.0 <= age) ++k;
-    if (k + 1 < pts.size()) {  // between two points
-        const double ta = pts[k].tMs / 1000.0, tb = pts[k + 1].tMs / 1000.0;
-        const float u = tb - ta > 1e-6 ? static_cast<float>((age - ta) / (tb - ta)) : 1.0f;
-        v.pos = Lerp(pts[k].pos, pts[k + 1].pos, std::clamp(u, 0.0f, 1.0f));
-        v.src = "points";
-        return v;
-    }
-    const Point& last = pts.back();
-    if ((last.flags & kEnd) || f.ended || (last.flags & kBounce)) {  // gone / after a bounce: where it was
-        v.pos = last.pos;
-        v.held = (last.flags & kEnd) || f.ended;
-        v.src = (last.flags & kEnd) || f.ended ? "end" : "points";
-        return v;
-    }
-    const double tLast = last.tMs / 1000.0;
-    double dt = age - tLast;
-    if (dt > kExtrapolate) {
-        dt = kExtrapolate;
-        v.held = true;
-    }
-    Vec3 vl = BallisticVel(f.t.vel, g, tLast);
-    if (pts.size() >= 2) {
-        const Point& prev = pts[pts.size() - 2];
-        const double tPrev = prev.tMs / 1000.0;
-        if (tLast - tPrev >= 0.02 && !(prev.flags & kBounce))
-            vl = BallisticVel(EstimateLaunch(prev.pos, tPrev, last.pos, tLast, g), g, tLast - tPrev);
-    }
-    v.pos = Ballistic(last.pos, vl, g, dt);
-    v.pos.z = std::max(v.pos.z, last.pos.z - 1.5f);  // not through the ground it is about to hit
-    v.src = "extrapolated";
-    return v;
 }
 
 const Flight* Book::Find(uint32_t from, uint32_t seq) const {
@@ -259,47 +245,14 @@ bool Book::Add(uint32_t from, const ThrowMsg& t, double now) {
     f.from = from;
     f.t = t;
     f.t0 = now - t.delayMs / 1000.0;
+    f.sim.Start(t.origin, t.vel, t.gravity, t.kind == Kind::Molotov);
     flights_[key] = std::move(f);
-    // points that came first
-    std::vector<Point> early;
-    orphans_.erase(std::remove_if(orphans_.begin(), orphans_.end(),
-                                  [&](const Orphan& o) {
-                                      if (o.from != from || o.seq != t.seq) return false;
-                                      early.push_back(o.p);
-                                      return true;
-                                  }),
-                   orphans_.end());
-    if (!early.empty()) {
-        FlightMsg m;
-        m.seq = t.seq;
-        m.points = std::move(early);
-        AddPoints(from, m, now);
-    }
     return true;
 }
 
-void Book::AddPoints(uint32_t from, const FlightMsg& m, double now) {
-    auto it = flights_.find({from, m.seq});
-    if (it == flights_.end()) {
-        orphans_.erase(std::remove_if(orphans_.begin(), orphans_.end(), [now](const Orphan& o) { return now - o.at > 2.0; }),
-                       orphans_.end());
-        for (const Point& p : m.points)
-            if (orphans_.size() < 64) orphans_.push_back({from, m.seq, now, p});
-        return;
-    }
-    Flight& f = it->second;
-    for (const Point& p : m.points) {
-        auto pos = std::lower_bound(f.points.begin(), f.points.end(), p.tMs,
-                                    [](const Point& a, uint16_t t) { return a.tMs < t; });
-        if (pos != f.points.end() && pos->tMs == p.tMs && pos->flags == p.flags) continue;  // a copy
-        if (f.points.size() >= 400) break;
-        f.points.insert(pos, p);
-        if (p.flags & kBounce) ++f.bounces;
-        if ((p.flags & kEnd) && !f.ended) {
-            f.ended = true;
-            f.endedAt = now;
-        }
-    }
+void Book::Step(double now, const RayFn& ray) {
+    for (auto& [key, f] : flights_)
+        if (!f.exploded) f.sim.Step(now - f.t0, ray);
 }
 
 Ended Book::MakeEnded(const Flight& f, EndWhy why, double now) const {
@@ -308,8 +261,10 @@ Ended Book::MakeEnded(const Flight& f, EndWhy why, double now) const {
     e.seq = f.t.seq;
     e.why = why;
     e.age = now - f.t0;
-    e.pos = PositionAt(f, e.age - kPlaybackDelay).pos;
-    e.points = f.points.size();
+    e.pos = f.sim.pos;
+    e.bounces = f.sim.bounces;
+    e.casts = f.sim.casts;
+    e.settled = f.sim.settled;
     return e;
 }
 
@@ -317,28 +272,37 @@ bool Book::EndByExplosion(uint32_t from, uint32_t throwSeq, const Vec3& pos, dou
     auto best = flights_.end();
     if (throwSeq != 0) {
         best = flights_.find({from, throwSeq});
+        if (best != flights_.end() && best->second.exploded) best = flights_.end();
     } else {
         float bestD = kMatchReach;
         for (auto it = flights_.begin(); it != flights_.end(); ++it) {
-            if (it->first.first != from) continue;
-            const Flight& f = it->second;
-            float d = boom::Dist(PositionAt(f, now - f.t0 - kPlaybackDelay).pos, pos);
-            if (f.t.flags & kHasLanding) d = std::min(d, boom::Dist(f.t.landing, pos));
+            if (it->first.first != from || it->second.exploded) continue;
+            const float d = boom::Dist(it->second.sim.pos, pos);
             if (d <= bestD) bestD = d, best = it;
         }
     }
     if (best == flights_.end()) return false;
-    out = MakeEnded(best->second, EndWhy::Explosion, now);
-    flights_.erase(best);
+    Flight& f = best->second;
+    out = MakeEnded(f, EndWhy::Explosion, now);
+    out.off = boom::Dist(f.sim.pos, pos);
+    f.exploded = true;  // the marker jumps to the true position for a moment
+    f.explodedAt = now;
+    f.boomPos = pos;
     return true;
 }
 
 void Book::Tick(double now, std::vector<Ended>& out) {
     for (auto it = flights_.begin(); it != flights_.end();) {
         const Flight& f = it->second;
+        if (f.exploded) {
+            if (now - f.explodedAt > kExplodedShow) it = flights_.erase(it);
+            else ++it;
+            continue;
+        }
+        const double age = now - f.t0;
         EndWhy why;
-        if (f.ended && now - f.endedAt > kHoldAfterEnd) why = EndWhy::EndPoint;
-        else if (now - f.t0 > kMaxFlight) why = EndWhy::Timeout;
+        if (f.t.fuseMs > 0 && age > f.t.fuseMs / 1000.0 + kFuseGrace) why = EndWhy::Fuse;
+        else if (age > kMaxFlight) why = EndWhy::Timeout;
         else {
             ++it;
             continue;
@@ -346,34 +310,41 @@ void Book::Tick(double now, std::vector<Ended>& out) {
         out.push_back(MakeEnded(f, why, now));
         it = flights_.erase(it);
     }
-    orphans_.erase(std::remove_if(orphans_.begin(), orphans_.end(), [now](const Orphan& o) { return now - o.at > 2.0; }),
-                   orphans_.end());
 }
 
 void Book::Visuals(double now, std::vector<Visual>& out) const {
-    for (const auto& [key, f] : flights_) out.push_back(PositionAt(f, now - f.t0 - kPlaybackDelay));
+    for (const auto& [key, f] : flights_) {
+        Visual v;
+        v.from = f.from;
+        v.seq = f.t.seq;
+        v.kind = f.t.kind;
+        v.flags = f.t.flags;
+        v.age = now - f.t0;
+        if (f.exploded) {
+            v.pos = f.boomPos;
+            v.held = true;
+            v.src = "boom";
+        } else {
+            v.pos = f.sim.pos;
+            v.held = f.sim.settled;
+            v.src = f.sim.settled ? "settled" : f.sim.rolling ? "roll" : f.sim.noRay ? "arc" : "sim";
+        }
+        out.push_back(v);
+    }
 }
 
 void Book::Forget(uint32_t from, double now, std::vector<Ended>& out) {
     for (auto it = flights_.begin(); it != flights_.end();) {
         if (it->first.first == from) {
-            out.push_back(MakeEnded(it->second, EndWhy::Left, now));
+            if (!it->second.exploded) out.push_back(MakeEnded(it->second, EndWhy::Left, now));
             it = flights_.erase(it);
         } else {
             ++it;
         }
     }
-    orphans_.erase(std::remove_if(orphans_.begin(), orphans_.end(), [from](const Orphan& o) { return o.from == from; }),
-                   orphans_.end());
 }
 
 // ---- the thrower ------------------------------------------------------------------------------------------------------
-Tracker::T* Tracker::Get(uint32_t seq) {
-    for (T& t : throws_)
-        if (t.seq == seq) return &t;
-    return nullptr;
-}
-
 bool Tracker::Active(uint32_t seq) const {
     for (const T& t : throws_)
         if (t.seq == seq) return true;
@@ -381,7 +352,7 @@ bool Tracker::Active(uint32_t seq) const {
 }
 
 void Tracker::Begin(uint32_t seq, Kind kind, const std::string& weapon, double now, const Vec3& standing) {
-    if (Get(seq)) return;
+    if (Active(seq)) return;
     if (throws_.size() >= 4) throws_.erase(throws_.begin());
     T t;
     t.seq = seq;
@@ -392,158 +363,100 @@ void Tracker::Begin(uint32_t seq, Kind kind, const std::string& weapon, double n
     throws_.push_back(std::move(t));
 }
 
-void Tracker::Model(uint32_t seq, const Vec3& origin, const Vec3& vel, bool hasLanding, const Vec3& landing,
-                    uint16_t flightMs) {
-    T* t = Get(seq);
-    if (!t || !Finite(origin) || !Finite(vel) || Len(vel) > kMaxSpeed) return;
-    t->hasModel = true;
-    t->modelOrigin = origin;
-    t->modelVel = vel;
-    t->modelLanding = hasLanding && Finite(landing) && flightMs > 0;
-    t->modelLandingPos = landing;
-    t->modelFlightMs = t->modelLanding ? flightMs : 0;
-}
-
-void Tracker::SendThrow(T& t, double now, std::vector<Out>& out) {
-    Out o;
-    o.type = Out::Type::Throw;
-    o.reliable = true;
-    ThrowMsg& m = o.t;
-    m.seq = t.seq;
-    m.kind = t.kind;
-    m.flags = (t.kind == Kind::Molotov ? kFire : 0) | (t.fromEntity ? kFromEntity : 0);
-    if (!t.fromEntity && t.modelLanding) {
-        m.flags |= kHasLanding;
-        m.flightMs = t.modelFlightMs;
-        m.landing = t.modelLandingPos;
-    }
-    m.origin = t.origin;
-    m.vel = t.vel;
-    m.gravity = kGravity;
-    m.delayMs = Ms(now - t.t0);
-    m.weapon = t.weapon;
-    t.sent = true;
-    t.lastPointAt = now;
-    out.push_back(std::move(o));
-}
-
-void Tracker::Flush(T& t, bool reliable, std::vector<Out>& out) {
-    while (!t.pending.empty()) {
-        Out o;
-        o.type = Out::Type::Points;
-        o.reliable = reliable;
-        o.f.seq = t.seq;
-        const size_t n = std::min(t.pending.size(), kMaxPointsPerMsg);
-        o.f.points.assign(t.pending.begin(), t.pending.begin() + static_cast<std::ptrdiff_t>(n));
-        t.pending.erase(t.pending.begin(), t.pending.begin() + static_cast<std::ptrdiff_t>(n));
-        t.nPoints += n;
-        out.push_back(std::move(o));
+void Tracker::Model(uint32_t seq, const Vec3& origin, const Vec3& vel) {
+    for (T& t : throws_) {
+        if (t.seq != seq) continue;
+        if (!Finite(origin) || !Finite(vel) || Len(vel) > kMaxSpeed) return;
+        t.hasModel = true;
+        t.modelOrigin = origin;
+        t.modelVel = vel;
     }
 }
 
-void Tracker::Sample(uint32_t seq, double now, const Vec3& pos, std::vector<Out>& out) {
-    T* t = Get(seq);
-    if (!t || !Finite(pos)) return;
-    ++t->nSamples;
-    t->last = pos;
-    t->lastAt = now;
-    if (t->samples.size() < 6 && (t->samples.empty() || now - t->samples.back().first > 1e-4))
-        t->samples.push_back({now, pos});
-    if (!t->sent) {
-        if (t->samples.size() < 2) return;
-        const Vec3 v = EstimateLaunch(t->samples[0].second, t->samples[0].first, t->samples[1].second,
-                                      t->samples[1].first, kGravity);
-        if (Len(v) > kMaxSpeed) {  // a jump in the readings (the entity placed at the hand): start again from here
-            t->samples.erase(t->samples.begin());
-            return;
-        }
-        t->fromEntity = true;
-        t->t0 = t->samples[0].first;
-        t->origin = t->samples[0].second;
-        t->vel = v;
-        SendThrow(*t, now, out);
-        return;
-    }
-    if (now - t->lastPointAt >= kPointInterval - 1e-6) {
-        t->pending.push_back({Ms(now - t->t0), 0, pos});
-        t->lastPointAt = now;
-        Flush(*t, false, out);
-    }
-}
-
-void Tracker::Bounce(uint32_t seq, double now, const Vec3& pos, std::vector<Out>& out) {
-    T* t = Get(seq);
-    if (!t || !Finite(pos)) return;
-    ++t->nBounces;
-    if (!t->sent) return;
-    t->pending.push_back({Ms(now - t->t0), kBounce, pos});
-    Flush(*t, false, out);
-}
-
-Summary Tracker::Summarize(const T& t, double now, const char* why) const {
+// sends throws_[i] from what it has (samples, else the model, else nothing) and removes it
+void Tracker::Finish(size_t i, double now, std::vector<Out>& out, std::vector<Summary>& done) {
+    T& t = throws_[i];
     Summary s;
     s.seq = t.seq;
     s.weapon = t.weapon;
-    s.sent = t.sent;
-    s.fromEntity = t.fromEntity;
-    s.samples = t.nSamples;
-    s.points = t.nPoints;
-    s.bounces = t.nBounces;
-    s.flight = t.sent ? (t.nSamples ? t.lastAt : now) - t.t0 : 0;
-    s.origin = t.sent ? t.origin : t.standing;
-    s.last = t.nSamples ? t.last : s.origin;
-    s.speed = t.sent ? Len(t.vel) : 0;
-    const auto& sm = t.samples;
-    float g = 0;
-    if (sm.size() >= 5 && FitGravity(sm[0].second, sm[0].first, sm[2].second, sm[2].first, sm[4].second, sm[4].first, g))
-        s.gravity = g;
-    else if (sm.size() >= 3 && FitGravity(sm[0].second, sm[0].first, sm[1].second, sm[1].first, sm[2].second, sm[2].first, g))
-        s.gravity = g;
+    s.samples = t.samples.size();
+    s.after = now - t.begin;
+    float yaw = 0;
     if (t.hasModel) {
-        float yaw = 0;
         s.modelSpeed = Len(t.modelVel);
         YawPitch(t.modelVel, yaw, s.modelPitch);
     }
-    if (t.sent) {
-        float yaw = 0;
-        YawPitch(t.vel, yaw, s.realPitch);
+    ThrowMsg m;
+    m.seq = t.seq;
+    m.kind = t.kind;
+    m.gravity = kGravity;
+    m.weapon = t.weapon;
+    double t0 = t.begin;
+    if (t.samples.size() >= 2) {
+        const auto& a = t.samples.front();
+        const auto& b = t.samples.back();  // the longest baseline
+        m.origin = a.second;
+        m.vel = EstimateLaunch(a.second, a.first, b.second, b.first, kGravity);
+        m.flags = kFromEntity;
+        t0 = a.first;
+        float g = 0;
+        if (t.samples.size() >= 3 && FitGravity(t.samples[0].second, t.samples[0].first, t.samples[1].second,
+                                                t.samples[1].first, t.samples[2].second, t.samples[2].first, g))
+            s.gravity = g;
+        s.why = "measured";
+        s.fromEntity = true;
+    } else if (t.hasModel) {
+        m.origin = t.modelOrigin;
+        m.vel = t.modelVel;
+        s.why = "model";
+    } else {
+        s.why = "no_projectile_no_model";
+        s.origin = t.standing;
+        done.push_back(std::move(s));
+        throws_.erase(throws_.begin() + static_cast<std::ptrdiff_t>(i));
+        return;
     }
-    s.why = why;
-    return s;
+    if (t.kind == Kind::Molotov) m.flags |= kFire;
+    m.delayMs = Ms(now - t0);
+    s.sent = true;
+    s.origin = m.origin;
+    s.speed = Len(m.vel);
+    YawPitch(m.vel, yaw, s.realPitch);
+    out.push_back({std::move(m)});
+    done.push_back(std::move(s));
+    throws_.erase(throws_.begin() + static_cast<std::ptrdiff_t>(i));
 }
 
-void Tracker::End(uint32_t seq, double now, const Vec3* pos, const char* why, std::vector<Out>& out,
-                  std::vector<Summary>& done) {
-    T* t = Get(seq);
-    if (!t) return;
-    if (t->sent) {
-        const Vec3 at = pos && Finite(*pos) ? *pos : t->last;
-        t->pending.push_back({Ms(now - t->t0), kEnd, at});
-        Flush(*t, true, out);
+void Tracker::Sample(uint32_t seq, double now, const Vec3& pos, std::vector<Out>& out, std::vector<Summary>& done) {
+    for (size_t i = 0; i < throws_.size(); ++i) {
+        T& t = throws_[i];
+        if (t.seq != seq) continue;
+        if (!Finite(pos) || (!t.samples.empty() && now - t.samples.back().first < 1e-4)) return;
+        if (!t.samples.empty()) {
+            const auto& a = t.samples.front();
+            if (Len(EstimateLaunch(a.second, a.first, pos, now, kGravity)) > kMaxSpeed) {
+                t.samples.clear();  // a jump in the readings (the entity placed at the hand first): start again here
+            }
+        }
+        t.samples.push_back({now, pos});
+        if (t.samples.size() >= kMeasureSamples) Finish(i, now, out, done);
+        return;
     }
-    done.push_back(Summarize(*t, now, why));
-    throws_.erase(throws_.begin() + (t - throws_.data()));
 }
 
 void Tracker::Tick(double now, std::vector<Out>& out, std::vector<Summary>& done) {
     for (size_t i = 0; i < throws_.size();) {
-        T& t = throws_[i];
-        if (!t.sent && t.hasModel && now - t.begin >= kEntityWait) {  // no projectile found: the aim model's launch
-            t.fromEntity = false;
-            t.t0 = t.begin;
-            t.origin = t.modelOrigin;
-            t.vel = t.modelVel;
-            SendThrow(t, now, out);
-        }
-        const char* why = nullptr;
-        if (now - t.begin > kTrackMax) why = "timeout";
-        else if (!t.sent && !t.hasModel && now - t.begin > 2.0) why = "no_projectile_no_model";
-        if (why) {
-            End(t.seq, now, nullptr, why, out, done);  // erases throws_[i]
-            continue;
-        }
-        ++i;
+        if (now - throws_[i].begin >= kMeasureWindow) Finish(i, now, out, done);  // erases throws_[i]
+        else ++i;
     }
+}
+
+void Tracker::End(uint32_t seq, double now, std::vector<Out>& out, std::vector<Summary>& done) {
+    for (size_t i = 0; i < throws_.size(); ++i)
+        if (throws_[i].seq == seq) {
+            Finish(i, now, out, done);
+            return;
+        }
 }
 
 // ---- aim log ---------------------------------------------------------------------------------------------------------
