@@ -280,7 +280,8 @@ function M.SpawnTick()
     pp.cb = nil
     pp.mult, pp.noMult = nil, nil  -- a fresh human: its speed multiplier is 1
     pp.ally, pp.spawnT = nil, M.now
-    pp.calm, pp.brainT, pp.seated, pp.leaving = nil, nil, false, nil  -- a fresh human: brain and seat state anew (M.Seat)
+    -- a fresh human: its brain and seat state anew (M.Ally, M.Seat)
+    pp.calm, pp.brain, pp.brainT, pp.seated, pp.leaving = nil, nil, nil, false, nil
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
       pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
     return
@@ -681,10 +682,12 @@ function M.CarsUpdate(p)
       M.cars[key] = c
       log("car " .. key .. ": ours, " .. c.model)
     end
+    -- a ride along into this car is under way and the game slid us to the wheel (M.RideTick moves us over): we are
+    -- still getting in (seat 9) for the others and do not take the car from its driver
+    if seat == 0 and c.driver and c.driver ~= "local" and M.ride and M.ride.key == key then seat = 9 end
     M.my = { key = key, seat = seat, c = c }
     c.used = M.now
-    -- (not while a ride along into this car is under way: the game may have slid us to the wheel, M.RideTick)
-    if seat == 0 and c.driver ~= "local" and not (c.driver and M.ride and M.ride.key == key) then
+    if seat == 0 and c.driver ~= "local" then
       if c.driver then log("car " .. key .. ": we took the wheel while player " .. c.driver .. " drove it") end
       c.driver, c.parkPending, c.parkApply, c.localDriven = "local", nil, nil, true
       log("car " .. key .. ": we drive it")
@@ -927,7 +930,7 @@ function M.Seat(pp, c)
         pp.seated, pp.seatedT = true, M.now
         if seatLogOk(pp) then
           log(string.format("puppet %s sits in car %s seat %d (%.1f s after the seat command, friend brain %s)",
-            pp.id, tostring(pp.vkey), pp.seat, M.now - (pp.seatT or M.now), pp.ally and "yes" or "no"))
+            pp.id, tostring(pp.vkey), pp.seat, M.now - (pp.seatT or M.now), pp.brain and "yes" or "no"))
         end
       end
       pp.seatTries, pp.leaving = 0, nil
@@ -981,7 +984,7 @@ function M.Seat(pp, c)
         .. "%d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects, pp.ejectsAll,
         M.now - (pp.seatedT or pp.seatT or M.now), g2 and (tonumber(sp) or -1) or -1, tostring(cmd.fix),
         cmd.pinned and " pinned" or "", g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
-        seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.ally and "yes" or "no",
+        seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.brain and "yes" or "no",
         pp.putBacks or 0, math.sqrt((q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 + (q.z - cp.z) ^ 2), tostring(c.driver),
         c.adopted and ", our mission car" or (c.localDriven and ", we drove it" or "")))
     end
@@ -1023,7 +1026,7 @@ function M.Seat(pp, c)
     if M.now - (pp.spawnT or M.now) < 2.5 then return false end
   end
   if pp.brainT and M.now - pp.brainT < BRAIN_SETTLE then return true end
-  if not pp.ally then M.Calm(pp, so) end
+  if not pp.brain then M.Calm(pp, so) end
   -- The puppet walked up to a standing car (its player was getting in, docs/protocol.md seat 9): it gets in with the
   -- game's own animation, once; it is given ANIM_WAIT to finish, then seated at once like any other time. A puppet
   -- just thrown out is put back at once (fast), else once a second.
@@ -1303,7 +1306,7 @@ function M.TracePuppet(pp)
     tostring(pp.seat), valid(own) and tostring(guidNum(own)) or "-", pp.seated and 1 or 0, pp.ejects or 0,
     pp.seatTries or 0, tostring(pp.seatAnim), g1 and tostring(phys) or "-", g2 and (spr and "1" or "0") or "-",
     so:IsDeath() and 1 or 0, tonumber(so.health) or -1, pp.moving and 1 or 0, pp.mult or 1, pp.moves or 0,
-    pp.snaps or 0, sown, pp.ally and 1 or 0, g3 and tostring(ai) or "-", pp.putBacks or 0, pp.leaving and 1 or 0,
+    pp.snaps or 0, sown, pp.brain and 1 or 0, g3 and tostring(ai) or "-", pp.putBacks or 0, pp.leaving and 1 or 0,
     pp.ejectsAll or 0))
 end
 
@@ -1339,6 +1342,7 @@ function M.Ally(pp, so)
   pp.ally = true
   local before = tostring(so:GetAIType())
   local good, err = pcall(so.SwitchBrain, so, 1)
+  pp.brain = good  -- the friend brain really set (pp.ally: tried)
   log(string.format("puppet %s: friend brain %s (AI type %s -> %s%s): it keeps its car seats, enemies target it%s",
     pp.id, good and "set" or "FAILED", before, tostring(so:GetAIType()), good and "" or (", " .. tostring(err)),
     (M.isHost and not M.allyOn) and " (their hits are not sent: enemies_target_guests = 0)" or ""))
