@@ -2065,11 +2065,14 @@ end
 -- "Hit"), and a puppet's swing must not hurt anyone here (M.ShieldFromSwing).
 -- ---------------------------------------------------------------------------------------------------------------
 local ACTION_NAMES = { [1] = "light punch", [2] = "heavy punch", [3] = "counter", [4] = "takedown", [5] = "throw",
-  [6] = "hit reaction" }
+  [6] = "hit reaction", [7] = "door kick", [8] = "lock pull", [9] = "door open" }
 -- Our player's HUMAN messages that are actions (besides MELEE_LIGHT/HEAVY_ATTACK, M.OnMeleeEvent): name, kind, and
 -- whether the message is about him being the victim (MELEE_HIT_REACT) rather than the attacker.
+-- The door ones (7-9, docs/game-api.md 20) also tell door_sync.lua that a door change next to us is ours
+-- (M.doorActKind / M.doorActT). UNVERIFIED that the game sends them to the player who acts (as the melee ones).
 local ACTION_EVENTS = { { "MELEE_COUNTER_ATTACK", 3 }, { "MELEE_COMBAT_TAKEDOWN", 4 },
-  { "MELEE_STEALTH_TAKEDOWN", 4 }, { "WEAPON_THROWN", 5 }, { "MELEE_HIT_REACT", 6, true } }
+  { "MELEE_STEALTH_TAKEDOWN", 4 }, { "WEAPON_THROWN", 5 }, { "MELEE_HIT_REACT", 6, true }, { "DOOR_KICK", 7 },
+  { "LOCKPICK_START", 8 }, { "PLAYER_CUSTOMLOCKPICK", 8 }, { "DOOR_OPEN", 9 } }
 M.ACTION_EVENTS = ACTION_EVENTS
 
 function M.LocalAction(kind, opp)
@@ -2077,6 +2080,7 @@ function M.LocalAction(kind, opp)
   if M.actKind == kind and M.now - (M.actT or -1) < 0.12 then return end
   M.actSeq = (M.actSeq + 1) % 256
   M.actKind, M.actT = kind, M.now
+  if kind >= 7 then M.doorActKind, M.doorActT = kind, M.now end  -- door_sync.lua: a door change near us is ours
   M.actsDone = (M.actsDone or 0) + 1
   if M.actsDone <= 40 or M.actsDone % 100 == 0 then
     log(string.format("we did a %s (action #%d, seq %d, opponent %s)", ACTION_NAMES[kind] or "?", M.actsDone,
@@ -2120,6 +2124,15 @@ M.actionAnims = M.actionAnims or {
     "hero_nw_alert_throw_knife_f" } },
   [6] = { dur = 0.6, list = { "hero_nw_alert_melee_hitreact2_v1", "hero_nw_alert_melee_hitreact2_v2",
     "enemy_nw_alert_melee_hitreact1_v1" } },
+  -- doors (docs/game-api.md 20; names from basic_anim / anim_project): the kick (1h, with a Tommy gun the trench set,
+  -- a rifle the rifle set), the lock pull (lockpick: the start of it, the game's pull itself takes longer), a door
+  -- opened by hand
+  [7] = { dur = 1.1, list = { "hero_1h_alert_doorkick", "hero_1h_alert_doorkick_left", "hero_trench_alert_doorkick",
+    "hero_rifle_alert_doorkick" }, armed = { "hero_1h_alert_doorkick" } },
+  [8] = { dur = 2.5, list = { "hero_nw_calm_idle_to_lockpull_begin_idle", "hero_lockpull_break_attempt",
+    "hero_lockpull_break_success" } },
+  [9] = { dur = 0.8, list = { "hero_nw_alert_door_open_push_far_handle", "hero_nw_alert_door_open_pull_near_handle",
+    "hero_nw_cov_door_open_push_far_handle_160cm" } },
 }
 M.badAnims = M.badAnims or {}  -- name -> failed tries (2 = not used again this session)
 local SWING_SHIELD = 3.0  -- m: a puppet swinging this close makes the local player a demigod for the swing

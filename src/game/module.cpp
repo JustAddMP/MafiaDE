@@ -15,6 +15,7 @@
 #include "game/save_guard.h"
 #include "game/sectors_guard.h"
 #include "game/traffic_sync.h"
+#include "game/door_sync.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -194,6 +195,7 @@ public:
             MissionSync::Install();
             NpcSync::Install();
             TrafficSync::Install();
+            DoorSync::Install();
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -207,12 +209,14 @@ public:
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
+        DoorSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        DoorSync::Detach();
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
@@ -248,12 +252,14 @@ public:
         core::trace::Line("RCN", "ev=back same=%d local=%u attempts=%d", sameSlot ? 1 : 0,
                           _session ? _session->LocalId() : 0, _session ? _session->ReconnectAttempts() : 0);
         MissionSync::OnReconnected();
+        DoorSync::OnReconnected();  // the doors around us are asked for again
     }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
+        DoorSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -274,6 +280,10 @@ public:
         case 0x0221: return "TrafficDespawn";
         case 0x0222: return "TrafficStates";
         case 0x0223: return "TrafficBump";
+        case 0x0230: return "DoorEvent";
+        case 0x0231: return "DoorApply";
+        case 0x0232: return "DoorSnapshot";
+        case 0x0233: return "DoorSnapRequest";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
         case 0x0420: return "GuestNpcStates";
@@ -288,6 +298,7 @@ public:
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);
+        DoorSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }

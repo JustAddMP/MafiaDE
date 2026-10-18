@@ -1,6 +1,7 @@
 #pragma once
-// Visible one-shot actions of a player (punches, a counter, a takedown, a throw, a melee hit reaction) for his
-// puppet on the other games (docs/protocol.md "PlayerState", action block). They ride at the end of every
+// Visible one-shot actions of a player (punches, a counter, a takedown, a throw, a melee hit reaction, a door kick,
+// a lock pull, a door opened by hand) for his puppet on the other games (docs/protocol.md "PlayerState", action
+// block). They ride at the end of every
 // PlayerState as a sequence counter plus the kind of the latest action, so a lost or reordered state does not lose
 // one: the next state carries the same counter, and the receiver plays an action once for each counter step it
 // sees (only the latest kind when it missed several). Pure logic, header-only: tests/player_actions_test.cpp.
@@ -19,8 +20,11 @@ enum class Action : uint8_t {
     Takedown = 4,    // MELEE_COMBAT_TAKEDOWN / MELEE_STEALTH_TAKEDOWN by our player
     Throw = 5,       // WEAPON_THROWN: a grenade, molotov or knife left our player's hand
     HitReact = 6,    // MELEE_HIT_REACT on our player: an NPC punched him on his own game
+    DoorKick = 7,    // DOOR_KICK: he kicked a door open (the door itself: door_sync, docs/game-api.md 20)
+    Lockpick = 8,    // LOCKPICK_START / PLAYER_CUSTOMLOCKPICK: he started the lock pull on a door
+    DoorOpen = 9,    // DOOR_OPEN: he opened a door by hand
 };
-constexpr uint8_t kLastAction = 6;
+constexpr uint8_t kLastAction = 9;
 
 inline const char* Name(Action a) {
     switch (a) {
@@ -31,6 +35,9 @@ inline const char* Name(Action a) {
         case Action::Takedown: return "takedown";
         case Action::Throw: return "throw";
         case Action::HitReact: return "hitreact";
+        case Action::DoorKick: return "doorkick";
+        case Action::Lockpick: return "lockpick";
+        case Action::DoorOpen: return "dooropen";
     }
     return "none";
 }

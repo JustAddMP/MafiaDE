@@ -82,7 +82,8 @@ void TestWire() {
     Check(r.Ok() && r.Remaining() == 2, "an older reader is not upset by the block");
 
     Check(FromCode(0) == Action::None && FromCode(1) == Action::LightPunch && FromCode(6) == Action::HitReact &&
-              FromCode(7) == Action::None && FromCode(255) == Action::None,
+              FromCode(7) == Action::DoorKick && FromCode(8) == Action::Lockpick && FromCode(9) == Action::DoorOpen &&
+              FromCode(10) == Action::None && FromCode(255) == Action::None,
           "codes from the Lua sample");
     Check(std::string(Name(Action::HeavyPunch)) == "heavy" && std::string(Name(Action::None)) == "none",
           "names for the log and the trace");
