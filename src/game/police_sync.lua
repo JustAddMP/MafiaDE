@@ -7,11 +7,12 @@
 -- red, a level, a centre = the area he has to leave to lose them), his fines and his arrests. This glue reads ours
 -- (GetActiveZones / GetZoneInfo, IsSeenByPolice, the police events, the HumanMessages our player gets) and reports it;
 -- the C++ side broadcasts it. Nothing of another player's state is copied into our game, except:
---   - host: a wanted guest near us is a target of OUR police (his puppet here): an offence is announced from his
---     puppet (AnnouncePoliceOffence) when he becomes a target and when his level goes up or his game reports a new
---     offence; while he is hunted at a high level, our police near his puppet attack it (Attack); police that saw
---     his puppet are counted (SEE_ENEMY) and reported, the C++ side tells him (PoliceChase). When he is clean again
---     the police we set on him forget it (unless we are wanted ourselves).
+--   - host: a wanted guest near us is a target of OUR police (his puppet here): while he is hunted, our police near
+--     his puppet attack it (Attack); police that saw his puppet are counted (SEE_ENEMY) and reported, the C++ side
+--     tells him (PoliceChase). When he is clean again the police we set on him forget it (unless we are wanted
+--     ourselves). No offence is announced from his puppet: the game has one police zone, its player's, and an
+--     offence announced from a puppet that a cop witnesses becomes OUR player's zone (in-game test 2026-10-18: the
+--     host was wanted at the puppet's spot 12 s after AnnouncePoliceOffence). The "A" commands are only logged.
 --   - guest: while the host's police chase us, our game holds our wanted level at least at the chase's level
 --     (ForceMinEscalationLevel) and starts a zone of its own here when the host's police see us and our game has none
 --     (ZoneCreate on our own player); released when the chase is over. Far from the host nothing is touched: our own
@@ -42,7 +43,6 @@ local SCAN_INTERVAL = 1.0   -- s between scans for our police near targeted pupp
 local POS_INTERVAL = 0.5    -- s between puppet / host positions sent to the C++ side (host)
 local COP_RANGE = 90        -- m from a targeted puppet: our police humans that count (and may be set on it)
 local SEE_KEEP = 5          -- s a cop that saw a puppet counts as seeing it
-local ATTACK_LEVEL = 3      -- hunted at this level or more: our police near his puppet attack it (UNVERIFIED scale)
 local ATTACK_AGAIN = 8      -- s before the same cop is told again
 local MAX_ATTACKERS = 6     -- cops set on one puppet at once
 local CHASE_NEAR = 250      -- m: ChaseNear (siren fallback for police copies)
@@ -247,30 +247,13 @@ local function pupPos(pp)
   return nil
 end
 
--- The offence announced from a puppet: the worse the guest's state, the worse the offence (enums.OffenceType names
--- without E_OT_; the scale of the levels is UNVERIFIED).
-local function offenceFor(level, hunt, inCar)
-  local ot = enums and enums.OffenceType
-  if not ot then return nil end
-  local name
-  if level >= ATTACK_LEVEL then name = "SHOOT_AT_DISCIPLINARY"
-  elseif hunt then name = "RUNNING_FROM_POLICE"
-  elseif inCar then name = "RECKLESS_DRIVING"
-  else name = "FISTFIGHT" end
-  return ot[name] or ot.STREET_SHOOTING, name
-end
-
+-- An offence would be announced from guest `id`'s puppet here. Not done: AnnouncePoliceOffence on a puppet makes OUR
+-- player wanted once a cop witnesses it (the game's one police zone is its player's; see the header). Logged only.
 function P.Announce(id, level, hunt)
-  local pp = M.pup and M.pup[id]
-  if not (pp and valid(pp.so)) then return end
-  local so = pp.so
-  local inCar = pp.veh and true or false
-  local ot, name = offenceFor(level, hunt, inCar)
-  if ot == nil then return end
-  local good, err = pcall(so.AnnouncePoliceOffence, so, ot)
   P.nAnnounce = (P.nAnnounce or 0) + 1
-  log(string.format("guest %s is wanted near us (level %d, %s): offence %s announced from his puppet %s", id, level,
-    hunt and "hunt" or "search", name, good and "ok" or ("FAILED: " .. tostring(err))))
+  log(string.format("guest %s is wanted near us (level %d, %s): no offence announced from his puppet (it would make "
+    .. "us wanted); our police %s", id, level, hunt and "hunt" or "search",
+    hunt and "near his puppet attack it" or "leave him to his own game while he is only searched"))
 end
 
 local function isCop(h)
@@ -304,7 +287,7 @@ function P.Scan(ev)
         n = n + 1
         if i == 1 then nearest = nc.d end
         if t.seen[nc.c.id] and M.now - t.seen[nc.c.id] < SEE_KEEP then seers = seers + 1 end
-        if t.hunt and t.level >= ATTACK_LEVEL and i <= MAX_ATTACKERS then
+        if t.hunt and i <= MAX_ATTACKERS then
           if not t.told[nc.c.id] or M.now - t.told[nc.c.id] >= ATTACK_AGAIN then
             local good, err = pcall(nc.c.h.Attack, nc.c.h, pp.so)
             t.told[nc.c.id] = M.now
