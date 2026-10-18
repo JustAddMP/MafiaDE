@@ -31,11 +31,14 @@
 --   E                                                                            enter key pressed (ride along)
 --   A                                                                            aim input held (RMB / left trigger)
 --   G tags markers ally brain                                                    settings: 1/0 name tags (send NT
---                                                                                events), 1/0 map markers (minimap
---                                                                                icons on puppets), 1/0 host: enemies
+--                                                                                events), 1/0 map markers (every
+--                                                                                other player on the minimap and
+--                                                                                the map), 1/0 host: enemies
 --                                                                                target guests, 1/0 the game-sectors
 --                                                                                guard is in (puppets may get the
 --                                                                                friend brain: M.Ally, M.Seat)
+--   N id name                                                                    a player's name (the rest of the
+--                                                                                line), shown on his map marker
 --   R id                                                                         remove that puppet
 --   X                                                                            remove everything
 -- Output: sample, status, events
@@ -1767,7 +1770,7 @@ end
 function M.Remove(id)
   local pp = M.pup[id]
   if not pp then return end
-  M.Unmark(pp)
+  M.Unmark(pp, "his puppet record goes")
   local f = M.fac
   if f.busy == id then f.busy = nil end
   M.Release(pp, pp.so)
@@ -2720,11 +2723,8 @@ end
 -- ---------------------------------------------------------------------------------------------------------------
 -- Name tags and map markers (docs/game-api.md 13). Tags: the dll draws each player's name over his puppet with our
 -- overlay; it gets the head's screen position from game.game:ProjectPointToScreen (x, y in -1..1 with y up, and
--- whether the point is in front of the camera). Markers: the game's own minimap icon for a human
--- (game.navigation:RegisterHumanEntityDirect(human, 1, 1), an orange marker), removed with UnregisterId. The game does
--- not give the same entity a second icon after UnregisterId, so a puppet keeps its icon until it is replaced.
--- Occlusion: a ray from the camera to the head (mc_raycast, the game's own physics ray cast, src/game/lua.cpp) five
--- times a second; a wall in between hides the tag (after two hits in a row, so a lamp post flicking past does not).
+-- whether the point is in front of the camera). Markers: see "Map markers" below. Occlusion: a ray from the camera
+-- to the head (mc_raycast, the game's own physics ray cast, src/game/lua.cpp) five times a second; a wall in between hides the tag (after two hits in a row, so a lamp post flicking past does not).
 -- Hits next to the camera, next to our own player (the camera looks over his shoulder) and at the puppet itself
 -- do not count.
 -- ---------------------------------------------------------------------------------------------------------------
@@ -2755,26 +2755,227 @@ local function tagOccluded(pp, c, h)
   return pp.occluded
 end
 
-function M.Unmark(pp)
-  if pp.blip then pcall(game.navigation.UnregisterId, game.navigation, pp.blip) end
-  pp.blip, pp.blipSo = nil, nil
+-- ---------------------------------------------------------------------------------------------------------------
+-- Map markers (docs/game-api.md 13): every other player in the session is on our minimap and on the pause menu's
+-- map, whatever he does. One navigation icon per player (pp.mk), made once per world and then moved, never made
+-- twice for the same puppet (the game gives an entity no second human icon after UnregisterId):
+--   - his puppet alive, shown and on foot: the game's human icon on it (RegisterHumanEntityDirect(puppet, 1, 1), the
+--     orange marker; it follows the entity by itself);
+--   - otherwise (he drives or rides: at his car's spot; no puppet yet, hidden in a cutscene, dead and respawning,
+--     re-created, swapped): the same icon at his position (ChangeIconTargetToPos), moved a few times a second from
+--     his latest state (the C++ side sends it every tick, near or far);
+--   - before his first puppet: a position icon (RegisterIconPos), replaced by the human icon once he has one.
+-- What to do is decided by mc_mapmark (src/game/map_markers.h, unit-tested). A puppet is never released with the icon
+-- on it: M.Unmark moves the icon off it first (the navigation module updates its icons once a second and read a
+-- released puppet through a stale icon: crash in exe+0x243a915, docs/game-api.md 15). The icon goes (UnregisterId)
+-- when the player leaves, the session ends, markers are switched off, or our world goes (loading screen, quit).
+-- His name is put on it (SetIconTextByNavId, UNVERIFIED where the map shows it), and it stays on the minimap's edge
+-- when he is far (SetIconFarVisibility, UNVERIFIED).
+-- ---------------------------------------------------------------------------------------------------------------
+local MARK_PERIOD = 0.2                 -- s between marker updates (5 Hz; the navigation module redraws once a second)
+local MARK_POS_ICON = "freeride-generic" -- RegisterIconPos icon type before he has a puppet (UNVERIFIED look)
+local MARK_TRACE_PERIOD = 1.0
+M.names = M.names or {}                 -- player id -> name ("N" commands), shown on his marker
+
+local function nav() return game.navigation end
+
+-- where he is for his marker: his car while he drives or rides, else himself (from his latest state)
+local function markPos(pp)
+  if pp.veh and (pp.seat or 0) <= 3 and pp.cx and pp.cy and pp.cz then return pp.cx, pp.cy, pp.cz end
+  return pp.tx, pp.ty, pp.tz
+end
+
+-- true when puppet `so` had a human icon of ours that was unregistered: the game gives it no second one (a register
+-- returns an id but shows nothing), so it only gets an icon moved onto it
+local function markBurnt(pp, so)
+  for _, b in ipairs(pp.mkBurnt or {}) do
+    if same(b, so) then return true end
+  end
+  return false
+end
+
+local function markLog(pp, text) log("player " .. tostring(pp.id) .. ": map marker " .. text) end
+
+local function markTrace(pp, mk, ev)
+  trace("MKE", string.format("id=%s nav=%s ev=%s icon=%s to=%s p=%.1f,%.1f,%.1f", tostring(pp.id), tostring(mk.id),
+    ev, mk.icon, mk.target, mk.x or 0, mk.y or 0, mk.z or 0))
+end
+
+-- the icon follows position x y z now; false when the game refused
+local function markToPos(pp, mk, x, y, z)
+  local good, ok = pcall(nav().ChangeIconTargetToPos, nav(), mk.id, V(x, y, z))
+  if not good or ok == false then return false end
+  mk.target, mk.so, mk.x, mk.y, mk.z = "pos", nil, x, y, z
+  return true
+end
+
+local function markName(pp, mk)
+  local name = M.names[pp.id]
+  if not name or mk.name == name then return end
+  mk.name = name
+  local good, err = pcall(nav().SetIconTextByNavId, nav(), mk.id, name)
+  if not good then markLog(pp, mk.id .. ": name not set (" .. tostring(err) .. ")") end
+end
+
+-- a new icon id for pp: settings every icon of ours gets
+local function markNew(pp, id, icon, target, so, x, y, z)
+  local mk = { id = id, icon = icon, target = target, so = so, x = x, y = y, z = z, world = M.inWorldAt, t = M.now }
+  pp.mk = mk
+  pcall(nav().SetIconFarVisibility, nav(), id, true)
+  markName(pp, mk)
+  return mk
+end
+
+-- Takes the icon off his puppet (it is about to be released, or the factory goes), to his position. remove (a
+-- reason): the icon goes altogether (he left, the session ended, our world goes). If the icon cannot be moved off the
+-- puppet it goes too: no icon may stay on a released puppet.
+function M.Unmark(pp, remove)
+  local mk = pp.mk
+  if not mk then return end
+  if not remove and mk.target ~= "puppet" then return end
+  local x, y, z = markPos(pp)
+  if not remove and x and y and z and markToPos(pp, mk, x, y, z) then
+    markLog(pp, mk.id .. " off his puppet, to his position")
+    markTrace(pp, mk, "detach")
+    return
+  end
+  pcall(nav().UnregisterId, nav(), mk.id)
+  pp.mk = nil
+  for _, e in ipairs({ mk.so, mk.made }) do  -- the puppets this icon was on get no second human icon
+    if valid(e) and not markBurnt(pp, e) then
+      pp.mkBurnt = pp.mkBurnt or {}
+      if #pp.mkBurnt >= 4 then table.remove(pp.mkBurnt, 1) end
+      pp.mkBurnt[#pp.mkBurnt + 1] = e
+    end
+  end
+  markLog(pp, mk.id .. " removed (" .. tostring(remove or "could not move it off his puppet") .. ")")
+  markTrace(pp, mk, "remove")
+end
+
+-- every marker goes (session over, markers off, our world goes)
+function M.MarkersClear(why)
+  for _, pp in pairs(M.pup) do
+    if pp.mk then M.Unmark(pp, why) end
+  end
+end
+
+function M.MarkOne(pp)
+  if not mc_mapmark then return end  -- an older dll with this file as a dev override
+  local mk = pp.mk
+  if mk and mk.world ~= M.inWorldAt then
+    -- made in a world that is gone (we did not see it go): the id means nothing now, it is not unregistered (it might
+    -- be one of the new world's icons)
+    markLog(pp, mk.id .. " forgotten (made in an earlier world)")
+    pp.mk, mk = nil, nil
+  end
+  local so = pp.so
+  -- his puppet may carry the icon: alive, shown, on foot (and the icon could be put on it: mkNoFollow)
+  local shown = pp.st == "alive" and valid(so) and not pp.hidden and not (pp.veh and (pp.seat or 0) <= 3)
+    and not same(pp.mkNoFollow, so)
+  if mk and mk.target == "puppet" and not (valid(mk.so) and shown and same(mk.so, so)) then
+    -- not on his shown puppet any more: off it at once, not at the next update
+    pp.mkT = nil
+  end
+  if pp.mkT and M.now - pp.mkT < MARK_PERIOD then return end
+  pp.mkT = M.now
+  local x, y, z = markPos(pp)
+  local hasPos = x ~= nil and y ~= nil and z ~= nil
+  local changed = mk and mk.target == "puppet" and not same(mk.so, so)
+  local refused = same(pp.mkFailed, so) or markBurnt(pp, so)  -- no (working) human icon for this puppet
+  local _, act = mc_mapmark(mk and mk.icon or "none", mk and mk.target or "none", shown and 1 or 0, changed and 1 or 0,
+    refused and 1 or 0, hasPos and 1 or 0, x or 0, y or 0, z or 0, mk and mk.x or 0, mk and mk.y or 0, mk and mk.z or 0)
+  if act == "keep" then
+    if mk then markName(pp, mk) end
+    return
+  end
+  local n = nav()
+  if act == "create_human" or act == "replace_with_human" then
+    if act == "replace_with_human" then
+      pcall(n.UnregisterId, n, mk.id)
+      markLog(pp, mk.id .. " (position icon) removed: he has a puppet now")
+      markTrace(pp, mk, "remove")
+      pp.mk = nil
+    end
+    local good, id = pcall(n.RegisterHumanEntityDirect, n, so, 1, 1)
+    if good and id then
+      mk = markNew(pp, id, "human", "puppet", so)
+      mk.made = so
+      markLog(pp, id .. " made on his puppet")
+      markTrace(pp, mk, "create")
+    else
+      pp.mkFailed = so
+      markLog(pp, "not made on his puppet (" .. tostring(id) .. "), at his position instead")
+      pp.mkT = nil  -- the position icon at the next tick
+    end
+  elseif act == "create_pos" then
+    if pp.mkPosFailed and M.now - pp.mkPosFailed < 5 then return end
+    -- (x, y, z, icon type, text, show text, ?, ?, colour, ?, ?): the 11-argument overload (exe, docs/game-api.md 13)
+    local good, id = pcall(n.RegisterIconPos, n, x, y, z, MARK_POS_ICON, M.names[pp.id] or "", true, "0", "", 16777215,
+      "", "")
+    if good and id then
+      pp.mkPosFailed = nil
+      mk = markNew(pp, id, "pos", "pos", nil, x, y, z)
+      markLog(pp, string.format("%s made at his position (%.0f %.0f %.0f, %s)", tostring(id), x, y, z,
+        valid(so) and "no human icon for his puppet" or "no puppet yet"))
+      markTrace(pp, mk, "create")
+    else
+      if not pp.mkPosFailed then markLog(pp, "position icon not made (" .. tostring(id) .. "), tried again in 5 s") end
+      pp.mkPosFailed = M.now
+    end
+  elseif act == "to_puppet" then
+    local good, ok = pcall(n.ChangeIconTargetToEntityDirect, n, mk.id, so)
+    if good and ok ~= false then
+      mk.target, mk.so = "puppet", so
+      markLog(pp, mk.id .. " on his puppet")
+      markTrace(pp, mk, "to_puppet")
+    elseif mk.icon == "human" then
+      -- not movable onto this puppet: a fresh human icon on it (the old one goes)
+      markLog(pp, mk.id .. " could not be put on his puppet (" .. tostring(ok) .. "): made anew on it")
+      M.Unmark(pp, "replaced")
+      pp.mkT = nil
+    else
+      -- a position icon that cannot follow this puppet: it stays at his position, moved from his states
+      markLog(pp, mk.id .. " could not be put on his puppet (" .. tostring(ok) .. "): it follows his position")
+      pp.mkNoFollow = so
+    end
+  elseif act == "to_pos" or act == "move_pos" then
+    if markToPos(pp, mk, x, y, z) then
+      if act == "to_pos" then
+        markLog(pp, string.format("%s at his position (%s)", tostring(mk.id),
+          (pp.veh and (pp.seat or 0) <= 3) and "in a car" or (pp.st ~= "alive" and "no puppet" or "puppet hidden")))
+        markTrace(pp, mk, "to_pos")
+      end
+    elseif mk.target == "puppet" then
+      M.Unmark(pp, "could not move it off his puppet")
+    elseif M.now - (pp.mkReT or -10) >= 1 then  -- made anew where he is, at most once a second
+      pp.mkReT = M.now
+      markLog(pp, mk.id .. " could not be moved: made anew")
+      M.Unmark(pp, "replaced")
+    end
+  end
 end
 
 function M.MarkersTick()
+  if not M.markers then
+    M.MarkersClear("map markers are off")
+    return
+  end
+  local nh, np, nn = 0, 0, 0
   for _, pp in pairs(M.pup) do
-    local so = pp.so
-    local want = M.markers and pp.st == "alive" and valid(so)
-    if pp.blip and (not want or pp.blipSo ~= so) then M.Unmark(pp) end
-    if want and not pp.blip and pp.blipFailed ~= so then
-      local good, id = pcall(game.navigation.RegisterHumanEntityDirect, game.navigation, so, 1, 1)
-      if good and id then
-        pp.blip, pp.blipSo = id, so
-        log("puppet " .. pp.id .. ": map marker " .. tostring(id))
-      else
-        pp.blipFailed = so
-        log("puppet " .. pp.id .. ": no map marker (" .. tostring(id) .. ")")
-      end
+    local good, err = pcall(M.MarkOne, pp)
+    if not good then logErr("marker", err) end
+    local mk = pp.mk
+    if not mk then nn = nn + 1 elseif mk.target == "puppet" then nh = nh + 1 else np = np + 1 end
+  end
+  if M.now - (M.mkTrT or -10) >= MARK_TRACE_PERIOD then
+    M.mkTrT = M.now
+    local ids = {}
+    for id, pp in pairs(M.pup) do
+      local mk = pp.mk
+      ids[#ids + 1] = id .. ":" .. (mk and (tostring(mk.id) .. "/" .. mk.icon .. "/" .. mk.target) or "-")
     end
+    trace("MK", string.format("players=%d puppet=%d pos=%d none=%d ids=%s", nh + np + nn, nh, np, nn,
+      #ids > 0 and table.concat(ids, ",") or "-"))
   end
 end
 
@@ -2885,6 +3086,9 @@ function M.Update(dt, cmds)
     elseif op == "G" then
       M.tags, M.markers, M.allyOn = f[2] == "1", f[3] == "1", f[4] ~= "0"
       M.brainOk = f[5] == "1"
+    elseif op == "N" then  -- a player's name for his map marker (the rest of the line)
+      local name = line:match("^N %S+ (.+)$")
+      if f[2] and name then M.names[f[2]] = name end
     elseif op == "R" then
       M.Remove(f[2])
     elseif op == "X" then
@@ -2990,6 +3194,9 @@ function M.Update(dt, cmds)
       good, err = pcall(M.TagsTick)
       if not good then logErr("tags", err) end
     end
+  else  -- no session, or our world goes (loading screen, quit): no markers (M.MarkersClear)
+    local good, err = pcall(M.MarkersClear, player and "no session" or "our world goes")
+    if not good then logErr("markers", err) end
   end
   pcall(M.WorldState)
   return sample, M.fac.st .. "|" .. table.concat(st, ";") .. "|" .. nc, table.concat(M.events, "\n")
