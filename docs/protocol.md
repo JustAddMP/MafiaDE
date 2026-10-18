@@ -38,7 +38,7 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103-0x01FF | reserved (phase 3 events) | | | |
 
-PlayerState body (54 bytes on foot + weapon name, ~136 bytes in a car):
+PlayerState body (56 bytes on foot + weapon name, ~138 bytes in a car):
 
 ```
 u8  version (4; 0.13.0, was 3)
@@ -69,7 +69,24 @@ u8  power                 throttle 0..1 (x255)
 u8  brake                 brake 0..1 (x255)
 u8  handbrake             handbrake 0..1 (x255)
 i8  gear                  GetGear() (< 0 taken as reverse)
+-- action block (melee sync; after everything above, the vehicle block included; optional, see below):
+u8  actSeq                visible one-shot actions of the player so far, mod 256; a change = new action(s)
+u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charged) punch, 3 counter, 4 takedown,
+                          5 throw (grenade, molotov, knife), 6 melee hit reaction (an NPC punched him); other values
+                          read as none
 ```
+
+**Action block** (src/game/player_actions.h, unit-tested in tests/player_actions_test.cpp). Punches and other
+one-shot actions are not a state, so they ride on the state as a counter plus the latest kind: a lost or reordered
+PlayerState does not lose a punch, because the next state carries the same counter. The receiver (one
+`actions::Tracker` per remote player, fed with the interpolated state, whose counter only moves forward) plays an
+action once per counter step: the first state it sees only sets the counter, a counter that went back (an older
+state) is ignored, several steps at once play only the latest kind (the skipped ones are logged and traced as
+`missed`). The block is **optional on the wire**: a state that ends before it (an older build) reads as no action,
+and an older build reading a state with it stops before the two bytes (its reader checks for overruns, not for
+trailing bytes); so `version` stays 4. A state that ends after one of the two bytes is rejected. Where the actions
+come from and how the puppet plays them: docs/game-api.md 17. The punch's damage still comes only as a Hit (0x0400);
+the puppet's swing is a picture.
 
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
 running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
@@ -212,6 +229,12 @@ car hurts the puppet of player V, the attacker's game sends **Hit** to V:
   (`MELEE_LIGHT_ATTACK` / `MELEE_HEAVY_ATTACK` with no opponent) is a Hit of 10 / 36 when a puppet stands within 1.9 m
   in front of us 0.25 s after it (the puppet gets a small `DoDamage` for its flinch);
 - `dx dy dz`: unit vector from the attacker to the puppet (unused by receivers so far).
+
+The attacker's swing itself is shown on the victim's game by the action block of his PlayerState (above): his puppet
+plays a punch animation there. That swing is only a picture: while a puppet within 3 m swings, the local player is a
+demigod for the swing (plus 0.3 s), a Hit arriving meanwhile still applies (`DoDamage` with the demigod switched off
+for the call), and should the puppet's swing land anyway (melee DAMAGE with that puppet as enemy) the health is given
+back (docs/game-api.md 17).
 
 The victim's game applies it to its real player:
 - a bullet (type 0) is replayed as one real shot from the attacker's puppet at the hit body part

@@ -36,13 +36,18 @@ on the other.
 | `H` | both | once | `trace=1 wall=<local date-time> qpc=<t> pid game mod core proto state role=host/guest local=<player id> hz=<state rate> interp=<ms> built` |
 | `PL` | both | per player | `id model name=<rest of the line>` (also our own) |
 | `PLX` | both | on leave | `id` |
-| `TX` | both | each state sent (60 Hz) | `sT=<ms> p h v m=<0 idle 1 walk 2 run 3 sprint> f=<flags: 1 car, 2 crouch, 4 sprint, 8 aim, 16 reload, 32 in air, 64 cover> hp sh=<shots> w=<weapon>`; in a car also `car=<key> mdl seat cp q cv ctl=<valid,steer,power,brake,handbrake,gear>` |
+| `TX` | both | each state sent (60 Hz) | `sT=<ms> p h v m=<0 idle 1 walk 2 run 3 sprint> f=<flags: 1 car, 2 crouch, 4 sprint, 8 aim, 16 reload, 32 in air, 64 cover> hp sh=<shots> w=<weapon> act=<action counter>:<latest kind: none light heavy counter takedown throw hitreact>`; in a car also `car=<key> mdl seat cp q cv ctl=<valid,steer,power,brake,handbrake,gear>` |
 | `RX` | both | each state received | `from sT off=<s> ...` the same fields as `TX` |
 | `RXD` | both | dropped state | `from sT last` (older than or equal to the newest) |
 | `CLK` | both | 1 Hz per remote | `id off rtt=<ms> hz=<received rate> snaps=<buffered> newest=<ms ahead of now> recv drop last=<s since the last state>` |
 | `PUP` | both | 60 Hz per remote on foot (plus every snap) | `id rT=<the remote time the target stands for, ms> tgt tv have=<copy position known> age=<s> cp=<puppet> ch=<its heading> err g=<gait 0-3> mult want meas carry base=<walk,run,sprint calibrated> fix=<0 none 1 nudge 2 snap> nudge re=<walk re-aimed> mv=<walk point> turn sm=<his mode> sf=<his flags>` |
 | `VEH` | both | 60 Hz per remote driver (plus pins, retries, snaps) | `id key rT have tgt tv cp cv err rot=<deg> fix=<0 none 1 blend 2 pin 3 snap> pin why=<0 - 1 too slow 2 ran off 3 stays off> jp=<pinned now> rt=<physics retried now> pins tsp csp vel=<wanted copy velocity> pw ctl st br hb gear` |
 | `PAS` | both | 60 Hz per remote passenger | `id key rT seat cp` |
+| `AL` | both | each action of ours | Lua: our player punched / countered / threw ... (docs/game-api.md 17): `kind=<1 light 2 heavy 3 counter 4 takedown 5 throw 6 hitreact> seq=<counter now> opp=<GUID of the human the game aimed it at, - none>` |
+| `ACS` | both | each action of ours sent | `sT=<ms of the state that first carries it> kind=<name> seq` |
+| `ACT` | both | each action of a remote player | his counter moved on the state his puppet is driven from: `id kind=<name> seq missed=<steps skipped>`; the puppet plays it this tick |
+| `AP` | both | each action played | Lua, on the puppet: `id kind anim=<animation name, - none accepted> ok=<1 AnimPlay accepted> dur=<s the puppet is left alone at most>` |
+| `AE` | both | each action ended | Lua: `id kind anim took=<s> done=<1 the animation reported done> why=<finished, time_up, next_action, he_is_in_a_car>`; the puppet walks again (its `PUP` lines show `have=0` while it played) |
 | `LR` | both | 20 Hz | our player read back: `p d spr hp`; in a car `car seat cp cv rb=<steer wish,power,brake,handbrake,steer linearity,front wheel angle (rad)> eng gear spd fixed rpm pwi` |
 | `PR` | both | 20 Hz per puppet | `id st p d hid veh seat own=<car it sits in> seated ejects tries anim phys spr dead hp mv mult moves snaps` |
 | `CR` | both | 20 Hz per driven car copy | `key drv adopted fix pin p v rb=<as LR> eng gear spd fixed rpm pwi cmd=<steer,power,brake,handbrake,gear given> steerIn=<SetSteer value> vel speedHow=<vector/number/none: how SetSpeed works> seat0=<puppet/none/other> locked` |

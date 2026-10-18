@@ -529,3 +529,78 @@ begin with a drive or a walk the tests cannot follow).
   Taxi mission does not let the player out). In chapters that start with each player in his own mission car (Lost
   Heaven chase, Taxi cp_020) the guest sits in his own car where the host's would be: the host's puppet waits hidden
   until the cars have parted, as before.
+
+## 17. Remote players' punches and other actions (melee sync) - static only, NOT verified in game
+
+Found by reading the exe, its Lua bindings and the game's animation and script archives while the game could not be
+started (no game launch for this work). Used by src/game/player_sync.lua "Visible actions" and the action block of
+PlayerState (docs/protocol.md). Everything below needs the in-game check.
+
+**Detecting our player's actions.** The swing messages of section 11 are sent to the attacker himself; the same
+`HumanMessages` table (enums dump, `C_WrapE_FightHint` at 0x5AEDF10 in re3/enums.txt) has the other melee moves and a
+throw, and the glue subscribes to each with one blanket HUMAN subscription, keeping only those whose receiver is our
+player:
+
+| message | value | action | checked |
+|---|---|---|---|
+| `MELEE_LIGHT_ATTACK` | 458809 | light punch (Q tapped) | yes (section 11) |
+| `MELEE_HEAVY_ATTACK` | 458810 | charged punch (Q held) | yes (section 11) |
+| `MELEE_COUNTER_ATTACK` | 458811 | counter (Left Alt) | no: assumed sent to the attacker like the two above; ignored when its opponent is our player |
+| `MELEE_COMBAT_TAKEDOWN` / `MELEE_STEALTH_TAKEDOWN` | 458812 / 458813 | takedown | no (same assumption) |
+| `WEAPON_THROWN` | 458830 | grenade / molotov / knife thrown | no: who receives it is not known |
+| `MELEE_HIT_REACT` | 458814 | an NPC punched our player | no: seen on NPC victims only (section 11) |
+
+There is no getter for "blocking": the player's defence in this game is the counter (Left Alt), so a block shows as a
+counter. Aiming (`flags` bit3), reloading (bit4), crouch and cover were already carried and shown (section 10).
+
+**Playing it on a puppet.** None of the script orders makes an AI human punch: `AttackMelee(target)` does nothing on
+a puppet (section 11), and `npc:SwitchBrain(2)` + `EnableCloseCombat(true)` + `AttackMelee` crashed the game.
+`DbgTesting_HumanCombatAction(n, 0)` is no melee either: its enum (`DbgTesting_HumanCombatActions`, 0x5AD8210) is
+NONE, LOOKAROUND_1..3, EVADE_1..3. What the glue uses instead is a plain animation:
+
+| call | notes |
+|---|---|
+| `h:AnimPlay(name, loop)` | the call of the game's `Human.Anim.Play` node (`common_human.lua`: `inEntity:AnimPlay(animation, loop)`, result kept as `anim_so`, then `Wait`). Binding `C_WrapperHuman::AnimPlay` (exe 0x23B1DA0) dispatches on the argument count: 2 (string, bool) -> 0x23D3000, also 5 and 6 arguments (other overloads, not used). The native call (0x2BA1F00) builds a 0x1B8-byte AI command and queues it on the human's AI (`+0x138`; for a human without one, a dead one or the player in some states it returns a sync object without queuing anything), like `MoveVec`: so a later walk, turn, aim or weapon command can replace it. Returns a sync object (`IsDone()`). UNVERIFIED in game |
+| `h:AnimStop()` | the `Human.Anim.Stop` node's call; used when the time for an action is up and the animation still runs |
+| `h:DesirePlayAnimation(name, desirability)` / `PlayAnimation(...)` | the other script ways (`Human.DesirePlayAnimation` node: inAnimation, inDesirability; `PlayAnimation` takes docking object, bone, loop). Not used; next to try if `AnimPlay` does nothing on a puppet |
+
+Animation names: from the game's own archives, `sds_retail/basic_anim/hitmelee_anim.sds` (melee attacks, hit
+reactions) and `basic_anim.sds` (throws, door kicks, the 1h punches), unpacked with re2/sds.py (Oodle). The scripted
+nodes use names from `basic_anim` the same way (`hero_nw_calm_idle_fidget_cracknuckles` in the Omerta park script),
+so names from these sets should be playable; whether the melee set is loaded outside a fight is not known. The glue
+tries, per kind (first accepted wins; a name `AnimPlay` rejects, or whose animation is over within 0.1 s, is dropped
+after two tries, logged):
+
+| kind | names (in order) | time left alone |
+|---|---|---|
+| light punch | combo step 1/2/3 when punches come less than 1.2 s apart: `hero_nw_alert_melee_attack_light_<1/2/3>_v1`, `hero_nw_alert_melee_punch_<1/2/3>`, `hero_nw_alert_melee_punch1_v1` / `punch2_v5` / `punch_3_v2`; with a gun in hand `hero_1h_alert_melee_punch_<1/2/3>` first | 0.7 s |
+| heavy punch | `hero_nw_alert_melee_attack_heavy_v2_01_release_hero`, `hero_nw_alert_melee_charge_punch3_v6`, `hero_nw_alert_melee_punch3_ko_l_v2` (armed: `hero_1h_alert_melee_attack_heavy_charge`, `hero_1h_alert_melee_punch2`) | 1.0 s |
+| counter | `hero_nw_alert_melee_dodge_down_l_hero`, `hero_nw_alert_melee_punch_2_v2`, `hero_nw_alert_melee_punch2_v5` | 0.9 s |
+| takedown | `hero_nw_alert_melee_punch3_ko_l_v2`, `hero_nw_alert_melee_attack_kick`, the heavy release | 1.4 s |
+| throw | `hero_1h_alert_grenade_throw_cf`, `trig_1h_idle_to_grenade_throw`, `hero_nw_alert_throw_knife_f` | 1.1 s |
+| hit reaction | `hero_nw_alert_melee_hitreact2_v1`, `hero_nw_alert_melee_hitreact2_v2`, `enemy_nw_alert_melee_hitreact1_v1` | 0.6 s |
+
+Other names in those sets for later: `hero_nw_alert_melee_attack_kick`, `hero_nw_alert_kick`, `hero_1h_alert_doorkick`,
+`hero_nw_idle_block_1` / `_enter_1` / `_exit_1`, `hero_nw_alert_melee_dodge_*`, `hero_2h_alert_melee_punch1` (rifle),
+`hero_knife_alert_melee_attack_light_1..3`, `hero_bat_alert_melee_attack_light_*`, `hero_1h_alert_grenade_throw_cl/cr`.
+The lists are a table in the glue, `MafiaCoop.actionAnims[kind]` (`dur`, `list`, `armed`, `combo`), and can be
+changed from the dev console to try others.
+
+While a puppet plays one: it is turned to its player's heading first and its aim dropped; nothing else is asked of it
+(no walk, turn, weapon or aim command, they would replace the animation) and its `PS` report says busy, so the C++
+locomotion controller treats it as "no copy" (no re-aims, nudges or snaps, its standing still is not measured as a
+walk speed; the calibration is kept) and walks it again right after. It ends when the sync object reports done or
+the time above is up (then `AnimStop()`).
+
+**No damage from the picture.** The animation is not an attack order, so it should not hit anyone; to be sure, a
+puppet swinging within 3 m makes the local player a demigod for the swing (+0.3 s; `SetDemigod`, which also stops
+DAMAGE events, section 5), the Hit of a real punch still applies (`M.HurtScript` switches the demigod off around its
+`DoDamage`), and a melee DAMAGE with a puppet as enemy is given back (logged "swing hit us here"). The demigod moment
+also blocks other damage for that time (an enemy NPC's bullet during a puppet's swing next to us).
+
+Not carried yet (seen while looking, not cheap with this mechanism): door kicks (`DOOR_KICK` 458857, the door's state
+is not synced either), the explosion of a thrown grenade or molotov on the other games (the puppet only shows the
+throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the receiver's game), medkit use
+(`PLAYER_USED_MEDKIT`), carrying bodies (`TakeBody` / `DropBody`), lockpicking, vaults and ladders (`USE_FENCE`,
+`USE_LADDER`; the puppet's walk takes its own way over them or snaps), jumping (only the in-air flag, the puppet does
+not jump), stalk (sneak) walking beyond crouch, and takedowns with their paired victim animation.
