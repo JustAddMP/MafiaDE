@@ -7,6 +7,7 @@
 #include "core/trace.h"
 #include "dll/ui_input.h"
 #include "game/characters.h"
+#include "game/item_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
@@ -194,6 +195,7 @@ public:
             MissionSync::Install();
             NpcSync::Install();
             TrafficSync::Install();
+            ItemSync::Install();
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -207,12 +209,14 @@ public:
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
+        ItemSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        ItemSync::Detach();
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
@@ -254,6 +258,7 @@ public:
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
+        ItemSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -288,6 +293,7 @@ public:
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);
+        ItemSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
