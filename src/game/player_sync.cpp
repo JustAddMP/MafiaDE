@@ -5,6 +5,7 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
+#include "game/car_swap.h"
 #include "game/characters.h"
 #include "game/lua.h"
 #include "mc/core_version.h"
@@ -686,7 +687,11 @@ bool ParseKey(const std::string& k, uint8_t& owner, uint32_t& guid) {
 }
 
 // ---- CarParked (0x0101, reliable): the last driver's game tells where a car came to rest -------------------------
-// Lua event line: "CP o:g model x y z qx qy qz qw"
+// Lua event line: "CP o:g model x y z qx qy qz qw [flags]"; flags bit 0: the car is destroyed (wrecked). The flags
+// byte is new in 0.15 and trails the old layout: older builds read the message without it, and a message without it
+// (from an older build) reads as flags 0.
+constexpr uint8_t kParkedWrecked = 1;
+
 bool WriteParked(net::ByteWriter& w, const std::string& line) {
     std::istringstream in(line);
     std::string tag, key, model;
@@ -696,10 +701,13 @@ bool WriteParked(net::ByteWriter& w, const std::string& line) {
     uint8_t owner = 0;
     uint32_t guid = 0;
     if (!in || tag != "CP" || !ParseKey(key, owner, guid)) return false;
+    unsigned flags = 0;
+    if (!(in >> flags)) flags = 0;
     w.U8(owner);
     w.U32(guid);
     w.Str(model);
     for (float f : v) w.F32(f);
+    w.U8(static_cast<uint8_t>(flags & kParkedWrecked));
     return true;
 }
 
@@ -710,12 +718,14 @@ void OnCarParked(net::PlayerId from, net::ByteReader& r) {
     float v[7];
     for (float& f : v) f = r.F32();
     if (!r.Ok() || model.empty() || !Token(model) || !InRange(v, 3, kMaxCoord) || !InRange(v + 3, 4, 2)) return;
+    const uint8_t flags = r.Remaining() >= 1 ? static_cast<uint8_t>(r.U8() & kParkedWrecked) : 0;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || from == sh.localId) return;
-    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f\n", owner, guid, model.c_str(),
-               v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
-    MC_LOG_INFO("sync: player %u parked car %u:%u (%s)", from, owner, guid, model.c_str());
+    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %u\n", owner, guid, model.c_str(),
+               v[0], v[1], v[2], v[3], v[4], v[5], v[6], flags);
+    MC_LOG_INFO("sync: player %u parked car %u:%u (%s)%s", from, owner, guid, model.c_str(),
+                (flags & kParkedWrecked) ? ", destroyed" : "");
 }
 
 // ---- WorldEnv (0x0200, reliable, host -> guests): time of day, time flow speed, weather set -------------------------
@@ -917,6 +927,46 @@ int McTrace(lua_State* L) {
     return 0;
 }
 
+// mc_carswap(key, now, bits, copySpeed, parkedAt) -> action, lockCopy, phase, why: one step of the swapped-car
+// machine (game/car_swap.h) for car `key` (player_sync.lua M.SwapTick). One machine per key, dropped after its action.
+// Every change of phase or reason is logged and traced ("SWP", docs/sync-trace.md). GameMainThread only.
+std::map<std::string, carswap::Machine> _swaps;
+
+int McCarSwap(lua_State* L) {
+    const char* key = lua::ToString(L, 1);
+    if (!key || !*key || std::strlen(key) > 40) {
+        lua::PushNil(L);
+        return 1;
+    }
+    const std::string k = key;
+    carswap::Input in;
+    in.now = lua::TypeOf(L, 2) == lua::TNumber ? lua::ToNumber(L, 2) : 0;
+    in.bits = lua::TypeOf(L, 3) == lua::TNumber ? static_cast<uint32_t>(lua::ToNumber(L, 3)) : 0;
+    in.copySpeed = lua::TypeOf(L, 4) == lua::TNumber ? std::fabs(lua::ToNumber(L, 4)) : 0;
+    in.parkedAt = lua::TypeOf(L, 5) == lua::TNumber ? lua::ToNumber(L, 5) : -1;
+    if (_swaps.size() > 64 && !_swaps.count(k)) _swaps.clear();  // stale keys (cars dropped mid-swap)
+    carswap::Machine& m = _swaps[k];
+    const carswap::Output o = m.Step(in);
+    const bool acted = o.action != carswap::Action::None;
+    if (o.changed || acted) {
+        char parked[32] = "never";
+        if (in.parkedAt >= 0) std::snprintf(parked, sizeof parked, "%.1f s ago", in.now - in.parkedAt);
+        MC_LOG_INFO("sync: swapped car %s: %s, %s%s%s (bits 0x%x, copy %.1f m/s, CarParked %s, copy %s)", k.c_str(),
+                    carswap::PhaseName(o.phase), o.why, acted ? " -> " : "", acted ? carswap::ActionName(o.action) : "",
+                    in.bits, in.copySpeed, parked, o.lockCopy ? "locked" : "open");
+        if (core::trace::IsOpen())
+            core::trace::Line("SWP", "key=%s phase=%s act=%s lock=%d bits=0x%x spd=%.2f parked=%.2f why=%s", k.c_str(),
+                              carswap::PhaseName(o.phase), carswap::ActionName(o.action), o.lockCopy ? 1 : 0, in.bits,
+                              in.copySpeed, in.parkedAt >= 0 ? in.now - in.parkedAt : -1.0, o.why);
+    }
+    if (o.phase == carswap::Phase::Done) _swaps.erase(k);
+    lua::PushString(L, carswap::ActionName(o.action));
+    lua::PushBool(L, o.lockCopy);
+    lua::PushString(L, carswap::PhaseName(o.phase));
+    lua::PushString(L, o.why);
+    return 4;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -935,6 +985,7 @@ bool LoadModule(lua_State* L) {
     MC_LOG_INFO("sync: Lua glue loaded (%s, version %s)", origin, lua::ToDisplay(L, -1).c_str());
     lua::RegisterGlobal(L, "mc_player_profile", &McPlayerProfile);
     lua::RegisterGlobal(L, "mc_trace", &McTrace);
+    lua::RegisterGlobal(L, "mc_carswap", &McCarSwap);
     return true;
 }
 
