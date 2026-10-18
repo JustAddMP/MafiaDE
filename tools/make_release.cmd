@@ -15,7 +15,7 @@ findstr /c:".modVersion = \"%VER%\"" "%ROOT%\src\game\game_info.cpp" >nul || (
 call "%ROOT%\build.cmd" || ( echo Build failed. & exit /b 1 )
 call "%CORE%\build.cmd" || ( echo Core build failed. & exit /b 1 )
 rem core's automated tests (steam_smoke is manual: it needs Steam and a steam_api64.dll copy)
-for %%T in (net_loopback net_password net_kick net_reconnect net_lobby net_interest net_motion core_trace net_fuzz pending_join steam_friends pad_nav crash_dump launcher_args config_set test_input proxy_test) do (
+for %%T in (net_loopback net_password net_kick net_reconnect net_lobby net_interest net_motion core_trace net_fuzz pending_join steam_friends pad_nav ui_prompts crash_dump launcher_args config_set test_input proxy_test) do (
     "%CORE%\out\%%T.exe" >nul 2>&1 || ( echo core test %%T failed. & exit /b 1 )
     echo core test %%T: ok
 )
