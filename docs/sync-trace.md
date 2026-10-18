@@ -72,18 +72,25 @@ on the other.
 | `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
-| `XT` | both | each explosive throw of ours | `weapon=<the selected explosive, - unknown> p=<where we stood>` (docs/game-api.md 20) |
+| `XT` | both | each explosive throw of ours | `weapon=<the selected explosive, - unknown> p=<where we stood> throw=<its throw number, GT>` (docs/game-api.md 20) |
 | `XG` | both | on event | `ev=player_grenade_explosion`: PLAYER_GRENADE_EXPLOSION came to our player |
 | `XB` | both | on event | Lua: our grenade bounced (EXPLOSIVE_BOUNCE sound owned by us): `p` (points of its flight, not shown elsewhere) |
-| `XC` | both | each explosion seen here | the detector's decision (src/game/explosion_model.h): `seq=<0 not sent> kind=<grenade/molotov/dynamite/object/car/unknown> flags=<1 fire, 2 an NPC's> p weapon owner=<us/npc/other/unknown: the sound's owner> npc obj=<crash object> reports=<HEAR_SOUND reports merged> send=<1 sent> why=<ours: the reason, or why not>` |
-| `XO` | both | each Explosion sent | `seq kind flags p weapon npc obj` |
-| `XR` | both | each Explosion received | `from seq kind flags p weapon npc obj` (duplicates and malformed ones are not traced) |
+| `XC` | both | each explosion seen here | the detector's decision (src/game/explosion_model.h): `seq=<0 not sent> kind=<grenade/molotov/dynamite/object/car/unknown> flags=<1 fire, 2 an NPC's> p weapon owner=<us/npc/other/unknown: the sound's owner> npc obj=<crash object> reports=<HEAR_SOUND reports merged> send=<1 sent> why=<ours: the reason, or why not> throw=<the throw it was matched with, 0 none> since=<s from that throw: the fuse / flight, -1 none>` |
+| `XO` | both | each Explosion sent | `seq kind flags p weapon npc obj throw` |
+| `XR` | both | each Explosion received | `from seq kind flags p weapon npc obj throw` (duplicates and malformed ones are not traced) |
 | `XV` | both | each received explosion handled | Lua: `from seq kind act=<shown/far/npc_here/failed> how=<script, or the error> d=<m from us> p fire` |
 | `XD` | both | each guard verdict other than keep | `victim=<local/puppet/npc/copy> enemy=<us/npc/puppet/copy/none/other> dtype=<1 explosion, 8 fire> amount verdict=<undo/ours> zone=<own:seq / remote:from:seq> p` |
 | `XU` | both | each NPC undo | Lua: `id act=<health: from to / died: could not be undone>` |
 | `XCS` | both | each CarExploded sent | `what=<shared/traffic> key p` |
 | `XCR` | both | each CarExploded received | `from what key p` |
 | `XCV` | both | each CarExploded handled | Lua: `from what key act=<set_exploded/already/no_car/failed:...>` |
+| `GA` | both | while our player lines up a throw, 5 Hz | `ev=<start/aim> weapon how=<what said we aim: hand (explosive in hand), input (aim input), msg (PLAYER_AIM_ENTER), joined by +> p=<standing> head hand bone=<1 a hand bone, 0 head + offset> cam dir yaw pitch land=<the aim model's landing, none:...> flight=<s to it>`; `ev=end lasted samples` when it stops (C++, throw_sync.cpp) |
+| `GT` | both | each throw of ours | `ev=release seq weapon kind p aimed=<s aimed before, -1 none>` (WEAPON_THROWN); `ev=sent seq kind flags=<1 fire 2 measured on the projectile 4 landing> o v yaw pitch g delay flight land weapon` (the Throw 0x0242) |
+| `GS` | both | each throw of ours | Lua: the projectile search: `seq found=1 id type d=<m from the hand> after=<s after the release> scans p` or `found=0 scans seen=<projectile entities seen at most>` |
+| `GF` | both | each flight message | `dir=out seq n t=<ms since the origin, last point> flags=<1 bounce 2 end> p rel=<1 reliable>` (sent), `dir=in from seq n t flags p known=<0: came before its Throw>` (received), `dir=bounce seq p` (our bounce sound) |
+| `GR` | both | each Throw received | `from seq kind flags o v speed yaw pitch g delay flight land weapon added` |
+| `GV` | both | 2 Hz per flight shown | Lua: `from seq p src=<arc/points/extrapolated/landing/end> held age d=<m from the camera> screen=<1 on screen>` |
+| `GE` | both | each throw over | `dir=out seq weapon why sent entity samples points bounces flight speed pitch model_speed model_pitch g=<gravity measured, 0 not> o last` (ours), `dir=boom seq fuse=<s release -> explosion> p tracked` (our explosion for it decided), `dir=in from seq why=<explosion/end_point/timeout/left/explosion_no_flight> age points p` (another game's) |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -120,7 +127,9 @@ Per player as seen on the other game:
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
 - **explosions:** none of the X records are read by the tool yet; grep them (`XC` on the thrower, `XR`/`XV`/`XD` on
-  the others: a sent explosion's `seq` pairs them).
+  the others: a sent explosion's `seq` pairs them). Throws (G records, not read by the tool either): `GT`/`GF out`
+  on the thrower and `GR`/`GF in`/`GV`/`GE in` on the others pair by `seq`; the explosion that ends a throw names it
+  (`XO`/`XR throw=`).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.
