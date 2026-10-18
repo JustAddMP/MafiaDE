@@ -237,7 +237,7 @@ The attacker's swing itself is shown on the victim's game by the action block of
 plays a punch animation there. That swing is only a picture: while a puppet within 3 m swings, the local player is a
 demigod for the swing (plus 0.3 s), a Hit arriving meanwhile still applies (`DoDamage` with the demigod switched off
 for the call), and should the puppet's swing land anyway (melee DAMAGE with that puppet as enemy) the health is given
-back (docs/game-api.md 18).
+back (docs/game-api.md 17).
 
 The victim's game applies it to its real player:
 - a bullet (type 0) is replayed as one real shot from the attacker's puppet at the hit body part
