@@ -16,7 +16,10 @@ at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of t
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
 ends with the driver's controls (6 bytes). After 0.14.0: guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd
-(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs").
+(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
+TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
+(0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
+its end (both always sent); CarParked with a trailing flags byte (wrecked).
 
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
@@ -79,8 +82,10 @@ u8  signals               car signals (seat 0 only; src/game/car_signals.h; read
                           docs/re-notes.md 9, NOT checked in game): bit0 park/side lights, bit1 headlights,
                           bit2 indicator A, bit3 indicator B (both = hazard; which one is left is not known),
                           bit4 beacon, bit5 siren, bit6 horn, bit7 valid (the driver's game could read them; 0 =
-                          unknown: the copy keeps its own). Last byte of the block, added without a version change:
-                          a block that ends at the gear reads as 0, and an older reader stops before it
+                          unknown: the copy keeps its own). Last byte of the block, added without a version change
+                          (with the action block below: a state without both reads as 0 / no action; the two are
+                          only unambiguous together, so a build must send both or neither, and builds that differ
+                          are kept apart by modVersion anyway)
 -- action block (melee sync; after everything above, the vehicle block included; optional, see below):
 u8  actSeq                visible one-shot actions of the player so far, mod 256; a change = new action(s)
 u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charged) punch, 3 counter, 4 takedown,

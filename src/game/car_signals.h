@@ -106,8 +106,13 @@ inline std::string Changes(uint8_t a, uint8_t b) {
     return out;
 }
 
-// Wire: one byte at the very end of the PlayerState vehicle block (after the gear). A state from a game without it
-// (the block ends at the gear) reads as 0 = unknown, and an older reader never gets to the extra byte.
+// Wire: one byte at the end of the PlayerState vehicle block (after the gear), before the action block
+// (player_actions.h) that ends every state. Read() takes the byte whenever one is left, so the two optional parts
+// are only unambiguous together: a state of this build always has both (player_sync.cpp Write; tested in
+// tests/car_signals.cpp "real tail"). A state from a build with only one of them (signals without actions, or
+// actions without signals) is misread or rejected: such builds differ in modVersion, and the session handshake keeps
+// them apart (docs/protocol.md "Version rules"). A block that simply ends at the gear (and no action block either)
+// reads as 0 = unknown.
 template <class Writer>
 void Write(Writer& w, uint8_t s) {
     w.U8(Sanitize(s));

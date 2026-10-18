@@ -39,11 +39,12 @@ constexpr uint16_t kMsgCarParked = 0x0101;
 constexpr uint16_t kMsgPlayerModel = 0x0102;  // every peer -> everyone: the character he picked and how he looks
 constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
-// 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block. Two optional
-// parts came later without a version change: the car signals byte at the end of the vehicle block (lights,
-// indicators, horn, siren, beacon; game/car_signals.h; a block without it reads as "unknown") and the action
-// block (u8 seq, u8 kind: player_actions.h) that ends every state (none = "no action"). Older readers stop before
-// them.
+// 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block. Two parts came
+// later without a version change: the car signals byte at the end of the vehicle block (lights, indicators, horn,
+// siren, beacon; game/car_signals.h) and the action block (u8 seq, u8 kind: player_actions.h) that ends every state.
+// A state without both reads as "unknown" signals and "no action"; a state with only one of them (a build that had
+// one feature but not the other) is misread in a car, which the modVersion handshake rules out. Older readers stop
+// before them.
 constexpr uint8_t kStateVersion = 4;
 // State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (position traces): at 20 Hz
 // with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
