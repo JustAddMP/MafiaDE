@@ -1343,6 +1343,7 @@ function M.Ally(pp, so)
   local before = tostring(so:GetAIType())
   local good, err = pcall(so.SwitchBrain, so, 1)
   pp.brain = good  -- the friend brain really set (pp.ally: tried)
+  if good then pp.brainT = M.now end  -- M.Seat lets it settle before seating
   log(string.format("puppet %s: friend brain %s (AI type %s -> %s%s): it keeps its car seats, enemies target it%s",
     pp.id, good and "set" or "FAILED", before, tostring(so:GetAIType()), good and "" or (", " .. tostring(err)),
     (M.isHost and not M.allyOn) and " (their hits are not sent: enemies_target_guests = 0)" or ""))
