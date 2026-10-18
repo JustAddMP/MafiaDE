@@ -53,9 +53,16 @@ on the other.
 | `CR` | both | 20 Hz per driven car copy | `key drv adopted fix pin p v rb=<as LR> eng gear spd fixed rpm pwi cmd=<steer,power,brake,handbrake,gear given> steerIn=<SetSteer value> vel speedHow=<vector/number/none: how SetSpeed works> seat0=<puppet/none/other> locked sigw=<signals wanted (his)> sigch=<changes applied> sigre=<times set again after the copy's game changed them back>`; `sig` = the copy's signals read back |
 | `SWP` | both | on change | swapped-car machine (src/game/car_swap.h): `key phase=<driven/parking/done> act=<none/restore/restore_here/restore_wrecked/forget> lock=<copy closed to us> bits=<car_swap.h Bit flags it was given> spd=<copy m/s> parked=<s since the CarParked, -1 none> why` |
 | `SWR` | both | on event | a real car hidden behind a copy: `key ev=swap orig at why`, `key ev=restore how=<copy/here> from p active copy wrecked why`, `key ev=forget orig world` |
-| `NHS` | host | 2 Hz | `sending hits kills` |
+| `NHS` | host | 2 Hz | `sending hits kills mirrors=<guests' own NPCs with a state> shown=<with a copy> lateKills=<our NPCs killed as dead mirrors>` |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id> copy ai car host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` |
-| `NGS` | guest | 2 Hz | `live matched copies avg max kills pulls` |
+| `NGS` | guest | 2 Hz | `live matched copies avg max kills pulls own=<our own NPCs> claims=<host claims carried out>` |
+| `NM` | host | 2 Hz per mirror (a guest's own NPC) | `mid from key=<its id on the guest's game> loc=<our copy> st=<copy state> ai guest=<pos there> our=<copy pos> d=<m> hp=<guest>/<copy> dead=<guest>/<copy> age` |
+| `NO` | guest | 2 Hz per own NPC | `key p hp dead ai` |
+| `NGO` | guest | on change | `key owned=<1 ours now, 0 not any more>` (C++) |
+| `NGE` | both | per GuestNpcEnd | `[from] key why=<0 died 1 handed back 2 gone 3 refused> host=<host NPC> hp byHost` (C++) |
+| `NGC` | guest | per NpcClaim | `key host dead ours` (C++) |
+| `NMC` | host | per claim sent | `mid to key host dead` (C++) |
+| `NMX` | host | mirror end | `mid why host hp` (C++) |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -83,6 +90,9 @@ Per player as seen on the other game:
   engine lines.
 - **NPCs** (guest): host NPCs in range and paired, the distance of ours from the host's, the NPCs most often more
   than 3 m off.
+- **guest-owned NPCs:** how many NPCs became the guest's own (only his game had them), how they ended (died,
+  handed back to the host, gone, claim refused), the host's claims, how often the host showed them with a copy and
+  how far that copy was from the guest's NPC.
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.

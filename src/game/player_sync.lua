@@ -1680,7 +1680,8 @@ function M.TraceLocal(p)
   trace("LR", line)
 end
 
--- Enemies react to guests (host only; ini enemies_target_guests = 0 turns it off). The
+-- Enemies react to guests (on the host; on a guest the host's puppet while that guest's game has NPCs of its own,
+-- npc_sync.lua "guest-owned NPCs"; ini enemies_target_guests = 0 turns it off). The
 -- game's enemies only target the player's side: a puppet is a civilian to them, and its spawn profile does not change
 -- that (an ai_ally_ profile reads AI type 1 but enemies still ignored it, even when told to Attack it). Its brain is
 -- switched to FRIEND (SwitchBrain(1)) 2 s after it spawned, on foot; from then on the host's enemies shoot at it, and

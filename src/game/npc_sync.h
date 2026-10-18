@@ -8,6 +8,9 @@
 //     its health at most the host's, kills it when the host's dies, puts it back when it wandered off; the guest's hits
 //     on copies hurt them and go to the host (NpcHit), where they are replayed as real shots from the guest's puppet
 //     (the NPC turns on the puppet); a hit that killed the guest's copy is lethal on the host too.
+//   - Guest-owned NPCs (npc_owner.h): NPCs only a guest's game has (no host NPC pairs with them) go guest -> host and
+//     are shown there as copies driven by the guest's states; the host's hits on them go back to the guest; when the
+//     host's own game spawns that NPC, it is paired again and the host is authoritative for it.
 // Threads: messages on the render thread; Lua on GameMainThread (tick callback); a mutex for the hand-over.
 #include "net/session.h"
 #include "render/overlay.h"
@@ -21,6 +24,7 @@ public:
     static void Install();  // once, after the Lua bridge
     static void Attach(net::Session& session);
     static void Detach();
+    static void OnPlayerLeft(net::PlayerId id);  // host: that guest's own NPCs go
     static void Tick(float dt);
     static void GetStatus(std::vector<render::OverlayLine>& out);
 };

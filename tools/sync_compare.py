@@ -405,6 +405,26 @@ def swapped_cars(tr):
             print("    %s %s machine: %s, %s (%s)" % (tr.wall(t), f.get("key"), f.get("phase"), f.get("act"), why(f)))
 
 
+def own_npcs(guest, host):
+    """Guest-owned NPCs: the ones only the guest's game had, as the host showed them (NO / NM / NGO / NGE / NMC)."""
+    ngo = [f for _, f in guest.records["NGO"]]
+    nm = [f for _, f in host.records["NM"]] if host else []
+    if not ngo and not nm:
+        return
+    section("NPCs only %s's game had (guest-owned)" % guest.name)
+    owned = sum(1 for f in ngo if f.get("owned") == "1")
+    ends = Counter(f.get("why") for _, f in guest.records["NGE"])
+    names = {"0": "died", "1": "handed back", "2": "gone", "3": "claim refused"}
+    print("  became the guest's own: %d; ends: %s" % (owned, ", ".join(
+        "%s %d" % (names.get(k, k), v) for k, v in sorted(ends.items())) or "none"))
+    if host:
+        print("  host claims sent: %d; mirrors shown with a copy (samples): %d of %d" % (
+            len(host.records["NMC"]), sum(1 for f in nm if f.get("loc") not in (None, "nil")), len(nm)))
+        d = [num(f.get("d"), -1) for f in nm if num(f.get("d"), -1) >= 0]
+        if d:
+            print("  distance of the host's copy from the guest's NPC: %s" % stats_line(d))
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -448,6 +468,7 @@ def main():
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
+        own_npcs(guest, b if guest is a else a)
     for tr in (a, b):
         swapped_cars(tr)
     if worst:
