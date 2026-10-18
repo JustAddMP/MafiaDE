@@ -69,13 +69,16 @@ link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\proxy_test.exe" /PDB:"%OUT%\pro
   "%OBJ%\tests\proxy_test.obj" %INFO% "%CB%\mc_core.lib" %MC_SYSLIBS%
 if errorlevel 1 ( echo [build] ERROR: linking proxy_test.exe failed & goto :fail )
 
+rem the game-free parts of src\game the tests link (only what a test uses is pulled in)
+lib /NOLOGO /OUT:"%OBJ%\game_logic.lib" "%OBJ%\game\car_swap.obj"
+if errorlevel 1 ( echo [build] ERROR: game_logic.lib failed & goto :fail )
 rem ---- our unit tests: every tests\*.cpp is one console exe (game-layer logic that needs no game) ----------------
 for %%f in ("%ROOT%\tests\*.cpp") do (
   echo [build] %%~nf.exe
   cl %CXXFLAGS% /Fd"%OBJ%\tests\vc.pdb" /Fo"%OBJ%\tests\%%~nf.obj" "%%f"
   if errorlevel 1 ( echo [build] ERROR: compiling %%~nxf failed & goto :fail )
   link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\%%~nf.exe" /PDB:"%OUT%\%%~nf.pdb" "%OBJ%\tests\%%~nf.obj" ^
-    "%CB%\mc_core.lib" %MC_SYSLIBS%
+    "%OBJ%\game_logic.lib" "%CB%\mc_core.lib" %MC_SYSLIBS%
   if errorlevel 1 ( echo [build] ERROR: linking %%~nf.exe failed & goto :fail )
 )
 

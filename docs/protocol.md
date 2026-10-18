@@ -34,7 +34,7 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
 | 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 60 Hz (0.9.0; was 20) | see below |
-| 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw |
+| 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags (0.15: bit 0 the car is destroyed; read as 0 when missing, older builds ignore it) |
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103-0x01FF | reserved (phase 3 events) | | | |
 
@@ -183,16 +183,26 @@ Message flow:
 3. **Get out / park.** A's PlayerState stops carrying K (on foot). The others stop moving K: their entity stays where
    it was (a parked car with normal physics, unlocked) and A's puppet climbs out. When A's car has stopped (speed
    < 0.3 m/s, or 8 s after getting out) A's game sends **CarParked** (reliable) with K and the final transform; the
-   others put their entity there (creating a copy if they never had one).
+   others put their entity there (creating a copy if they never had one). Its flags say whether the car is
+   destroyed (`car:GetDamage()` >= 100 on A's game; the scale is unverified).
 4. **Take over.** Anybody gets into the parked car K's driver seat the normal way (E). That game now simulates K and
    sends `seat 0` with K: step 1 with the new owner. On a game whose player drove K before (e.g. A's own real car),
-   the entity is swapped for a fresh copy first, because a car the local player has driven throws NPC drivers out
-   (docs/game-api.md 7): a copy we spawned is despawned, a real car is deactivated (hidden).
+   or whose own mission car K is (adopted, its NPC driver thrown out twice), the entity is swapped for a fresh copy
+   first, because such a car throws NPC drivers out (docs/game-api.md 7): a copy we spawned is despawned, a real car
+   is deactivated (hidden) and kept.
+5. **The real car comes back** (0.15). A real car hidden behind a copy comes back at the copy's place when K is
+   parked again: the copy is empty (the driver's puppet climbed out, nobody else in it) and A's CarParked arrived
+   (or, without one, the copy stood still for 1 s 10 s after A got out). Meanwhile the copy is closed to the local
+   player. It also comes back on a new world (where it is, if it survived the load), when the session ends, and
+   when the copy is lost; destroyed on A's game, it is blown up on ours. The rules: docs/game-api.md 15 "Mission
+   car back", src/game/car_swap.h.
 
 Conflicts: if two players get into the driver seat of the same parked car at the same moment, each game keeps its
 own player driving (the other's `seat 0` claim for K is ignored and logged) until one of them gets out; then step 3/4
-apply. Copies are capped at 12 per game (the oldest parked copy nobody sits in is despawned). When the session ends,
-copies nobody sits in are despawned; the one the local player sits in stays as a normal car. A player who joins late
+apply. Copies are capped at 12 per game (the oldest parked copy nobody sits in is despawned; never one with a real
+car hidden behind it). When the session ends, copies nobody sits in are despawned (a hidden real car is shown at
+the copy's place); the one the local player sits in stays as a normal car (a real car hidden behind it comes back
+once he got out). A player who joins late
 does not see cars parked before he joined until somebody drives them.
 
 Puppets that cannot be seated (seat taken, the game keeps throwing them out) are hidden at the car and retried every

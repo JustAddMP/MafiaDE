@@ -755,6 +755,14 @@ return "zones: " .. tostring(ok) .. " " .. tostring(z) .. " (" .. #zs .. " value
 3. `GetActiveZones` / `GetZoneInfo` return shapes are not decoded.
 4. Mission-script traffic overrides (`SetMaxVehicleElements` per checkpoint) on the host would not reach guests
    unless mirrored. Mirror the 5 numbers when the host's node runs (wrap the Lua node) [guess].
+5. Mission car swapped for a copy (0.9.0) and back (0.15, docs/game-api.md 15 "Mission car back"): the real car
+   is hidden with `Deactivate()` and shown again with `Activate()` at the copy's place once the car is parked.
+   Open: whether `Activate` brings a car back with its mission state as it was (the mission's scripts keep the
+   entity, so they should), whether a deactivated car takes `SetPos`, `GetDamage()`'s scale (wreck detection),
+   whether a checkpoint save made while a car is hidden stores it deactivated, and what a mission does with NPCs
+   that should board the hidden car meanwhile [all unverified]. A cleaner alternative, if `Activate` misbehaves:
+   keep the real car shown and driven (pinned like the 0.9 copies) with the remote driver's puppet beside it in
+   the passenger seat, which keeps NPCs (passenger seats are fine, game-api 7).
 
 ---------------------------------------------------------------------------------------------------------------
 

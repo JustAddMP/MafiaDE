@@ -43,6 +43,9 @@ tools\make_release.cmd 0.8.0      build, run every core test and proxy_test, wri
     Steam" below.
   - `proxy_test.exe`: core's `tests\proxy_test.cpp` built against our descriptor (tests our launcher and proxy
     without the game; see below).
+  - `car_swap_test.exe`: our own unit test (`tests\car_swap_test.cpp`) of the swapped-car machine
+    (`src\game\car_swap.*`: when a mission car hidden behind a copy comes back); prints PASS/FAIL per check, exit
+    code 0 when all pass. `tools\make_release.cmd` runs it.
   - Object files go to `out\obj\game\`, core's to `out\obj\core\`.
 - Core's own tests (net_loopback, net_password, net_kick, net_interest, net_fuzz, proxy_test with a made-up game, ...):
   `external\core\build.cmd`, then the exes in `external\core\out\` (see core's README.md).

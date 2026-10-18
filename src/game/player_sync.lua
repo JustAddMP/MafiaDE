@@ -22,7 +22,8 @@
 --                                                                                3 counter, 4 takedown, 5 throw,
 --                                                                                6 melee hit reaction;
 --                                                                                player_actions.h)
---   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
+--   K vkey model x y z qx qy qz qw wrecked                                       a car was parked (CarParked;
+--                                                                                wrecked 1 = it is destroyed)
 --   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
 --   M profile                                                                    our own model (profile; "tommy" = as the
@@ -43,7 +44,7 @@
 --            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction;
 --             sig: our car's signals byte, src/game/car_signals.h, 0 = unknown or not the driver)
 --   status = "factory|id:state:dist;...|cars" for the overlay
---   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
+--   events = lines for the network: "CP vkey model x y z qx qy qz qw wrecked" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
@@ -330,51 +331,109 @@ function M.KeyOf(ent)
 end
 
 -- A car the local player has driven does not keep an NPC in its driver seat (the puppet is thrown out a few
--- frames after GetOnVehicle). When another player takes the wheel of such a car, this game swaps it for a fresh
--- copy at the same place: our own copy is despawned, a real car (not spawned by us) is deactivated (hidden).
--- keepOrig: an adopted mission car (M.FindLocalCar) is kept, hidden, and comes back where the copy is parked
--- (M.Restore), so this game's own mission still has its car afterwards.
-function M.Swap(c, keepOrig)
+-- frames after GetOnVehicle), and neither does a mission car of this game (adopted, M.FindLocalCar). When another
+-- player takes the wheel of such a car, this game swaps it for a fresh copy at the same place: our own copy is
+-- despawned; a real car (not spawned by us: a mission car, the car we drove) is deactivated (hidden) and kept in
+-- c.orig, because this game's mission scripts reference that entity, not the copy. It comes back when the car is
+-- parked, the world reloads or the session ends (M.SwapTick, the machine in src/game/car_swap.h). Before 0.15 only
+-- an adopted mission car was kept; the host's own mission car, swapped when a guest drove it, never came back.
+function M.Swap(c, why)
   c.rv = nil  -- a fresh copy: its own steering linearity, controls applied anew
+  local hid = false
   if c.qid then
     pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
-  elseif valid(c.ent) then
+  elseif valid(c.ent) and not c.orig then
     try("Deactivate", c.ent.Deactivate, c.ent)
-    if keepOrig then c.orig = c.ent end
+    c.orig, c.origId, c.origAdopted = c.ent, guidNum(c.ent), c.adopted
+    local p = c.ent:GetPos()
+    c.origAt = string.format("%.1f %.1f %.1f", p.x, p.y, p.z)
+    hid = true
   end
-  c.ent, c.qid, c.st, c.closed, c.localDriven, c.noAdopt = nil, nil, "new", nil, nil, keepOrig
-  log("car " .. c.key .. ": replaced by a fresh copy for the new driver" .. (keepOrig and " (ours hidden meanwhile)" or ""))
+  c.ent, c.qid, c.so, c.sp, c.st, c.closed, c.localDriven = nil, nil, nil, nil, "new", nil, nil
+  c.noAdopt = c.orig ~= nil  -- the copy must not adopt our own hidden car (or another of the same model) again
+  if c.orig then c.swapBegin, c.parkAt, c.parkWrecked, c.lockCopy = true, nil, nil, nil end
+  log("car " .. c.key .. ": replaced by a fresh copy for the new driver (" .. tostring(why or "-") .. ")"
+    .. (hid and (", ours (" .. tostring(c.origId) .. " at " .. c.origAt .. ") hidden meanwhile")
+      or (c.orig and ", ours stays hidden" or "")))
+  trace("SWR", string.format("key=%s ev=swap orig=%s at=%s why=%s", c.key, tostring(c.origId),
+    (tostring(c.origAt):gsub(" ", ",")), (tostring(why or "-"):gsub(" ", "_"))))
 end
 
--- The remote driver parked a copy that stands in for our hidden mission car: the mission car comes back at the
--- copy's place and the copy goes.
-function M.Restore(c)
-  local orig = c.orig
-  c.orig = nil
-  if not valid(orig) then return end
-  if valid(c.ent) then
-    local p, q = c.ent:GetPos(), c.ent:GetRot()
-    if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
-    pcall(orig.SetPos, orig, p)
-    pcall(orig.SetRot, orig, q)
+-- true when `e` is a real car hidden behind a copy (it must not be adopted or count as standing in the way)
+function M.IsHiddenOrig(e)
+  for _, c in pairs(M.cars) do
+    if c.orig and same(c.orig, e) then return true end
   end
-  try("Activate", orig.Activate, orig)
-  c.ent, c.qid, c.adopted, c.noAdopt = orig, nil, true, nil
-  log("car " .. c.key .. ": our mission car is back where the copy was parked")
+  return false
+end
+
+-- Our hidden real car comes back (M.SwapTick decided when). how: "copy" = at the copy's place (it was just put at
+-- the last driver's final transform by his CarParked), or at the driver's last transform when there is no copy;
+-- "here" = where it was hidden (a new world: the copy is from the old one and is not touched). The copy goes first:
+-- it stands exactly where our car is put. wrecked: the car was destroyed on the last driver's game: ours is blown
+-- up (car:Explode, docs/game-api.md 14) so this game's mission sees the same. failed: the copy could not be spawned
+-- (no further swaps of this car: its NPC driver is thrown out as before 0.9.0).
+function M.Restore(c, how, wrecked, why, failed)
+  local orig = c.orig
+  c.orig, c.lockCopy = nil, nil
+  if not valid(orig) then
+    log("car " .. c.key .. ": our hidden car is gone, nothing to bring back (" .. tostring(why) .. ")")
+    return
+  end
+  local p, q, from = nil, nil, "where it was hidden"
+  local copyOk = c.st == "ready" and valid(c.ent) and not same(c.ent, orig)
+  if how == "copy" then
+    if copyOk then
+      p, q, from = c.ent:GetPos(), c.ent:GetRot(), "at the copy's place"
+    elseif c.tx then
+      p, q = V(c.tx, c.ty, c.tz), Math:newQuat()
+      q.v, q.s = V(c.qx, c.qy, c.qz), c.qw
+      from = "at the driver's last transform"
+    end
+  end
+  local copy = "no copy"
+  if how ~= "here" and c.qid then
+    local good = pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
+    copy = good and "copy despawned" or "copy despawn failed"
+  elseif how == "here" and c.qid then
+    copy = "copy left to the old world"
+  end
+  -- SetPos before and after Activate: whether a deactivated car takes a teleport is not known (UNVERIFIED)
+  if p then pcall(orig.SetPos, orig, p); pcall(orig.SetRot, orig, q) end
+  local good, err = pcall(orig.Activate, orig)
+  if p then pcall(orig.SetPos, orig, p); pcall(orig.SetRot, orig, q) end
+  local g2, active = pcall(orig.IsActive, orig)
+  local np = orig:GetPos()
+  c.ent, c.qid, c.so, c.sp, c.rv, c.st = orig, nil, nil, nil, nil, "ready"
+  c.adopted, c.noAdopt, c.parkAt, c.parkWrecked, c.parkApply = c.origAdopted, nil, nil, nil, nil
+  c.noNpc = true      -- it throws NPC drivers out: the next remote driver gets a copy at once
+  c.closed = false    -- the mission's own lock state stays as it is (we never locked the hidden car)
+  if failed then c.swapFailed = true end
+  log(string.format("car %s: our own car %s is back %s (%.1f %.1f %.1f; hidden at %s), activate %s, active %s, %s: %s",
+    c.key, tostring(c.origId), from, np.x, np.y, np.z, tostring(c.origAt), good and "ok" or ("failed: " .. tostring(err)),
+    g2 and tostring(active) or "?", copy, tostring(why)))
+  trace("SWR", string.format("key=%s ev=restore how=%s from=%s p=%.3f,%.3f,%.3f active=%s copy=%s wrecked=%d why=%s",
+    c.key, how, (from:gsub(" ", "_")), np.x, np.y, np.z, g2 and tostring(active) or "-", (copy:gsub(" ", "_")),
+    wrecked and 1 or 0, (tostring(why):gsub(" ", "_"))))
+  if wrecked then
+    local g3, e3 = pcall(orig.Explode, orig)
+    log("car " .. c.key .. ": destroyed on the last driver's game: ours blown up too" .. (g3 and "" or (" (failed: " .. tostring(e3) .. ")")))
+  end
 end
 
 function M.DropCar(c)
+  if c.orig then M.Restore(c, "copy", false, "its record is dropped") end  -- never leave our real car hidden
   if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
   M.cars[c.key] = nil
   log("car " .. c.key .. " removed")
 end
 
--- Make room: drop the oldest copy nobody drives and the local player is not in.
+-- Make room: drop the oldest copy nobody drives and the local player is not in (not one with our car hidden behind).
 local function trimCars()
   local n, oldest = 0, nil
   for _, c in pairs(M.cars) do
     n = n + 1
-    if c.qid and not c.driver and not c.localIn and (not oldest or c.used < oldest.used) then oldest = c end
+    if c.qid and not c.orig and not c.driver and not c.localIn and (not oldest or c.used < oldest.used) then oldest = c end
   end
   if n > MAX_CARS and oldest then M.DropCar(oldest) end
 end
@@ -682,7 +741,7 @@ function M.FindLocalCar(c)
   local best, bestD, block
   for s in string.gmatch(mc_entity_ids(10), "%d+") do
     local e = mc_entity(tonumber(s))
-    if e and e.GetVehicleModelName then
+    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) then  -- a hidden car is neither free nor in the way
       local q = e:GetPos()
       local d = (q.x - c.tx) ^ 2 + (q.y - c.ty) ^ 2 + (q.z - c.tz) ^ 2
       if d <= ADOPT_DIST * ADOPT_DIST then
@@ -742,7 +801,16 @@ function M.CarTick(c)
       log("car " .. c.key .. ": copy ready " .. tostring(car))
     end
   elseif c.st == "ready" then
-    if not valid(c.ent) then M.cars[c.key] = nil; return end
+    if not valid(c.ent) then
+      -- the copy is gone (despawned by the game): with our real car hidden behind it, M.SwapTick brings that back
+      if c.orig then
+        c.st = "lost"
+        log("car " .. c.key .. ": the copy is gone")
+      else
+        M.cars[c.key] = nil
+      end
+      return
+    end
     if c.driver == "local" then
       setLock(c, false)
     elseif c.driver then
@@ -764,15 +832,139 @@ function M.CarTick(c)
       else
         setTransform(c)
       end
-    else  -- parked: a normal car, open for anyone
-      setLock(c, false)
+    else  -- parked: a normal car, open for anyone; a copy with our real car hidden behind it is kept closed to
+          -- the local player until that car is back (M.SwapTick: he would get into the copy, not his mission's car)
+      setLock(c, c.orig ~= nil and c.lockCopy == true)
       if c.rv and c.rv.driven then RV.Idle(c.rv, c.ent) end
-      if c.parkApply then  -- final resting transform from the last driver
+      if c.parkApply then  -- final resting transform from the last driver (M.SwapTick then restores ours there)
         c.parkApply = nil
         setTransform(c)
-        if c.orig then M.Restore(c) end
       end
     end
+  end
+end
+
+-- Swapped cars (c.orig: our real car hidden behind a copy): what this game sees, given to the machine in
+-- src/game/car_swap.h (mc_carswap), which says when the real car comes back. Bits as car_swap.h's Bit.
+local SW = { begin = 1, orig = 2, copy = 4, pending = 8, rdrv = 16, ldrv = 32, raboard = 64, pup = 128, lin = 256,
+  other = 512, wrecked = 1024, world = 2048, over = 4096 }
+M.SW = SW
+
+-- who sits in car `ent`: a puppet, the local player, somebody else (an NPC); humans getting in or out count too
+local function occupants(ent)
+  local pup, loc, other = false, false, false
+  local me = game.game:GetActivePlayer()
+  local function isPup(h)
+    for _, pp in pairs(M.pup) do if same(pp.so, h) then return true end end
+    return false
+  end
+  local g0, n = pcall(ent.GetSeatCount, ent)
+  n = (g0 and tonumber(n)) or 4
+  for s = 0, math.min(n, 8) - 1 do
+    local good, o = pcall(ent.GetSeatOwner, ent, s)
+    if good and valid(o) then
+      if me and same(o, me) then loc = true elseif isPup(o) then pup = true else other = true end
+    end
+  end
+  for _, pp in pairs(M.pup) do
+    if valid(pp.so) then
+      local good, own = pcall(pp.so.GetOwner, pp.so)
+      if good and own and same(own, ent) then pup = true end
+    end
+  end
+  if me then
+    local good, own = pcall(me.GetOwner, me)
+    if good and own and same(own, ent) then loc = true end
+  end
+  return pup, loc, other
+end
+
+-- sessionOver: no session (RemoveAll, or after it); worldGone: a new world was loaded since the last tick
+function M.SwapTick(c, sessionOver, worldGone)
+  if not c.orig then return end
+  if not mc_carswap then  -- a dev-override glue on an older dll: the 0.9 behaviour (back on CarParked)
+    if c.parkAt and not c.driver then M.Restore(c, "copy", false, "CarParked (no mc_carswap)") end
+    return
+  end
+  local origOk = valid(c.orig) and guidNum(c.orig) == c.origId
+  local copyOk = c.st == "ready" and valid(c.ent) and not same(c.ent, c.orig)
+  local pending = c.st == "new" or c.st == "obtain" or c.st == "spawn"
+  local bits = 0
+  local function add(b, on) if on then bits = bits + b end end
+  add(SW.begin, c.swapBegin)
+  add(SW.orig, origOk)
+  add(SW.copy, copyOk)
+  add(SW.pending, pending and not worldGone)
+  add(SW.rdrv, not sessionOver and c.driver ~= nil and c.driver ~= "local")
+  add(SW.ldrv, c.driver == "local")
+  local aboard = false
+  if not sessionOver then
+    for _, pp in pairs(M.pup) do
+      if pp.veh and pp.vkey == c.key and pp.seat ~= 0 then aboard = true end
+    end
+  end
+  add(SW.raboard, aboard)
+  local speed = 0
+  if copyOk and not worldGone then
+    local pup, loc, other = occupants(c.ent)
+    add(SW.pup, pup)
+    add(SW.lin, loc or c.localIn)
+    add(SW.other, other)
+    local good, sp = pcall(c.ent.GetSpeedFloat, c.ent)
+    speed = good and math.abs(tonumber(sp) or 0) or 0
+  end
+  add(SW.wrecked, c.parkWrecked)
+  add(SW.world, worldGone)
+  add(SW.over, sessionOver)
+  local act, lock, phase, why = mc_carswap(c.key, M.now, bits, speed, c.parkAt or -1)
+  c.swapBegin = nil
+  c.lockCopy = lock and copyOk or nil
+  if act == "restore" then
+    M.Restore(c, "copy", false, why, c.st == "failed")
+  elseif act == "restore_wrecked" then
+    M.Restore(c, "copy", true, why)
+  elseif act == "restore_here" then
+    M.Restore(c, "here", false, why)
+  elseif act == "forget" then
+    log("car " .. c.key .. ": our hidden car " .. tostring(c.origId) .. " is gone" .. (worldGone and " with the old world" or ""))
+    trace("SWR", string.format("key=%s ev=forget orig=%s world=%d", c.key, tostring(c.origId), worldGone and 1 or 0))
+    c.orig, c.lockCopy = nil, nil
+  end
+end
+
+-- Swapped cars after the session ended (RemoveAll): the copy we sit in stays until we got out, then ours comes back.
+M.leftCars = M.leftCars or {}
+
+-- A new world (checkpoint load, reload, quit): every hidden real car is shown again if it survived the load
+-- (otherwise forgotten), and a copy left over from the session goes.
+function M.CarsNewWorld()
+  for _, list in ipairs({ M.cars, M.leftCars }) do
+    for _, c in pairs(list) do
+      if c.orig then
+        -- the copy still standing means the entities survived (a loading screen in the same world): not a new world
+        local same_world = c.st == "ready" and valid(c.ent) and not same(c.ent, c.orig)
+        if not same_world then
+          local good, err = pcall(M.SwapTick, c, list == M.leftCars or not M.inSession, true)
+          if not good then logErr("swap", err) end
+        end
+      end
+    end
+  end
+  for k, c in pairs(M.leftCars) do
+    if not c.orig then M.leftCars[k] = nil end
+  end
+end
+
+-- Every tick in the world: swapped cars left over from an ended session (we sat in the copy).
+function M.LeftCarsTick(p)
+  if next(M.leftCars) == nil then return end
+  local own = p:GetOwner()
+  for k, c in pairs(M.leftCars) do
+    local inIt = own ~= nil and valid(c.ent) and same(own, c.ent)
+    c.localIn = inIt
+    c.driver = (inIt and same(c.ent:GetSeatOwner(0), p)) and "local" or nil
+    M.SwapTick(c, true, false)
+    if not c.orig then M.leftCars[k] = nil end
   end
 end
 
@@ -822,7 +1014,11 @@ function M.CarsUpdate(p)
         c = M.EnsureCar(pp.vkey, pp.veh, pp.cx, pp.cy, pp.cz, pp.qx, pp.qy, pp.qz, pp.qw)
         if c.driver ~= id then
           log("car " .. pp.vkey .. ": player " .. id .. " drives it")
-          if c.localDriven and c.st == "ready" and not c.localIn then M.Swap(c) end
+          -- noNpc: a real car of ours that came back from a swap (it threw his puppet out before): a copy at once
+          if (c.localDriven or c.noNpc) and c.st == "ready" and not c.localIn and not c.swapFailed then
+            M.Swap(c, c.localDriven and ("player " .. id .. " drives a car we drove") or ("player " .. id
+              .. " drives our car again"))
+          end
         end
         c.driver, c.parkPending, c.parkApply = id, nil, nil
       end
@@ -843,9 +1039,13 @@ function M.CarsUpdate(p)
       if M.now - c.exitT > 1 and (math.abs(sp) < 0.3 or M.now - c.exitT > 8) then
         c.parkPending = nil
         local cp, q = c.ent:GetPos(), c.ent:GetRot()
-        M.events[#M.events + 1] = string.format("CP %s %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f", key, c.model,
-          cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s)
-        log("car " .. key .. ": parked, final transform sent")
+        local wrecked, dmg, motor = M.Wrecked(c.ent)
+        M.events[#M.events + 1] = string.format("CP %s %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %d", key, c.model,
+          cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, wrecked and 1 or 0)
+        log(string.format("car %s: parked, final transform sent (damage %s, motor damage %s%s)", key, tostring(dmg),
+          tostring(motor), wrecked and ", destroyed" or ""))
+        -- we drove a copy that stands in for our own hidden car: it comes back here (M.SwapTick)
+        if c.orig then c.parkAt, c.parkWrecked = M.now, wrecked end
       end
     end
   end
@@ -853,15 +1053,41 @@ function M.CarsUpdate(p)
     local good, err = pcall(M.CarTick, c)
     if not good then log("car " .. c.key .. " error: " .. tostring(err)); c.st = "failed" end
   end
+  for _, c in pairs(M.cars) do
+    if c.orig then
+      local good, err = pcall(M.SwapTick, c, not M.inSession, false)
+      if not good then logErr("swap", err) end
+    end
+  end
 end
 
--- CarParked from the network: the last driver's game says where the car came to rest.
-function M.Parked(key, model, x, y, z, qx, qy, qz, qw)
+-- Destroyed? car:GetDamage() (C_WrapperCar; its scale is not known, UNVERIFIED): taken as destroyed at 100 or more,
+-- so a 0..1 scale never says so (a missed wreck only means the other games keep an intact car; the mission's own
+-- failure, if any, still reloads everyone). Returns wrecked, damage, motor damage (raw, for the log).
+function M.Wrecked(ent)
+  local g1, d = pcall(ent.GetDamage, ent)
+  local g2, md = pcall(ent.GetMotorDamage, ent)
+  d = g1 and tonumber(d) or nil
+  md = g2 and tonumber(md) or nil
+  return d ~= nil and d >= 100, d, md
+end
+
+-- CarParked from the network: the last driver's game says where the car came to rest (wrecked: it is destroyed).
+function M.Parked(key, model, x, y, z, qx, qy, qz, qw, wrecked)
   local c = M.cars[key]
-  if c and c.driver then return end  -- somebody (maybe we) drives it again already
+  if c and c.orig then
+    -- also while his state still shows him at the wheel (CarParked is reliable, his state is not: either can come
+    -- first); the machine only counts it for the parking that follows (car_swap.h kParkSlack)
+    c.parkAt, c.parkWrecked = M.now, wrecked or nil
+  end
+  if c and c.driver then
+    log("car " .. key .. ": CarParked while player " .. tostring(c.driver) .. " still drives it here")
+    return
+  end
   c = M.EnsureCar(key, model, x, y, z, qx, qy, qz, qw)
   c.parkApply = true
-  log("car " .. key .. ": parked by its last driver")
+  log("car " .. key .. ": parked by its last driver" .. (wrecked and ", destroyed" or "")
+    .. (c.orig and " (ours is hidden behind this copy)" or ""))
 end
 
 -- Ride along: E next to a car somebody else drives seats the local player in its first free passenger seat
@@ -1100,12 +1326,13 @@ function M.Seat(pp, c)
         pp.putBacks or 0, math.sqrt((q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 + (q.z - cp.z) ^ 2), tostring(c.driver),
         c.adopted and ", our mission car" or (c.localDriven and ", we drove it" or "")))
     end
-    -- A mission car of this game (adopted, M.FindLocalCar) that does not keep the remote driver's puppet at its wheel
-    -- even so is swapped for a copy (ours hidden until the copy is parked, M.Restore) the moment it throws him out
-    -- twice.
-    if pp.ejects == 2 and pp.seat == 0 and c.adopted and not c.localIn and c.st == "ready" then
+    -- A mission car of this game (adopted, M.FindLocalCar) does not keep an NPC at its wheel either: it is swapped
+    -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice. The
+    -- same for a real car that came back from a swap (noNpc; e.g. our copy was lost while he drove).
+    if pp.ejects == 2 and pp.seat == 0 and (c.adopted or c.noNpc) and not c.qid and not c.localIn and c.st == "ready"
+      and not c.swapFailed then
       log("puppet " .. pp.id .. " is thrown out of our mission car " .. c.key .. ": a copy takes its place")
-      M.Swap(c, true)
+      M.Swap(c, "puppet " .. pp.id .. " thrown out twice")
       pp.ejects, pp.seatTries = 0, 0
       return false
     end
@@ -1550,7 +1777,24 @@ end
 function M.RemoveAll()
   for id, _ in pairs(M.pup) do M.Remove(id) end
   for _, c in pairs(M.cars) do
-    if c.qid and not c.localIn then
+    if c.orig then  -- our real car hidden behind a copy: it comes back now, or once we are out of the copy
+      if c.st ~= "ready" then
+        M.Restore(c, "copy", false, "session over before the copy was spawned")
+      else
+        local good, err = pcall(M.SwapTick, c, true, false)
+        if not good then logErr("swap", err) end
+      end
+      if c.orig then
+        M.leftCars[c.key] = c
+        if valid(c.ent) then
+          pcall(c.ent.Unlock, c.ent)
+          pcall(c.ent.UnlockPlayerEntryPoints, c.ent)
+        end
+        log("car " .. c.key .. ": session over, the copy is still in use: ours stays hidden until it is free")
+      end
+    end
+    if c.orig then  -- kept in M.leftCars
+    elseif c.qid and not c.localIn then
       M.DropCar(c)
     elseif c.ent and valid(c.ent) then  -- ours, or the copy we sit in: back to a normal car
       pcall(c.ent.Unlock, c.ent)
@@ -2566,6 +2810,8 @@ function M.Update(dt, cmds)
     M.inWorldAt = M.now
     M.grave = {}  -- a new world: the old one's entities are gone
     log("local player in world")
+    local good, err = pcall(M.CarsNewWorld)  -- hidden real cars: shown again or forgotten
+    if not good then logErr("cars new world", err) end
   elseif not player then
     M.inWorldAt = nil
   end
@@ -2620,7 +2866,7 @@ function M.Update(dt, cmds)
     elseif op == "K" then
       local n = {}
       for i = 4, 10 do n[#n + 1] = tonumber(f[i]) end
-      if #n == 7 then M.Parked(f[2], f[3], n[1], n[2], n[3], n[4], n[5], n[6], n[7]) end
+      if #n == 7 then M.Parked(f[2], f[3], n[1], n[2], n[3], n[4], n[5], n[6], n[7], f[11] == "1") end
     elseif op == "L" then
       M.localId = f[2] or M.localId
       active, host = true, f[3] == "1"
@@ -2710,6 +2956,8 @@ function M.Update(dt, cmds)
       if not good then logErr("ride along", err) end
     end
     pcall(M.RideTick, player)
+    good, err = pcall(M.LeftCarsTick, player)
+    if not good then logErr("left cars", err) end
   end
 
   if mc_trace and active and player and M.now - (M.trT or -1) >= TRACE_PERIOD then
