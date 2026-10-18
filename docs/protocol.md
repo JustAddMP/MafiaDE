@@ -26,6 +26,10 @@ connection was lost keeps playing while core rejoins the host; the host holds hi
 
 Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
 
+Doors (unreleased, after 0.15.0; not yet checked in game): DoorEvent (0x0230), DoorApply (0x0231), DoorSnapshot
+(0x0232), DoorSnapRequest (0x0233), additive (a peer without them ignores them; see "Doors"); the PlayerState action
+block has three more kinds (7 door kick, 8 lock pull, 9 door open), read as none by older builds.
+
 App id allocation (core reserves 0x0000-0x00FF):
 
 | Range | Owner |
@@ -89,8 +93,9 @@ u8  signals               car signals (seat 0 only; src/game/car_signals.h; read
 -- action block (melee sync; after everything above, the vehicle block included; optional, see below):
 u8  actSeq                visible one-shot actions of the player so far, mod 256; a change = new action(s)
 u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charged) punch, 3 counter, 4 takedown,
-                          5 throw (grenade, molotov, knife), 6 melee hit reaction (an NPC punched him); other values
-                          read as none
+                          5 throw (grenade, molotov, knife), 6 melee hit reaction (an NPC punched him), 7 door kick,
+                          8 lock pull (lockpick), 9 door opened by hand (7-9: doors, unreleased; the door itself is
+                          "Doors" below); other values read as none (a build without 7-9 plays nothing for them)
 ```
 
 **Action block** (src/game/player_actions.h, unit-tested in tests/player_actions_test.cpp). Punches and other
@@ -533,6 +538,61 @@ npc_sync.lua.
   controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
   through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves is not shared.
 
+### Doors (unreleased; not yet checked in game)
+
+Doors are the same on every game: a door a player opens, closes, kicks open, unlocks or lockpicks (the lock pull)
+changes on the other games too, and his puppet plays the kick / lock pull / door opening (the action block above).
+The host's game decides the story doors. Code: `src/game/door_model.h` (the rules, unit-tested in
+`tests/door_test.cpp`), `src/game/door_sync.{h,cpp,lua}`; the game side is docs/game-api.md 20.
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0230 | DoorEvent | guest -> host (`SendToHost`) | R | u16 seq, u8 by (ignored: the host puts the sender), u8 act, u8 state, u32 name, f32 x y z, f32 fx fy fz (33 bytes) |
+| 0x0231 | DoorApply | host -> guests (`Broadcast`; `SendTo` one guest for a correction) | R | the DoorEvent body; `by` = the player who did it, 255 = the host's world (his mission scripts, his NPCs, a door closing by itself) |
+| 0x0232 | DoorSnapshot | host -> one guest (`SendTo`) | R | u8 n (at most 96), then n x: u32 name, f32 x y z, u8 state (17 bytes) |
+| 0x0233 | DoorSnapRequest | guest -> host (`SendToHost`) | R | f32 x y z (the guest's player), u8 reason (1 join, 2 reconnect, 3 a new world) |
+
+- **A door on every game:** doors are entities of type 21; their entity ids differ between games, so a door is
+  identified by `name` = FNV-1a 32 of its lower-case scene name (`GetName()`; 0 when it has none) and its position
+  (`GetPos()` when first seen): the same name within 1.0 m is the same door (nameless doors: 0.3 m), the nearest one
+  when several match (double doors).
+- **state:** bit0 open (`not IsClosed()`), bit1 locked (`IsLocked()`); other bits are refused. **act** says how the
+  door got there and how the receiver gets it there: 1 open (by hand), 2 close, 3 kick (forced open: unlocks), 4
+  unlock, 5 lockpick (the lock pull), 6 lock, 7 set (several bits, corrections, snapshots); the receiver brings its
+  door to `state` (Unlock, then Kick(from) for a kick or Open(from), Close, Lock) and `from` (where the one who did it
+  stood) gives the direction the door swings. Other act values and non-finite numbers drop the message.
+- **Who sends what:** every game polls the doors within 35 m of its own player (5 times a second, plus any door that
+  just got a door message or that it changed for somebody else) and works out who changed one: its own player (the
+  door message's sender is him; or within 2 s of his door kick / lock pull / door open action and within 3.5 m; or
+  he stood within 1.8 m on foot), else its own world. A **guest** sends his player's changes to the host
+  (DoorEvent); the changes of his own world (NPCs, his own copies of the mission scripts) stay on his game. The
+  **host** sends his player's changes and his world's (`by` 255: the story's locks and unlocks, NPCs) to every guest
+  as DoorApply.
+- **The host decides:** a guest's DoorEvent that opens by hand a door that is locked on the host's game (a state
+  read in the last 3 s: near the host) is refused: the host answers that guest alone with a DoorApply `set` to the
+  host's state (his door closes and locks again). Kicks, lock pulls, unlocks and doors the host has not loaded
+  (or not polled lately) are accepted: the host applies it to his door and sends it as DoorApply to every guest (the
+  sender skips his own). On a guest, a lock change by his own world of a door the host told him about (DoorApply,
+  snapshot) is put back to the host's lock, at most 3 times a minute per door; his world opening or closing such a
+  door is left alone (NPCs walk through doors on every game).
+- **No echoes:** a game that changes a door for somebody else expects that state for 3 s; the poll seeing it (or a
+  step toward it: a kick unlocks, then opens) is not reported again. One that did not get there in time is logged
+  (`unmet`).
+- **Doors that are not loaded:** every game remembers the changes of this session (the host all of his, a guest
+  what the host told him and his own; at most 256, the oldest go first); a door that comes into the entity table
+  later (streamed in, or loaded again) is set to its remembered state. A new world of a game (a load, a checkpoint,
+  the main menu) forgets its doors and its memory.
+- **Snapshot:** a guest asks for one 3 s after the session became active (join; reconnect) and 5 s after each new
+  world of his, once he is in it: the host answers with the doors within 40 m of the guest's position whose state
+  his game read in the last 3 s (doors near the host too), nearest first, then the remembered changes nearest first
+  (no door twice), at most 96 (~1.6 KB). The guest remembers every entry and sets his loaded doors that differ.
+- Bandwidth: one 33-byte reliable message per door change (a few a minute), the snapshot per join / world.
+- Logs: `doors: ...` (main log), trace records `DR` (C++: local changes and their verdict, tx, rx, applies,
+  corrections, snapshots, unmet), `DL` (Lua: door messages and detected changes with the attribution) and `DA`
+  (Lua: what was called on a door), docs/sync-trace.md; `tools/sync_compare.py` has a doors section per game.
+- UNVERIFIED in game: all of it (docs/game-api.md 20): that `mc_entity_ids(21)` lists the doors of houses, shops,
+  garages and gates, that names and positions match across games, the door calls, the door messages.
+
 ## Reconnect (no messages of its own)
 
 Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,
@@ -546,6 +606,7 @@ the game layer does with it:
 | host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
 
+| lost guest | the session is inactive / back | DoorSync: nothing is sent or applied meanwhile; when the session is active again the glue reads its doors again and asks the host for a DoorSnapshot (reason reconnect) |
 | host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
 | lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 

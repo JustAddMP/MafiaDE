@@ -36,14 +36,14 @@ on the other.
 | `H` | both | once | `trace=1 wall=<local date-time> qpc=<t> pid game mod core proto state role=host/guest local=<player id> hz=<state rate> interp=<ms> built` |
 | `PL` | both | per player | `id model name=<rest of the line>` (also our own) |
 | `PLX` | both | on leave | `id` |
-| `TX` | both | each state sent (60 Hz) | `sT=<ms> p h v m=<0 idle 1 walk 2 run 3 sprint> f=<flags: 1 car, 2 crouch, 4 sprint, 8 aim, 16 reload, 32 in air, 64 cover> hp sh=<shots> w=<weapon> act=<action counter>:<latest kind: none light heavy counter takedown throw hitreact>`; in a car also `car=<key> mdl seat cp q cv ctl=<valid,steer,power,brake,handbrake,gear> sig=<car signals byte: 1 park, 2 head, 4 indicator A, 8 indicator B, 16 beacon, 32 siren, 64 horn, 128 valid; 0 unknown>` |
+| `TX` | both | each state sent (60 Hz) | `sT=<ms> p h v m=<0 idle 1 walk 2 run 3 sprint> f=<flags: 1 car, 2 crouch, 4 sprint, 8 aim, 16 reload, 32 in air, 64 cover> hp sh=<shots> w=<weapon> act=<action counter>:<latest kind: none light heavy counter takedown throw hitreact doorkick lockpick dooropen>`; in a car also `car=<key> mdl seat cp q cv ctl=<valid,steer,power,brake,handbrake,gear> sig=<car signals byte: 1 park, 2 head, 4 indicator A, 8 indicator B, 16 beacon, 32 siren, 64 horn, 128 valid; 0 unknown>` |
 | `RX` | both | each state received | `from sT off=<s> ...` the same fields as `TX` |
 | `RXD` | both | dropped state | `from sT last` (older than or equal to the newest) |
 | `CLK` | both | 1 Hz per remote | `id off rtt=<ms> hz=<received rate> snaps=<buffered> newest=<ms ahead of now> recv drop last=<s since the last state>` |
 | `PUP` | both | 60 Hz per remote on foot (plus every snap) | `id rT=<the remote time the target stands for, ms> tgt tv have=<copy position known> age=<s> cp=<puppet> ch=<its heading> err g=<gait 0-3> mult want meas carry base=<walk,run,sprint calibrated> fix=<0 none 1 nudge 2 snap> nudge re=<walk re-aimed> mv=<walk point> turn sm=<his mode> sf=<his flags>` |
 | `VEH` | both | 60 Hz per remote driver (plus pins, retries, snaps) | `id key rT have tgt tv cp cv err rot=<deg> fix=<0 none 1 blend 2 pin 3 snap> pin why=<0 - 1 too slow 2 ran off 3 stays off> jp=<pinned now> rt=<physics retried now> pins tsp csp vel=<wanted copy velocity> pw ctl st br hb gear sig=<his car signals>` |
 | `PAS` | both | 60 Hz per remote passenger | `id key rT seat cp` |
-| `AL` | both | each action of ours | Lua: our player punched / countered / threw ... (docs/game-api.md 17): `kind=<1 light 2 heavy 3 counter 4 takedown 5 throw 6 hitreact> seq=<counter now> opp=<GUID of the human the game aimed it at, - none>` |
+| `AL` | both | each action of ours | Lua: our player punched / countered / threw ... (docs/game-api.md 17): `kind=<1 light 2 heavy 3 counter 4 takedown 5 throw 6 hitreact 7 doorkick 8 lockpick 9 dooropen> seq=<counter now> opp=<GUID of the human the game aimed it at, - none>` |
 | `ACS` | both | each action of ours sent | `sT=<ms of the state that first carries it> kind=<name> seq` |
 | `ACT` | both | each action of a remote player | his counter moved on the state his puppet is driven from: `id kind=<name> seq missed=<steps skipped>`; the puppet plays it this tick |
 | `AP` | both | each action played | Lua, on the puppet: `id kind anim=<animation name, - none accepted> ok=<1 AnimPlay accepted> dur=<s the puppet is left alone at most>` |
@@ -72,6 +72,9 @@ on the other.
 | `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
+| `DR` | both | each door event (C++, docs/protocol.md "Doors") | `ev=local id door=<name hash> p old state ours act how verdict=<send/echo/kept/revert/same/unknown>` (our poll saw a door change), `ev=tx seq by=<p<id> or world> act state door p from sent` (we sent it: guest DoorEvent, host DoorApply), `ev=rx ... verdict=<accept/reject (host), applied/kept/own (guest)>`, `ev=fix ...` (host: the correction a refused guest gets), `ev=apply id act state by why=<remote/memory/snapshot/revert>` (we change our door), `ev=unmet id` (it did not get there in 3 s), `ev=snapreq reason p`, `ev=snaptx to reason p n open unlocked mem`, `ev=snaprx n applied`, `ev=world key doors mem` (a new world: table and memory forgotten) |
+| `DL` | both | each door message / door change (Lua) | `ev=msg id kind=<OPEN CLOSE KICK LOCKPICK TOGGLELOCK TOGGLEOPEN> sender=<GUID> ours known`; `ev=change id name p old state ours act how=<msg: its door message came from our player, act: our player's door action, near: he stood at it, -: our world> d=<m from our player> msg=<latest message kind@age>` |
+| `DA` | both | each change carried out on a door (Lua) | `id name act want cur by why calls=<calls made, ! = failed> ok` |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -105,6 +108,9 @@ Per player as seen on the other game:
 - **traffic:** host cars near the guest, bytes per second, unchanged states skipped, budget deferrals; on the guest
   how often the host's traffic showed, copies, the copy-vs-target error and the copies most often off, pins, bumps,
   and how many of the guest's own traffic cars were hidden or still drove near him.
+- **doors:** per game, the door events by kind and verdict, how changes were attributed, the door messages, the
+  applies with a failed call, how many of the changes it sent arrived on the other game, and the first 30 sends /
+  receipts / snapshots.
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
