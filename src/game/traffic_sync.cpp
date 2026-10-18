@@ -419,7 +419,9 @@ void HostSend(double now) {
     for (const auto& p : _session->Players()) {
         if (p.id == net::kHostPlayer) continue;
         if (const auto* st = _host->Stats(p.id)) {
-            std::snprintf(buf, sizeof buf, ", guest %u: %u of %u", p.id, st->admitted, st->relevant);
+            // per guest (three or four players: each has his own share and budget): cars, and bytes sent so far
+            std::snprintf(buf, sizeof buf, ", guest %u: %u of %u (%llu KB)", p.id, st->admitted, st->relevant,
+                          static_cast<unsigned long long>(st->bytes / 1024));
             s += buf;
         }
     }

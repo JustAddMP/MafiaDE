@@ -792,6 +792,12 @@ puppets never get. Which civilian desire fires exactly was not traced (UNVERIFIE
   cannot be, there is no ride (logged, press E again). If the game still seats us at the wheel, `p:SlideToSeat(seat
   + 1)` is tried (below) and the seat we report stays "getting in" (9) until the ride is done, so nobody's car is
   taken over; still at the wheel after 2 s, we drive it (as before).
+- Three or four players in one car (0.15 multi-guest, NOT checked in game): the ride-along seat is the first
+  passenger seat that is free here and that no other player's state names (`mc_rideseat(seatCount, freeMask,
+  "id:seat ...")`, src/game/seats.h); a passenger seat that two players took at once is kept by the lower player id,
+  the other slides over (`mc_yieldseat(localId, seat, seatCount, freeMask, claims)` -> seat, -1 stay, -2 none;
+  `SlideToSeat(seat + 1)`, UNVERIFIED like below). Logged as `ride along: seat S of car K (... the others' seats:
+  1:1 3:2)` and `seats: ... we slide to seat S`; trace `SEA`.
 
 **Bindings looked at for this (static, exe):**
 

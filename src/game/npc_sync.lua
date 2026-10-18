@@ -347,23 +347,57 @@ local function viewpoints(p)
   return v
 end
 
-function N.HostSend(p, ev)
-  local vps = viewpoints(p)
-  local list = {}
-  for id, e in pairs(N.ents) do
+-- The NPCs of this round: at most MAX_SEND, taken in turns from each viewpoint's nearest (the host, then every
+-- guest). With three or four players in different places a guest far from the others still gets the NPCs around
+-- him; before, the 48 nearest to anyone went out, and a big fight around the host filled them all.
+function N.PickSend(vps)
+  local per, all = {}, 0
+  for vi = 1, #vps do per[vi] = {} end
+  for _, e in pairs(N.ents) do
     local h = e.h
     if valid(h) and active(h) then
       local q = h:GetPos()
-      local best
-      for _, v in ipairs(vps) do
+      local item
+      for vi, v in ipairs(vps) do
         local d = (q.x - v[1]) ^ 2 + (q.y - v[2]) ^ 2
-        if not best or d < best then best = d end
+        if d <= RANGE * RANGE then
+          item = item or { e = e, q = q }
+          per[vi][#per[vi] + 1] = { it = item, d = d }
+        end
       end
-      if best and best <= RANGE * RANGE then list[#list + 1] = { e = e, d = best, q = q } end
+      if item then all = all + 1 end
     end
   end
-  table.sort(list, function(a, b) return a.d < b.d end)
-  for i = 1, math.min(#list, MAX_SEND) do
+  for vi = 1, #vps do table.sort(per[vi], function(a, b) return a.d < b.d end) end
+  local list, picked, at = {}, {}, {}
+  local more = true
+  while more and #list < MAX_SEND do
+    more = false
+    for vi = 1, #vps do
+      local l = per[vi]
+      local i = at[vi] or 1
+      while l[i] and picked[l[i].it] do i = i + 1 end
+      if l[i] and #list < MAX_SEND then
+        picked[l[i].it] = true
+        list[#list + 1] = l[i].it
+        i = i + 1
+        more = true
+      end
+      at[vi] = i
+    end
+  end
+  return list, all
+end
+
+function N.HostSend(p, ev)
+  local vps = viewpoints(p)
+  local list, all = N.PickSend(vps)
+  if all > MAX_SEND and (N.cutLogT == nil or M.now - N.cutLogT > 30) then
+    N.cutLogT = M.now
+    log(string.format("%d NPCs near the %d players, %d sent each round (in turns from each player's nearest)", all,
+      #vps, MAX_SEND))
+  end
+  for i = 1, #list do
     local e, q, h = list[i].e, list[i].q, list[i].e.h
     local d = h:GetDir()
     local dead = h:IsDeath()

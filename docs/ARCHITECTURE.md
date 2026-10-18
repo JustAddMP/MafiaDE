@@ -35,6 +35,8 @@ src/game/
                          controllers (one pair per remote player), fed by the glue's "PS"/"VS" reports (0.13.0)
   car_swap.{h,cpp}       when a real car hidden behind a copy comes back (parked, new world, session end); pure
                          logic, called from player_sync.lua as mc_carswap, unit-tested in tests/car_swap_test.cpp
+  seats.{h,cpp}          seats of a car three or four players share (ride-along seat, who yields a doubly taken
+                         seat); pure logic, player_sync.lua's mc_rideseat / mc_yieldseat, tests/seats_test.cpp
   mission_sync.{h,cpp}   phase 4 story: the host's chapter/checkpoint/objective/cutscene and checkpoint save to the
   mission_sync.lua       guests, guests load and follow it (lobby STORY / CHAPTER); the chapter loader hooks;
                          deaths / failed missions in chapter loads reload the checkpoint (never a save outside the session)

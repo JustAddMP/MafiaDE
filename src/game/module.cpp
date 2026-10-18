@@ -164,10 +164,21 @@ std::string ReconnectNotice() {
     }
     const auto dropped = _session->DroppedPlayers();
     if (dropped.empty()) return {};
-    std::string name = dropped[0].info.name;
-    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    std::snprintf(buf, sizeof buf, "%s LOST THE CONNECTION - WAITING FOR %s TO RECONNECT... %d S", name.c_str(),
-                  dropped.size() > 1 ? "THEM" : "THE PLAYER", static_cast<int>(std::ceil(dropped[0].leftS)));
+    // several players at once (three or four in the session): every name, and the longest wait (before: only the
+    // first one's name and time)
+    std::string names;
+    double left = 0;
+    for (size_t i = 0; i < dropped.size(); ++i) {
+        std::string name = dropped[i].info.name;
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        if (i > 0) names += i + 1 == dropped.size() ? " AND " : ", ";
+        names += name;
+        left = std::max(left, dropped[i].leftS);
+    }
+    if (names.size() > 60) names = std::to_string(dropped.size()) + " PLAYERS";
+    std::snprintf(buf, sizeof buf, "%s LOST THE CONNECTION - WAITING FOR %s TO RECONNECT... %d S", names.c_str(),
+                  dropped.size() > 1 ? "THEM" : "THE PLAYER", static_cast<int>(std::ceil(left)));
     return buf;
 }
 
