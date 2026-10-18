@@ -1,4 +1,5 @@
 #include "game/item_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -292,6 +293,9 @@ void Events(Shared& sh, const char* events) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kItem);
+    latency::Applied(latency::kItemEvent);
     Shared& sh = S();
     std::string cmds;
     {

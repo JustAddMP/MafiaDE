@@ -486,7 +486,15 @@ void HostTraffic::Tick(double now, uint32_t hostMs, std::vector<PeerOut>& out) {
 }
 
 // ---- guest ------------------------------------------------------------------------------------------------------
-GuestTraffic::GuestTraffic(const GuestConfig& cfg) : cfg_(cfg) {}
+namespace {
+net::playout::PlayoutTuning TrafficPlayout(const GuestConfig& cfg) {
+    net::playout::PlayoutTuning t;
+    t.startDelay = cfg.interpDelay;
+    return t;
+}
+}  // namespace
+
+GuestTraffic::GuestTraffic(const GuestConfig& cfg) : cfg_(cfg), playout_(TrafficPlayout(cfg)) {}
 
 void GuestTraffic::OnSpawn(const SpawnInfo& s, double now) {
     if (s.net == 0) return;
@@ -532,13 +540,9 @@ void GuestTraffic::OnStates(uint32_t hostMs, const std::vector<CarState>& states
     }
     lastRawMs_ = hostMs;
     const double t = static_cast<double>(clockMs_) / 1000.0;
-    const double o = now - t;
-    if (!haveOffset_ || o < offset_) {
-        offset_ = o;
-        haveOffset_ = true;
-    } else {
-        offset_ += (o - offset_) * 0.002;  // clock drift and a once-short trip do not stick for ever
-    }
+    playout_.Observe(t, now);
+    offset_ = playout_.Offset();
+    haveOffset_ = true;
     for (const CarState& s : states) {
         auto it = cars_.find(s.net);
         if (it == cars_.end() || !it->second.haveInfo || it->second.despawnAt >= 0) continue;
@@ -599,7 +603,7 @@ bool GuestTraffic::Present(const Car& c, double now, CarState& out) const {
         out = c.info.st;
         return true;
     }
-    const double rt = now - offset_ - cfg_.interpDelay;
+    const double rt = playout_.RenderTime(now);
     const Snap* later = &c.snaps.back();
     if (rt <= c.snaps.front().t) {
         out = c.snaps.front().s;
@@ -623,14 +627,14 @@ bool GuestTraffic::Present(const Car& c, double now, CarState& out) const {
             const float u = static_cast<float>((rt - a.t) / std::max(1e-6, b.t - a.t));
             out = b.s;
             auto lerp = [u](float x, float y) { return x + (y - x) * u; };
-            out.pos = {lerp(a.s.pos.x, b.s.pos.x), lerp(a.s.pos.y, b.s.pos.y), lerp(a.s.pos.z, b.s.pos.z)};
+            out.pos = net::playout::Hermite(a.s.pos, a.s.vel, b.s.pos, b.s.vel, b.t - a.t, u);
             out.vel = {lerp(a.s.vel.x, b.s.vel.x), lerp(a.s.vel.y, b.s.vel.y), lerp(a.s.vel.z, b.s.vel.z)};
             motion::Nlerp(a.s.rot, b.s.rot, u, out.rot);
             break;
         }
     }
     // the time the interpolation stands behind, moved forward along the velocity (bounded): where it is now
-    const float lead = static_cast<float>(cfg_.interpDelay);
+    const float lead = static_cast<float>(std::max(0.0, playout_.Delay()));
     Vec3 d = {out.vel.x * lead, out.vel.y * lead, out.vel.z * lead};
     const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
     const float k = len > cfg_.maxLead ? cfg_.maxLead / len : 1.0f;
@@ -668,6 +672,7 @@ bool GuestTraffic::CopyInfo(uint16_t net, float& err, bool& pinned, int& pins) c
 void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps) {
     out.clear();
     bumps.clear();
+    playout_.Update(now);  // the copies' render clock toward the adaptive delay
     auto drop = [&out](uint16_t net, bool grace) {
         GuestCmd c;
         c.type = GuestCmd::Type::Remove;

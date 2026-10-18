@@ -6,6 +6,7 @@
 // out: no Lua, no session, no OS calls, so tests/traffic_test.cpp runs it without the game. game/traffic_sync.cpp
 // feeds it from the Lua glue (traffic_sync.lua) and the session. Single-threaded (the caller locks).
 #include "net/interest.h"
+#include "net/playout.h"
 #include "net/remote_motion.h"
 #include "net/wire.h"
 
@@ -160,7 +161,9 @@ private:
 
 // ---- guest ------------------------------------------------------------------------------------------------------
 struct GuestConfig {
-    double interpDelay = 0.12;      // s behind the newest host time
+    // s behind the newest host time until the adaptive playout delay (net/playout.h: jitter + the state interval,
+    // ~55-70 ms at 20 Hz on a quiet link; was this fixed 120 ms before 0.15) has enough states
+    double interpDelay = 0.12;
     double maxExtrapolate = 0.5;    // s past the newest state: then held
     float maxLead = 2.0f;           // m: the "now" lead (velocity x delay) at most
     float teleport = 25.0f;         // m between two states: a jump, not lerped
@@ -222,6 +225,7 @@ public:
     // Commands for this tick: Remove first, then Add (nearest first), then Drive for the copies that are due.
     void Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps);
     bool HostMode() const { return hostMode_; }  // near the host: his traffic here, ours off
+    double PlayoutDelay() const { return playout_.Delay(); }  // s the copies are shown behind the host's states
     const GuestStats& Stats() const { return stats_; }
     // For traces: the copy of `net` (nullptr if none) and its last error.
     bool CopyInfo(uint16_t net, float& err, bool& pinned, int& pins) const;
@@ -260,8 +264,9 @@ private:
     int64_t clockMs_ = 0;                  // host clock unwrapped from its 32-bit wire value
     uint32_t lastRawMs_ = 0;
     bool haveClock_ = false;
-    double offset_ = 0;  // local clock - host clock (smallest seen, slowly relaxed)
+    double offset_ = 0;  // local clock - host clock (the playout clock's: smallest over the last seconds)
     bool haveOffset_ = false;
+    net::playout::PlayoutClock playout_;  // how far behind the host's states the copies are shown
     Vec3 me_;
     bool haveMe_ = false;
     bool hostMode_ = false;

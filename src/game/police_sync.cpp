@@ -1,4 +1,5 @@
 #include "game/police_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -251,6 +252,8 @@ void ParseEvents(Shared& sh, const char* events, double now) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kPolice);
     Shared& sh = S();
     const double now = Now();
     std::string cmds;

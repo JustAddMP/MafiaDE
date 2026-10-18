@@ -1,4 +1,5 @@
 #include "game/traffic_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -251,6 +252,9 @@ void GuestTrace(Shared& sh, double now) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kTraffic);
+    latency::Applied(latency::kTrafficEvent);
     Shared& sh = S();
     const double now = Now();
     std::string cmds;

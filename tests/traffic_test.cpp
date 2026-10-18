@@ -497,6 +497,56 @@ void TestGuest() {
 }
 
 // ---- end to end: host -> bytes -> guest ----
+// The copies' playout delay adapts (net/playout.h): 20 Hz host states over a quiet link (arrivals on the guest's
+// 60 fps frames) settle well below the old fixed 120 ms; with 80 ms of jitter it grows to cover it.
+void TestAdaptiveDelay() {
+    for (int jitterMs : {0, 80}) {
+        GuestTraffic g;
+        g.OnSpawn(Spawn(1, 0, 0), 0);
+        std::vector<GuestCmd> cmds;
+        std::vector<GuestBump> bumps;
+        uint32_t seed = 12345;
+        auto rnd = [&seed] {
+            seed = seed * 1664525u + 1013904223u;
+            return static_cast<double>(seed >> 8) / 16777216.0;
+        };
+        struct P {
+            double arrive;
+            uint32_t ms;
+        };
+        std::vector<P> inflight;
+        double nextSend = 0;
+        int late = 0, total = 0;
+        for (double t = 0; t < 8; t += 1 / 60.0) {
+            while (nextSend <= t) {
+                inflight.push_back({nextSend + 0.03 + rnd() * jitterMs / 1000.0, static_cast<uint32_t>(nextSend * 1000)});
+                nextSend += 0.05;
+            }
+            const double local = 100 + t;
+            for (size_t i = 0; i < inflight.size();) {
+                if (inflight[i].arrive <= t) {
+                    const float x = inflight[i].ms / 1000.0f * 10;
+                    if (t > 3) {
+                        ++total;
+                        // arrived after the render time passed it: it was shown by extrapolation
+                        if (inflight[i].ms / 1000.0 < local - (100 - 0.0) - g.PlayoutDelay() - 0.03) ++late;
+                    }
+                    g.OnStates(inflight[i].ms, {State(1, x, 0, 10, 0)}, local);
+                    inflight.erase(inflight.begin() + static_cast<ptrdiff_t>(i));
+                } else {
+                    ++i;
+                }
+            }
+            g.Tick(local, 1 / 60.0f, cmds, bumps);
+        }
+        const double d = g.PlayoutDelay() * 1000;
+        if (jitterMs == 0)
+            Check(d > 40 && d < 90, "guest: adaptive delay at 20 Hz below the old 120 ms", Fmt("%.1f ms", d));
+        else
+            Check(d > 100 && d < 200, "guest: adaptive delay covers 80 ms jitter", Fmt("%.1f ms", d));
+    }
+}
+
 void TestEndToEnd() {
     HostTraffic h;
     GuestTraffic g;
@@ -614,6 +664,7 @@ int main() {
     TestHost();
     TestHostCap();
     TestGuest();
+    TestAdaptiveDelay();
     TestEndToEnd();
     TestHostThreeGuests();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");

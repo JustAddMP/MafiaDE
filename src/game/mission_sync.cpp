@@ -1,4 +1,5 @@
 #include "game/mission_sync.h"
+#include "game/latency.h"
 
 #include "core/compat.h"
 #include "core/config.h"
@@ -1409,6 +1410,8 @@ bool LoadModule(lua_State* L) {
 std::string Dash(const std::string& s) { return s.empty() ? "-" : s; }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kWorld);
     Shared& sh = S();
     std::string cmds;
     {

@@ -15,6 +15,8 @@
 #include "game/seats.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
+#include "game/latency.h"
+#include "net/playout.h"
 #include "net/remote_motion.h"
 #include "net/wire.h"
 
@@ -52,7 +54,8 @@ constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker h
 constexpr uint8_t kStateVersion = 4;
 // State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (position traces): at 20 Hz
 // with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
-// ~4 KB/s per player. ini: net_state_hz (10..120, default 60), net_interp_ms (0..500, default 50).
+// ~4 KB/s per player. ini: net_state_hz (10..120, default 60), net_interp_ms (0..500, default 50): the playout delay
+// until the adaptive one (net/playout.h, per remote player: jitter + snapshot interval) has enough states.
 double SendInterval() {
     static const double v = 1.0 / std::clamp(core::Config::Get().GetInt("net_state_hz", 60), 10, 120);
     return v;
@@ -60,6 +63,11 @@ double SendInterval() {
 double InterpDelay() {
     static const double v = std::clamp(core::Config::Get().GetInt("net_interp_ms", 50), 0, 500) / 1000.0;
     return v;
+}
+net::playout::PlayoutTuning PlayoutTuning() {
+    net::playout::PlayoutTuning t;
+    t.startDelay = InterpDelay();
+    return t;
 }
 constexpr double kMaxExtrapolate = 0.25;    // then hold
 constexpr float kMaxLead = 1.5f;            // m: the most the "now" lead may move a position (see Interpolate)
@@ -112,8 +120,9 @@ struct Remote {
     int64_t clockMs = 0;  // sender clock unwrapped from its 32-bit wire value (wraps every 49.7 days of uptime)
     uint32_t lastRawMs = 0;
     bool haveClock = false;
-    double offset = 0;  // local clock - sender clock (smoothed toward the minimum)
+    double offset = 0;  // local clock - sender clock (the playout clock's: minimum over the last seconds)
     bool haveOffset = false;
+    net::playout::PlayoutClock playout{PlayoutTuning()};  // how far in the past his states are shown (adaptive)
     double lastRecv = 0;
     uint32_t recvCount = 0;
     double rateWindowStart = 0;
@@ -203,6 +212,7 @@ net::Session* _session = nullptr;
 std::set<std::pair<net::PlayerId, uint32_t>> _seenPlayers;
 bool _enterWasDown = false;
 double _sendAccum = 0;
+double _sentSampleAt = -1;  // localAt of the sample sent last
 uint32_t _sent = 0;
 uint32_t _envSent = 0;
 bool _haveActSeq = false;  // the action counter of the last state sent (player_actions.h), for the log
@@ -446,18 +456,14 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     rem.lastRawMs = timeMs;
     rem.haveClock = true;
     const double t = static_cast<double>(rem.clockMs) / 1000.0;
-    const double off = now - t;
-    if (!rem.haveOffset || off < rem.offset) {
-        rem.offset = off;
-        rem.haveOffset = true;
-    } else {
-        rem.offset += (off - rem.offset) * 0.01;  // follow clock drift / a lasting latency increase slowly
-    }
     if (!rem.snaps.empty() && t <= rem.snaps.back().t) {  // old or duplicate
         ++rem.dropped;
         core::trace::Line("RXD", "from=%u sT=%u last=%.0f", from, timeMs, rem.snaps.back().t * 1000);
         return;
     }
+    rem.playout.Observe(t, now);
+    rem.offset = rem.playout.Offset();
+    rem.haveOffset = true;
     if (rem.recvCount == 0) MC_LOG_INFO("sync: first state from player %u", from);
     if (core::trace::IsOpen())
         core::trace::Line("RX", "from=%u sT=%u off=%.4f %s", from, timeMs, rem.offset, TraceFields(s).c_str());
@@ -483,7 +489,7 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
 float Lerp(float a, float b, float t) { return a + (b - a) * t; }
 
 PlayerState Interpolate(const Remote& rem, double now) {
-    const double rt = now - rem.offset - InterpDelay();
+    const double rt = rem.playout.RenderTime(now);
     const auto& sn = rem.snaps;
     if (rt <= sn.front().t) return sn.front().s;
     if (rt >= sn.back().t) {
@@ -505,10 +511,16 @@ PlayerState Interpolate(const Remote& rem, double now) {
         return dx * dx + dy * dy + dz * dz > kTeleport * kTeleport;
     };
     if (jumped(a.s.pos, b.s.pos)) return s;
-    for (int k = 0; k < 3; ++k) {
-        s.pos[k] = Lerp(a.s.pos[k], b.s.pos[k], t);
-        s.vel[k] = Lerp(a.s.vel[k], b.s.vel[k], t);
-    }
+    // Positions on the Hermite curve through both states with their velocities (no corner at every state)
+    auto hermite = [&](const float* p0, const float* v0, const float* p1, const float* v1, float* out) {
+        const net::playout::Vec3 h = net::playout::Hermite({p0[0], p0[1], p0[2]}, {v0[0], v0[1], v0[2]},
+                                                           {p1[0], p1[1], p1[2]}, {v1[0], v1[1], v1[2]}, b.t - a.t, t);
+        out[0] = h.x;
+        out[1] = h.y;
+        out[2] = h.z;
+    };
+    hermite(a.s.pos, a.s.vel, b.s.pos, b.s.vel, s.pos);
+    for (int k = 0; k < 3; ++k) s.vel[k] = Lerp(a.s.vel[k], b.s.vel[k], t);
     float hx = Lerp(a.s.head[0], b.s.head[0], t), hy = Lerp(a.s.head[1], b.s.head[1], t);
     const float hl = std::sqrt(hx * hx + hy * hy);
     if (hl > 1e-4f) {
@@ -517,10 +529,8 @@ PlayerState Interpolate(const Remote& rem, double now) {
     }
     if ((a.s.flags & kInVehicle) && (b.s.flags & kInVehicle) && a.s.vehId == b.s.vehId &&
         !jumped(a.s.cpos, b.s.cpos)) {
-        for (int k = 0; k < 3; ++k) {
-            s.cpos[k] = Lerp(a.s.cpos[k], b.s.cpos[k], t);
-            s.cvel[k] = Lerp(a.s.cvel[k], b.s.cvel[k], t);
-        }
+        hermite(a.s.cpos, a.s.cvel, b.s.cpos, b.s.cvel, s.cpos);
+        for (int k = 0; k < 3; ++k) s.cvel[k] = Lerp(a.s.cvel[k], b.s.cvel[k], t);
         float dot = 0;
         for (int k = 0; k < 4; ++k) dot += a.s.quat[k] * b.s.quat[k];
         const float sign = dot < 0 ? -1.0f : 1.0f;
@@ -542,11 +552,11 @@ PlayerState Interpolate(const Remote& rem, double now) {
     return s;
 }
 
-// Where the remote player is now: the interpolated state (InterpDelay in the past, smooth) moved forward along its
-// velocity by that delay, at most kMaxLead metres. Without it a car copy trails its driver by speed x delay.
+// Where the remote player is now: the interpolated state (the playout delay in the past, smooth) moved forward along
+// his velocity by that delay, at most kMaxLead metres. Without it a car copy trails its driver by speed x delay.
 PlayerState Present(const Remote& rem, double now) {
     PlayerState s = Interpolate(rem, now);
-    const float lead = static_cast<float>(InterpDelay());
+    const float lead = static_cast<float>(std::max(0.0, rem.playout.Delay()));
     auto push = [lead](float* p, const float* v) {
         float d[3], len = 0;
         for (int i = 0; i < 3; ++i) {
@@ -1199,6 +1209,9 @@ void LuaError(const std::string& err) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kPlayer);
+    latency::Applied(latency::kHit);
     Shared& sh = S();
     std::string cmds;
     bool active;
@@ -1238,6 +1251,7 @@ void MainTick(lua_State* L, float dt) {
             }
             for (auto& [id, rem] : sh.remotes) {
                 if (rem.snaps.empty()) continue;
+                rem.playout.Update(now);  // the render clock toward its adaptive delay (net/playout.h)
                 const PlayerState s = Present(rem, now);
                 motion::LocomotionCommand lc;
                 motion::VehicleCommand vc;
@@ -1448,6 +1462,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     const bool active = _session->IsActive();
     PlayerState local;
     bool send = false;
+    double sampleAt = 0;
     std::vector<std::string> parked, env, hits;
     bool sendModel = false;
     std::string modelLook;
@@ -1530,13 +1545,16 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                                   rem.recvCount, rem.dropped, clockAt - rem.lastRecv);
             }
         }
+        // The newest sample goes out in the frame the render thread first sees it (core flushes right after this
+        // tick), at most at the state rate (a 10 % slack so a 60 fps game sends every frame at 60 Hz).
         _sendAccum += dt;
-        if (active && _sendAccum >= SendInterval()) {
-            _sendAccum = std::fmod(_sendAccum, SendInterval());
-            if (sh.localValid && Now() - sh.localAt < 1.0) {
-                local = sh.local;
-                send = true;
-            }
+        if (active && sh.localValid && sh.localAt != _sentSampleAt && _sendAccum >= SendInterval() * 0.9 &&
+            Now() - sh.localAt < 1.0) {
+            _sendAccum = 0;
+            _sentSampleAt = sh.localAt;
+            local = sh.local;
+            sampleAt = sh.localAt;
+            send = true;
         }
     }
     for (const std::string& line : parked) {
@@ -1572,7 +1590,9 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     }
     if (!send) return;
     net::ByteWriter w(128);
-    const uint32_t sentMs = NowMs();
+    // stamped with the moment it was sampled (not sent): the receiver's timeline is the player's, without our
+    // sample -> send wait in it
+    const uint32_t sentMs = static_cast<uint32_t>(static_cast<uint64_t>(sampleAt * 1000.0));
     Write(w, local, sentMs);
     if (core::trace::IsOpen()) core::trace::Line("TX", "sT=%u %s", sentMs, TraceFields(local).c_str());
     if (_haveActSeq && local.act.seq != _lastActSeq) {  // a punch / throw ... of ours goes out with this state

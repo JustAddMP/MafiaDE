@@ -7,6 +7,7 @@
 #include "core/trace.h"
 #include "dll/ui_input.h"
 #include "game/characters.h"
+#include "game/latency.h"
 #include "game/explosion_sync.h"
 #include "game/item_sync.h"
 #include "game/lua.h"
@@ -224,6 +225,7 @@ public:
 
     void OnSessionStart(net::Session& session) override {
         _session = &session;
+        latency::Attach(&session);  // lanes, send priorities, the LAT trace (game/latency.h)
         PlayerSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
@@ -244,6 +246,7 @@ public:
         PoliceSync::Detach();
         ExplosionSync::Detach();
         CarDamageSync::Detach();
+        latency::Attach(nullptr);
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
@@ -297,7 +300,14 @@ public:
         PoliceSync::Tick(dt);
         ExplosionSync::Tick(dt);
         CarDamageSync::Tick(dt);
+        _latencyLogIn -= dt;
+        if (_latencyLogIn <= 0) {
+            _latencyLogIn = 10;
+            const std::string line = latency::Summary();
+            if (!line.empty()) MC_LOG_INFO("%s", line.c_str());
+        }
     }
+    float _latencyLogIn = 10;
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
     const char* MessageName(uint16_t id) override {  // names in the traffic statistics (core NetMonitor)

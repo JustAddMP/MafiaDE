@@ -1,4 +1,5 @@
 #include "game/car_damage_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/mem.h"
@@ -609,6 +610,8 @@ void Carry(const Apply& a, uint32_t entity) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kCarDamage);
     Shared& sh = S();
     bool active, host;
     int local;

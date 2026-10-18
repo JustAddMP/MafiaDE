@@ -1,4 +1,5 @@
 #include "game/explosion_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -335,6 +336,8 @@ void Decided(const Seen& s, Shared& sh) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kExplosion);
     Shared& sh = S();
     Main& g = G();
     const double now = Now();

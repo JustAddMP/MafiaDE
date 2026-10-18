@@ -1,4 +1,5 @@
 #include "game/npc_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -377,6 +378,9 @@ void MirrorCommands(Shared& sh, std::string& cmds) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kNpc);
+    latency::Applied(latency::kNpcEvent);
     Shared& sh = S();
     std::string cmds;
     {

@@ -1,4 +1,5 @@
 #include "game/door_sync.h"
+#include "game/latency.h"
 
 #include "core/log.h"
 #include "core/trace.h"
@@ -353,6 +354,8 @@ void AppendApplies(std::string& cmds, const std::vector<Apply>& list) {
 }
 
 void MainTick(lua_State* L, float dt) {
+    // what the render thread received for this system so far is handed to the game now (sync trace LAT)
+    latency::Applied(latency::kDoor);
     Shared& sh = S();
     const double now = Now();
     std::string cmds;
