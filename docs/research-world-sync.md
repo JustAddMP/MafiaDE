@@ -631,6 +631,31 @@ return table.concat(r, " ") .. " | now fire a gun next to it: it should not flee
 5. Blanket handlers run inside the game's message dispatch: keep them non-blocking. Avoid spawning or despawning
    from inside one; queue the work for the next tick.
 
+### Guest-owned NPCs (the reverse direction; after 0.14.0, not yet checked in game)
+
+Each game spawns a checkpoint's waves for its own player, so the guest's game can have enemies the host's has not
+spawned yet ("he got somewhere first"). Design (docs/protocol.md "Guest-owned NPCs"): the guest's job NPCs that stay
+unpaired for 5 s are his own; their states go to the host, which shows them as spawned copies (the 0.12.0 copy
+recipe, reused: profile from the spawner name, `C_RuntimeSpawnerComponent` on a parked traffic car's driver, driven
+like a puppet). Ownership, caps, claims and timeouts are pure C++ (`src/game/npc_owner.h`, unit-tested); the copies
+are registered there by entity id so a copy is never reported or sent (no loops). The host's own late spawn of the
+same NPC is claimed (same spot / same archetype tag within 40 m) and handed back: authority is always the host's
+once both games have the NPC.
+
+UNVERIFIED (static design, nothing of it run in game yet):
+1. That the guest's mission NPC is named `behavior_object_prime-NN-<spawner>` on the guest's game too (the profile
+   comes from there; without one the host shows no copy, the hits and deaths still sync for nothing visible).
+2. That the host's puppet on the guest's game with the FRIEND brain (`SwitchBrain(1)`, so far only used on the host)
+   draws the guest's enemies' fire and stays crash-free (the sectors guard covers it as on the host). The guest's
+   copies of host enemies may now shoot at it as well (harmless: puppets do not die, those hits are not relayed).
+3. That `CreateShots` from the host's puppet on the guest's game lands on the guest's NPC like the guest's replays do
+   on the host (else `DoDamage`).
+4. That the host's late spawn really comes up within 40 m of where the guest's NPC is (the same spawn points, but
+   the guest's enemies may have moved): farther, it is not claimed and both games show a copy of the other's NPC
+   (doubles) until one dies; the guest's loose pairing has the same 40 m limit.
+5. Health hand-over at the hand-back (`h.health = hp` on the host's NPC) as in the existing enforce code.
+6. Other guests do not see a guest's own NPCs (a host copy is never sent on).
+
 ---------------------------------------------------------------------------------------------------------------
 
 ## B4. Traffic, parked cars, mission cars, police

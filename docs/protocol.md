@@ -15,7 +15,8 @@ startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x020
 at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet). 0.12.0:
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
-ends with the driver's controls (6 bytes).
+ends with the driver's controls (6 bytes). After 0.14.0: guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd
+(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs").
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -340,3 +341,57 @@ scripts may change things in between; the next WorldEnv puts them back.
   the puppet drives the copy; when the remote driver parks it, the mission car comes back at the copy's place. No
   copy is looked for or spawned during a loading screen and for 4 s after it (a copy spawned before the mission had
   placed its car landed on it).
+
+### Guest-owned NPCs (next release after 0.14.0; not yet checked in game)
+
+The reverse of the copies above: NPCs that only a guest's game has. Every game spawns a checkpoint's waves for its
+own player, so a guest who got somewhere first has enemies the host's game has not spawned (yet); the host saw
+nothing of them before.
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0420 | GuestNpcStates | guest -> host (`SendToHost`) | U, 10 Hz | the NpcStates body (u8 n at most 16, then n x the same NPC record); key = the NPC's entity id on the guest's game |
+| 0x0421 | GuestNpcEnd | guest -> host (`SendToHost`) | R | u32 key, u8 reason (0 died, 1 handed back, 2 gone, 3 claim refused), u32 hostKey (1 and 3: the host NPC), u16 health (its last), u8 flags (1: it died of the host's hit) |
+| 0x0422 | HostNpcHit | host -> that guest (`SendTo`) | R | u32 key (the guest's NPC), f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (1 = lethal: the host's copy died of his hits) |
+| 0x0423 | NpcClaim | host -> that guest (`SendTo`) | R | u32 guestKey, u32 hostKey, u8 flags (1: the guest's NPC is dead) |
+
+The ownership rules are C++ (`src/game/npc_owner.h`, unit-tested by `tests/npc_owner_test.cpp`); the game side is
+npc_sync.lua.
+
+- **Which NPCs (guest):** 10 times a second the guest reports his NPCs with a job (AI type not 0) within 100 m (the
+  64 nearest; none in the first 10 s after his world loaded or during a cutscene) with the host NPC each is paired
+  with. One that stays unpaired for 5 s (alive) becomes **his own**: the 16 nearest at most, their states go to the
+  host as GuestNpcStates (at most 16 a round, one message). Spawned copies (his copies of host NPCs) are never
+  reported, and the C++ side drops any id in the copy list again (no feedback loop). A paired moment restarts the 5 s;
+  an NPC that died before it was his own is never sent.
+- **Mirrors (host):** every guest NPC gets a mirror id (unique on the host; at most 24 per guest). It is shown like a
+  guest's copy of a host NPC (above), the other way round: a human from the copy spawner with the NPC's spawn profile
+  (the guest reads it from the NPC's spawner name like the host does), its weapon and health, driven from the
+  guest's states (walk/run, heading, its shots as pictures), a civilian on the host's game (no fight of its own), at
+  most 10 at a time, within 90 m of the host, released 12 s after its death, 5 s after the last state, in a car, in
+  a cutscene, with the session and the world. Mirror copies are never in the host's NpcStates (no NPC goes back to the
+  game it came from). Other guests do not see a guest's own NPCs.
+- **Hits:** the host's hit on a mirror's copy goes to its guest as HostNpcHit; he replays a bullet as a real shot
+  from the host's puppet on his game (`CreateShots`; else, or when it does not land within 0.35 s, `DoDamage`), so
+  the NPC turns on the host's puppet. When the copy dies within 1.5 s of the host's hit, the hit is lethal: 0.8 s
+  later the guest's NPC is killed if it still lives (the same rules as a guest's lethal NpcHit). The guest's own NPCs
+  shoot at the host's puppet on his game (it gets the FRIEND brain there while the guest has NPCs of his own,
+  player_sync.lua `M.Ally`); those hits go to the host as a Hit with source 1, which he takes like any NPC's.
+- **Deaths:** the guest's NPC dies -> GuestNpcEnd died -> the mirror's copy dies on the host (health also follows the
+  guest's down, never up). The host kills the copy -> lethal HostNpcHit -> the guest's NPC dies.
+- **Back to the host (no doubles):** when the host's own game spawns that NPC (the host arrives), it is paired again
+  and the host is authoritative for it. Either the guest's usual pairing finds the host NPC (same spot, or same kind
+  within 40 m after 2 s) or the host **claims** it: a host NPC (alive, with a job, sent for 2.5 s, no copy) at the
+  same spot as a mirror (1.5 m, same tag or none) or of the same tag within 40 m (8 m height) is sent to that guest
+  as NpcClaim (pairs taken nearest first, same spot first; one claim per mirror and per host NPC at a time). The
+  guest pairs them (a spawned copy of that host NPC goes), or answers GuestNpcEnd claim refused (his NPC is paired
+  with another host NPC, that host NPC with another of his, or no state of it yet); no answer in 3 s counts as
+  refused, and a refused pair is not tried again for 15 s. On the pairing the guest sends GuestNpcEnd handed back
+  with its health: the host releases the copy and lowers his own NPC's health to it. A late GuestNpcStates of an
+  ended NPC (unreliable after reliable) makes no new mirror for 3 s.
+- **Dead mirrors:** a mirror that died is remembered for 60 s: a host NPC that spawns at its place (same rules)
+  in that time is claimed dead: the host kills his NPC (the guest already killed it) and the guest pairs it with his
+  dead one, so it gets no copy there.
+- **Gone:** an NPC of his own out of the guest's rounds for 2 s (out of 100 m, despawned) ends (GuestNpcEnd gone); a
+  mirror without a state for 5 s ends on the host; a guest who leaves takes his mirrors along.
+- Bandwidth: at most 16 NPCs x 10 Hz x ~45 bytes = ~7 KB/s per guest (like the host's 48 x 10 Hz).
