@@ -266,6 +266,8 @@ public:
         case 0x0201: return "MissionState";
         case 0x0202: return "HostSave";
         case 0x0203: return "Cutscene";
+        case 0x0205: return "MissionFail";
+        case 0x0206: return "FailVerdict";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
         case 0x0220: return "TrafficSpawn";
