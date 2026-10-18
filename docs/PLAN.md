@@ -115,12 +115,13 @@ Tick an item (`- [x]`) in the same commit that lands it.
    real controls, engine, gear and wheel angle in the sync trace.
    0.15.0: the puppet keeps its seat in the copy (seats, see the item above) and the copy shows the driver's lights
    and signals (item below). Built, needs the in-game test.
-- [ ] **Car signals** (0.15.0, built 2026-10-18 from static research, docs/game-api.md 7/16, re-notes 9): headlights,
+- [x] **Car signals** (0.15.0, built 2026-10-18 from static research, docs/game-api.md 7/16, re-notes 9): headlights,
    indicators, horn, siren and beacon read from the driver's car (vehicle part +0xD00 / +0xA88 / +0x119C,
    `mc_car_signals`), one byte at the end of the PlayerState vehicle block, set on the copy on change
    (`mc_car_set_signals`, SetHornOn / SetSirenOn / SetBeaconLightOn, SetLightState) and re-set when the copy's game
    changes them back; unit test car_signals. Gate: lights, indicators, horn and a police car's siren and beacon show
    on the copy within a moment, nothing flickers. Built, needs the in-game test.
+   In-game 2026-10-18 (two instances, one PC, Free Ride): the game's own headlights in a tunnel reached the copy (`signals off -> park+head (copy has off, change #2)`, off again outside); indicators A/B, horn, siren and beacon set through the host car's own setters (the player has no key for lights or indicators) each showed on the copy (`indA`, `indB`, `park+head+horn`, `park+head+siren+beacon`, changes #4-#11, no re-sets, tail lights lit in the capture). A real police car was not driven.
 - [ ] **Melee and other visible actions on puppets** (0.15.0, built 2026-10-18, static only, docs/game-api.md 17):
    punches, charged punches, counters, takedowns, throws and melee hit reactions sent as an action block (u8 seq,
    u8 kind) at the end of PlayerState and played with the game's own animation (`AnimPlay`) on the puppet, its walk
@@ -128,6 +129,7 @@ Tick an item (`- [x]`) in the same commit that lands it.
    player_actions_test. Gate: punches / counter / throw visible on the other game, no extra damage, no sliding or
    snap during a swing. Still missing: door kicks, grenade explosions, medkit, carrying bodies, lockpick, vault /
    ladder, jump, stalk, paired takedowns. Built, needs the in-game test.
+   In-game 2026-10-18: BROKEN (visuals). Light / heavy punches go out and arrive (`our light goes out`, `puppet 0 plays a light punch: hero_nw_alert_melee_attack_light_1_v1`, trace AL/ACS/ACT/AP) and the real hit lands (36 damage), but no punch shows on the puppet (burst captures side-on); every AE ends `done=0 why=time_up`. From the console AnimPlay of a punch shows nothing within 5 s, while AnimPlay of `hero_nw_calm_idle_fidget_cracknuckles` plays, ~2 s after the call every time. The throw animation ends after 0.14 s the same way. Needs another way to play the melee set (not loaded outside a fight?) and the 2 s AnimPlay latency explained.
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
@@ -221,7 +223,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    longer sits through it while the host is already past it (Bon Appetit: 3 minutes of ambush film): only the host's
    cutscene holds a reload. A crash in the game-sectors walk during a failed mission's load with a friend-brain puppet
    (Omerta, host) is guarded (re-notes 8).
-- [ ] **Failed missions in one load** (0.15.0, built 2026-10-18, static, docs/re-notes.md 7, game-api.md 14,
+- [x] **Failed missions in one load** (0.15.0, built 2026-10-18, static, docs/re-notes.md 7, game-api.md 14,
    protocol.md "Story"): the save system's FreeRoamRetry (exe+0x21E8B20, the Free Ride stop) is skipped in co-op
    chapters, so every fail kind takes one load: a chapter host goes straight to his newest checkpoint, a STORY host
    keeps the game's fail screen, a guest's failure is decided by the host (REJOIN / WAIT), a host's failure takes
@@ -230,6 +232,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    a guest reconnects. Fallback to the game's way when still in the failed world after 20 s. Gate: Taxi cp_010, drive
    > 250 m away or `car:Explode()`: no `freeroam_before_quest_activated` load, one loading screen on each game,
    host and guest failures. Built, needs the in-game test. (Replaces the two-load path of 0.10.0 described above.)
+   In-game 2026-10-18 (CHAPTER 2: TAXI, cp_020): host's mission taxi blown up -> `FreeRoamRetry ... as chapter host: skipped`, ONE load of checkpoint_mm_20_taxi_cp_020 on each game, 0 `freeroam_before_quest` loads, guest `verdict HOST_FAILED` -> waits at the menu -> loads when the host is back; guest's taxi blown up -> host `REJOIN (we play on, he loads our point)`, guest one load, host none. Trace FAIL freeroamretry skip=1 / verdict. (Driving the taxi 300 m away did not fail cp_020; no `ev=gameover` record was written; both failing at once not tried.)
 - [x] **NPC mirroring** (research: docs/research-world-sync.md): host enumerates relevant humans (mission NPCs, enemies near players), streams
    spawn/state/despawn; guests spawn puppets driven like player puppets. Enemies must react to guests:
    either guests' shots are sent to the host which applies damage to the real NPC, or the host spawns an
@@ -356,6 +359,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    crewed copies driven with core's VehicleController (police with siren and beacon); trace TRH / TRP / TRG / TRC /
    TRL. Both built, need the in-game test: the "mission car coming back" and "traffic and police each player's own"
    points above are built, needs the in-game test. Pedestrians stay local.
+   In-game 2026-10-18 (0.15.0, one PC): traffic near the host shown on the guest (`the host's traffic shows here`, back to his own beyond 250 m, copies p95 1.1 m off the host's cars, bumps put back and reported). Police: a guest's wanted state reaches the host; the 0.15.0 offence announced from his puppet made the HOST wanted (fixed 968d300: no announce, cops attack a hunted guest's puppet; retested: `our cop ... set on guest 1's puppet: ok`, host stayed clean). Mission car back: the swap and the real car restored at the copy's place when the guest's world went (`our own car 3102474 is back at the copy's place`); the parked case not reached. A player's car copy is another variant/colour of the model (no colours/plate for player cars on the wire).
 - [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
   Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
   guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the
@@ -385,6 +389,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   other version, full; REFRESH, STEAM FRIENDS LIST), joins through the friend's Steam lobby, the version is checked
   before connecting (invites too), Steam join errors in words; unit test steam_friends (fake Steam). Built, needs
   the in-game test (two accounts, two PCs).
+  In-game 2026-10-18 (one PC): the panel opens from the pause CO-OP panel when idle, `NO FRIEND IS PLAYING MAFIA: DEFINITIVE EDITION (9 ONLINE)` with the hint line, pad Y refreshes (`coop: friends list refresh`), B goes back. Listing and joining a friend still needs two PCs.
 - [ ] **Physical gamepad in the co-op panels** (0.15.0, core 0.11.0 `pad_nav`, README-dev.md "Testing the co-op
   panels"): every XInput slot, hotplug (empty slots probed once a second, logged), stick hysteresis with the
   dominant axis (left / right too), repeat, a button held at open ignored, B / START / BACK = back, an unplugged pad
@@ -394,6 +399,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   after keys / mouse, each switch logged); X / Y / LB / RB act through the prompts (lobby X START / READY / JOIN
   GAME, Y INVITE; CO-OP panel Y INVITE; JOIN FRIEND Y REFRESH; text boxes X delete, Y paste); the main menu's CO-OP
   page keeps the game's own footer; unit test ui_prompts. Built, needs the in-game test.
+  In-game 2026-10-18 (test pad): lobby footers switch to pad glyphs after a pad press (`prompts now for gamepad`, host `[A] Select [X] Start [Y] Invite [B] Back`, guest `[X] Ready`) and back to key names on a mouse move; pad X started the lobby, X readied, JOIN FRIEND `[Y] Refresh` worked. Not checked: text boxes (X delete / Y paste), pause panel Y INVITE, the main menu CO-OP page footer. Found: closing a panel with a pad button left the game's keyboard blocked on the loading screen (core ui_input: the release guard reads a pad state that is only refreshed while the game polls XInput or a panel is open).
 - [x] CO-OP page refreshes when a background join completes. Done 2026-10-15 (game-api.md 13 "Main menu live
   refresh"): the patched main menu polls us every frame (an enterFrame listener) and rebuilds the page when what it
   shows changed; checked in game: the host's page went to LOBBY (1 PLAYER) when hosting started and to LOBBY (2
@@ -418,6 +424,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   names on the icons (`SetIconTextByNavId`); decision in `src/game/map_markers.h` (unit test map_markers_test), trace
   MK / MKE. Gate: the other player stays on the minimap and map while he drives, after a respawn and a cutscene,
   with his name, no crash on reloads. Built, needs the in-game test.
+  In-game 2026-10-18: the logs show one icon per player through spawn, car, reconnect (`made at his position (no puppet yet)` -> `made on his puppet` -> `at his position (in a car)` -> back on his puppet), never two; but no orange marker for the host could be found on the guest's minimap with him 12 / 40 m away. Not confirmed on screen.
 - [x] Settings page (name, show tags, debug overlay). Done 2026-10-15: CO-OP SETTINGS (core v0.5.0 panel; main menu
   CO-OP > SETTINGS, the lobby, pause menu CO-OP > SETTINGS): NAME (text box; used from the next session), DEBUG
   OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE, all saved in MafiaCoop.ini with `Config::Set`. Checked in game:
@@ -521,6 +528,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   joinSeq), the guest keeps following the host's point (no reload unless the host moved), trace RCN; kProtocolVersion
   8; unit test net_reconnect. Gate: a guest whose network is cut for 10-30 s comes back as the same player without
   a reload, NPC copies and traffic return; also over Steam P2P. Built, needs the in-game test.
+  In-game 2026-10-18 (one PC, UDP, guest process suspended): 15 s -> host `lost the connection (timed out); slot held 60 s`, banner `... WAITING FOR THE PLAYER TO RECONNECT... 55 S`, puppet removed; on resume `reconnected after 0.5 s: same slot, still player 1`, no reload, puppets back, trace RCN. 66 s -> host `did not reconnect within 60 s; slot freed`. Not yet: Steam P2P, LEAVE CO-OP during the retries, the guest-side banner (a suspended game draws nothing).
 - [x] **Bandwidth and player desync** (user, 2026-10-16: "there was some desync with the players loaded"). Done
   2026-10-16 (core v0.6.0, docs/protocol.md "PlayerState", README-dev.md "Network statistics"): traffic statistics per
   peer and per message in the log every 5 s and on F7; limits raised (relay 1 MB/s per guest, interest 512 KB/s,
