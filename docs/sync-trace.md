@@ -63,6 +63,11 @@ on the other.
 | `NGC` | guest | per NpcClaim | `key host dead ours` (C++) |
 | `NMC` | host | per claim sent | `mid to key host dead` (C++) |
 | `NMX` | host | mirror end | `mid why host hp` (C++) |
+| `TRH` | host | 2 Hz | traffic totals: `cars=<host traffic cars near guests> spawnMsgs stateMsgs despawnMsgs bytes=<all traffic bytes sent> bumps=<TrafficBump received>` |
+| `TRP` | host | 2 Hz per guest | `id relevant=<host cars in his range> admitted=<cars he has copies of> spawned despawned states skipped=<unchanged, not sent> bytes deferred=<due but over the budget, this tick>` |
+| `TRG` | guest | 2 Hz | `mode=<1 host traffic here, 0 our own> known live copies avg max=<copy vs target, m> pins snaps bumps states spawns despawns old=<states dropped as older>` |
+| `TRC` | guest | 2 Hz per traffic copy | `net tgt tv cp cv err pin pins f=<state flags: 1 handbrake 2 siren 4 no driver 8 controls 16 reversing>` (`err` 1e9 before the first report) |
+| `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
@@ -93,6 +98,9 @@ Per player as seen on the other game:
 - **guest-owned NPCs:** how many NPCs became the guest's own (only his game had them), how they ended (died,
   handed back to the host, gone, claim refused), the host's claims, how often the host showed them with a copy and
   how far that copy was from the guest's NPC.
+- **traffic:** host cars near the guest, bytes per second, unchanged states skipped, budget deferrals; on the guest
+  how often the host's traffic showed, copies, the copy-vs-target error and the copies most often off, pins, bumps,
+  and how many of the guest's own traffic cars were hidden or still drove near him.
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.

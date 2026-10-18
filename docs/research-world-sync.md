@@ -772,6 +772,33 @@ return "zones: " .. tostring(ok) .. " " .. tostring(z) .. " (" .. #zs .. " value
   .. " -- guest: pol:DisableOffencesGlobal(true); pol:ZoneCreate(pos, enums.PoliceZoneType.HUNT, 1)"
 ```
 
+### Implementation (next version after 0.14.0; not yet run in game)
+
+The "start local" recommendation above is replaced: **the host's traffic is authoritative near the host.**
+`src/game/traffic_sync.lua` (game side), `src/game/traffic_sync.cpp` (session, Lua bridge) and
+`src/game/traffic_model.*` (pure C++, unit-tested in `tests/traffic_test.cpp`); messages 0x0220-0x0223
+(docs/protocol.md "Traffic"); trace records TRH / TRP / TRG / TRC / TRL (docs/sync-trace.md, tools/sync_compare.py
+"Traffic").
+
+- Host: moving traffic and police cars (generator drivers) within 380 m of a guest are reported 20 times a second;
+  core's InterestManager (Kind::Vehicle) plus an admission cap give each guest the nearest 24 within 260 m, with
+  spawn / despawn messages and changed-only packed states (22 bytes a car).
+- Guest: within 250 m of the host (hysteresis to 400 m) his own ambient traffic and police spawning are switched off
+  (`SetEnableAmbientTrafficSpawning`, `PreventPoliceSpawning`; not `SwitchGenerators`, risk 1) and his remaining
+  moving traffic cars are deactivated once more than 70 m away; the nearest 20 host cars get crewed copies driven by
+  core's VehicleController with the host car's controls, the way remote players' cars are. Far from the host he keeps
+  his own traffic (the host's generators only fill the area around the host; no call was found to generate around
+  another point).
+- Parked cars stay local (risk: a parked car of one game where the other game's traffic drives). Mission cars and
+  player cars are excluded on the host; a traffic car a player takes is handed over to player_sync on both games.
+- Driver deaths and shots at drivers go through npc_sync (traffic drivers are NPCs, paired by position like mission
+  NPCs). Damage to the cars themselves is not shared; a copy knocked off is put back and reported (TrafficBump).
+
+Open (to check in game, README-dev / the coordinator's test plan): whether `SetEnableAmbientTrafficSpawning(false)`
+removes cars already driving; whether `Deactivate` on crewed traffic cars is safe; the crew preset layout; whether
+`LockControls` stops the copy's AI driver (else the copies get pinned: TRG pins); the siren heuristic; the look
+getters' slots; Lua cost with 20 copies (each tick: SetPos/SetRot/SetSpeed and four control setters per near copy).
+
 ### Risks / open questions
 
 1. `SwitchGenerators(false)` may also stop *mission* traffic generators (some chases rely on them). Test in a

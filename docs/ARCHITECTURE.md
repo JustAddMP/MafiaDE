@@ -40,6 +40,10 @@ src/game/
                          deaths / failed missions in chapter loads reload the checkpoint (never a save outside the session)
   npc_sync.{h,cpp,lua}   phase 4 NPCs: host-authoritative mission NPCs (states, deaths), guests pair them with
                          their own copies, guests' hits replayed on the host from their puppets
+  traffic_sync.{h,cpp,lua} phase 4 traffic: the host's moving traffic and police cars near each guest (core's
+                         InterestManager, net ids, spawn/despawn/packed states); a guest near the host turns his
+                         own traffic off and drives crewed copies with core's VehicleController
+  traffic_model.{h,cpp}  the game-free part of it (wire format, host tracking, guest table), tests/traffic_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)
@@ -49,6 +53,7 @@ tests/                   our unit tests of game-free logic (car_swap_test.cpp); 
                          tools\make_release.cmd runs them
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
                          research-*.md, re-tools/, screenshots/
+tests/                   traffic_test.cpp (built by build.cmd, run by make_release.cmd; no game needed)
 tools/                   devlua.ps1 (run Lua in a running game), make_release.cmd + release-readme.txt
 ```
 

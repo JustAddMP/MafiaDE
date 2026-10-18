@@ -13,6 +13,7 @@
 #include "game/player_sync.h"
 #include "game/save_guard.h"
 #include "game/sectors_guard.h"
+#include "game/traffic_sync.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -169,6 +170,7 @@ public:
             PlayerSync::Install();
             MissionSync::Install();
             NpcSync::Install();
+            TrafficSync::Install();
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -180,20 +182,24 @@ public:
         PlayerSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
+        TrafficSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
+        TrafficSync::Detach();
     }
     void OnPlayerLeft(net::PlayerId id) override {
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);
+        TrafficSync::OnPlayerLeft(id);
     }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
+        TrafficSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -208,6 +214,10 @@ public:
         case 0x0203: return "Cutscene";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
+        case 0x0220: return "TrafficSpawn";
+        case 0x0221: return "TrafficDespawn";
+        case 0x0222: return "TrafficStates";
+        case 0x0223: return "TrafficBump";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
         case 0x0420: return "GuestNpcStates";
@@ -221,6 +231,7 @@ public:
         PlayerSync::GetStatus(out);
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
+        TrafficSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
