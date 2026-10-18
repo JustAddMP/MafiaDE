@@ -477,15 +477,17 @@ end
 
 function T.Drive(c, f)
   local n = tonumber
+  local tx, ty, tz = n(f[19]), n(f[20]), n(f[21])
+  if not (tx and ty and tz) then return end
+  -- the target also places a copy that is still loading (it spawns where the host's car is by then)
+  c.tx, c.ty, c.tz, c.qx, c.qy, c.qz, c.qw = tx, ty, tz, n(f[7]) or c.qx, n(f[8]) or c.qy, n(f[9]) or c.qz,
+    n(f[10]) or c.qw
   if c.st ~= "ready" or not valid(c.ent) or not M.RV then return end
   local cmd = { fix = n(f[3]) or 2, nx = n(f[4]) or 0, ny = n(f[5]) or 0, nz = n(f[6]) or 0, qx = n(f[7]) or 0,
     qy = n(f[8]) or 0, qz = n(f[9]) or 0, qw = n(f[10]) or 1, power = n(f[11]) or 0, steer = n(f[12]) or 0,
     brake = n(f[13]) or 0, hb = n(f[14]) or 0, ctl = f[15] == "1", vx = n(f[16]) or 0, vy = n(f[17]) or 0,
     vz = n(f[18]) or 0 }
-  local tx, ty, tz = n(f[19]), n(f[20]), n(f[21])
   local flags = n(f[22]) or 0
-  if not (tx and ty and tz) then return end
-  c.tx, c.ty, c.tz, c.qx, c.qy, c.qz, c.qw = tx, ty, tz, cmd.qx, cmd.qy, cmd.qz, cmd.qw
   local good, err = pcall(M.RV.Drive, c.rv, c.ent, cmd, tx, ty, tz)
   if not good then
     c.errs = (c.errs or 0) + 1
@@ -564,6 +566,10 @@ function T.Update(dt, cmds)
     end
   end
   if not (isActive and p) then
+    -- copies the C++ side asked for while we are not in a world are not made: it is told, and asks again later
+    if isActive then
+      for _, f in ipairs(adds) do ev[#ev + 1] = "TG " .. tostring(f[2]) end
+    end
     if T.localOn ~= nil and T.localOn ~= true and p then T.LocalTraffic(true, "the session ended") end
     if next(T.copies) then T.DropAll("the session ended", p) end
     return table.concat(ev, "\n")
@@ -627,7 +633,14 @@ function T.Update(dt, cmds)
     end
     for _, f in ipairs(drives) do
       local c = T.copies[tonumber(f[2]) or -1]
-      if c then T.Drive(c, f) end
+      if c then
+        T.Drive(c, f)
+      elseif not T.told or T.told[f[2]] ~= M.now then
+        -- the C++ side drives a copy we do not have (lost on the way): it is told, and adds it again
+        T.told = T.told or {}
+        T.told[f[2]] = M.now
+        ev[#ev + 1] = "TG " .. f[2]
+      end
     end
     if T.localOn == false then
       local good, err = pcall(T.ClearLocal, p)

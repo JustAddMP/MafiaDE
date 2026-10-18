@@ -529,3 +529,24 @@ begin with a drive or a walk the tests cannot follow).
   Taxi mission does not let the player out). In chapters that start with each player in his own mission car (Lost
   Heaven chase, Taxi cp_020) the guest sits in his own car where the host's would be: the host's puppet waits hidden
   until the cars have parted, as before.
+
+## 17. Traffic and police on two games (B4) - static only, NOT verified in game
+
+Used by src/game/traffic_sync.* (messages in docs/protocol.md "Traffic"). Nothing here has been run in the game yet;
+each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
+
+| call | notes |
+|---|---|
+| traffic car = generator driver | a car whose seat 0 holds a human named `behavior_object_prime-NN-` (empty suffix, section 15) is moving traffic or police from the generators; the host shares those. **UNVERIFIED** that every generator car has such a driver and that no mission car does |
+| police | the driver's `GetAIType()` is 4 (POLICE), or the model name contains `police`. **UNVERIFIED** for police cars of the generators |
+| `car:GetColor(1)`, `car:GetColor(2)` / `car:SetColor(c1, c2)` | the copy gets the host car's two colour numbers (only when both read). **UNVERIFIED**: slot meaning (research-world-sync B4-3) |
+| `car:GetSPZText()` / `car:SetSPZText(text, true)` | the plate, copied (letters, digits, `-`, `_` only). **UNVERIFIED** |
+| `game.traffic:SetEnableAmbientTrafficSpawning(false/true)` | guest near the host: his ambient traffic spawning off, back on when he leaves (and when the session ends). **UNVERIFIED**: whether it removes the cars already there (the glue hides them itself, below) and whether it touches mission traffic (it is the narrower switch; `SwitchGenerators` is not used) |
+| `game.police:PreventPoliceSpawning(true/false)` | the same moments: no police cars of the guest's own while the host's are shown. **UNVERIFIED**; a mission that sets it itself is overridden only on those switches |
+| `car:Deactivate()` / `Activate()` on a traffic car and its crew | the guest's own moving traffic cars farther than 70 m are hidden this way while the host's traffic shows, shown again afterwards. **UNVERIFIED** for crewed traffic cars (verified only for an empty mission car, section 7) |
+| `ObtainCarWithCrew(model, {profile})` for a copy | crew profile: the first profile path found in `data_traffic.crew_presets.civilian_white_crew` (police: `police_lvl1`), else `visuals/hero/game_main_tommy_gangster_trenchcoat`. **UNVERIFIED** layout of the presets (the log names the profile used); `ObtainSpecificCar(model)` (no crew) when it is refused |
+| crew `LockControls(true)` | so the copy's own AI driver does not steer against the host car's controls. **UNVERIFIED** that it stops a traffic AI (if not, the VehicleController pins the copy, as for player car copies) |
+| `car:SetSirenOn(b)`, `car:SetBeaconLightOn(b)` | police copies, from the host's siren flag. There is no siren getter, so the host's flag is a guess: on while a police car goes faster than 14 m/s and 8 s after |
+| `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on |
+| `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7) |
+| `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |

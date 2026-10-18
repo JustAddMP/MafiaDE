@@ -757,7 +757,7 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
             c.repAt = -1e9;
             c.haveLast = false;
             c.accDt = 0;
-            c.lastErr = 0;
+            c.lastErr = 1e9f;  // no bump before the copy was seen on its target once
             ++copies;
         }
     }

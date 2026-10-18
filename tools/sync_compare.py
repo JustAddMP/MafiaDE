@@ -369,6 +369,58 @@ def npcs(guest):
         print("  NPCs most often more than 3 m off: %s" % ", ".join("%s (%d)" % kv for kv in far.most_common(5)))
 
 
+def traffic(host, guest):
+    """Traffic sync (docs/sync-trace.md TRH / TRP / TRG / TRC / TRL)."""
+    trg = [f for _, f in guest.records["TRG"]] if guest else []
+    trh = host.records["TRH"] if host else []
+    if not trg and not trh:
+        return
+    section("Traffic (the host's cars on %s's game)" % (guest.name if guest else "the guest"))
+    if len(trh) >= 2:
+        (t0, a), (t1, b) = trh[0], trh[-1]
+        secs = max(t1 - t0, 1e-6)
+        cars = [num(f.get("cars"), 0) for _, f in trh]
+        print("  host: %.0f traffic cars near guests on average (max %d), %.1f KB/s sent, %d spawn / %d state / %d "
+              "despawn messages, bumps reported %d" % (
+                  statistics.fmean(cars), max(cars), (num(b.get("bytes"), 0) - num(a.get("bytes"), 0)) / 1024 / secs,
+                  num(b.get("spawnMsgs"), 0), num(b.get("stateMsgs"), 0), num(b.get("despawnMsgs"), 0),
+                  num(b.get("bumps"), 0)))
+        trp = [f for _, f in host.records["TRP"]]
+        if trp:
+            print("  host per guest: relevant mean %.1f, admitted mean %.1f, states skipped as unchanged %d of %d, "
+                  "deferred by the budget (max) %d" % (
+                      statistics.fmean(num(f.get("relevant"), 0) for f in trp),
+                      statistics.fmean(num(f.get("admitted"), 0) for f in trp), num(trp[-1].get("skipped"), 0),
+                      num(trp[-1].get("skipped"), 0) + num(trp[-1].get("states"), 0),
+                      max(num(f.get("deferred"), 0) for f in trp)))
+    if trg:
+        on = [f for f in trg if num(f.get("mode"), 0) == 1]
+        print("  guest: host traffic shown %.0f%% of the time; copies mean %.1f (max %d) of %.1f host cars" % (
+            100.0 * len(on) / len(trg), statistics.fmean(num(f.get("copies"), 0) for f in trg),
+            max(num(f.get("copies"), 0) for f in trg), statistics.fmean(num(f.get("live"), 0) for f in trg)))
+        last = trg[-1]
+        print("  guest: pins %d, snaps %d, bumps %d, states received %d (dropped as old %d)" % (
+            num(last.get("pins"), 0), num(last.get("snaps"), 0), num(last.get("bumps"), 0),
+            num(last.get("states"), 0), num(last.get("old"), 0)))
+    errs = [num(f.get("err"), 0) for _, f in guest.records["TRC"]] if guest else []
+    errs = [e for e in errs if e < 1e6]
+    if errs:
+        print("  copy vs host car (target, per sample): %s" % stats_line(errs))
+        far = Counter()
+        for _, f in guest.records["TRC"]:
+            if 3 < num(f.get("err"), 0) < 1e6:
+                far[f.get("net")] += 1
+        if far:
+            print("  copies most often more than 3 m off: %s" % ", ".join("net %s (%d)" % kv for kv in far.most_common(5)))
+    trl = [f for _, f in guest.records["TRL"]] if guest else []
+    if trl:
+        print("  our own traffic while the host's showed: hidden max %d, still driving near us max %d" % (
+            max(num(f.get("hidden"), 0) for f in trl), max(num(f.get("near"), 0) for f in trl)))
+    notes = [s for _, s in guest.logs if "traffic: " in s and ("failed" in s or "knocked" in s)] if guest else []
+    for s in notes[:6]:
+        print("  note: %s" % s.split("traffic: ", 1)[-1][:160])
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -412,6 +464,8 @@ def main():
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
+    host = a if a.role == "host" else b if b.role == "host" else None
+    traffic(host, guest)
     if worst:
         section("Worst moments (at least a second apart)")
         shown = []
