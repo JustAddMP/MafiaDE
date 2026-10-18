@@ -1,10 +1,11 @@
 #pragma once
 // Visible one-shot actions of a player (punches, a counter, a takedown, a throw, a melee hit reaction, and the
 // traversal moves: jump, vault, climb up, drop down, landing, ladders, a slide into cover; a medkit, picking up and
-// dropping a body) for his puppet on the other games (docs/protocol.md "PlayerState", action block). They ride at the end of every
-// PlayerState as a sequence counter plus the kind of the latest action, so a lost or reordered state does not lose
-// one: the next state carries the same counter, and the receiver plays an action once for each counter step it
-// sees (only the latest kind when it missed several). Pure logic, header-only: tests/player_actions_test.cpp.
+// dropping a body; a door kick, a lock pull, a door opened by hand) for his puppet on the other games
+// (docs/protocol.md "PlayerState", action block). They ride at the end of every PlayerState as a sequence counter
+// plus the kind of the latest action, so a lost or reordered state does not lose one: the next state carries the
+// same counter, and the receiver plays an action once for each counter step it sees (only the latest kind when it
+// missed several). Pure logic, header-only: tests/player_actions_test.cpp.
 #include "net/wire.h"
 
 #include <cstdint>
@@ -34,8 +35,12 @@ enum class Action : uint8_t {
     Medkit = 15,     // PLAYER_USED_MEDKIT
     PickupBody = 16, // PICKUP_BODY (or IsCarryingBody went on)
     DropBody = 17,   // DROP_BODY (or IsCarryingBody went off)
+    // doors (game/door_sync: these also tell it that a door change next to our player is his)
+    DoorKick = 18,   // DOOR_KICK: he kicked a door open (the door itself: door_sync, docs/game-api.md 21)
+    Lockpick = 19,   // LOCKPICK_START / PLAYER_CUSTOMLOCKPICK: he started the lock pull on a door
+    DoorOpen = 20,   // DOOR_OPEN: he opened a door by hand
 };
-constexpr uint8_t kLastAction = 17;
+constexpr uint8_t kLastAction = 20;
 
 inline const char* Name(Action a) {
     switch (a) {
@@ -57,6 +62,9 @@ inline const char* Name(Action a) {
         case Action::Medkit: return "medkit";
         case Action::PickupBody: return "pickupbody";
         case Action::DropBody: return "dropbody";
+        case Action::DoorKick: return "doorkick";
+        case Action::Lockpick: return "lockpick";
+        case Action::DoorOpen: return "dooropen";
     }
     return "none";
 }

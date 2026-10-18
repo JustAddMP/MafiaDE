@@ -83,7 +83,9 @@ void TestWire() {
     Check(r.Ok() && r.Remaining() == 2, "an older reader is not upset by the block");
 
     Check(FromCode(0) == Action::None && FromCode(1) == Action::LightPunch && FromCode(6) == Action::HitReact &&
-              FromCode(7) == Action::Jump && FromCode(17) == Action::DropBody && FromCode(18) == Action::None &&
+              FromCode(7) == Action::Jump && FromCode(17) == Action::DropBody &&
+              FromCode(18) == Action::DoorKick && FromCode(19) == Action::Lockpick &&
+              FromCode(20) == Action::DoorOpen && FromCode(21) == Action::None &&
               FromCode(255) == Action::None,
           "codes from the Lua sample");
     bool named = true;
@@ -91,7 +93,8 @@ void TestWire() {
     Check(named, "every kind has a name");
     Check(!IsMove(Action::HitReact) && IsMove(Action::Jump) && IsMove(Action::Vault) && IsMove(Action::LadderDown) &&
               IsMove(Action::CoverSlide) && !IsMove(Action::Medkit) && !IsMove(Action::PickupBody) &&
-              !IsMove(Action::None),
+              !IsMove(Action::None) &&
+              !IsMove(Action::DoorKick) && !IsMove(Action::Lockpick) && !IsMove(Action::DoorOpen),
           "traversal moves vs. actions on the spot");
     // a receiver from before the traversal kinds read kinds 7.. as unknown: the step moved its counter, it played
     // nothing; ours reads kinds beyond its own the same way

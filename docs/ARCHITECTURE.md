@@ -44,6 +44,9 @@ src/game/
                          InterestManager, net ids, spawn/despawn/packed states); a guest near the host turns his
                          own traffic off and drives crewed copies with core's VehicleController
   traffic_model.{h,cpp}  the game-free part of it (wire format, host tracking, guest table), tests/traffic_test.cpp
+  door_sync.{h,cpp,lua}  doors on every game: door table scan + state poll + attribution + applying (Lua), the
+                         host's authority over story doors, snapshots on join / reconnect / a new world
+  door_model.{h,cpp}     the game-free part of it (wire format, identity, table, memory, echoes), tests/door_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)

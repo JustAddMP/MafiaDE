@@ -498,6 +498,58 @@ def reconnects(tr):
         print("  (not back by the end of the trace)")
 
 
+def doors(tr, other):
+    """Door changes on this game and what the other game made of them (DR / DL / DA, docs/sync-trace.md)."""
+    dr, dl, da = tr.records["DR"], tr.records["DL"], tr.records["DA"]
+    if not (dr or dl or da):
+        return
+    section("Doors on %s's game (%s)" % (tr.name, tr.role))
+    count = defaultdict(int)
+    for _, f in dr:
+        ev = f.get("ev", "?")
+        key = ev
+        if ev == "local":
+            key = "local %s (ours=%s)" % (f.get("verdict", "?"), f.get("ours", "?"))
+        elif ev == "rx":
+            key = "rx %s" % f.get("verdict", "?")
+        elif ev == "apply":
+            key = "apply %s" % f.get("why", "?")
+        count[key] += 1
+    for k in sorted(count):
+        print("  %-34s %d" % (k, count[k]))
+    hows = defaultdict(int)
+    for _, f in dl:
+        if f.get("ev") == "change":
+            hows["change how=%s" % f.get("how", "?")] += 1
+        elif f.get("ev") == "msg":
+            hows["door message %s (ours=%s)" % (f.get("kind", "?"), f.get("ours", "?"))] += 1
+    for k in sorted(hows):
+        print("  %-34s %d" % (k, hows[k]))
+    if da:
+        bad = [f for _, f in da if f.get("ok") != "1"]
+        print("  applied on our doors: %d, with a failed call: %d" % (len(da), len(bad)))
+        for f in bad[:10]:
+            print("    door %s (%s) calls=%s" % (f.get("id"), f.get("name"), f.get("calls")))
+    # what we sent: did the other game get it (same door hash and act)?
+    if other is not None:
+        theirs = defaultdict(int)
+        for _, f in other.records["DR"]:
+            if f.get("ev") == "rx":
+                theirs[(f.get("door"), f.get("act"))] += 1
+        sent = [(t, f) for t, f in dr if f.get("ev") == "tx"]
+        got = 0
+        for _, f in sent:
+            k = (f.get("door"), f.get("act"))
+            if theirs.get(k, 0) > 0:
+                theirs[k] -= 1
+                got += 1
+        if sent:
+            print("  sent %d door changes, %d of them arrived on the other game (by door and act)" % (len(sent), got))
+    for t, f in [r for r in dr if r[1].get("ev") in ("tx", "rx", "fix", "snapreq", "snaptx", "snaprx", "unmet")][:30]:
+        extra = " ".join("%s=%s" % (k, v) for k, v in f.items() if k != "ev")
+        print("  %s %s %s" % (tr.wall(t), f.get("ev"), extra))
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -546,6 +598,8 @@ def main():
         swapped_cars(tr)
     for tr in (a, b):
         reconnects(tr)
+    for x, y in ((a, b), (b, a)):
+        doors(x, y)
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
     if worst:

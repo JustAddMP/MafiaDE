@@ -684,6 +684,7 @@ player:
 | `MELEE_COMBAT_TAKEDOWN` / `MELEE_STEALTH_TAKEDOWN` | 458812 / 458813 | takedown | no (same assumption) |
 | `WEAPON_THROWN` | 458830 | grenade / molotov / knife thrown | no: who receives it is not known |
 | `MELEE_HIT_REACT` | 458814 | an NPC punched our player | no: seen on NPC victims only (section 11) |
+| `DOOR_KICK` / `LOCKPICK_START`, `PLAYER_CUSTOMLOCKPICK` / `DOOR_OPEN` | 458857 / 458792, 458833 / 458858 | door kick (18), lock pull (19), door opened by hand (20); the door itself: section 21 | no |
 
 There is no getter for "blocking": the player's defence in this game is the counter (Left Alt), so a block shows as a
 counter. Aiming (`flags` bit3), reloading (bit4), crouch and cover were already carried and shown (section 10).
@@ -733,11 +734,10 @@ DAMAGE events, section 5), the Hit of a real punch still applies (`M.HurtScript`
 `DoDamage`), and a melee DAMAGE with a puppet as enemy is given back (logged "swing hit us here"). The demigod moment
 also blocks other damage for that time (an enemy NPC's bullet during a puppet's swing next to us).
 
-Not carried yet (seen while looking, not cheap with this mechanism): door kicks (`DOOR_KICK` 458857, the door's state
-is not synced either), the explosion of a thrown grenade or molotov on the other games (the puppet only shows the
-throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the receiver's game), lockpicking (left to
-the doors work), and takedowns with their paired victim animation. Medkits, bodies, vaults, ladders, jumps and the
-sneak walk: "Traversal" below.
+Not carried yet (seen while looking, not cheap with this mechanism): the explosion of a thrown grenade or molotov on
+the other games (the puppet only shows the throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on
+the receiver's game), and takedowns with their paired victim animation. Medkits, bodies, vaults, ladders, jumps and
+the sneak walk: "Traversal" below. Door kicks, the lock pull and doors opened by hand: section 21.
 
 ### Traversal: jumps, vaults, ledges, drops, ladders, cover slides, sneaking, bodies, medkits - static only, NOT verified in game
 
@@ -972,3 +972,74 @@ x y z hidden: <why>`, `items: item I (...) moved from ... to the host's spot ...
 P (ours: I)`, `items: another player took that item first: W taken away again (...)`, `items: we collected <name>`,
 `items: player P found <name> (<kind>) on his game; ours stays for our own save`. Sync trace: `ITH`, `ITG`, `ITE`,
 `ITL`, `COL` (docs/sync-trace.md).
+
+## 21. Doors on every game (unreleased) - static only, NOT verified in game
+
+Found by reading the exe, its Lua bindings, the game's own door scripts (`tables\scripts.sds`:
+`/scripts/common/commands_library/entity/door.lua`, `.../system/game/persistent_location.lua`) and its animation
+archives, without launching the game. Used by src/game/door_sync.lua (rules in src/game/door_model.h, messages in
+docs/protocol.md "Doors"). Every call is wrapped in `pcall`; failures are logged (`doors: ... failed`) and traced
+(`DA calls=...!`).
+
+**What a door is.** Two script faces of one thing (UNVERIFIED that they are the same object for every door):
+
+| face | calls (re-notes appendix) | notes |
+|---|---|---|
+| entity, `C_WrapperDoor` : `C_WrapperActorDeform` (table 0x5AD8480) | `Lock()`, `Unlock()`, `AILock`, `AIUnlock`, `IsLocked()`, `StartLockpick`, `StopLockpick(bool)`, `IsLockpicking`, `Kick(vec)`, `Open(vec)` / `Open(vec, bool)` (the thunk 0x23C5120 dispatches on the argument count: 0x23DA650 vec, 0x23DA710 vec + bool), `Close()`, `ToggleOpen(vec[, bool])`, `IsClosed()`, `EnableAction` / `DisableAction`, `PlayAnim`, `StopAnim` | `Lock` (0x23C0050) takes no argument (self only, then a native call on `[self + 0x10]`). The `vec` of Open / Kick / ToggleOpen is a position: the game's `SetState` door node passes `inPos:GetPos()` (the door swings away from it, a guess from the name). Entity type 21 (`enums.EntityType.DOOR`) |
+| scene object component `C_RuntimeDoorComponent` (table 0x5ACF860) | `IsOpen`, `IsClosed`, `Open`, `Close`, `Lock`, `Unlock`, `EnableForPlayer` / `DisableForPlayer`, `EnableForNPCs` / `DisableForNPCs`, `DisableLockPulling`, `RegisterCallback(enums.DoorEventType.X, fn)` (OPEN 2, CLOSE 4, KICK 8, STEALTH_OPEN 18 = the lock pull), `RegisterOnKickedCallback` | what the game's newer scripts use: `door.lua`'s `Lock2.doorLock` calls `Lock` through `CallObjectComponentFunction(entity, "C_RuntimeDoorComponent", "Lock", difficulty, kickable)`; the shops and safehouses (`persistent_location.lua` `InitDoors`) find their doors as subobjects named `door_front_*`, `door_back_*`, `door_interior_*`, `door_front_safehouse_*`, `door_back_safehouse_*`, `door_alarm_*` and open / disable them per location state |
+
+The glue lists doors with `mc_entity_ids(21)` (the entity table, section 15) every 4 s and gets each one with
+`mc_entity(id)`; it uses the wrapper's calls when the value has `IsClosed` and `Open`, else the component
+(`GetComponent("C_RuntimeDoorComponent")`; the lock bit then from `IsLocked` if the value has it). How many doors a
+city world has, and whether gates, garage doors and car-park barriers are type-21 doors, is UNVERIFIED (the status
+line and the `ST` text count doors and which face they use; a door without either face is logged once as
+`entity N (type 21) has no door calls we know`).
+
+**The same door on two games.** Entity ids differ between games (section 15). A door is its scene name (`GetName()`,
+from the scene file, so it should be the same on every game; UNVERIFIED) and its position when first seen, matched
+within 1.0 m (door_model.h `Same`). UNVERIFIED: whether `GetPos()` of a door moves while it swings (if it is the
+leaf's centre, a door first seen open on one game and closed on the other is up to ~0.5 m apart: still within the
+match distance for a normal door).
+
+**Story doors.** The mission scripts lock, unlock, open and close doors themselves: `door.lua` has nodes for all of
+them (`doorLock`, `doorUnlock`, `doorOpen2`, `doorClose2`, `SetState`, `doorEnableForPlayer`, ...) and for the door
+events (`OnOpen`, `OnClose`, `OnKick`, `OnLockPick`, by `RegisterEvent(..., enums.EventType.DOOR,
+enums.DoorMessages.X)`), and the shops set their doors from the location state. Each game runs its own copy of
+those scripts, so the host's game decides: its world's changes go to the guests, a guest's own world's lock changes
+of doors the host decided are put back (docs/protocol.md "Doors").
+
+**Messages.**
+
+| what | value | used for |
+|---|---|---|
+| `enums.DoorMessages` (base 0x150000, enum at exe 0x5AE1600) | OPEN 1376257, CLOSE 1376258, KICK 1376259, TOGGLELOCK 1376260, LOCKPICK 1376261, OPENING 1376262, CLOSING 1376263, TOGGLEOPEN 1376264 | blanket subscriptions (`RegisterBlanketEvent(ctx, fn, enums.EventType.DOOR, msg)`, EventType.DOOR = 6) to OPEN, CLOSE, KICK, LOCKPICK, TOGGLELOCK, TOGGLEOPEN: the receiver GUID is the door (polled at once, wherever it is), the sender GUID is compared with our player's. UNVERIFIED that blanket events reach doors and who the sender is; the poll works without them |
+| `HumanMessages.DOOR_KICK` 458857, `DOOR_OPEN` 458858, `LOCKPICK_START` 458792, `PLAYER_CUSTOMLOCKPICK` 458833 | on our player | player_sync.lua's action subscription (section 17): action kinds 18 door kick, 19 lock pull, 20 door open, and `M.doorActKind` / `M.doorActT` for door_sync's attribution. UNVERIFIED that the game sends them to the player who acts (as the melee ones); `LOCKPICK_START` may come for a car's lock as well (the puppet then plays the lock pull too) |
+| `LOCKPICK_END` 458793, `PICKUP_BODY`, ... | | not used |
+
+The lockpick of a door in this game is the **lock pull** (`C_WrapperPlayer:StartLockPull`, `LockPullGetSyncObjects`,
+the `lockpull` animations, `DisableLockPulling` on the component); the poll sees its result (the door unlocked, and
+opened).
+
+**Applying a change** (door_sync.lua `D.Apply`): from the door's current state to the wanted one: `Unlock()` when
+it has to be unlocked; `Kick(from)` for a kick (wrapper only), else `Open(from)` (then `Open(from, false)`,
+`ToggleOpen(from)` if that fails; the component's `Open()`); `Close()`; `Lock()`. `from` is where the player who did
+it stood. UNVERIFIED: every one of these on a door from a script outside the door's own scripts, that `Kick` does
+no damage, that `Lock` right after `Close` locks (the door may still be swinging: a door that does not reach the
+state in 3 s is traced `DR ev=unmet`).
+
+**The puppet** (player_sync.lua `M.actionAnims`, section 17), names from `basic_anim` / `anim_project` (UNVERIFIED
+that they play on a puppet):
+
+| kind | names (in order) | time left alone |
+|---|---|---|
+| 18 door kick | `hero_1h_alert_doorkick`, `hero_1h_alert_doorkick_left`, `hero_trench_alert_doorkick`, `hero_rifle_alert_doorkick` | 1.1 s |
+| 19 lock pull | `hero_nw_calm_idle_to_lockpull_begin_idle`, `hero_lockpull_break_attempt`, `hero_lockpull_break_success` | 2.5 s |
+| 20 door open | `hero_nw_alert_door_open_push_far_handle`, `hero_nw_alert_door_open_pull_near_handle`, `hero_nw_cov_door_open_push_far_handle_160cm` | 0.8 s |
+
+Other door animations seen: `hero_nw_alert_door_open_pull_far_handle(_horizontal/_vertical/_prison/_farm)`,
+`hero_nw_stalk_door_open_*`, `hero_lockpull_begin_idle_loop`, `hero_lockpull_break_idle_loop`,
+`hero_lockpull_hit_exit`, `hero_lockpull_exit_to_nw_calm_idle`, `hero_trench_alert_doorkick_left`,
+`hero_rifle_alert_doorkick_left`, `sc_garage_door_large_open` (a garage door's own animation).
+
+**Cost.** One entity table scan every 4 s (as the traffic scan), new doors read 120 per tick, the doors within 35 m
+polled 5 times a second (`IsClosed` + `IsLocked`), one 33-byte reliable message per change.
