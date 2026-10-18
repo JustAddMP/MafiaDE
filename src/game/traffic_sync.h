@@ -25,6 +25,9 @@ public:
     // Host, render thread: the traffic net id of our car with entity id `key` (0: not shared traffic). Used by
     // explosion_sync (CarExploded for a traffic car).
     static uint16_t NetOfKey(uint32_t key);
+    // host, render thread: the net id of our traffic car `key` (its entity id) and back; 0 = not shared (car damage)
+    static uint16_t HostNetOf(uint32_t key);
+    static uint32_t HostKeyOf(uint16_t net);
 };
 
 }  // namespace mc::game

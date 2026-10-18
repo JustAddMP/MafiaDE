@@ -597,6 +597,7 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
   local s0 = probe and speedOf(ent)
   if cmd.fix == 2 or cmd.fix == 3 then
     ent:SetPos(V(tx, ty, tz))
+    st.setPosT = M.now  -- car_damage.lua: a copy put in place by SetPos does not report its own bumps as damage
   elseif cmd.fix == 1 then
     local p = ent:GetPos()
     ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
@@ -1094,9 +1095,9 @@ function M.CarsUpdate(p)
   end
 end
 
--- Destroyed? car:GetDamage() (C_WrapperCar; its scale is not known, UNVERIFIED): taken as destroyed at 100 or more,
--- so a 0..1 scale never says so (a missed wreck only means the other games keep an intact car; the mission's own
--- failure, if any, still reloads everyone). Returns wrecked, damage, motor damage (raw, for the log).
+-- Destroyed? car:GetDamage() (C_WrapperCar): 0..100, the weighted damage of the car's parts in percent, and exactly
+-- 100 once the car has exploded (read from the exe, docs/re-notes.md 11; NOT checked in game), so 100 or more =
+-- destroyed. Returns wrecked, damage, motor damage (raw, for the log). The damage itself is synced by car_damage.lua.
 function M.Wrecked(ent)
   local g1, d = pcall(ent.GetDamage, ent)
   local g2, md = pcall(ent.GetMotorDamage, ent)

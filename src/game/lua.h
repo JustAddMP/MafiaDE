@@ -80,6 +80,8 @@ void RegisterGlobal(lua_State* L, const char* name, CFunction fn);
 // resolves to it. Never touches freed memory unguarded. GameMainThread.
 bool EntityLookupAvailable();
 bool EntityIsLive(const void* entity);
+// The entity whose id (its GUID number) is `id`, or nullptr. Guarded. GameMainThread.
+void* EntityByGuid(uint32_t id);
 
 }  // namespace lua
 }  // namespace mc::game

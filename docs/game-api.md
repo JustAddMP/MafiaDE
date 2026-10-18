@@ -648,7 +648,7 @@ when a guest drove it, used to stay hidden for good. When it comes back is decid
 | the driver gets back in before ours is back | the copy is driven again, nothing restored |
 | a remote player drives ours after it came back | swapped for a copy at once (`c.noNpc`: it threw his puppet out before) instead of after two throw-outs |
 | we drive the copy ourselves (we rode along, the lock did not hold) | it is our car until we park it; our own CarParked counts like his, and ours comes back where we left the copy once we are out |
-| CarParked says the car was destroyed (new flags byte, docs/protocol.md) | ours comes back there and is set exploded (`car:SetExploded()`, the wreck without a second blast; since 0.16, section 23: the blast itself is shown as a picture) so this game's mission sees what the driver's saw. The driver's game takes a car as destroyed when `car:GetDamage()` is 100 or more: **its scale is not known** (the raw `GetDamage` / `GetMotorDamage` are logged with every CarParked to calibrate it); a 0..1 scale never says destroyed, and then the mission's own failure reload still brings everyone back |
+| CarParked says the car was destroyed (new flags byte, docs/protocol.md) | ours comes back there and is set exploded (`car:SetExploded()`, the wreck without a second blast; since 0.16, section 23: the blast itself is shown as a picture) so this game's mission sees what the driver's saw. The driver's game takes a car as destroyed when `car:GetDamage()` is 100 or more: its scale is 0..100 percent and **100 = exploded** (read from the exe, section 24 / re-notes 11; the raw `GetDamage` / `GetMotorDamage` are still logged with every CarParked). Since the car damage sync (section 24) ours also gets the car's damage when it comes back, and its explosion if it blew up meanwhile |
 | the copy could not be spawned, or the game removed it | ours comes back at once at the driver's last transform (no further swaps of that car if spawning failed) |
 | a new world (checkpoint load, reload after a death or a failed mission, following the host, quit) | ours, if the entity survived the load (same GUID), is shown where it is (`Activate`), else forgotten; the old world's copy is not touched (its traffic id may belong to a new car). A copy that is still valid means it was only a loading screen in the same world: nothing happens |
 | the session ends | ours comes back at the copy's place at once; if we sit in the copy it stays (a normal car) and ours comes back when we got out (`M.leftCars`) |
@@ -660,8 +660,8 @@ Log lines: `car K: replaced by a fresh copy for the new driver (why), ours (id a
 parked`. Sync trace: `SWP` (machine) and `SWR` (swap / restore / forget), docs/sync-trace.md.
 
 Unverified: `Activate()` on a deactivated car (and a teleport of it) showing it again where we put it, with its
-mission state; `DespawnEntityImmediately` of a copy right after its occupants got out; `GetDamage`'s scale;
-whether a deactivated car survives a checkpoint load deactivated (it is shown again then); a checkpoint **save**
+mission state; `DespawnEntityImmediately` of a copy right after its occupants got out; `GetDamage`'s scale in a
+running game (read from the exe since: 0..100, 100 = exploded, section 24); whether a deactivated car survives a checkpoint load deactivated (it is shown again then); a checkpoint **save**
 made while a car is hidden (the host's own car while a guest drives it, or a guest's while the host does): the save
 may store it deactivated; mission NPCs that board the hidden car meanwhile (Taxi customers) were not looked at.
 
@@ -912,7 +912,7 @@ each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
 | `ObtainCarWithCrew(model, {profile})` for a copy | crew profile: the first profile path found in `data_traffic.crew_presets.civilian_white_crew` (police: `police_lvl1`), else `visuals/hero/game_main_tommy_gangster_trenchcoat`. **UNVERIFIED** layout of the presets (the log names the profile used); `ObtainSpecificCar(model)` (no crew) when it is refused |
 | crew `LockControls(true)` | so the copy's own AI driver does not steer against the host car's controls. **UNVERIFIED** that it stops a traffic AI (if not, the VehicleController pins the copy, as for player car copies) |
 | `car:SetSirenOn(b)`, `car:SetBeaconLightOn(b)` | police copies, from the host's siren flag: the host reads its police car's siren / beacon bits (`mc_car_signals`, section 22); only when they cannot be read the flag is a guess: on while a police car goes faster than 14 m/s (or is near a hunted player) and 8 s after |
-| `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on |
+| `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on. Since the car damage sync (section 24) the host's car's fire and explosion reach the copy through that sync instead, and its dents, tyres and parts too |
 | `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7) |
 | `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |
 
@@ -1155,3 +1155,90 @@ it take damage (the log says "another game's explosion hurt us here: given back"
 Not carried (known): the projectile's flight; car damage from another game's explosion; fire spreading (each
 picture's fire burns by itself on its game); mission dynamite and scripted car bombs (each game's own mission sets
 them off).
+
+## 24. Car damage on every game - static only, NOT verified in game
+
+Found by reading the exe (docs/re-notes.md 11) without running the game. Used by src/game/car_damage_sync.cpp,
+car_damage.lua and the game-free rules in src/game/car_damage.h (unit-tested in tests/car_damage_test.cpp); messages
+in docs/protocol.md "Car damage". Everything below needs the in-game check.
+
+**What the script API has** (C_WrapperCar, docs/re-notes.md appendix):
+
+| call | notes |
+|---|---|
+| `car:GetDamage()` | **0..100 percent**: the weighted damage of the car's deform parts and doors, and **exactly 100 once the car has exploded** (re-notes 11). So "destroyed = GetDamage >= 100" (CarParked, section 15) is right |
+| `car:GetMotorDamage()` / `SetMotorDamage(x)` | 0..100: the engine part's (type 13) lost energy; 100 when exploded. Set goes through the same part energy setter the collision code uses |
+| `car:GetPartCount()` | the number of deform parts (entity + 0x100). There is no per-part getter or setter on cars: `GetPartEnergy` / `SetPartEnergy` / `GetPartVersion` are `C_WrapperActorDeform`'s (crash objects), on the same kind of part list |
+| `car:Repair()` / `RepairAndClear()` | repair (and clean). Used on a copy whose car was repaired on the driver's game |
+| `car:Explode()` / `SetExploded()` | Explode: the car catches fire and blows up after the game's delay; SetExploded: at once |
+| `car:DisableExplosion(b)` / `IsDisableExplosion()` | entity + 0x1EF0 bit 0x1000000; copies have it on (they must not blow up on one game only). Whether it also stops Explode / the native explosion is not known |
+| `car:SetCarDamage(x)` | random damage (its argument is not used): parts, lights, glass, doors, a tyre unless `SetWheelsProtected(true)`. Not used |
+| `car:SetTyre` / `SetWheel` / `GetWheel` | tyre and rim models (tuning), not damage |
+| `Get/SetBrakeDamage`, `Get/SetHandbrakeDamage` | not carried |
+| `C_EntityMessageVehicleDamaged` | a car's damage event (type, incoming, final, attacker, local position); not used |
+
+There is no script call for a single part, a dent, a tyre burst or a lost wheel, so the dll does those itself with the
+game's own functions (re-notes 11): the **part energy setter** (what SetMotorDamage, the collisions and bullets
+call: it plays the part's effects, swaps its damage model when its stage changes - dented, broken glass, a broken
+light, a bumper, door or hood hanging or off - and drives its morph deformation), the **tyre burst** and **wheel
+off** functions (what SetCarDamage's random damage and the exploded-car code call), and the **explosion** function
+(with a delay > 0 the car burns and blows up when the time is out: the fire; with -1 at once). The patterns'
+bytes contain the offsets each one uses, and two more (GetMotorDamage's native, the game's loop over all wheels)
+confirm the part list, the part fields, the exploded bit and the wheel layout, so a different build disables the feature instead of reading garbage (logged `damage: car layout
+not confirmed`).
+
+**One car's damage as a snapshot** (`car_damage::Snapshot`): per deform part 0 intact .. 254 no energy left (1 -
+energy / maximum, quantized) or 255 gone; per wheel ok / tyre burst / wheel off; exploded; burning with the seconds
+left. Same model = same part list: a layout hash of the part types tells whether two cars can exchange part indexes
+(if not, only tyres, the fire and the explosion are synced, logged once per car).
+
+**Who holds a car's damage** (the authority): a player car's driver's game, and while it is parked its last driver's
+(the car key's first driver if nobody drove it in this session); the host for his traffic. Every game reads its cars
+4 times a second:
+
+- **Authority:** a change (a part by 2 quanta or more, a tyre, the fire, the explosion) goes to everyone at once as
+  a CarDamage with only the parts that changed; a damaged car's whole state again every 15 s, and to anyone who
+  asks (CarDamageRequest, sent by a game that has a new copy or entity for the car). A **repair** (a part 24 quanta
+  or more better, a gone part back, a tyre back, the explosion undone: a garage, Repair by a script, a respawned car)
+  moves the car's epoch on and sends the whole state.
+- **Copy:** only ever **raises** its damage to the authority's (raise-only; a part the game will not take is not set
+  again until the authority's rises further); a newer epoch makes it `Repair()` first and set the authority's damage
+  0.6 s later. A copy's **own** damage (more than the authority's by more than 3 quanta: a guest shooting the host's
+  car, ramming it on his game) is reported after 0.4 s (CarDamageReport); the authority puts it on the real car
+  (raise-only) and its next change brings it back to everyone. While a copy is moved by SetPos (pinned / snapped
+  by the car controller, the last second) its own part damage is **not** reported (those are bumps from being put in
+  place, not real damage); once such damage adds up (30 quanta) the copy is repaired and set to the authority's
+  again (at most every 20 s). Tyres, the fire and the explosion of a copy are reported even then.
+- **A new entity for a car** (our own car back from behind a copy, section 15 "Mission car back"; a fresh copy for
+  a new driver): it gets the authority's damage at once; if it has damage the car does not (the driver had it
+  repaired while ours was hidden), it is repaired first. The authority's own new entity gets what everyone was told.
+- **The fire and the explosion:** a copy of a burning car burns with the same seconds left (the native explosion
+  function with that delay), and blows up with it when the authority's car is exploded (at once, native; if the
+  exploded bit does not show right after, `DisableExplosion(false)` + `SetExploded()` from Lua). One explosion on
+  every game: the copies' own explosions stay switched off, and the CarParked wrecked flag / car_swap's
+  `restore_wrecked` (section 15) set a hidden real car that comes back exploded (`SetExploded`, no second blast:
+  the blast is the explosions sync's picture, section 23; both paths end in an exploded car, the second is a
+  no-op on an exploded car). A player car copy we drive ourselves (we hold its damage now) has
+  its explosion switched back on, and off again when another game holds it.
+- **Traffic:** the host's traffic cars (traffic_sync, section 19) are named by his entity id on his game and by their
+  net id on the wire and on the guests' games; a guest's copy is a copy like any other (it asks the host, reports
+  its own damage to him). A traffic car a player takes over becomes a player car (its damage goes on with it: the
+  entity keeps it).
+
+**Logs** (main log, `damage: ...`): `car layout confirmed ...` at start; per car `its damage from our game`,
+`damage changed on our game: parts 3/41 damaged (worst 47%, 0 gone), tyres 1 burst ...`, `damage set on our copy
+(...)`, `car entity N: 2 of 2 parts set (0 refused by the game, 0 failed), 1 of 1 wheels, fire started / blown up`,
+`our copy took damage of its own (...): reported to player N's game`, `damage another game's copy took is put on our
+car`, `repaired on our game ...: epoch N`, `our copy is repaired (why ...)`, `our game holds its damage now`,
+`its damage cannot be read (why)`. Sync trace: CDS, CDT, CDR, CDA, CDX, CDQ (docs/sync-trace.md);
+`tools/sync_compare.py` lists them and each player car's last state on both games side by side.
+
+**UNVERIFIED (all of it, static only):** the field offsets and flag meanings (part list, energy and maximum, gone
+flag, wheels and their bits, exploded / burning bits, the fire timer); that the same model has the same part order
+on two games (the layout hash guards the indexes, not the meaning); that setting a part's energy from outside a
+collision shows the same dents and broken / hanging / lost parts (the morph deformation and the stage models come
+from the energy, the free mesh deformation of a crash does not: a copy's dents are the part's morph targets, not the
+exact shape); that the tyre and wheel functions are safe to call with r8 = false outside their callers; whether
+`DisableExplosion` stops the native fire / explosion on a copy (read back and logged; Lua fallback for the
+explosion); that a part the game refuses (inactive, already gone) is reported as refused, not crashed (guarded);
+GetDamage's scale (read from the code: 100 = exploded) in a running game; which part type is which beyond the engine.

@@ -12,6 +12,7 @@
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
+#include "game/car_damage_sync.h"
 #include "game/npc_sync.h"
 #include "game/player_sync.h"
 #include "game/save_guard.h"
@@ -201,6 +202,7 @@ public:
             PoliceSync::Install();  // after TrafficSync: traffic_sync.lua asks police_sync.lua
             ItemSync::Install();
             DoorSync::Install();
+            CarDamageSync::Install();  // after traffic: its Lua reads player_sync's and traffic_sync's cars
             ExplosionSync::Install();  // last: its glue reads the others' tables
         }
         menu::Install(dllDir);
@@ -219,6 +221,7 @@ public:
         DoorSync::Attach(session);
         PoliceSync::Attach(session);
         ExplosionSync::Attach(session);
+        CarDamageSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
@@ -229,6 +232,7 @@ public:
         DoorSync::Detach();
         PoliceSync::Detach();
         ExplosionSync::Detach();
+        CarDamageSync::Detach();
         _session = nullptr;
     }
     void OnPlayerLeft(net::PlayerId id) override {
@@ -237,6 +241,7 @@ public:
         TrafficSync::OnPlayerLeft(id);
         PoliceSync::OnPlayerLeft(id);
         ExplosionSync::OnPlayerLeft(id);
+        CarDamageSync::OnPlayerLeft(id);
     }
 
     // ---- reconnect (core: docs/protocol.md "Reconnect"; ours: docs/protocol.md "Reconnect") ----
@@ -250,6 +255,7 @@ public:
         TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
         ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
+        CarDamageSync::OnPlayerLeft(id);  // his copies ask for the cars' damage again when back
     }
     // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
     // session turns inactive), the story keeps the host's point (MissionSync), our NPC copies are dropped (NpcSync).
@@ -279,6 +285,7 @@ public:
         DoorSync::Tick(dt);
         PoliceSync::Tick(dt);
         ExplosionSync::Tick(dt);
+        CarDamageSync::Tick(dt);
     }
 
     int PlayerHealth(net::PlayerId id) override { return PlayerSync::Health(id); }
@@ -305,6 +312,9 @@ public:
         case 0x0233: return "DoorSnapRequest";
         case 0x0240: return "Explosion";
         case 0x0241: return "CarExploded";
+        case 0x0250: return "CarDamage";
+        case 0x0251: return "CarDamageReport";
+        case 0x0252: return "CarDamageRequest";
         case 0x0260: return "PoliceState";
         case 0x0261: return "PoliceEvent";
         case 0x0262: return "PoliceChase";
@@ -330,6 +340,7 @@ public:
         DoorSync::GetStatus(out);
         PoliceSync::GetStatus(out);
         ExplosionSync::GetStatus(out);
+        CarDamageSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
