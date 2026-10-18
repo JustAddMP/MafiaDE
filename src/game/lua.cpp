@@ -834,6 +834,8 @@ bool EntityIsLive(const void* entity) {
     }
 }
 
+void* EntityByGuid(uint32_t id) { return EntityLookupAvailable() ? EntityById(id) : nullptr; }
+
 // ---- setup ----------------------------------------------------------------------------------------------------
 bool Install(const std::wstring& dllDir, const std::string& tag) {
     _dllDir = dllDir;

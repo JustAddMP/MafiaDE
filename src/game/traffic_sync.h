@@ -21,6 +21,9 @@ public:
     static void OnPlayerLeft(net::PlayerId id);
     static void Tick(float dt);
     static void GetStatus(std::vector<render::OverlayLine>& out);
+    // host, render thread: the net id of our traffic car `key` (its entity id) and back; 0 = not shared (car damage)
+    static uint16_t HostNetOf(uint32_t key);
+    static uint32_t HostKeyOf(uint16_t net);
 };
 
 }  // namespace mc::game

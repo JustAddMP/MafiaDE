@@ -519,6 +519,10 @@ void TrafficSync::Tick(float dt) {
     }
 }
 
+uint16_t TrafficSync::HostNetOf(uint32_t key) { return _host ? _host->NetOf(key) : 0; }
+
+uint32_t TrafficSync::HostKeyOf(uint16_t net) { return _host ? _host->KeyOf(net) : 0; }
+
 void TrafficSync::GetStatus(std::vector<render::OverlayLine>& out) {
     if (!_session || !_session->IsActive()) return;
     std::string line;
