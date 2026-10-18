@@ -477,6 +477,58 @@ def traffic(host, guest):
         print("  note: %s" % s.split("traffic: ", 1)[-1][:160])
 
 
+def car_damage(a, b):
+    """Car damage sync (docs/sync-trace.md CDS / CDT / CDR / CDA / CDX / CDQ): what each game sent, received and set,
+    and per player car the last state on both games side by side (traffic cars are named by entity on the host and by
+    net id on the guest, so they are only listed)."""
+    if not any(tr.records[k] for tr in (a, b) for k in ("CDS", "CDT", "CDA")):
+        return
+    section("Car damage")
+    last = {}
+    for tr in (a, b):
+        sent = Counter(f.get("kind", "?") for _, f in tr.records["CDT"])
+        got = Counter(f.get("kind", "?") for _, f in tr.records["CDR"])
+        applied = Counter(f.get("why", "?") for _, f in tr.records["CDA"])
+        print("  %s's game (%s): sent %s; received %s; set on cars %s; own damage reported %d, state asked for %d" % (
+            tr.name, tr.role, ", ".join("%s %d" % kv for kv in sorted(sent.items())) or "-",
+            ", ".join("%s %d" % kv for kv in sorted(got.items())) or "-",
+            ", ".join("%s %d" % kv for kv in sorted(applied.items())) or "-",
+            len(tr.records["CDX"]), len(tr.records["CDQ"])))
+        for t, f in tr.records["CDS"]:
+            last[(tr.name, f.get("ref"))] = (t, f)
+        unread = sorted({f.get("ref") for _, f in tr.records["CDS"] if f.get("read") == "0"})
+        if unread:
+            print("    cars whose damage could not be read: %s" % ", ".join(unread[:12]))
+    refs = sorted({r for (_, r) in last if r and ":" in r})
+    if refs:
+        print("  player cars, last state (role, damaged parts / parts, worst 0-254, gone, tyres, flags 1 exploded 2 "
+              "burning, GetDamage):")
+    for r in refs:
+        cells = []
+        for tr in (a, b):
+            e = last.get((tr.name, r))
+            if not e:
+                cells.append("%s: -" % tr.name)
+                continue
+            f = e[1]
+            cells.append("%s: %s %s/%s w%s g%s t%s f%s gd %s" % (tr.name, f.get("role"), f.get("dmg"), f.get("parts"),
+                                                               f.get("worst"), f.get("gone"), f.get("tyres"),
+                                                               f.get("flags"), f.get("gd")))
+        ea, eb = last.get((a.name, r)), last.get((b.name, r))
+        diff = ""
+        if ea and eb:
+            fa, fb = ea[1], eb[1]
+            if (fa.get("tyres"), fa.get("flags"), fa.get("gone")) != (fb.get("tyres"), fb.get("flags"), fb.get("gone")) \
+                    or abs(num(fa.get("dmg"), 0) - num(fb.get("dmg"), 0)) > 1:
+                diff = "  <- differs"
+        print("    %-14s %s%s" % (r, " | ".join(cells), diff))
+    for tr in (a, b):
+        tc = sorted({r for (n, r) in last if n == tr.name and r and r[0] in "th" and ":" not in r})
+        if tc:
+            dmg = [r for r in tc if num(last[(tr.name, r)][1].get("dmg"), 0) or last[(tr.name, r)][1].get("tyres") != "0"]
+            print("  %s's traffic cars: %d (%d damaged: %s)" % (tr.name, len(tc), len(dmg), ", ".join(dmg[:10]) or "-"))
+
+
 def reconnects(tr):
     """Lost connections and rejoins on this game (RCN, docs/sync-trace.md; docs/protocol.md "Reconnect")."""
     ev = tr.records["RCN"]
@@ -548,6 +600,7 @@ def main():
         reconnects(tr)
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
+    car_damage(a, b)
     if worst:
         section("Worst moments (at least a second apart)")
         shown = []

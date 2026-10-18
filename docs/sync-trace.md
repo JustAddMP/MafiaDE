@@ -70,6 +70,12 @@ on the other.
 | `TRG` | guest | 2 Hz | `mode=<1 host traffic here, 0 our own> known live copies avg max=<copy vs target, m> pins snaps bumps states spawns despawns old=<states dropped as older>` |
 | `TRC` | guest | 2 Hz per traffic copy | `net tgt tv cp cv err pin pins f=<state flags: 1 handbrake 2 siren 4 no driver 8 controls 16 reversing>` (`err` 1e9 before the first report) |
 | `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
+| `CDS` | both | 1 Hz per car | car damage (docs/game-api.md 20): `ref=<o:g player car, h<id> our traffic car (host), t<net> a host traffic car's copy (guest)> ent role=<A we hold its damage, C a copy> auth=<the player whose game holds it> quiet=<1 moved by SetPos lately> read=<1 its damage could be read> parts dmg=<damaged parts> gone worst=<0-254> tyres=<burst or off> flags=<1 exploded 2 burning> burn=<s left> gd md=<GetDamage, GetMotorDamage> known=<a full state of the car is known> ep=<epoch> adm atyres aflags=<the holder's state as known here> layout` |
+| `CDT` | both | per CarDamage sent | `ref kind=<first, diff, full, keyframe, repair, answer> ep n=<parts listed> flags parts=<index:damage,...> to=<answer: the player>` |
+| `CDR` | both | per car damage message received | `from ref kind=<damage, report, request> ep n flags full repaired` |
+| `CDA` | both | per change set on a car | `ref ent why=<sync: a copy raised to the holder's; report: another game's copy's damage on our car; rebind: a new entity for a car; repair> parts=<index:damage,...> wheels=<count> burn explode reason=<repair: epoch, stale, quiet>` |
+| `CDX` | both | per CarDamageReport sent | `ref to ep parts wheels=<1 a tyre / wheel> flags` |
+| `CDQ` | both | per CarDamageRequest sent | `ref to` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
 | `END` | both | at the end | `why` |
@@ -105,6 +111,9 @@ Per player as seen on the other game:
 - **traffic:** host cars near the guest, bytes per second, unchanged states skipped, budget deferrals; on the guest
   how often the host's traffic showed, copies, the copy-vs-target error and the copies most often off, pins, bumps,
   and how many of the guest's own traffic cars were hidden or still drove near him.
+- **car damage:** per game what it sent (by kind), received, set on cars and reported; each player car's last
+  state on both games side by side (marked when it differs), cars whose damage could not be read, and the
+  traffic cars each game had (damaged ones named).
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.

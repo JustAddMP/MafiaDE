@@ -828,6 +828,76 @@ Strings: `ue::game::vehicle::E_VehicleLightType`, `E_VehicleLightColor`, `C_CarA
 allocates a 0x48-byte AI command with m when m differs from a constant. `OverrideMoveSpeed` (0x23AC1B0) ->
 exe+0x2B98A70: `[[entity + 0x130] + 0xB0] = v`; `ResetMoveSpeed` (0x23AC670) stores -1.0 there.
 
+## 10. Car damage: parts, tyres, fire, explosion [static, unverified: found 2026-10-18]
+
+Read from the C_WrapperCar bindings (table 0x5AD4CB0) and what they call, without running the game. Used by
+src/game/car_damage_sync.cpp (docs/game-api.md 20).
+
+**GetDamage is a percentage.** `C_WrapperCar::GetDamage` (0x239AF70) returns exe+0x254E630(entity): **100.0 when the
+car has exploded** (entity +0x1280 bit 0x10000), else a weighted sum over the car's deform parts and its doors,
+`sum / weights * 100`. Per part (list entity +0x100 .. +0x108, pointers; skipped: null, flag bit 0x80000 of +0x10)
+`d = 1 - energy / max` (energy part +0x24, max `[part + 0x70] + 0x148`); the weight depends on the part type (+8,
+a switch over 1..18): type 1 and 13 weight 100 (d x 100), 2 weight 5, 3 weight 2 (counted only when broken: flag
+0x200000), 4 and 6 weight 20 (full when broken, else d x 10, +10 when a linked object is gone), 5 weight 30 (when
+broken), 7 weight 10 (d x 5), 11 weight 20, 12 weight 10 (a check through exe+0x1BCD990/0x1BF3220), 14 weight 4, 18
+weight 10; a part whose type is -1 counts 30 of 30. Then each door (entity +0xE00 .. +0xE08) weight 3: +3 when its
+state dword (+0x3C) has bit 0x01, +1.5 with 0x40. So the CarParked "destroyed at GetDamage >= 100" rule of 0.15
+(docs/protocol.md) is right: 100 means exploded (a car whose every weighted part is empty also gets there).
+
+**GetMotorDamage** (0x239B410 -> exe+0x2559A30): 100 when exploded, else the first part of type **13** (the engine):
+`100 - energy * 100 / max`; 0 without one. **SetMotorDamage(x)** (0x239BAF0 -> exe+0x25871F0): x x 0.01 clamped
+0..1, engine energy = (1 - that) x max, set through the part energy setter below (nothing when exploded).
+
+**Deform parts.** The car's part list is the same one `C_WrapperActorDeform::GetPartEnergy/SetPartEnergy` (0x23ABBA0
+/ 0x23AC3A0, 1-based index, energy x 100 / x 0.01) index on other actors, and `C_WrapperCar::GetPartCount` (0x23A8D10)
+counts. Part fields: +0x08 int type, +0x10 qword flags (0x1 inactive, 0x20 / 0x40 / 0x80 internal, 0x80000 not
+counted by GetDamage, 0x200000 gone: broken off / destroyed, 0x40000000 set by the detach functions), +0x22 short
+(the owner index), +0x24 float energy, +0x2C / +0x30 a second energy pool (effects), +0x46 byte the damage stage
+("version", `GetPartVersion` 0x23ACB50), +0x70 the part's data (+0x148 the maximum energy).
+
+| function | what it does |
+|---|---|
+| exe+0xA49F30 (vehicle part, part, float energy) -> bool | the energy setter everything uses (SetMotorDamage, SetPartEnergy, the collision and bullet code: 20 callers): plays the part's damage effects for the energy lost, then tail-calls exe+0xA05500 |
+| exe+0xA05500 (vehicle part, part, energy, bool) | refuses parts with flag 0x200001; stores the energy (clamped 0..max), recomputes the stage (vtable +0x30): a new stage sets flag 0x80, swaps the part's model (exe+0xA4A1A0) and notifies (vtable +0xC0); drives the part's morph deformation from the energy ratio (exe+0x323A3A0 per morph target): this is where the dents come from |
+| exe+0xA4A120 (vehicle part, part, energy) | the same through the second pool (+0x2C / +0x30): used by SetCarDamage's random damage on the parts listed at vehicle part +0x5C8 (which parts those are is not known) |
+
+**Wheels.** Vehicle part +0x4F0 .. +0x4F8: the axles (pointers); each axle holds two wheels of 0x620 bytes, wheel i
+= `axle[i / 2] + (i % 2) * 0x620` (exe+0x1BB8CC0 and exe+0x1BAE8E0 walk them that way). The tyre object is wheel +
+0x198, its state dword wheel + 0x748 (= tyre + 0x5B0): **0x10 tyre burst, 0x40 wheel off**, 0x20 not identified; the
+wheel's own part is index `[tyre + 0x4AC]` in the part list.
+
+| function | what it does |
+|---|---|
+| exe+0x1C0EDF0 (vehicle part, tyre, bool) | bursts the tyre: nothing when 0x70 is set; sets 0x10, the flat tyre's physics and effects, notifies (vtable +0x100) |
+| exe+0x1C0EF80 (vehicle part, tyre, bool) | takes the wheel off: nothing when 0x60 is set; sets 0x50, the wheel part's energy to 0 (exe+0xA49F30) |
+| exe+0x1BB8CC0 (in a function over every wheel) | bursts and takes off all wheels (with r8 = 0, as SetCarDamage's random damage does) |
+
+`SetWheelsProtected` (0x23A9860) sets entity +0x1EF0 bit 0x80000 (bulletproof tyres); `SetCarDamage` (0x239D050 ->
+exe+0x1BABA10, its number argument is not used) damages the car at random (random part energies, lights, glass,
+doors, and with tyres not protected a random tyre). `SetTyre` / `SetWheel` / `GetWheel` are the tyre and rim
+*models* (tuning), not damage.
+
+**Fire and explosion.** `Explode` (0x239B550) -> exe+0x2540A50 -> exe+0x2540380(entity, delay, true) with the game's
+delay (a global at exe+0x637DCCC); `SetExploded` (0x239BCC0) -> exe+0x2540380(entity, -1, true). exe+0x2540380:
+nothing when already exploded (+0x1280 bit 0x10000); **delay > 0: the car catches fire** (entity +0x1EF0 bit 0x80,
+exe+0x1BB8F40 starts the effects, +0x1FB8 = seconds left, the shorter of old and new); delay <= 0: it blows up now.
+The car update (exe+0x2577C80) counts +0x1FB8 down while bit 0x80 is set and blows the car up at 0 (a burning car
+whose timer is already 0 gets the game's delay through exe+0x2540A50). Whether `DisableExplosion` (entity +0x1EF0
+bit 0x1000000) stops exe+0x2540380 was not found (it is not checked at its start).
+
+**Repair.** `Repair` (0x239C3B0) -> exe+0x2583DE0(entity, true, false, false); `RepairAndClear` (0x239C6B0) the same
+with the second flag, then exe+0x2579A40(entity, 0) (dirt).
+
+**Damage events.** `C_EntityMessageVehicleDamaged` (table 0x5AC1930): GetDamageType, GetDamageIncoming,
+GetDamageFinal, GetAttackerGUID, GetLocalPos: a car's damage event (its message id was not looked up; not used).
+
+**Not carried:** the free deformation of the body mesh beyond the parts' morph targets (the save game has its own
+deformation records: `S_DeformationSaveLoad`, `S_DeformationSaveLoadPart`, `...PartDeformBone`, `...PartJoint`,
+`...Owner` - a lead for exact dents), brake and handbrake damage (`Get/SetBrakeDamage`, `Get/SetHandbrakeDamage`),
+dirt and rust.
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
@@ -911,6 +981,12 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | CarHorn_PartSet (section 9; +0x85 = `mov [rcx+0xA88], r10b`) | 0x1C0A820 | `44 0F B6 D2 B8 00 00 80 00 41 B8 FF FF 7F FF 84 D2 74 08 09 81 9C 11 00 00` |
 | CarSiren_PartSet (section 9) | 0x1C0DFC0 | `44 0F B6 D2 B8 00 00 00 02 41 B8 FF FF FF FD 84 D2 74 08 09 81 9C 11 00 00` |
 | RayCast (PhysicsPointBelow) | 0x23E83F0 | `48 89 5C 24 08 48 89 7C 24 10 55 48 8D 6C 24 A9 48 81 EC E0 00 00 00 F2 41 0F 10 00 48 8D 05 ?? ?? ?? ?? F2 0F 11 45 EF 49 8B F8 F3 0F 10 4D F3`: query vtable lea at +0x1C, filter 0x404DA386 at +0x55, physics getter call +0x9B (world = [ret+0x58]), cast call +0xAC (exe+0x1A68E50), result release call +0x1C0 |
+| CarPart_SetEnergy (section 10; +0x10 `F3 0F 10 72 24` = energy +0x24) | 0xA49F30 | `40 56 41 56 48 83 EC 48 0F 29 74 24 30 48 8B F2 F3 0F 10 72 24 4C 8B F1 0F 29 7C 24 20 0F 28 FA F3 0F 5C F7` |
+| CarTyre_Burst (section 10; tyre state +0x5B0) | 0x1C0EDF0 | `48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 8B 82 B0 05 00 00 41 8B F0 48 8B FA 48 8B D9 A8 70 0F 85 54 01` |
+| CarWheel_Off (section 10) | 0x1C0EF80 | `40 55 56 41 56 48 83 EC 30 8B 82 B0 05 00 00 41 0F B6 E8 48 8B F2 4C 8B F1 A8 60 0F 85 D2 01 00 00 48 63 8A` |
+| Car_Explode (section 10; +0x47 `or [rdi+0x1EF0], 0x80`, +0x63 `movss xmm1, [rdi+0x1FB8]`, checked by the dll) | 0x2540380 | `F3 0F 11 4C 24 10 4C 8B DC 55 57 49 8D AB E8 FE FF FF 48 81 EC 08 02 00 00 48 8B F9 41 0F 29 73 C8 48 8B 89 80 12 00 00` |
+| Car_MotorDamage (GetMotorDamage's native; section 10: confirms the part list, the exploded bit, the part fields) | 0x2559A30 | `8B 81 80 12 00 00 48 C1 E8 10 A8 01 74 09 F3 0F 10 05 ?? ?? ?? ?? C3 48 8B 81 00 01 00 00 48 8B 89 08 01 00 00 48 3B C1 74 36 48 8B 10 48 85 D2 74 06 83 7A 08 0D 74 06 48 83 C0 08 EB E7 F3 0F 10 05 ?? ?? ?? ?? F3 0F 10 4A 24 48 8B 42 70 F3 0F 59 C8 F3 0F 5E 88 48 01 00 00` |
+| CarWheels_BurstAll (a loop inside a function, not its start; section 10: confirms the wheel layout) | 0x1BB8CC0 | `48 8B 83 F8 04 00 00 48 2B 83 F0 04 00 00 48 C1 F8 03 48 03 C0 74 74 66 0F 1F 84 00 00 00 00 00 48 8B 93 F0 04 00 00 48 8B C6 83 E0 01 4C 8B C6 48 69 C8 20 06 00 00 49 D1 E8 4A 8B 3C C2 48 03 F9 F6 87 48 07 00 00 60 75 24 45 33 C0 48 8D 97 98 01 00 00 48 8B CB E8` |
 
 Rip/call operand offsets used above: `C_GameScriptModule_Tick` +3 (disp) / +7 (end) gives g_ScriptGameMachine; `Steam_MemLoadApi` +9/+0xD gives g_SteamApiTable; `Steam_Init` +0x2F/+0x33 gives the SteamAPI_Init slot, +0x39/+0x3D SteamUser slot, +0x60/+0x64 SteamClient slot; `Lua_Game_GetActivePlayer` E8 rel32 at +0x14 gives the C_Game getter; `ScriptGameMachine_Create` mov [rip+disp],rax at +0x2B (disp +0x2E, end +0x32) also gives g_ScriptGameMachine.
 

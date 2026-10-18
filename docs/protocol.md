@@ -26,6 +26,9 @@ connection was lost keeps playing while core rejoins the host; the host holds hi
 
 Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
 
+Car damage: CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252), 0x0253 reserved; additive (a
+peer without them ignores them and keeps its own car damage). See "Car damage".
+
 App id allocation (core reserves 0x0000-0x00FF):
 
 | Range | Owner |
@@ -195,7 +198,8 @@ Message flow:
    it was (a parked car with normal physics, unlocked) and A's puppet climbs out. When A's car has stopped (speed
    < 0.3 m/s, or 8 s after getting out) A's game sends **CarParked** (reliable) with K and the final transform; the
    others put their entity there (creating a copy if they never had one). Its flags say whether the car is
-   destroyed (`car:GetDamage()` >= 100 on A's game; the scale is unverified).
+   destroyed (`car:GetDamage()` >= 100 on A's game: 0..100, 100 = exploded, docs/game-api.md 20). The car's damage
+   itself (parts, tyres, fire, explosion) travels in CarDamage ("Car damage").
 4. **Take over.** Anybody gets into the parked car K's driver seat the normal way (E). That game now simulates K and
    sends `seat 0` with K: step 1 with the new owner. On a game whose player drove K before (e.g. A's own real car),
    or whose own mission car K is (adopted, its NPC driver thrown out twice), the entity is swapped for a fresh copy
@@ -531,7 +535,61 @@ npc_sync.lua.
   is not moved by a guest's game; the guest's own car is a copy on the host's game (Phase 3) and hits the host's car
   there by itself. A copy knocked more than 3 m off its target (that was on it a moment before) is put back by the
   controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
-  through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves is not shared.
+  through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves (dents, parts, tyres, fire, the
+  explosion) is shared since the car damage sync: the host's game holds it, a guest's copy reports its own ("Car
+  damage").
+
+### Car damage (not yet checked in game)
+
+Code: `src/game/car_damage.{h,cpp}` (wire format and rules, unit-tested in `tests/car_damage_test.cpp`),
+`src/game/car_damage_sync.cpp` (messages, the native reads and writes), `src/game/car_damage.lua` (which cars, who holds
+them). What is read and set on the game: docs/game-api.md 20, docs/re-notes.md 10. Additive: a build without these
+messages ignores them (and keeps each game's own car damage, as before).
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0250 | CarDamage | the game that holds a car's damage -> everyone (`Broadcast`; the host's traffic: host -> guests); an answer to a request -> that player (`SendTo`) | R | see below |
+| 0x0251 | CarDamageReport | a game with a copy -> the game that holds the car (`SendTo`; `SendToHost` for the host and his traffic) | R | the same body: what the copy has beyond the holder's state (parts, wheels, the fire / explosion bits) |
+| 0x0252 | CarDamageRequest | a game with a new copy or entity for a car -> the game that holds it | R | car ref only: send me the whole state (answered with a full CarDamage) |
+| 0x0253 | reserved (car damage) | | | |
+
+Body (CarDamage and CarDamageReport; 18 bytes for a player car, 15 for traffic, + 1 per 4 wheels + 2 per listed part; at most ~520):
+
+```
+u8  refKind               0 player car, 1 the host's traffic car
+    kind 0: u8 keyOwner, u32 vehId        the car key (Phase 3 "Shared cars")
+    kind 1: u16 net                       its net id (TrafficSpawn; the host's own book keeps his entity id)
+u16 epoch                 moves on with every repair of the car on the holder's game (a copy repairs itself when
+                          it sees a newer one; a report of an older epoch is ignored)
+u8  flags                 bit0 exploded, bit1 burning (the countdown to the explosion runs), bit4 full (every
+                          damaged part is listed: the rest are intact), bit5 repaired (the epoch moved on with this)
+u16 burnLeft              seconds to the explosion while burning (1/100 s)
+u32 layout                hash of the car's part types (FNV-1a of the count and each type): part indexes are only
+                          exchanged between cars of the same layout
+u8  partCount             parts the car has (at most 250)
+u8  wheelCount            at most 16
+    ceil(wheelCount / 4) bytes: 2 bits per wheel, low bits first: 0 ok, 1 tyre burst, 2 wheel off
+u8  n                     parts listed
+    n x (u8 index, u8 damage)   0 intact .. 254 no energy left, 255 gone (broken off / destroyed)
+```
+
+- **Who holds a car:** a player car's driver (the game whose player sits at its wheel), while parked its last driver
+  (each game remembers who that was from the states; the key's first driver if unknown); the host for his traffic.
+  Two drivers at once (Phase 3 "Conflicts"): each takes the other's CarDamage as raise-only damage of its own.
+- **Sending:** the holder reads the car 4 times a second and sends a CarDamage with the parts that changed (2 quanta
+  or more, or reaching / leaving intact, empty or gone) whenever something changed; the whole state (full) the first
+  time it is damaged, every 15 s while damaged, after a repair (repaired, new epoch) and to whoever asks.
+- **Receiving:** the state of the car merges raise-only (a newer epoch replaces it); a copy sets what it lacks (more
+  than 3 quanta below) with the game's own functions, never lowers anything except by a repair (newer epoch), and
+  asks (CarDamageRequest, every 3 s) until it has a full state. A copy whose own damage stands above the holder's for
+  0.4 s reports it (CarDamageReport, only what it did not report yet); not while it was moved by SetPos in the last
+  second (pinned or snapped by the car controller), except tyres and the fire / explosion bits; such bumps are
+  undone by a repair once they add up (see docs/game-api.md 20).
+- **The host's traffic:** CarDamage goes out by net id to all guests (a guest without that copy ignores it); a
+  traffic car nobody has a copy of is not sent. Reports and requests for it go to the host, who maps the net id back
+  to his car.
+- A message that does not parse is dropped (counted, `bad msgs` in the overlay). Car refs of player cars that this
+  game does not know are kept for 30 s (the copy may come a moment later).
 
 ## Reconnect (no messages of its own)
 
@@ -546,6 +604,7 @@ the game layer does with it:
 | host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
 
+| everyone | a player is dropped | CarDamageSync forgets him as the holder of cars and as someone who asked for a state: his cars' copies ask whoever drives them next; when he is back his copies ask for every car's state again |
 | host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
 | lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
