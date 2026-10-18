@@ -828,6 +828,54 @@ Strings: `ue::game::vehicle::E_VehicleLightType`, `E_VehicleLightColor`, `C_CarA
 allocates a 0x48-byte AI command with m when m differs from a constant. `OverrideMoveSpeed` (0x23AC1B0) ->
 exe+0x2B98A70: `[[entity + 0x130] + 0xB0] = v`; `ResetMoveSpeed` (0x23AC670) stores -1.0 there.
 
+## 10. Police: the police force module and its Lua bindings [static, unverified: found 2026-10-18 without running the game]
+
+How the police API of `game.police` (`C_PoliceForceWrapper`, luaL_Reg table RVA 0x5AF3280) works, read from the
+thunks (docs/game-api.md 22 for the use; the arguments were read the way `sigs.txt` reads them: `0x3811340` self
+adaptor, `0x785B30` number, `0x1AC6B10` bool, `0x3810FF0` vector, `0x3819C20` "wrong number of arguments").
+
+- **The police module** is the global `[0x63CF248]` (every police thunk loads it with `mov rax/rcx, [rip+..]`).
+  - `+0x38`: the player's police zone (one zone: the game has one player). Its flags byte `+0x78`: `0x10` active,
+    `0x04` decaying (set by `ZoneDecayAll` / `ZoneDecayRed`, 0x2DC98C0). Zone fields: `+0x00` centre x y z (floats),
+    `+0x10` level (u32), `+0x14` type (i32: 0 SEARCH / blue, 1 HUNT / red).
+  - `+0x104` the escalation clamp (`ClampEscalationLevel(n)`, 0x2DB3930: `cvttss2si`, stored as int), `+0x108` the
+    forced minimum (`ForceMinEscalationLevel(n)`, 0x2DB39E0). What reads them was not followed.
+  - `+0x128` a queue of zone requests (`ZoneCreate` adds one only when it is empty and `+0xE4` (enabled) is set),
+    `+0x210` the police event listeners (`RegisterForPoliceEvent`), `+0x238` pending police events, `+0x290` offences
+    disabled (`AreOffencesDisabled`, 0x2DB3740).
+- `GetActiveZones()` (0x2DB19B0): pushes one number, 0, when `[module+0x38]` exists and is active, nothing otherwise.
+  So it is "is our player wanted" (the id is always 0).
+- `GetZoneInfo(id)` (0x2DB1B20): exactly one argument; pushes the zone centre (vector), `+0x10` and `+0x14` as
+  numbers ((0,0,0), 0, 0 without a zone). The flow node `GetZoneInfo` names its outputs `pos`, `level`, `zone_type`
+  in that order (scripts.sds constants) and compares `zone_type` with `enums.PoliceZoneType.SEARCH`.
+- `ZoneCreate(pos, type [, level [, bool]])` (argc dispatch 0x2DB1F10 -> 0x2DB5EE0 / 0x2DB5DE0 / 0x2DB5C80) ->
+  0x2DC9730(module, &pos, type, level, bool): queues {level clamped to 1..(number of escalation entries of the AI
+  singleton `[0x639E120]`), type, pos, 48.0, 0.0, bool}; the telemetry name is `E_ZT_YELLOW` (type 0), `E_ZT_RED` (1),
+  `E_ZT_NONE` (2). It is the player's zone: a zone made for someone else would be the player's.
+- `RegisterForPoliceEvent(ctx, {flags...}, fn)` (0x2DB16B0): at least four stack values; #3 must be a table (its
+  values are OR-ed as numbers: "Second argument should be flags!!!"), #4 a function ("Third Argument should be
+  function with one param"); returns an id (also `[0x63CF250]`, incremented). The game's flow nodes call it as
+  `data.police_event = game.police:RegisterForPoliceEvent(data, {enums.PoliceEventType.X, ...}, fn)`.
+  `UnregisterForPoliceEvent(id)`.
+- `C_WrapperHuman::AnnouncePoliceOffence(offenceType)` (0x23CB2F0) -> 0x23E3290 -> 0x29D8460(`[0x639E120]`,
+  type, entity id `[e+0x18]`, `[e+0x280]`, its position, ...): looks up the offence type's entry (0x60 bytes each,
+  `[+0xC8]`), and when its two enable bytes (`+0xA`, `+0xB`) are set queues an offence record with the human's id as
+  the offender (0x29E8C40). No player check on that path: any human can be the offender [whether the police then
+  react to a non-player offender is UNVERIFIED]. The flow node passes `game.game:GetActivePlayer()`.
+- `C_WrapperPlayer::IsSeenByPolice()` (0x23C6990): reads `[[0x639E120] + 0x25D]` (one flag for the player).
+- Strings of the event enum (`C_WrapE_EventType` = `enums.PoliceEventType`): PLAYER_ENTER_BLUEZONE,
+  PLAYER_EXIT_BLUEZONE, PLAYER_ENTER_REDZONE, PLAYER_EXIT_REDZONE, BLUEZONE_DECAY, PLAYER_ZONE_MERGED,
+  DISTRICT_OFFENCE_TIMER_EXPIRED, NPC_JOINED, NPC_LEFT, NPC_KILLED, VEHICLE_JOINED, VEHICLE_LEFT, VEHICLE_DESTROYED,
+  PLAYER_DEATH, PLAYER_FINE, PLAYER_AREST, POLICE_ANIM_START, POLICE_REZIST_ARREST, POLICE_WITNESS_STATE_STARTED,
+  POLICE_REDZONE_STARTED, POLICE_BLUEZONE_STARTED, POLICE_ZONE_DECAYED, POLICE_FINE_STARTED, POLICE_FINE_FINISHED,
+  POLICE_ARREST_STARTED, POLICE_ARREST_ESCAPED, POLICE_ARREST_ARRESTED, POLICE_ACTIVITY_ENDED (values: bit flags,
+  read at run time from `enums.PoliceEventType`). Human messages: `E_HM_OFFENDER`, `E_HM_OFFENDER_UPDATE`,
+  `E_HM_RECOGNIZED_BY_POLICE`, `E_HM_POLICE_SEARCH`, `E_HM_ARRESTED` (`C_HumanMessageArrested:GetArrestFinished`,
+  `C_HumanMessageOffenceDetected:GetOffenderPlayer`). Offence types: the `E_OT_*` strings (SPEEDING, RED_LIGHT,
+  RECKLESS_DRIVING, BUMPING_TO_POLICE, RUNNING_FROM_POLICE, STREET_SHOOTING, SHOOT_AT_DISCIPLINARY, ...).
+- Not bound: a getter for the wanted level or "is wanted" other than the zone; no bribe API (no strings); the
+  `gamehunt` flow helpers of the scripts (Mafia III hunt scenario) have no bound class.
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,

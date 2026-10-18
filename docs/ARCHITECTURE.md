@@ -47,6 +47,10 @@ src/game/
   door_sync.{h,cpp,lua}  doors on every game: door table scan + state poll + attribution + applying (Lua), the
                          host's authority over story doors, snapshots on join / reconnect / a new world
   door_model.{h,cpp}     the game-free part of it (wire format, identity, table, memory, echoes), tests/door_test.cpp
+  police_sync.{h,cpp,lua} police: every player's wanted state (his own game's) broadcast; a wanted guest near the
+                         host is a target of the host's police (his puppet), and his game holds its level while they
+                         chase him
+  police_model.{h,cpp}   the game-free part of it (wire format, targets, chase answer), tests/police_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)

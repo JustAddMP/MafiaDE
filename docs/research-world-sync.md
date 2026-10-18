@@ -716,8 +716,9 @@ UNVERIFIED (static design, nothing of it run in game yet):
   shared cars).
 - On guests, mission cars come from the guest's own mission run or from host copies (`ObtainSpecificCar` + looks
   from the getters above).
-- Police: host-authoritative. The host sends `GetActiveZones` and wanted level; guests `DisableOffencesGlobal(true)`
-  so their own actions do not start local chases, then `ZoneCreate` to mirror the host's zones if wanted.
+- Police: replaced (see "Police (implementation)" below): each player's wanted state stays his own game's (there
+  is one zone per game, the player's: `ZoneCreate` cannot mirror another player's zone); near the host his puppet is
+  a target of the host's police and his game holds its level while they chase him.
 
 ### Live tests
 
@@ -799,12 +800,20 @@ removes cars already driving; whether `Deactivate` on crewed traffic cars is saf
 `LockControls` stops the copy's AI driver (else the copies get pinned: TRG pins); the siren heuristic; the look
 getters' slots; Lua cost with 20 copies (each tick: SetPos/SetRot/SetSpeed and four control setters per near copy).
 
+### Police (implementation; unreleased, not yet run in game)
+
+`src/game/police_sync.lua` / `.cpp`, `src/game/police_model.*` (tests/police_test.cpp), messages 0x0260-0x0262
+(docs/protocol.md "Police"), the API in docs/game-api.md 22 and docs/re-notes.md 10. `GetActiveZones` returns `0`
+when the player has a zone and `GetZoneInfo(0)` gives centre, level and type (risk 3 below is answered statically).
+Open: the level scale, what police do with an offence announced from a puppet, the callback argument of
+`RegisterForPoliceEvent`, whether `ForceMinEscalationLevel(0)` is "none".
+
 ### Risks / open questions
 
 1. `SwitchGenerators(false)` may also stop *mission* traffic generators (some chases rely on them). Test in a
    chase chapter. `SetEnableAmbientTrafficSpawning` is the narrower switch.
 2. `GetColor` slot numbering and colour index meaning (palette index vs RGB) need B4-3.
-3. `GetActiveZones` / `GetZoneInfo` return shapes are not decoded.
+3. `GetActiveZones` / `GetZoneInfo` return shapes: decoded statically (re-notes 10), not seen in game.
 4. Mission-script traffic overrides (`SetMaxVehicleElements` per checkpoint) on the host would not reach guests
    unless mirrored. Mirror the 5 numbers when the host's node runs (wrap the Lua node) [guess].
 5. Mission car swapped for a copy (0.9.0) and back (0.15, docs/game-api.md 15 "Mission car back"): the real car
