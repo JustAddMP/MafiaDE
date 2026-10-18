@@ -28,6 +28,9 @@ struct Sys {
     std::deque<Pending> pending;
     uint32_t count = 0;              // applied, for the 1-in-4 sampling of streams
     std::vector<float> window;       // apply latencies since the last Summary
+    double lastTick = 0;             // the system's last Applied call (0: none since Attach)
+    uint32_t heldCount = 0;          // since the last Summary: applied after the tick had stopped (kept out of window)
+    float heldMaxMs = 0;
 };
 
 struct State {
@@ -44,6 +47,10 @@ bool IsStream(System s) { return s == kPlayer || s == kNpc || s == kTraffic || s
 
 constexpr size_t kMaxPending = 512;  // a system whose tick does not run (paused) keeps only the newest
 constexpr size_t kMaxWindow = 4096;
+// A system's tick that has not run for this long had stopped (a guest in the menus or on a loading screen: WorldEnv
+// arrives in the menu and is applied once the world has loaded). What it takes when it runs again waited for the
+// game, not for the network or the hand-off: traced as held=1 and counted apart, not in the latency stats.
+constexpr double kTickGapS = 1.0;
 
 }  // namespace
 
@@ -116,6 +123,9 @@ void Attach(net::Session* session) {
         s.pending.clear();
         s.window.clear();
         s.count = 0;
+        s.lastTick = 0;
+        s.heldCount = 0;
+        s.heldMaxMs = 0;
     }
 }
 
@@ -136,16 +146,24 @@ void Applied(System s) {
     State& st = S();
     std::lock_guard lock(st.mu);
     Sys& sy = st.sys[s];
-    if (sy.pending.empty()) return;
     const double now = Now();
+    // the tick had stopped (or never ran since Attach): everything pending arrived while it was not running
+    const bool resumed = sy.lastTick == 0 || now - sy.lastTick > kTickGapS;
+    sy.lastTick = now;
+    if (sy.pending.empty()) return;
     const bool stream = IsStream(s);
     for (const Pending& p : sy.pending) {
         const float hand = static_cast<float>((now - p.recvAt) * 1000.0);
         const float apply = p.ageMs + hand;
-        if (sy.window.size() < kMaxWindow) sy.window.push_back(apply);
+        if (resumed) {
+            ++sy.heldCount;
+            sy.heldMaxMs = std::max(sy.heldMaxMs, apply);
+        } else if (sy.window.size() < kMaxWindow) {
+            sy.window.push_back(apply);
+        }
         if ((!stream || sy.count % 4 == 0) && core::trace::IsOpen())
-            core::trace::Line("LAT", "sys=%s from=%u age=%.1f hand=%.1f apply=%.1f", Name(s), p.from, p.ageMs, hand,
-                              apply);
+            core::trace::Line("LAT", "sys=%s from=%u age=%.1f hand=%.1f apply=%.1f held=%d", Name(s), p.from, p.ageMs,
+                              hand, apply, resumed ? 1 : 0);
         ++sy.count;
     }
     sy.pending.clear();
@@ -154,18 +172,30 @@ void Applied(System s) {
 std::string Summary() {
     State& st = S();
     std::lock_guard lock(st.mu);
-    std::string out;
+    std::string out, held;
     for (int i = 0; i < kCount; ++i) {
-        std::vector<float>& w = st.sys[i].window;
+        Sys& sy = st.sys[i];
+        char b[96];
+        if (sy.heldCount) {
+            std::snprintf(b, sizeof(b), "%s%s %u (max %.1f s)", held.empty() ? "" : ", ",
+                          Name(static_cast<System>(i)), sy.heldCount, sy.heldMaxMs / 1000.0f);
+            held += b;
+            sy.heldCount = 0;
+            sy.heldMaxMs = 0;
+        }
+        std::vector<float>& w = sy.window;
         if (w.empty()) continue;
         std::sort(w.begin(), w.end());
-        char b[96];
         std::snprintf(b, sizeof(b), "%s%s %.0f/%.0f/%.0f ms (%zu)", out.empty() ? "" : ", ", Name(static_cast<System>(i)),
                       w[w.size() / 2], w[std::min(w.size() - 1, w.size() * 95 / 100)], w.back(), w.size());
         out += b;
         w.clear();
     }
-    return out.empty() ? out : "latency (send -> applied, p50/p95/max): " + out;
+    std::string line;
+    if (!out.empty()) line = "latency (send -> applied, p50/p95/max): " + out;
+    if (!held.empty())
+        line += (line.empty() ? "latency: " : "; ") + std::string("waited for the game's tick (left out): ") + held;
+    return line;
 }
 
 }  // namespace mc::game::latency

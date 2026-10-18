@@ -64,7 +64,9 @@ int main() {
     guest.Join("127.0.0.1:" + std::to_string(ht.BoundPort()));
     int got = 0;
     host.On(0x0230, [&](net::PlayerId, net::ByteReader&) { ++got; });
-    const DWORD until = GetTickCount() + 5000;
+    // phase 1: the door system's tick runs every loop (in the world): three door events counted in the stats
+    latency::Applied(latency::kDoor);
+    DWORD until = GetTickCount() + 5000;
     bool sent = false;
     while (GetTickCount() < until && got < 3) {
         host.Poll();
@@ -75,13 +77,49 @@ int main() {
             guest.Flush();
             sent = true;
         }
+        latency::Applied(latency::kDoor);
         Sleep(1);
     }
     Sleep(5);
     latency::Applied(latency::kDoor);
     const std::string sum = latency::Summary();
-    Check(got == 3 && sum.find("door") != std::string::npos, "received -> applied: summary per system", sum);
+    Check(got == 3 && sum.find("door") != std::string::npos && sum.find("(3)") != std::string::npos &&
+              sum.find("waited") == std::string::npos,
+          "received -> applied: summary per system", sum);
     Check(latency::Summary().empty(), "summary starts over");
+
+    // phase 2: the tick stops (menus / loading screen) while two events arrive, and runs again 1.2 s later: they
+    // waited for the game, so they are counted apart and stay out of the latency stats
+    const uint8_t b = 1;
+    for (int i = 0; i < 2; ++i) guest.SendToHost(0x0230, std::span<const uint8_t>(&b, 1));
+    guest.Flush();
+    until = GetTickCount() + 1200;
+    while (GetTickCount() < until) {
+        host.Poll();
+        guest.Poll();
+        Sleep(1);
+    }
+    latency::Applied(latency::kDoor);
+    const std::string held = latency::Summary();
+    Check(got == 5 && held.find("waited for the game's tick (left out): door 2 (max 1.") != std::string::npos &&
+              held.find("p50") == std::string::npos,
+          "tick stopped: held messages counted apart, not in the stats", held);
+    // ticking again: back in the stats
+    latency::Applied(latency::kDoor);
+    guest.SendToHost(0x0230, std::span<const uint8_t>(&b, 1));
+    guest.Flush();
+    until = GetTickCount() + 2000;
+    while (GetTickCount() < until && got < 6) {
+        host.Poll();
+        guest.Poll();
+        latency::Applied(latency::kDoor);
+        Sleep(1);
+    }
+    latency::Applied(latency::kDoor);
+    const std::string again = latency::Summary();
+    Check(got == 6 && again.find("door") != std::string::npos && again.find("(1)") != std::string::npos &&
+              again.find("waited") == std::string::npos,
+          "tick running again: in the stats", again);
     latency::Attach(nullptr);
     Check(!host.onAppMessage, "detached: hook removed");
     std::printf("%s\n", g_fail ? "FAILED" : "ALL PASSED");

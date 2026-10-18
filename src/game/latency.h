@@ -9,10 +9,14 @@
 //   Applied(sys)         GameMainThread, when the system's tick takes what arrived (every message of sys received so
 //                        far is applied now)
 //
-// and writes a trace record per applied message: LAT sys=<name> from=<id> age=<ms> hand=<ms> apply=<ms> (apply = age
-// + hand: the sender's send -> this game applying it). State streams (player, NPC, traffic, item states) are written
-// one in four. tools/sync_compare.py turns them into p50 / p95 / max per system. Also kept as running stats for the
-// log (Summary, every net_log_interval).
+// and writes a trace record per applied message: LAT sys=<name> from=<id> age=<ms> hand=<ms> apply=<ms> held=<0|1>
+// (apply = age + hand: the sender's send -> this game applying it). State streams (player, NPC, traffic, item states)
+// are written one in four. tools/sync_compare.py turns them into p50 / p95 / max per system. Also kept as running
+// stats for the log (Summary, every net_log_interval).
+// held=1: the system's tick had not run for over a second (or not yet since Attach) when it took the message - a
+// guest in the menus or on a loading screen (WorldEnv arrives in the menu and is applied once the world is loaded).
+// That wait is the game's, not the network's: held messages are counted apart (Summary: "waited for the game's
+// tick", count and max) and left out of the latency stats, here and in sync_compare.py.
 #include <cstdint>
 #include <string>
 

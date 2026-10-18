@@ -608,23 +608,31 @@ def doors(tr, other):
 
 def latency(traces):
     """LAT records (game/latency.h): per receiving game and system, send -> applied (apply), of it on the wire and in
-    the queues until the handler (age) and the hand-off to the script tick (hand). Streams are sampled 1 in 4."""
+    the queues until the handler (age) and the hand-off to the script tick (hand). Streams are sampled 1 in 4.
+    held=1 records (the system's tick had stopped: a guest in the menus / loading) are left out and listed apart."""
     section("Latency (sender's send -> applied here; session clock)")
     any_rec = False
     for tr in traces:
         by = defaultdict(lambda: ([], [], []))
+        held = defaultdict(list)
         for _, f in tr.records.get("LAT", []):
             a, g, h = num(f.get("apply")), num(f.get("age")), num(f.get("hand"))
             if a is None:
+                continue
+            if f.get("held") == "1":
+                held[f.get("sys", "?")].append(a)
                 continue
             ap, ag, ha = by[f.get("sys", "?")]
             ap.append(a)
             ag.append(g if g is not None else a)
             ha.append(h if h is not None else 0.0)
-        if not by:
+        if not by and not held:
             continue
         any_rec = True
         print("  on %s's game (%s):" % (tr.name, tr.role))
+        if held:
+            print("    waited for the game's tick (menus / loading; left out below): " + ", ".join(
+                "%s %d (max %.1f s)" % (s, len(v), max(v) / 1000.0) for s, v in sorted(held.items())))
         print("    %-14s %7s %8s %8s %8s   %-24s %s" % ("system", "msgs", "p50", "p95", "max", "of it on arrival p50/p95",
                                                      "hand-off p50/p95"))
         for sys_name in sorted(by, key=lambda s: -pct(by[s][0], 50)):

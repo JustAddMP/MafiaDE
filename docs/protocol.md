@@ -1013,4 +1013,6 @@ threads).
 Measuring: the sync trace has `LAT` records per applied message (send -> applied, session clock) and `CLK pd/jit`
 per remote player; `tools/sync_compare.py` prints "Latency" (p50 / p95 / max per system and receiving game) and
 "Bandwidth" (median / max KB/s per system from core's NetMonitor lines, thinned / deferred counts). The log has a
-`latency (send -> applied, p50/p95/max): ...` line every 10 s.
+`latency (send -> applied, p50/p95/max): ...` line every 10 s. Messages a system took after its tick had stopped
+for over a second (a guest in the menus or on a loading screen: WorldEnv received in the menu, applied once the
+world is loaded) are `LAT held=1`, left out of those stats and listed apart ("waited for the game's tick").
