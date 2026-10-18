@@ -68,6 +68,17 @@ link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\proxy_test.exe" /PDB:"%OUT%\pro
   "%OBJ%\tests\proxy_test.obj" %INFO% "%CB%\mc_core.lib" %MC_SYSLIBS%
 if errorlevel 1 ( echo [build] ERROR: linking proxy_test.exe failed & goto :fail )
 
+rem ---- our unit tests (tests\*.cpp: game-layer logic without the game), one exe each in out\ ------------------------
+rem tools\make_release.cmd runs every one of them.
+for %%f in ("%ROOT%\tests\*.cpp") do (
+  echo [build] test %%~nf.exe
+  cl %CXXFLAGS% /Fd"%OBJ%\tests\vc.pdb" /Fo"%OBJ%\tests\%%~nf.obj" "%%f"
+  if errorlevel 1 ( echo [build] ERROR: compiling tests\%%~nxf failed & goto :fail )
+  link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\%%~nf.exe" /PDB:"%OUT%\%%~nf.pdb" ^
+    "%OBJ%\tests\%%~nf.obj" "%CB%\mc_core.lib" %MC_SYSLIBS%
+  if errorlevel 1 ( echo [build] ERROR: linking %%~nf.exe failed & goto :fail )
+)
+
 echo [build] OK -^> %OUT%
 endlocal
 exit /b 0

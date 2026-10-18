@@ -5,6 +5,7 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
+#include "game/car_signals.h"
 #include "game/characters.h"
 #include "game/lua.h"
 #include "mc/core_version.h"
@@ -36,7 +37,9 @@ constexpr uint16_t kMsgCarParked = 0x0101;
 constexpr uint16_t kMsgPlayerModel = 0x0102;  // every peer -> everyone: the character he picked and how he looks
 constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
-// 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block.
+// 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block. The car signals byte
+// at the end of the vehicle block (lights, indicators, horn, siren, beacon; game/car_signals.h) came later without a
+// version change: a block without it reads as "unknown", and older readers stop before it.
 constexpr uint8_t kStateVersion = 4;
 // State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (position traces): at 20 Hz
 // with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
@@ -84,6 +87,7 @@ struct PlayerState {
     float brake = 0;      // 0..1
     float handbrake = 0;  // 0..1
     int8_t gear = 0;      // GetGear(): < 0 reverse (as far as known)
+    uint8_t signals = 0;  // car_signals bits (kValid unset = his game could not read them; then the copy is left alone)
 };
 
 struct Snap {
@@ -114,6 +118,7 @@ struct Remote {
     bool inCar = false;
     double traceAt = 0;  // last PUP/VEH trace record (main thread)
     uint32_t dropped = 0;  // states dropped as old or duplicate
+    uint8_t signals = 0;   // car signals of the car he drives, as last logged
 };
 
 // Where the Lua glue last saw a puppet (on foot, visible: "PS") or the car copy a remote player drives ("VS").
@@ -304,6 +309,7 @@ void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
         w.U8(motion::PackUnorm8(s.brake));
         w.U8(motion::PackUnorm8(s.handbrake));
         w.U8(static_cast<uint8_t>(s.gear));
+        car_signals::Write(w, s.signals);  // last: see kStateVersion
     }
 }
 
@@ -326,7 +332,8 @@ bool InRange(const float* v, int n, float lim) {
 
 // ---- sync trace (core/trace.h, docs/sync-trace.md) -------------------------------------------------------------------
 // The state fields of a TX / RX record: "p=x,y,z h=hx,hy v=vx,vy,vz m=mode f=flags hp=health sh=shots w=weapon"
-// plus, in a car, "car=key mdl=model seat=n cp=x,y,z q=qx,qy,qz,qw cv=x,y,z ctl=valid,steer,power,brake,hb,gear".
+// plus, in a car, "car=key mdl=model seat=n cp=x,y,z q=qx,qy,qz,qw cv=x,y,z ctl=valid,steer,power,brake,hb,gear sig=n"
+// (sig: the car signals byte, game/car_signals.h; 0 = unknown).
 std::string TraceFields(const PlayerState& s) {
     char buf[640];
     int n = std::snprintf(buf, sizeof buf, "p=%.3f,%.3f,%.3f h=%.4f,%.4f v=%.3f,%.3f,%.3f m=%u f=%u hp=%u sh=%u w=%s",
@@ -335,10 +342,10 @@ std::string TraceFields(const PlayerState& s) {
     if ((s.flags & kInVehicle) && n > 0 && n < static_cast<int>(sizeof buf))
         std::snprintf(buf + n, sizeof buf - n,
                       " car=%u:%u mdl=%s seat=%u cp=%.3f,%.3f,%.3f q=%.5f,%.5f,%.5f,%.5f cv=%.3f,%.3f,%.3f "
-                      "ctl=%d,%.3f,%.3f,%.3f,%.3f,%d",
+                      "ctl=%d,%.3f,%.3f,%.3f,%.3f,%d sig=%u",
                       s.keyOwner, s.vehId, s.model.c_str(), s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0],
                       s.quat[1], s.quat[2], s.quat[3], s.cvel[0], s.cvel[1], s.cvel[2], s.ctlValid ? 1 : 0, s.steer,
-                      s.power, s.brake, s.handbrake, static_cast<int>(s.gear));
+                      s.power, s.brake, s.handbrake, static_cast<int>(s.gear), s.signals);
     return buf;
 }
 
@@ -381,6 +388,7 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
         s.brake = motion::UnpackUnorm8(r.U8());
         s.handbrake = motion::UnpackUnorm8(r.U8());
         s.gear = static_cast<int8_t>(r.U8());
+        s.signals = car_signals::Read(r);
     }
     if (!r.Ok()) return false;
     // Everything below ends up in a Lua command line ("T ..."): one %S+ field per string, and numbers small enough
@@ -422,6 +430,12 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     if (rem.recvCount == 0) MC_LOG_INFO("sync: first state from player %u", from);
     if (core::trace::IsOpen())
         core::trace::Line("RX", "from=%u sT=%u off=%.4f %s", from, timeMs, rem.offset, TraceFields(s).c_str());
+    const uint8_t sig = (s.flags & kInVehicle) && s.seat == 0 ? s.signals : 0;
+    if (sig != rem.signals) {
+        MC_LOG_INFO("sync: player %u's car signals: %s (%s)", from, car_signals::Describe(sig).c_str(),
+                    car_signals::Changes(rem.signals, sig).c_str());
+        rem.signals = sig;
+    }
     rem.snaps.push_back({t, std::move(s)});
     while (rem.snaps.size() > kMaxSnaps) rem.snaps.pop_front();
     rem.lastRecv = now;
@@ -518,8 +532,8 @@ PlayerState Present(const Remote& rem, double now) {
 }
 
 // One "T" line per remote player: his state, then what to do with his puppet (lc: the locomotion command) and with
-// the car copy he drives (vc: the vehicle command, applied with his controls, then its wanted velocity). Field order:
-// player_sync.lua M.Update.
+// the car copy he drives (vc: the vehicle command, applied with his controls, then its wanted velocity, then his car
+// signals). Field order: player_sync.lua M.Update.
 void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s,
                   const motion::LocomotionCommand& lc, const motion::VehicleCommand& vc) {
     char key[32] = "-";
@@ -529,7 +543,7 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
                   "%d %d %d %u %.3f %.3f %.3f %u "
                   "%d %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f "
-                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f\n",
+                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f %u\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
@@ -543,8 +557,8 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   static_cast<unsigned>(vc.fix), vc.nudge.x, vc.nudge.y, vc.nudge.z, vc.rot[0], vc.rot[1], vc.rot[2],
                   vc.rot[3], vc.power, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear), s.ctlValid ? 1 : 0,
                   vc.pinned ? 1 : 0,
-                  // 60..62: the velocity to give the copy after moving it
-                  vc.vel.x, vc.vel.y, vc.vel.z);
+                  // 60..62: the velocity to give the copy after moving it; 63: his car signals (car_signals.h)
+                  vc.vel.x, vc.vel.y, vc.vel.z, veh && s.seat == 0 ? s.signals : 0u);
 }
 
 // Report lines from the Lua glue: "PS id x y z hx hy" (puppet on foot, after this tick's commands),
@@ -662,13 +676,14 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         core::trace::Line("VEH",
                           "id=%u key=%s rT=%.0f have=%d tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
                           "cv=%.3f,%.3f,%.3f err=%.3f rot=%.2f fix=%u pin=%d why=%u jp=%d rt=%d pins=%d tsp=%.3f "
-                          "csp=%.3f vel=%.3f,%.3f,%.3f pw=%.3f ctl=%d st=%.3f br=%.3f hb=%.3f gear=%d",
+                          "csp=%.3f vel=%.3f,%.3f,%.3f pw=%.3f ctl=%d st=%.3f br=%.3f hb=%.3f gear=%d sig=%u",
                           id, key, rT, vi.haveCopy ? 1 : 0, vi.target.x, vi.target.y, vi.target.z, vi.targetVel.x,
                           vi.targetVel.y, vi.targetVel.z, vi.copy.x, vi.copy.y, vi.copy.z, vi.copyVel.x,
                           vi.copyVel.y, vi.copyVel.z, vc.error, vc.rotErrDeg, static_cast<unsigned>(vc.fix),
                           vc.pinned ? 1 : 0, static_cast<unsigned>(vc.why), vc.justPinned ? 1 : 0,
                           vc.retried ? 1 : 0, rem.veh.Pins(), vc.tspeed, vc.cspeed, vc.vel.x, vc.vel.y, vc.vel.z,
-                          vc.power, s.ctlValid ? 1 : 0, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear));
+                          vc.power, s.ctlValid ? 1 : 0, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear),
+                          s.signals);
     } else {
         core::trace::Line("PAS", "id=%u key=%s rT=%.0f seat=%u cp=%.3f,%.3f,%.3f", id, key, rT, s.seat, s.cpos[0],
                           s.cpos[1], s.cpos[2]);
@@ -826,7 +841,7 @@ void OnPlayerModel(net::PlayerId from, net::ByteReader& r) {
 
 // ---- local sample ---------------------------------------------------------------------------------------------------
 // "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz aim reload shots ax ay az
-//  cover ctl steer power brake handbrake gear"
+//  cover ctl steer power brake handbrake gear [signals]"  (signals: car_signals.h byte, 0 = unknown / on foot)
 bool ParseSample(const std::string& line, PlayerState& s) {
     std::istringstream in(line);
     std::string tag, weapon, model, key;
@@ -836,6 +851,8 @@ bool ParseSample(const std::string& line, PlayerState& s) {
         s.quat[3] >> s.cvel[0] >> s.cvel[1] >> s.cvel[2] >> aim >> reload >> shots >> s.aim[0] >> s.aim[1] >> s.aim[2] >>
         cover >> ctl >> s.steer >> s.power >> s.brake >> s.handbrake >> gear;
     if (!in || tag != "P") return false;
+    int sig = 0;
+    if (!(in >> sig)) sig = 0;  // an older glue (dev override) does not send it
     s.ctlValid = ctl != 0 && std::isfinite(s.steer) && std::isfinite(s.power) && std::isfinite(s.brake) &&
                  std::isfinite(s.handbrake);
     if (!s.ctlValid) s.steer = s.power = s.brake = s.handbrake = 0;
@@ -855,6 +872,7 @@ bool ParseSample(const std::string& line, PlayerState& s) {
         s.flags |= kInVehicle;
         s.model = model;
         s.seat = static_cast<uint8_t>(seat);
+        if (s.seat == 0) s.signals = car_signals::Sanitize(static_cast<uint8_t>(std::clamp(sig, 0, 255)));
     }
     if (crouch) s.flags |= kCrouch;
     if (sprint) s.flags |= kSprint;

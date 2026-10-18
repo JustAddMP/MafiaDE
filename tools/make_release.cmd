@@ -21,6 +21,11 @@ for %%T in (net_loopback net_password net_kick net_lobby net_interest net_motion
 )
 "%ROOT%\out\proxy_test.exe" >nul 2>&1 || ( echo proxy_test failed. & exit /b 1 )
 echo proxy_test: ok
+rem our own unit tests (tests\*.cpp, built by build.cmd)
+for %%f in ("%ROOT%\tests\*.cpp") do (
+    "%ROOT%\out\%%~nf.exe" >nul 2>&1 || ( echo test %%~nf failed. & exit /b 1 )
+    echo test %%~nf: ok
+)
 set "REL=%ROOT%\out\release"
 set "STAGE=%REL%\MafiaCoop-%VER%"
 set "SYMS=%REL%\MafiaCoop-%VER%-symbols"
