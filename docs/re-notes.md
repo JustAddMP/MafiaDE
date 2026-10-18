@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 69 patterns below; prints OK/FAIL each)
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 71 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -700,6 +700,44 @@ Used by src/game/save_guard.cpp.
   screen is confirmed for the player instead (a DirectInput Enter through core `ui_input::PressGameKey`, 3 s after
   the screen is up; window messages and the virtual pad do not confirm it, and the game reads DirectInput only while
   its window has focus) and the screen is kept black while that world is up.
+- **Why a failed mission took two loads** (static, 2026-10-18; logs of 2026-10-16 n2/run1): in a chapter-loader
+  load the game answers the failure with a load of `freeroam_before_quest_activated` (load 1, the "Free Ride stop":
+  black, its loading screen confirmed for the player); once that world was up the story sync quit to the main menu and
+  loaded the session's checkpoint through the chapter loader (load 2). The guest of that run loaded once (he only
+  followed the host's reload), but a guest whose own mission failed took the same two loads, and when both failed
+  (a timer running out on both games) both did. Not the cause: the two `load of ...` lines per load in the log (every
+  load, also our chapter loads, issues its request twice, 1.5-2 s apart).
+- **Failed missions: where the game answers them** [likely: static; the in-game check is pending]:
+  - `bool FreeRoamRetry()` at 0x21E8B20 (pattern `SaveSys_FreeRoamRetry`): the object at `[0x6353120]` ->
+    0x21EE050 (looks up a save entry by the name in the global string `[0x6353B70]`; [guess] built at start from
+    `freeroam` + `before_quest_activated`, .rdata 0x4B1EE18 / 0x4B1EE68) -> 0x2209E60(entry, &id, 1) (asks for the
+    load, the same call `Retry` 0x21E0D10 makes for the last checkpoint); returns true when a load was asked for.
+    Callers (all of them): the Lua binding `game.savesystem:FreeRoamRetry` (0x2E570F0, table
+    `C_MafiaSaveSystemScriptWrapper` 0x5AF5810; the flows' `free_roam_retry` node in savesystem.lua),
+    `C_GameOverController2`'s done step (0x2386920, also reached from the Lua binding at 0x2F5BEC0 with the fail
+    screen's choice: 2 = main menu 0x2214390; else, when vf 0xB8 of 0x226E0B0's object allows a retry, 0 = Retry /
+    1 = Restart Chapter 0x2219C30; when that did not load anything, FreeRoamRetry; when that did not either, the main
+    menu) and a menu handler at 0x3018B20. Its game tick (0x2386890) starts that step when the player's flags
+    `+0x1F9` (death, set at 0x2B5A0E8) or `+0x1FA` (set by 0x2D1FAD0) are set. So a death and every mission failure the
+    game turns into a "game over" end in FreeRoamRetry in a replay-style load, whatever the fail kind (the chapters'
+    fail texts, e.g. Taxi: `mm_20_taxi_go_taxi_abandoned`, `_go_taxi_drowned`, `_go_pass_dead`, `_go_law`,
+    `_go_hit_ped`; Race: `mm_50_race_go_time_out`, `_go_car_destroyed`, `_go_race_lost`; Motel `_go_escaped`; Plane
+    `mm_170_plane_go_morello_escaped`; arrest `mm_000_go_arrest` and death `mm_000_go_death` in the
+    `game_over_manager` flow script, whose event is `MS:MissionFailed`) [likely; only the abandoned objective and the
+    lost car were seen in game, both loaded `freeroam_before_quest_activated`].
+  - MafiaCoop (0.15): while a chapter host or a following guest is in a co-op chapter, FreeRoamRetry is not run:
+    the hook returns true ("asked for") and the story sync goes straight to the main menu and loads the checkpoint
+    (one load; src/game/fail_flow.h, docs/protocol.md "Failed missions"). The game-over controller treats it as done
+    (`mov byte [rbx+8], 0`). **UNVERIFIED:** that nothing else in the game waits for that load (screen faded,
+    controls locked: we quit 1 s later anyway); if the player is still in the failed world 20 s later the original
+    FreeRoamRetry runs after all (the old Free Ride stop path).
+  - The director's `GameOver(id)`: the Lua binding at 0x2245970 (pattern `Director_GameOverBinding`) takes the
+    string, `strtoul(s, 0, 10)`, and calls virtual function 1 (`[vt+8]`, edx = id) of the interface at `[G] + 8`,
+    `G` = the global read at binding+0x67 (`48 8B 0D`, 0x635A740 in this build; the same global the other director
+    bindings use, e.g. `[vt+0x190]`, `[vt+0x1E0]`). The class and its vtable were not found statically (no RTTI,
+    vtables packed back to back); MafiaCoop reads `[[G]+8][1]` at run time once `[G]` is set and hooks that function
+    (logged: `the director's GameOver hooked at exe+...`). Called by hand in a co-op chapter it did nothing visible
+    (game-api.md 14), so it loads nothing; it is logged (the reason id) and tells the guests of a STORY host's failure.
 - `game.savesystem:EnableSaveLogic(name)` takes a string (a named save logic), not a switch; `RequestCheckpointSave()`
   wrote nothing in a replay-style session.
 
@@ -793,6 +831,8 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | SaveSys_LoadRequest (section 7) | 0x2E78060 | `48 89 5C 24 10 48 89 6C 24 18 56 57 41 54 41 56 41 57 48 83 EC 20 48 8B 01 48 8B FA 48 8B 6C 24 70 49 8B F1 48 8B D5 45 8B F8 4C 8B F1 FF 50 40 B9 48 00 00 00` |
 | SaveSys_Find (storage entry lookup, section 7) | 0x2E6E320 | `48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 49 8B 00 8B EA 48 8B F1 48 89 44 24 40 49 8B D0 48 8D 4C 24 40 49 8B F8 33 DB` |
 | SaveSys_SlotFind (story / Free Ride slot storage lookup, section 7) | 0x2E74C80 | `48 89 5C 24 18 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 20 33 ED 41 83 CF FF 89 6C 24 60 4D 8B E0 48 8B 59 20 4C 8B E9 48 3B 59 28` |
+| SaveSys_FreeRoamRetry (the game's answer to a failure in a replay-style load, section 7) | 0x21E8B20 | `40 53 48 83 EC 20 48 8B 0D ?? ?? ?? ?? 48 8D 54 24 30 48 C7 44 24 30 00 00 00 00 E8 ?? ?? ?? ?? 48 85 C0 74 14 41 B0 01 48 8D 54 24 30 48 8B C8 E8 ?? ?? ?? ?? B3 01 EB 02 32 DB` |
+| Director_GameOverBinding (game.director:GameOver; `48 8B 0D` of the director global at +0x67, section 7) | 0x2245970 | `40 53 48 83 EC 20 BA 01 00 00 00 48 8B D9 44 8B C2 E8 ?? ?? ?? ?? BA 02 00 00 00 48 8B CB E8 ?? ?? ?? ?? BA 02 00 00 00 48 8B CB 85 C0 75 2E 44 8D 42 01 E8 ?? ?? ?? ?? BA 04 00 00 00 48 8B CB E8 ?? ?? ?? ?? 4C 8B C0 BA 02 00 00 00 48 8B CB E8 ?? ?? ?? ?? 33 C0 48 83 C4 20 5B C3 E8 ?? ?? ?? ?? 48 85 C0 74 38 48 8B 0D ?? ?? ?? ?? 48 89 7C 24 30 48 85 C9 74 06 48 8D 79 08 EB 02 33 FF 48 8B 1F 33 D2 48 8B C8 44 8D 42 0A FF 15 ?? ?? ?? ?? 8B D0 48 8B CF FF 53 08` |
 | Lua_GetEntityByGUID (thunk; its calls at +0x39/+0x46/+0x61/+0x69/+0x89 give entity manager, lookup by id, the wrapper steps and the push; `mc_entity`) | 0x239E510 | `48 89 5C 24 08 48 89 74 24 20 57 48 83 EC 20 BA 01 00 00 00 48 8B F1 44 8B C2 E8 ?? ?? ?? ?? 33 FF 4C 8D 44 24 38 48 8B CE 89 7C 24 38 8D 57 02 E8 ?? ?? ?? ?? 8B 5C 24 38 E8` |
 | lua_pushlstring | 0xE4DA50 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 40 BF 1F 00 00` |
 | lua_setfield | 0xE4DCD0 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B 41 48` |

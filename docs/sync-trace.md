@@ -49,6 +49,7 @@ on the other.
 | `NHS` | host | 2 Hz | `sending hits kills` |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id> copy ai car host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` |
 | `NGS` | guest | 2 Hz | `live matched copies avg max kills pulls` |
+| `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script

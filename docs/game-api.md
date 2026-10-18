@@ -404,6 +404,7 @@ docs/re-notes.md 6).
 | `game.hud:QuitToMainMenu()` | leaves the world for the main menu at once (no dialog, no save written). Called while a loading screen waits for Enter it hung the game on a black screen with the spinner (2026-10-16) |
 | failed mission | leaving the mission area 250 m (Taxi cp_010, Omerta cp_020 reached by its own flow): in a chapter-loader load the game loads `freeroam_before_quest_activated` at once (no screen; re-notes 7); in a CONTINUE load it shows "YOU ABANDONED THE OBJECTIVE" with Load Last Checkpoint / Restart Chapter / Return to Main Menu (scripts paused). Omerta started at cp_020 by `QuestSetCustomState` (after a reload) did not fail even 900 m away, and the host appeared at -943 -232 (the Free Ride start spot) instead of the park: a chapter-loader load never puts the player where the save has him (re-notes 7); since 0.10.0 the story sync moves him there before the quest starts, and then the check works (Omerta cp_020 failed again from every reloaded checkpoint). A destroyed mission car (Taxi cp_010, the parked taxi blown up with `car:Explode()`) fails the same way (the same `freeroam_before_quest_activated` load, about 20 s later); with the player in it he dies instead. Timer failures exist (`mm_50_race_go_time_out`, a later drive of the Race chapter) but were not reached. `timer_helper.StartTimer(s, f)` / `SimpleFail()` (timer.lua) showed nothing in a co-op chapter |
 | `game.director:GameOver("0059310003")` | (the id `timer.lua` uses) returned without error in Taxi cp_010 and showed nothing |
+| `game.savesystem:FreeRoamRetry()` | (static, re-notes 7) the game's own answer to a failure or a death in a chapter-loader load: asks for the load of `freeroam_before_quest_activated` and returns true. The game-over controller calls the same C++ function (exe+0x21E8B20) when a checkpoint retry is not possible. MafiaCoop skips it in a co-op chapter (0.15, below) |
 | `skipobjective()`, `savemission()` | debug globals that post events to a "temp_mission_flow" kit: nothing happens in this build |
 | cutscene object `game.entitywrapper:GetSceneObjectByName("cine_1100_omerta_cs_object")` -> `GetComponent("C_RuntimeCutsceneComponent")` | exists only while the chapter's quest runs. `IsCutscenePlaybackInProgress()` true while it plays (also when the mission flow plays it); `LoadCutscene()` then (when `IsCutsceneLoadFinished()`) `PlayCutscene2("", "", "", "")` (**four** strings; three = "wrong number of arguments") plays it on demand; `StopCutscene()` ends it (the play sync object is then done), `UnloadCutscene()`. After a stop the screen stays black: `HUD_FaderFadeIn(0.5)` (global) fades back in. `GetCutsceneId()` -1 before a load, 50001 after |
 | `game.gfx:GetCurrentWeatherSetName()` | after chapter loads it can name another chapter's set (`mm_160_harbor_cp_080_harbour_entrance_cutscene` in Omerta) |
@@ -422,6 +423,13 @@ docs/re-notes.md 6).
   of the host's cutscene object (or its own flow already does), stops it when the host's ends or is skipped, and is
   held (controls locked, "THE HOST IS WATCHING A CUTSCENE") if it skipped or cannot play it; puppets are hidden
   while a cutscene plays.
+- **Failed missions (0.15, src/game/fail_flow.h; static, UNVERIFIED in game):** every failure kind and a death the
+  game handles itself end in FreeRoamRetry in a co-op chapter. A chapter host or a following guest skips it: the
+  screen fades out, he leaves for the main menu at once and loads the checkpoint (one load instead of the Free Ride
+  stop plus the reload). The host's failure goes to the guests (FailVerdict HOST_FAILED: they leave at once and load
+  his checkpoint once he is back in his world); a guest's failure goes to the host (MissionFail), who decides:
+  REJOIN (he plays on: the guest loads his point) or WAIT (he fails or loads too: the guest follows his reload).
+  A STORY host keeps his fail screen; his GameOver tells the guests. docs/protocol.md "Failed missions".
 - Checked: lobby STORY from the Omerta cp_020 save (guest at cp_020 with the quest running and the objective);
   lobby CHAPTER 10: OMERTA (both at cp_010, intro cutscene on both, both flows reached cp_020 together, the host's
   cp_020 save went to the guest); lobby CHAPTER 2: TAXI (both in the chapter with objective markers); host cutscene
