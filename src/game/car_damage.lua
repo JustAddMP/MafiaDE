@@ -29,7 +29,7 @@ M.CarDamage = M.CarDamage or {}
 local D = M.CarDamage
 D.version = 1
 
-local ROUND = 0.25        -- s between rounds
+local ROUND = 0.15        -- s between rounds (was 0.25; a round sends only what changed)
 local QUIET = 1.0         -- s after a SetPos (pin / snap) a copy's own damage is not reported
 D.last = D.last or {}     -- player car key -> id of its last driver (the game that holds its damage while parked)
 D.expl = D.expl or {}     -- player car key -> true: our copy's explosion was switched back on (we hold the car)

@@ -1540,9 +1540,11 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                 const net::PlayerInfo* pi = _session->FindPlayer(id);
                 const double ahead = rem.snaps.empty() ? 0 : (rem.snaps.back().t - (clockAt - rem.offset)) * 1000;
                 core::trace::Line("CLK", "id=%u off=%.4f rtt=%.1f hz=%.1f snaps=%zu newest=%.1f recv=%u drop=%u "
-                                  "last=%.3f",
+                                  "last=%.3f pd=%.1f pdt=%.1f jit=%.1f late=%u sclk=%.1f",
                                   id, rem.offset, pi ? pi->rttMs : -1.0f, rem.rateHz, rem.snaps.size(), ahead,
-                                  rem.recvCount, rem.dropped, clockAt - rem.lastRecv);
+                                  rem.recvCount, rem.dropped, clockAt - rem.lastRecv, rem.playout.Delay() * 1000,
+                                  rem.playout.TargetDelay() * 1000, rem.playout.Lateness() * 1000, rem.playout.Late(),
+                                  _session->ClockOffsetS() * 1000);
             }
         }
         // The newest sample goes out in the frame the render thread first sees it (core flushes right after this

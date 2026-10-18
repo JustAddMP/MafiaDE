@@ -61,7 +61,7 @@ local N = M.Npc
 N.version = 4
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
-local SEND_INTERVAL = 0.1   -- s between host state rounds (10 Hz; ~10 KB/s for 48 NPCs)
+local SEND_INTERVAL = 0.066 -- s between host state rounds (15 Hz, was 10; ~15 KB/s for 48 NPCs)
 local RANGE = 120           -- m from the host or a puppet: NPCs sent
 local MAX_SEND = 48         -- NPCs per round
 local MATCH_DIST = 1.5      -- m: a guest NPC this close to a host NPC (when first paired) is its copy

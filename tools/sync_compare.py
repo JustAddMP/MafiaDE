@@ -14,6 +14,10 @@ seen on the other's game:
 - seats: puppets thrown out of cars (from the copied log lines)
 - NPCs: how far the guest's NPCs were from the host's
 - swapped cars: real cars hidden behind a copy and how they came back (SWR / SWP records)
+- bandwidth per system (from the copied "net: messages:" log lines of core's NetMonitor): typical (median) and
+  worst (max) KB/s out and in, plus what the send budget thinned or deferred
+- latency per system (LAT records): how long a message took from the sender's send to this game applying it,
+  p50 / p95 / max per system and receiving game (age on arrival + hand-off to the script tick)
 - the worst moments with the wall-clock time of both games, to look them up in a video or the logs
 
 --csv DIR writes the lined-up time series (one file per player and kind) for plotting.
@@ -602,6 +606,108 @@ def doors(tr, other):
         print("  %s %s %s" % (tr.wall(t), f.get("ev"), extra))
 
 
+def latency(traces):
+    """LAT records (game/latency.h): per receiving game and system, send -> applied (apply), of it on the wire and in
+    the queues until the handler (age) and the hand-off to the script tick (hand). Streams are sampled 1 in 4."""
+    section("Latency (sender's send -> applied here; session clock)")
+    any_rec = False
+    for tr in traces:
+        by = defaultdict(lambda: ([], [], []))
+        for _, f in tr.records.get("LAT", []):
+            a, g, h = num(f.get("apply")), num(f.get("age")), num(f.get("hand"))
+            if a is None:
+                continue
+            ap, ag, ha = by[f.get("sys", "?")]
+            ap.append(a)
+            ag.append(g if g is not None else a)
+            ha.append(h if h is not None else 0.0)
+        if not by:
+            continue
+        any_rec = True
+        print("  on %s's game (%s):" % (tr.name, tr.role))
+        print("    %-14s %7s %8s %8s %8s   %-24s %s" % ("system", "msgs", "p50", "p95", "max", "of it on arrival p50/p95",
+                                                     "hand-off p50/p95"))
+        for sys_name in sorted(by, key=lambda s: -pct(by[s][0], 50)):
+            ap, ag, ha = by[sys_name]
+            print("    %-14s %7d %6.1f ms %6.1f ms %6.1f ms   %6.1f / %6.1f ms        %5.1f / %5.1f ms" % (
+                sys_name, len(ap), pct(ap, 50), pct(ap, 95), max(ap), pct(ag, 50), pct(ag, 95), pct(ha, 50),
+                pct(ha, 95)))
+    if not any_rec:
+        print("  no LAT records (a build before the latency trace, or the clocks never synced)")
+
+
+MSG_RE = re.compile(r"(\S+) out ([\d.]+) KB/s [\d.]+/s, in ([\d.]+) KB/s [\d.]+/s([^;]*)")
+
+
+def msg_system(name):
+    """Message name (module.cpp MessageName) -> system, as in game/latency.h."""
+    n = name
+    if n in ("PlayerState", "CarParked", "PlayerModel"):
+        return "player"
+    if n in ("WorldEnv", "MissionState", "HostSave", "Cutscene", "MissionFail", "FailVerdict"):
+        return "world"
+    if n in ("NpcStates", "GuestNpcStates"):
+        return "npc"
+    if n.startswith("Npc") or n in ("GuestNpcEnd", "HostNpcHit"):
+        return "npc-event"
+    if n == "TrafficStates":
+        return "traffic"
+    if n.startswith("Traffic"):
+        return "traffic-event"
+    if n.startswith("Door"):
+        return "door"
+    if n in ("Explosion", "CarExploded") or n.startswith("Throw") or n.startswith("0x024"):
+        return "explosion"
+    if n.startswith("CarDamage"):
+        return "car-damage"
+    if n.startswith("Police"):
+        return "police"
+    if n == "ItemStates":
+        return "item"
+    if n.startswith("Item") or n == "Collectible":
+        return "item-event"
+    if n == "Hit":
+        return "hit"
+    return n
+
+
+def bandwidth(traces):
+    section("Bandwidth per system (NetMonitor reports, KB/s)")
+    any_rec = False
+    for tr in traces:
+        rows = defaultdict(lambda: ([], [], 0, 0))  # system -> (out per report, in per report, thinned, deferred)
+        reports = 0
+        for _, text in tr.logs:
+            if "net: messages: " not in text:
+                continue
+            reports += 1
+            per = defaultdict(lambda: [0.0, 0.0])
+            for m in MSG_RE.finditer(text.split("net: messages: ", 1)[1]):
+                s = msg_system(m.group(1))
+                per[s][0] += float(m.group(2))
+                per[s][1] += float(m.group(3))
+                extra = m.group(4)
+                th = re.search(r"thinned (\d+)", extra)
+                de = re.search(r"deferred (\d+)", extra)
+                o, i, t0, d0 = rows[s]
+                rows[s] = (o, i, t0 + (int(th.group(1)) if th else 0), d0 + (int(de.group(1)) if de else 0))
+            for s, (o, i) in per.items():
+                rows[s][0].append(o)
+                rows[s][1].append(i)
+        if not rows:
+            continue
+        any_rec = True
+        print("  %s's game (%s), %d reports:" % (tr.name, tr.role, reports))
+        print("    %-14s %16s %16s %10s %10s" % ("system", "out median/max", "in median/max", "thinned", "deferred"))
+        for s in sorted(rows, key=lambda k: -(max(rows[k][0] or [0]) + max(rows[k][1] or [0]))):
+            o, i, th, de = rows[s]
+            o = o + [0.0] * (reports - len(o))  # reports without this system: 0
+            i = i + [0.0] * (reports - len(i))
+            print("    %-14s %7.2f / %6.2f %7.2f / %6.2f %10d %10d" % (s, pct(o, 50), max(o), pct(i, 50), max(i), th, de))
+    if not any_rec:
+        print("  no NetMonitor lines in the traces (net_log_interval 0, or the log copy was off)")
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -655,6 +761,8 @@ def main():
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
     car_damage(a, b)
+    bandwidth((a, b))
+    latency((a, b))
     if worst:
         section("Worst moments (at least a second apart)")
         shown = []

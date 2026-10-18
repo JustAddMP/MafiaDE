@@ -32,6 +32,10 @@ additive (see "Car damage").
 Several guests (3-4 players; not yet in a release): HostNpcHit (0x0422) gets a trailing u8 attacker (read as the
 host when missing), NpcStates carry the other guests' own NPCs under relay keys (see "Several guests").
 
+Latency (not yet in a release; core `kProtocolVersion` 9: lanes, session clock, app message send stamps, core
+docs/protocol.md "Latency"): no message of ours changes; PlayerState's u32 time is now the moment the state was
+sampled (was: sent), which only shifts the receiver's timeline. See "Latency budget" at the end.
+
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
 
@@ -918,3 +922,57 @@ Known limits (documented, not fixed):
 - Puppets are spawned one at a time (one runtime spawner): with three others the last one may appear a few seconds
   after the first.
 - Two players in one car: their name tags and map markers overlap.
+
+## Latency budget (lanes, priorities, rates; not yet checked in game)
+
+Every sync should reach the other games as fast as it can without jittery motion or a fat link. Core does the
+transport part (core docs/protocol.md "Latency", "Lanes", "Send priorities", "Session clock", "Playout delay"):
+what a game sends in a frame goes out at the end of that frame (`Session::Flush` after `SessionTick`), a lost
+reliable unit is resent after about one round trip (fast retransmit), every app message carries the sender's
+session-clock stamp. Ours (`src/game/latency.cpp`, `Configure`):
+
+| Lane | Messages | Why apart |
+|---|---|---|
+| 0 | players, NPCs, traffic cars, car damage, explosions (incl. throws), hits | they refer to each other's cars and NPCs: one order |
+| 1 | world / mission 0x0200-0x020F | the host's checkpoint save (up to 256 KB) holds back nothing else |
+| 2 | doors 0x0230-0x023F | |
+| 3 | police 0x0260-0x026F | |
+| 4 | items 0x0270-0x027F | |
+
+A lane message still comes after the lane-0 messages sent before it; lane 0 does not wait for the lanes, so e.g. an
+NPC death sent after a mission change can arrive before it (UNVERIFIED that no handler minds; none checks for it).
+
+Priorities against the per-peer send budget (`net_budget_kbps`, lowered automatically on a lossy / backed-up link):
+Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
+NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
+(0x0260-0x0262), MissionFail / FailVerdict. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
+DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, car damage, the rest.
+
+Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
+parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way
+network delay N. "Before" is 0.15 main (core 0.11).
+
+| System | Rate / trigger | Before | Now | Bandwidth (per receiving peer) |
+|---|---|---|---|---|
+| PlayerState (on foot, car) | 60 Hz | sample -> send 0..1 frame (E) + send queued until the next Poll 16.7 ms (measured) + N + 0..1 frame + fixed 50 ms playout (led forward by 50 ms) | sent in the frame it is first seen, flushed at once (0.06 ms measured) + N + 0..1 frame + adaptive playout 24.5 ms at a quiet 60 Hz (measured, net_latency; grows with jitter), stamped with the sample time | ~4 KB/s per player on foot (~60 B x 60), ~6 KB/s in a car (E; +4 B stamp per state = +0.24 KB/s) |
+| Actions (punch, throw, jump ...) | ride on PlayerState | as PlayerState | as PlayerState | none extra |
+| Traffic cars | 20 Hz host rounds | 16.7 ms queue + N + fixed 120 ms playout | flushed + N + adaptive ~57 ms (traffic_test, quiet link; 140 ms under 80 ms jitter) | ~25 B per car per state: 20 cars x 20 Hz = ~10 KB/s typical, ~20 KB/s worst (cap 20 copies, E); Bulk: thinned first |
+| NPC states | 10 Hz -> 15 Hz | 0..100 ms round + 16.7 + N | 0..66 ms + N (no playout delay: the AI walks to the newest state) | ~15 KB/s for 48 NPCs (was ~10; E) |
+| NPC deaths / hits / claims | event | 16.7 + N (+ RTO 50 ms+ on a loss) | N (+ ~1 RTT on a loss) | < 0.5 KB/s (E) |
+| Doors | door message -> next tick; poll 5 Hz -> 10 Hz | 0..200 ms poll + 16.7 + N | next tick on a door message, else 0..100 ms + N | < 0.2 KB/s events; snapshots on request ~2-6 KB each (E), Bulk |
+| Items | scan 2 Hz -> 4 Hz | 0..500 ms + 16.7 + N | 0..250 ms + N | ItemStates ~1-3 KB/s near items (E), Bulk |
+| Police | read 5 Hz -> 10 Hz | 0..200 ms + 16.7 + N | 0..100 ms + N | < 0.3 KB/s (E) |
+| Car damage | rounds 4 Hz -> ~6.7 Hz | 0..250 ms + 16.7 + N | 0..150 ms + N | only changes: < 1 KB/s typical, a few KB in a crash (E) |
+| Explosions, throws | event (detector) | 16.7 + N | N | < 0.2 KB/s (E) |
+| Mission state / fail | on change | 16.7 + N (HostSave held back everything after it) | N; HostSave on its own lane | HostSave up to 256 KB once per checkpoint, Bulk |
+
+Everything is also behind one hop more for guest -> guest traffic (via the host's relay, which forwards in the Poll
+that received it). Lua <-> C++: every system's tick hands what arrived to its Lua glue in the same script tick
+(`latency::Applied` measures that hand-off, `LAT hand`) and the glue applies it in that call; what the glue reports
+goes out in the next render-thread `SessionTick` (0..1 frame, E: the script tick and Present are on different
+threads).
+
+Measuring: the sync trace has `LAT` records per applied message (send -> applied, session clock) and `CLK pd/jit`
+per remote player; `tools/sync_compare.py` prints "Latency" (p50 / p95 / max per system and receiving game) and
+"Bandwidth" (median / max KB/s per system from core's NetMonitor lines, thinned / deferred counts). The log has a
+`latency (send -> applied, p50/p95/max): ...` line every 10 s.

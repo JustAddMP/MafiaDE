@@ -37,7 +37,7 @@ M.Police = M.Police or {}
 local P = M.Police
 P.version = 1
 
-local READ_INTERVAL = 0.2   -- s between reads of our police state
+local READ_INTERVAL = 0.1   -- s between reads of our police state (was 0.2)
 local SCAN_INTERVAL = 1.0   -- s between scans for our police near targeted puppets (host)
 local POS_INTERVAL = 0.5    -- s between puppet / host positions sent to the C++ side (host)
 local COP_RANGE = 90        -- m from a targeted puppet: our police humans that count (and may be set on it)

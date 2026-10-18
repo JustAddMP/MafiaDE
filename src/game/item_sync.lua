@@ -33,7 +33,7 @@ M.Items = M.Items or {}
 local I = M.Items
 I.version = 1
 
-local SCAN_INTERVAL = 0.5   -- s between item rounds (the entity table scan, mc_entity_ids)
+local SCAN_INTERVAL = 0.25  -- s between item rounds (the entity table scan, mc_entity_ids; was 0.5)
 local RANGE = 100           -- m from a viewpoint: items reported
 local TYPES = { 63, 66 }    -- EntityType ITEM_WEAPON, ITEM_INVENTORY
 local GAIN_WINDOW = 2.0     -- s: weapons gained this recently count for a take

@@ -37,7 +37,7 @@ local SCAN_INTERVAL = 4.0    -- s between scans of the entity table
 local NEW_PER_TICK = 120     -- new doors read per tick (the first scan of a city world finds many)
 local NEAR_RADIUS = 35       -- m: doors this close to our player are polled
 local NEAR_INTERVAL = 1.0    -- s between recomputing the near list
-local POLL_INTERVAL = 0.2    -- s between polls of the near doors
+local POLL_INTERVAL = 0.1    -- s between polls of the near doors (a door message polls its door at once)
 local FRESH_INTERVAL = 1.0   -- s between DF lines
 local WATCH_TIME = 4.0       -- s a door that got a message or that we changed is polled wherever it is
 local OURS_WINDOW = 2.0      -- s after our player's door action (player_sync M.doorActT) a change near him is his
@@ -87,6 +87,7 @@ D.todo = D.todo or {}    -- ids found by the scan, not read yet
 D.bad = D.bad or {}      -- ids that are no usable door (no state readable)
 D.near = D.near or {}    -- ids polled every POLL_INTERVAL
 D.watch = D.watch or {}  -- id -> until: polled wherever it is
+D.urgent = D.urgent or {}  -- id -> true: got a door message, polled in the next tick (latency)
 D.msgs = D.msgs or {}    -- id -> { kind, sender, t }: the latest door message of that door
 D.subs = D.subs or {}
 
@@ -281,6 +282,7 @@ function D.OnDoorMessage(m, kind)
   local sender = good and tostring(s) or "-"
   D.msgs[id] = { kind = kind, sender = sender, t = M.now }
   D.watch[id] = M.now + WATCH_TIME
+  D.urgent[id] = true  -- polled in the next tick, not at the next poll round
   D.msgCount = (D.msgCount or 0) + 1
   local d = D.doors[id]
   trace("DL", string.format("ev=msg id=%d kind=%s sender=%s ours=%d known=%d", id, kind, sender,
@@ -444,8 +446,16 @@ function D.Update(dt, cmds)
     D.nearT = M.now
     pcall(D.Near, p)
   end
+  if next(D.urgent) and M.now - (D.pollT or -10) < POLL_INTERVAL then
+    local ids = {}
+    for id, _ in pairs(D.urgent) do ids[#ids + 1] = id end
+    D.urgent = {}
+    local good, err = pcall(D.Poll, p, ev, ids)
+    if not good then log("poll error: " .. tostring(err)) end
+  end
   if M.now - (D.pollT or -10) >= POLL_INTERVAL then
     D.pollT = M.now
+    D.urgent = {}
     local ids, inList = {}, {}
     for _, id in ipairs(D.near) do ids[#ids + 1] = id; inList[id] = true end
     for id, untilT in pairs(D.watch) do
