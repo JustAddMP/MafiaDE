@@ -21,6 +21,8 @@ ends with the driver's controls (6 bytes). After 0.14.0: guest-owned NPCs, Guest
 Reconnect (core docs/protocol.md "Reconnect"): no app message of ours changes and none is added. A guest whose
 connection was lost keeps playing while core rejoins the host; the host holds his slot. See "Reconnect" at the end.
 
+Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
+
 App id allocation (core reserves 0x0000-0x00FF):
 
 | Range | Owner |
@@ -307,6 +309,8 @@ scripts may change things in between; the next WorldEnv puts them back.
 | 0x0201 | MissionState | host -> guests (`Broadcast`; `SendTo` a new player) | R | str quest, str checkpoint, str objective, str overrideObjective, str saveId, u8 inWorld |
 | 0x0202 | HostSave | host -> guests (`Broadcast`; `SendTo` a new player) | R | u32 seq, str saveId, u32 size, size bytes (the save file, at most 200 KB) |
 | 0x0203 | Cutscene | host -> guests (`Broadcast`; `SendTo` a new player) | R | str name (`cine_..._cs_object` without the suffix; "" = none) |
+| 0x0205 | MissionFail | guest -> host (`SendToHost`) | R | u32 seq (counts the guest's failures), u32 reason (the last GameOver id, 0 = unknown), str quest, str checkpoint (the guest's point) |
+| 0x0206 | FailVerdict | host -> guests (`Broadcast` for HOST_FAILED; `SendTo` the reporting guest otherwise) | R | u8 kind (1 HOST_FAILED, 2 REJOIN, 3 WAIT), u32 seq (the MissionFail it answers; 0 for HOST_FAILED), u32 reason |
 
 - MissionState: `quest` = `GetActiveQuest()` (`mm_110_omerta`), `checkpoint` = the quest's custom state (`cp_020`),
   the objective ids (`active_objective`, `override_objective`), `saveId` = `GetLoadedSaveId()`, `inWorld`. Sent at
@@ -335,6 +339,27 @@ scripts may change things in between; the next WorldEnv puts them back.
   co-op chapter (save slots blocked) it gets the chapter loader's entry (in practice the Free Ride start) and the
   takeover leaves that world as soon as it is up (docs/re-notes.md 7). While the host is in it his MissionState
   carries that save id (`freeroam_...`), so guests do not follow him there.
+- **Failed missions (0.15; MissionFail 0x0205, FailVerdict 0x0206; src/game/fail_flow.h, re-notes 7).** Before, a
+  failure in a co-op chapter took two loads: the game's own answer (the free roam state before the quest, the "Free
+  Ride stop") and then our reload of the checkpoint from the main menu. Every failure kind (objective abandoned, the
+  mission car lost, a timer run out, an ally dead, a target escaped, arrested) and a death the game handles itself
+  end in the save system's FreeRoamRetry; it is skipped now and the player goes straight to the checkpoint:
+  - chapter host (lobby CHAPTER): screen faded out, at once to the main menu, his newest checkpoint of the session
+    loads (one load). He broadcasts FailVerdict HOST_FAILED;
+  - STORY host: his game shows its fail screen as in single player (Load Last Checkpoint = one load); when the
+    director's GameOver fires he broadcasts HOST_FAILED too;
+  - guest: skips it, leaves for the main menu at once and sends MissionFail. The host answers REJOIN when he is in
+    his world at a chapter point and not failing himself (the guest loads the host's point now; the host plays on),
+    else WAIT (the guest loads the host's point once the host has left his world and is back at a chapter point).
+    No answer within 6 s counts as REJOIN;
+  - a guest that gets HOST_FAILED leaves his world at once (also when his own failure is under way) and loads the
+    host's point once the host is back: one load on every game, also when the mission fails on both at the same
+    moment (a timer). If the host never leaves his world, the guest loads his point after 90 s;
+  - while a failure is handled the follow logic does not load or reload on its own, and a death adds no reload; the
+    game's second request of the same failure is skipped too. If the player is still in the failed world 20 s after
+    skipping (the quit did not happen), or the game loads the free roam state anyway, the 0.9.1 way runs (Free Ride
+    stop, then the reload). A peer without these messages ignores them; a guest whose host does not answer goes back
+    after 6 s; a host without them does not send HOST_FAILED (the guests then follow his reload as in 0.11.0).
 - A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
   instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
 
