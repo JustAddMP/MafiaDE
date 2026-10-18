@@ -337,6 +337,12 @@ function B.OnRemote(f)
       if good and valid(o) then try("Hide " .. object, o.Hide, o) end
     end
   end
+  -- the cars whose damage we hold take its effect here (car_damage.lua D.Blast), far or near; not when our own copy of
+  -- his NPC threw it here (then that blast was real on our game and hit our cars already)
+  if act ~= "npc_here" and M.CarDamage and M.CarDamage.Blast then
+    local good, err = pcall(M.CarDamage.Blast, x, y, z, kind, from, seq)
+    if not good then log("car blast error: " .. tostring(err)) end
+  end
   local n = B.stats.shown + B.stats.failed + B.stats.far + B.stats.npcSkip
   if n <= 60 or n % 50 == 0 then
     log(string.format("player %s's %s at %.1f %.1f %.1f (%.0f m from us): %s%s", tostring(from),
@@ -387,6 +393,13 @@ function B.OnRemoteCar(f)
     B.Picture(x, y, z, "exp_grenade", false, from, 0, 5)  -- no car here: at least the blast
     act = "no_car"
   end
+  -- its blast reaches the cars we hold nearby (car_damage.lua D.Blast; the car itself is exploded already)
+  local bx, by, bz = x, y, z
+  if valid(ent) then
+    local good, q = pcall(ent.GetPos, ent)
+    if good and q then bx, by, bz = q.x, q.y, q.z end
+  end
+  if bx and M.CarDamage and M.CarDamage.Blast then pcall(M.CarDamage.Blast, bx, by, bz, 5, from, 0) end
   log(string.format("player %s's %s blew up: %s", tostring(from), label, act))
   trace("XCV", string.format("from=%s what=%d key=%s act=%s", tostring(from), what, tostring(key), act))
 end

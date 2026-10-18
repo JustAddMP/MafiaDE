@@ -441,6 +441,60 @@ void TestExplodeOnce() {
     Check(!stillHeld && n.b.GetStats().reports == 0, "an exploded copy is not held, nothing reported back");
 }
 
+void TestBlast() {
+    // the falloff
+    const BlastEffect at3 = BlastOn(3.0f, false), at4 = BlastOn(4.0f, false), at5 = BlastOn(5.0f, false),
+                      at7 = BlastOn(7.0f, false), at9 = BlastOn(9.5f, false), at11 = BlastOn(11.0f, false);
+    Check(at3.explode && at4.explode && !at5.explode, "within 4 m the car explodes");
+    Check(at5.parts > at7.parts && at7.parts > at9.parts && at9.parts > 0 && at11.Empty(),
+          "part damage falls off with distance, none beyond 10 m",
+          std::to_string(at5.parts) + " " + std::to_string(at7.parts) + " " + std::to_string(at9.parts));
+    Check(at5.tyres && !at7.tyres && at5.burn && !at7.burn, "tyres burst and fire start only close by");
+    Check(BlastOn(-1.0f, false).Empty() && BlastOn(NAN, false).Empty(), "bad distances do nothing");
+    const BlastEffect m1 = BlastOn(1.0f, true), m4 = BlastOn(4.0f, true);
+    Check(m1.burn && !m1.explode && m1.parts > 0 && m4.Empty(), "a molotov: fire within 3 m, never an explosion");
+
+    // the writes it makes on our car (raise-only)
+    Snapshot car = Car();
+    car.parts[2] = 240;
+    car.parts[3] = kGone;
+    Applied d;
+    Apply a = Plan(car, BlastTarget(car, at7), d);
+    bool noGone = true, capped = true;
+    for (const auto& [i, v] : a.parts) {
+        if (i == 3) noGone = false;
+        if (v > kMaxDamage) capped = false;
+    }
+    Check(!a.parts.empty() && noGone && capped && a.wheels.empty() && !a.burn && !a.explode,
+          "7 m: parts raised, nothing else", std::to_string(a.parts.size()));
+    Applied d2;
+    Check(Plan(car, BlastTarget(car, at3), d2).explode, "3 m: the explosion write");
+    Applied d3;
+    Apply c = Plan(car, BlastTarget(car, at5), d3);
+    Check(c.burn && c.wheels.size() == car.wheels.size(), "5 m: fire and every tyre");
+
+    // the dedupe: our game (the holder) put another game's blast on the car; the copy's report of the same blast
+    // (its game's real blast hit it there) is dropped for a moment, a later report is taken
+    Net n;
+    Snapshot ha = Car(), cb = Car();
+    for (int i = 0; i < 3; ++i) Step(n, ha, 11, Role::Authority, cb, 22, Role::Copy);
+    const CarRef ref{CarRef::kPlayer, 0, 5000};
+    n.a.OnRemoteBlast(ref, n.now);
+    ha.parts[4] = 150;  // what our blast write did
+    cb.parts[4] = 170;  // the copy's own game: its real blast did a bit more
+    for (int i = 0; i < 4; ++i) Step(n, ha, 11, Role::Authority, cb, 22, Role::Copy);
+    Check(n.a.GetStats().blastDropped >= 1 && ha.parts[4] == 150, "the copy's report of the same blast is dropped",
+          std::to_string(n.a.GetStats().blastDropped) + " p4=" + std::to_string(ha.parts[4]));
+    n.now += 2.0;
+    cb.wheels[0] = kWheelBurst;  // later, its own damage again: taken
+    for (int i = 0; i < 6; ++i) Step(n, ha, 11, Role::Authority, cb, 22, Role::Copy);
+    Check(ha.wheels[0] == kWheelBurst, "a report after the quiet time is taken");
+    Check(n.a.GetStats().blasts == 1, "one blast counted");
+    Book copyBook;
+    copyBook.OnRemoteBlast(ref, 0);
+    Check(copyBook.GetStats().blasts == 0, "a car we do not hold takes no blast");
+}
+
 void TestBookTraffic() {
     // the host's own book keeps his traffic cars by entity (h...), the guest's by net (t...): the sync translates
     Book host, guest;
@@ -491,6 +545,7 @@ int main() {
     TestBookHandOver();
     TestBookExplosion();
     TestExplodeOnce();
+    TestBlast();
     TestBookTraffic();
     TestStale();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");

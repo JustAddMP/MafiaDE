@@ -653,6 +653,10 @@ u8  n                     parts listed
   undone by a repair once they add up (see docs/game-api.md 24). A copy never blows up by itself: a burning copy
   burns with its countdown held, and the holder's exploded flag (or the explosions sync's CarExploded, whichever comes
   first) sets it exploded once, with a visual-only picture ("Explosions"; docs/game-api.md 24 "One explosion").
+- **Blasts on other games:** an Explosion from another game (a picture here) is put on the cars this game holds
+  within 10 m by this game itself (explode within 4 m, parts / tyres / fire by distance; docs/game-api.md 24), and
+  CarDamage carries it on; the holder drops copies' CarDamageReports of that car for 1.5 s after, so the blast counts
+  once.
 - **The host's traffic:** CarDamage goes out by net id to all guests (a guest without that copy ignores it); a
   traffic car nobody has a copy of is not sent. Reports and requests for it go to the host, who maps the net id back
   to his car.

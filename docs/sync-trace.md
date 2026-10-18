@@ -90,6 +90,7 @@ on the other.
 | `CDA` | both | per change set on a car | `ref ent why=<sync: a copy raised to the holder's; report: another game's copy's damage on our car; rebind: a new entity for a car; repair> parts=<index:damage,...> wheels=<count> burn explode reason=<repair: epoch, stale, quiet>` |
 | `CDX` | both | per CarDamageReport sent | `ref to ep parts wheels=<1 a tyre / wheel> flags` |
 | `CDQ` | both | per CarDamageRequest sent | `ref to` |
+| `CDK` | both | another game's explosion put on a car we hold (C++) | `ref ent d=<m from the blast> fire=<1 a molotov's fire only> seq from parts=<quanta added> tyres burn explode writes=<writes made>` (docs/game-api.md 24) |
 | `CDB` | both | each ask of the one-explosion book (C++) | `ent first=<1 it blows up now, 0 refused: blown up already>` (docs/game-api.md 24 "One explosion") |
 | `CDE` | both | each car blown up by the one explode routine (Lua D.Explode) | `ent ok=<SetExploded worked> picture=<1 a picture shown> claimed=<1 our own car, asked already> from=<the player whose game said so, - car damage>` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |

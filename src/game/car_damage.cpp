@@ -358,6 +358,48 @@ float HoldFire(float left, float hold) {
     return std::isfinite(left) && left > hold ? left : hold;
 }
 
+BlastEffect BlastOn(float distance, bool fireOnly) {
+    BlastEffect e;
+    if (!std::isfinite(distance) || distance < 0) return e;
+    if (fireOnly) {
+        if (distance <= kFireReach) {
+            e.burn = true;
+            e.burnLeft = kFireBurn;
+            e.parts = static_cast<uint8_t>(std::lround(kFireParts * (1.0f - distance / kFireReach)));
+        }
+        return e;
+    }
+    if (distance <= kBlastKill) {
+        e.explode = true;
+        return e;
+    }
+    if (distance >= kBlastReach) return e;
+    const float f = (kBlastReach - distance) / (kBlastReach - kBlastKill);
+    e.parts = static_cast<uint8_t>(std::lround(kBlastParts * f));
+    e.tyres = distance <= kBlastTyres;
+    if (distance <= kBlastFire) {
+        e.burn = true;
+        e.burnLeft = kBlastBurn;
+    }
+    return e;
+}
+
+Snapshot BlastTarget(const Snapshot& local, const BlastEffect& e) {
+    Snapshot t = local;
+    for (uint8_t& p : t.parts)
+        if (p != kGone) p = static_cast<uint8_t>(std::min<int>(kMaxDamage, p + e.parts));
+    if (e.tyres)
+        for (uint8_t& w : t.wheels)
+            if (w == kWheelOk) w = kWheelBurst;
+    if (e.explode) {
+        t.flags |= kExploded;
+    } else if (e.burn && !(t.flags & (kBurning | kExploded))) {
+        t.flags |= kBurning;
+        t.burnLeft = e.burnLeft;
+    }
+    return t;
+}
+
 bool Empty(const Update& u) {
     if (!u.parts.empty() || u.flags) return false;
     for (uint8_t w : u.wheels)
@@ -440,8 +482,19 @@ void Book::OnReport(const Update& u, int from, double now) {
     ++stats_.reportsIn;
     if (c.role != Role::Authority || !c.entity) return;  // not ours (any more): its new driver's copy reports to him
     if (u.epoch < c.epoch) return;                       // taken before our last repair
+    if (now < c.blastUntil) {                            // the blast we put on the car ourselves: not twice
+        ++stats_.blastDropped;
+        return;
+    }
     if (MergeUp(c.raise, u)) c.haveRaise = true;
     (void)from;
+}
+
+void Book::OnRemoteBlast(const CarRef& ref, double now) {
+    auto it = cars_.find(ref);
+    if (it == cars_.end() || it->second.role != Role::Authority) return;
+    it->second.blastUntil = now + cfg_.blastQuiet;
+    ++stats_.blasts;
 }
 
 void Book::OnRequest(const CarRef& ref, int from) {

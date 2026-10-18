@@ -22,6 +22,8 @@
 --                                place by SetPos in the last second (pinned / snapped: its own bumps are no damage),
 --                                gd / md = GetDamage / GetMotorDamage (0..100, for the logs; - unknown)
 --   CE                           end of the round
+--   BL ref ent dist fire seq from another game's explosion `dist` m from our car `ent` (we hold its damage): the dll
+--                                puts the blast's effect on it (car_damage.h BlastOn); fire 1 = a molotov's fire only
 --   ST text                      status for the overlay (once a second)
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
@@ -35,6 +37,9 @@ D.last = D.last or {}     -- player car key -> id of its last driver (the game t
 D.expl = D.expl or {}     -- player car key -> true: our copy's explosion was switched back on (we hold the car)
 D.off = D.off or {}       -- entity id -> true: a car another game holds, its explosion switched off by us
 D.blown = D.blown or {}   -- entity id -> true: blown up by D.Explode (nothing to switch off any more)
+D.held = D.held or {}     -- the cars we hold (this round): { ref, e }
+D.blasts = D.blasts or {} -- "BL ..." lines for the next round
+local BLAST_REACH = 10.5  -- m: cars farther from another game's explosion are not touched (car_damage.h kBlastReach)
 
 local function log(s) if mc_log then mc_log("damage: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -167,9 +172,37 @@ local function line(ev, ref, e, role, auth, quiet)
     g1 and num(gd) or "-", g2 and num(md) or "-")
 end
 
+-- Another game's explosion at x y z (explosion_sync.lua B.OnRemote / B.OnRemoteCar; a damage-free picture here):
+-- cars stay destroyable by anyone's explosion, so the cars we hold within reach take its effect on our game (the dll
+-- writes it; docs/game-api.md 24 "Another game's explosion"). kind: Explosion kind (2 molotov: fire only).
+function D.Blast(x, y, z, kind, from, seq)
+  x, y, z = tonumber(x), tonumber(y), tonumber(z)
+  if not (x and y and z) then return 0 end
+  local n = 0
+  for _, h in ipairs(D.held) do
+    if valid(h.e) then
+      local good, q = pcall(h.e.GetPos, h.e)
+      if good and q then
+        local d = math.sqrt((q.x - x) ^ 2 + (q.y - y) ^ 2 + (q.z - z) ^ 2)
+        if d <= BLAST_REACH then
+          local id = entId(h.e)
+          if id then
+            D.blasts[#D.blasts + 1] = string.format("BL %s %d %.2f %d %s %s", h.ref, id, d,
+              tonumber(kind) == 2 and 1 or 0, tostring(seq or 0), tostring(from or "-"))
+            n = n + 1
+          end
+        end
+      end
+    end
+  end
+  if n > 0 then log(string.format("player %s's explosion at %.1f %.1f %.1f: %d of our cars within reach", tostring(from), x, y, z, n)) end
+  return n
+end
+
 function D.Round(ev)
   local me = M.localId or "0"
   local n, own, copies = 0, 0, 0
+  D.held = {}
   for key, c in pairs(M.cars or {}) do
     if c.driver then D.last[key] = (c.driver == "local") and me or c.driver end
     if c.st == "ready" and valid(c.ent) then
@@ -177,6 +210,7 @@ function D.Round(ev)
       local ours = holder == me
       explosionFor(key, c, ours)
       line(ev, key, c.ent, ours and "A" or "C", holder, ours and "0" or quietOf(c.rv))
+      if ours then D.held[#D.held + 1] = { ref = key, e = c.ent } end
       n = n + 1
       if ours then own = own + 1 else copies = copies + 1 end
     end
@@ -187,6 +221,7 @@ function D.Round(ev)
       for id, c in pairs(T.list or {}) do
         if valid(c.e) then
           line(ev, "h" .. id, c.e, "A", me, "0")
+          D.held[#D.held + 1] = { ref = "h" .. id, e = c.e }
           n, own = n + 1, own + 1
         end
       end
@@ -230,8 +265,11 @@ function D.Update(dt, cmds)
   end
   if not D.active then
     if next(D.last) or next(D.expl) or next(D.off) or next(D.blown) then D.last, D.expl, D.off, D.blown = {}, {}, {}, {} end
+    D.held, D.blasts = {}, {}
     return ""
   end
+  for _, l in ipairs(D.blasts) do ev[#ev + 1] = l end
+  D.blasts = {}
   D.t = (D.t or 0) + (dt or 0)
   if D.t >= ROUND then
     D.t = 0

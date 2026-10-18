@@ -608,6 +608,44 @@ void Carry(const Apply& a, uint32_t entity) {
     }
 }
 
+// "BL ref ent dist fire seq from": another game's explosion near a car we hold (car_damage.lua D.Blast). Its effect
+// (car_damage.h BlastOn) goes on our real car with the usual writes; the next round's CarDamage brings it to every
+// copy, and the copies' own reports of the same blast are dropped for a moment (Book::OnRemoteBlast).
+void ApplyBlast(const std::string& line, double now) {
+    char ref[32] = {}, seq[16] = {}, from[16] = {};
+    unsigned long ent = 0;
+    float dist = 0;
+    int fireOnly = 0;
+    if (std::sscanf(line.c_str() + 3, "%31s %lu %f %d %15s %15s", ref, &ent, &dist, &fireOnly, seq, from) != 6) return;
+    CarRef r;
+    if (!CarRef::Parse(ref, r)) return;
+    const auto entity = static_cast<uint32_t>(ent);
+    const BlastEffect fx = BlastOn(dist, fireOnly != 0);
+    Snapshot s;
+    if (fx.Empty() || !ReadCar(entity, s)) return;
+    Applied done;
+    Apply a = Plan(s, BlastTarget(s, fx), done);
+    a.entity = entity;
+    a.copy = false;  // our own car: the real writes (its explosion natively, once: ExplodeOnce)
+    {
+        Shared& sh = S();
+        std::lock_guard lock(sh.mu);
+        sh.book.OnRemoteBlast(r, now);
+    }
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "car %s: player %s's explosion %.1f m away (seq %s) hits our car: parts +%u, tyres %s%s%s", ref, from,
+                  dist, seq, fx.parts, fx.tyres ? "burst" : "kept", fx.burn ? ", fire" : "",
+                  fx.explode ? ", blown up" : "");
+    Log(buf);
+    if (core::trace::IsOpen())
+        core::trace::Line("CDK", "ref=%s ent=%u d=%.2f fire=%d seq=%s from=%s parts=%u tyres=%d burn=%d explode=%d "
+                                 "writes=%zu",
+                          ref, entity, dist, fireOnly, seq, from, fx.parts, fx.tyres ? 1 : 0, fx.burn ? 1 : 0,
+                          fx.explode ? 1 : 0, a.parts.size() + a.wheels.size() + (a.burn ? 1 : 0) + (a.explode ? 1 : 0));
+    if (!a.Empty()) Carry(a, entity);
+}
+
 void MainTick(lua_State* L, float dt) {
     Shared& sh = S();
     bool active, host;
@@ -692,6 +730,8 @@ void MainTick(lua_State* L, float dt) {
         } else if (line.rfind("ST ", 0) == 0) {
             std::lock_guard lock(sh.mu);
             sh.status = line.substr(3);
+        } else if (line.rfind("BL ", 0) == 0 && _g.read) {
+            ApplyBlast(line, Now());
         }
     }
     if (!round) return;

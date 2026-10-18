@@ -151,6 +151,35 @@ constexpr float kHoldFire = 3.0f;  // s: a burning copy's countdown is put back 
 // The countdown value a held copy gets: `left` when it is above `hold`, else `hold` (also for NaN / negative values).
 float HoldFire(float left, float hold = kHoldFire);
 
+// ---- another game's explosion on the cars we hold ------------------------------------------------------------------
+// Cars stay destroyable by anyone's explosion: an explosion on another game reaches us as Explosion (0x0240, a
+// damage-free picture here), and the game that HOLDS a car's damage puts the blast's effect on its real car itself
+// (the native writes: parts, tyres, the fire, the explosion); the usual CarDamage then brings it to every copy. The
+// falloff is ours (the game's own explosion damage curve was not found statically; UNVERIFIED constants):
+//   within kBlastKill (4 m)            the car explodes (native, after ExplodeOnce)
+//   kBlastKill .. kBlastReach (10 m)   every part takes up to kBlastParts quanta, linear to 0 at kBlastReach; within
+//                                      kBlastTyres (6 m) every tyre bursts; within kBlastFire (5 m) the car catches
+//                                      fire (kBlastBurn s to its own explosion)
+//   a molotov (fire only)              within kFireReach (3 m) the car catches fire and its parts take up to
+//                                      kFireParts quanta; no explosion
+// Players and NPCs are not touched by this (their damage is decided once, by the sender's game).
+constexpr float kBlastKill = 4.0f, kBlastReach = 10.0f, kBlastTyres = 6.0f, kBlastFire = 5.0f, kBlastBurn = 8.0f;
+constexpr int kBlastParts = 200;
+constexpr float kFireReach = 3.0f, kFireBurn = 10.0f;
+constexpr int kFireParts = 40;
+struct BlastEffect {
+    bool explode = false;
+    bool burn = false;
+    float burnLeft = 0;
+    uint8_t parts = 0;  // quanta every part is raised by (to at most kMaxDamage)
+    bool tyres = false; // every tyre bursts
+    bool Empty() const { return !explode && !burn && parts == 0 && !tyres; }
+};
+// The effect of a blast `distance` m away; `fireOnly`: a molotov's fire (Explosion kind 2) rather than a blast.
+BlastEffect BlastOn(float distance, bool fireOnly);
+// What `local` becomes under `e` (raise-only: nothing gets better); Plan(local, BlastTarget(...)) gives the writes.
+Snapshot BlastTarget(const Snapshot& local, const BlastEffect& e);
+
 // ---- the per-game book of every car's damage ------------------------------------------------------------------------
 enum class Role : uint8_t { Authority, Copy };
 
@@ -183,6 +212,7 @@ struct BookConfig {
     double quietRepairGap = 20;  // s between two repairs of a copy that took damage while it was moved by SetPos
     int quietRepairMin = 30;     // quanta of such damage (summed) before a copy is repaired and set again
     double forget = 30.0;        // s a car may be missing from the rounds before it is forgotten
+    double blastQuiet = 1.5;     // s after we put another game's blast on our car: copies' reports of it are dropped
 };
 
 class Book {
@@ -191,6 +221,9 @@ public:
     void OnDamage(const Update& u, int from, double now);   // CarDamage arrived
     void OnReport(const Update& u, int from, double now);   // CarDamageReport arrived (we may be the authority)
     void OnRequest(const CarRef& ref, int from);            // CarDamageRequest arrived
+    // We put another game's blast on our car `ref` (the holder): the copies' reports of the same blast (their own
+    // games' real blast hit them too, reported 0.4 s later) are dropped for blastQuiet s, so it is not applied twice.
+    void OnRemoteBlast(const CarRef& ref, double now);
     void Round(const std::vector<CarInput>& cars, double now, Outbox& out);
     void OnPlayerLeft(int id);
     void Clear() { cars_.clear(); }
@@ -198,7 +231,7 @@ public:
     struct Stats {
         uint32_t cars = 0, authority = 0, copies = 0, damaged = 0;
         uint64_t sent = 0, fulls = 0, reports = 0, requests = 0, received = 0, applied = 0, repairs = 0,
-                 explosions = 0, reportsIn = 0;
+                 explosions = 0, reportsIn = 0, blasts = 0, blastDropped = 0;
     };
     const Stats& GetStats() const { return stats_; }
     // test access
@@ -234,6 +267,7 @@ private:
         double quietRepairAt = -1e9;
         bool layoutWarned = false;
         bool fresh = false;          // a new entity: checked once for damage the car does not have
+        double blastUntil = -1e9;    // authority: copies' reports dropped until then (OnRemoteBlast)
     };
     void AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);
     void CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);

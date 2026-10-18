@@ -1237,9 +1237,20 @@ left. Same model = same part list: a layout hash of the part types tells whether
     picture was shown for that car already). Traced `CDB` (the book's answer) and `CDE` (what was done).
   On the holder's game (the driver's, the last driver's while parked, the host for his traffic) the car blows up the
   game's own way; a player car copy we drive ourselves (we hold its damage now) has its explosion switched back on,
-  and off again when another game holds it. Known consequence (UNVERIFIED in game): a parked car another game holds
-  does not blow up on this game from a blast here (an explosion of this game near it only shows as a picture on the
-  holder's game, which does not damage cars).
+  and off again when another game holds it.
+- **Another game's explosion on the cars we hold.** Cars stay destroyable by anyone's explosion: a blast on any game
+  reaches the holder's game as Explosion (section 23; a damage-free picture there), and the holder puts the blast's
+  effect on every car it holds within 10 m itself (explosion_sync.lua `B.OnRemote` / `B.OnRemoteCar` -> car_damage.lua
+  `D.Blast` -> "BL" -> car_damage_sync.cpp `ApplyBlast`, the falloff in car_damage.h `BlastOn`): within 4 m the car
+  explodes (native, after `ExplodeOnce`); 4..10 m every part takes up to 200 quanta, linear to 0 at 10 m; within 6 m
+  every tyre bursts; within 5 m it catches fire (8 s to its own explosion); a molotov's fire (Explosion kind 2): within
+  3 m it catches fire, parts up to 40 quanta, never an explosion. The game's own explosion damage curve was not found
+  statically: these constants are guesses (UNVERIFIED). The usual CarDamage then brings it to every copy. Not when
+  our own copy of an NPC threw it here (its blast was real on our game). Players and NPCs are not touched by this
+  (their damage is decided once, by the sender's game). The copy on the game where the blast really happened takes
+  its own part damage there (its explosion is off) and reports it 0.4 s later: the holder drops the copies' reports of
+  that car for 1.5 s after it put a remote blast on it (`Book::OnRemoteBlast`), so the blast counts once (the holder's
+  version). Traced `CDK`.
 - **Traffic:** the host's traffic cars (traffic_sync, section 19) are named by his entity id on his game and by their
   net id on the wire and on the guests' games; a guest's copy is a copy like any other (it asks the host, reports
   its own damage to him). A traffic car a player takes over becomes a player car (its damage goes on with it: the
