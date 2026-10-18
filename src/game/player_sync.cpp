@@ -10,6 +10,7 @@
 #include "game/characters.h"
 #include "game/player_actions.h"
 #include "game/lua.h"
+#include "game/map_markers.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
 #include "net/remote_motion.h"
@@ -981,6 +982,26 @@ int McTrace(lua_State* L) {
     return 0;
 }
 
+// mc_mapmark(icon, target, puppet, changed, failed, hasPos, x, y, z, lx, ly, lz) -> want, action: what to do with a
+// remote player's map marker (game/map_markers.h; player_sync.lua M.MarkersTick). icon "none"/"human"/"pos", target
+// "none"/"puppet"/"pos", the flags 1/0; returns the target names and the action name. GameMainThread only.
+int McMapMark(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    mapmark::Input in;
+    in.icon = mapmark::IconFromName(lua::TypeOf(L, 1) == lua::TString ? lua::ToString(L, 1) : nullptr);
+    in.target = mapmark::TargetFromName(lua::TypeOf(L, 2) == lua::TString ? lua::ToString(L, 2) : nullptr);
+    in.puppet = num(3) != 0;
+    in.puppetChanged = num(4) != 0;
+    in.humanFailed = num(5) != 0;
+    in.hasPos = num(6) != 0;
+    in.x = num(7), in.y = num(8), in.z = num(9);
+    in.lastX = num(10), in.lastY = num(11), in.lastZ = num(12);
+    const mapmark::Plan p = mapmark::Decide(in);
+    lua::PushString(L, mapmark::TargetName(p.want));
+    lua::PushString(L, mapmark::ActionName(p.act));
+    return 2;
+}
+
 // mc_carswap(key, now, bits, copySpeed, parkedAt) -> action, lockCopy, phase, why: one step of the swapped-car
 // machine (game/car_swap.h) for car `key` (player_sync.lua M.SwapTick). One machine per key, dropped after its action.
 // Every change of phase or reason is logged and traced ("SWP", docs/sync-trace.md). GameMainThread only.
@@ -1043,6 +1064,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_player_profile", &McPlayerProfile);
     lua::RegisterGlobal(L, "mc_trace", &McTrace);
     lua::RegisterGlobal(L, "mc_carswap", &McCarSwap);
+    lua::RegisterGlobal(L, "mc_mapmark", &McMapMark);
     return true;
 }
 
@@ -1078,6 +1100,13 @@ void MainTick(lua_State* L, float dt) {
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
             sh.enterPressed = false;
             if (sh.aimDown) cmds += "A\n";
+            // the other players' names for their map markers (player_sync.lua M.names), once a second
+            static double lastNames = -10;
+            if (now - lastNames >= 1.0) {
+                lastNames = now;
+                for (const auto& [id, name] : sh.names)
+                    if (id != sh.localId) cmds += mapmark::NameLine(id, name);
+            }
             for (const auto& [id, name] : sh.names) {  // in the session but nothing received yet: preload the model
                 auto it = sh.remotes.find(id);
                 if (id != sh.localId && (it == sh.remotes.end() || it->second.snaps.empty()))
