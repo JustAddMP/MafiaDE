@@ -44,7 +44,7 @@ on the other.
 | `VEH` | both | 60 Hz per remote driver (plus pins, retries, snaps) | `id key rT have tgt tv cp cv err rot=<deg> fix=<0 none 1 blend 2 pin 3 snap> pin why=<0 - 1 too slow 2 ran off 3 stays off> jp=<pinned now> rt=<physics retried now> pins tsp csp vel=<wanted copy velocity> pw ctl st br hb gear` |
 | `PAS` | both | 60 Hz per remote passenger | `id key rT seat cp` |
 | `LR` | both | 20 Hz | our player read back: `p d spr hp`; in a car `car seat cp cv rb=<steer wish,power,brake,handbrake,steer linearity,front wheel angle (rad)> eng gear spd fixed rpm pwi` |
-| `PR` | both | 20 Hz per puppet | `id st p d hid veh seat own=<car it sits in> seated ejects tries anim phys spr dead hp mv mult moves snaps` |
+| `PR` | both | 20 Hz per puppet | `id st p d hid veh seat own=<car it sits in> seated ejects tries anim phys spr dead hp mv mult moves snaps sown=<who holds its seat: ours/free/other/?, - on foot> brain=<friend brain set> ai=<GetAIType> back=<put-backs into the seat> leaving=<out of its seat inside the car now> ejAll=<throw-outs this session>` (the last six since 0.15, docs/game-api.md 17) |
 | `CR` | both | 20 Hz per driven car copy | `key drv adopted fix pin p v rb=<as LR> eng gear spd fixed rpm pwi cmd=<steer,power,brake,handbrake,gear given> steerIn=<SetSteer value> vel speedHow=<vector/number/none: how SetSpeed works> seat0=<puppet/none/other> locked` |
 | `NHS` | host | 2 Hz | `sending hits kills` |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id> copy ai car host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` |
@@ -69,7 +69,9 @@ Per player as seen on the other game:
   how often its physics was retried; the copy's speed against the driver's; the steering wish on the copy against
   the driver's (did SetSteer stick) and the front wheel angle against the driver's car; engine states; how SetSpeed
   worked.
-- **seats:** "thrown out" lines of that player's puppet (with the car's speed, fix, physics state).
+- **seats:** "thrown out" lines of that player's puppet (with the car's speed, fix, physics state, brain, who holds
+  the seat); since 0.15 also its brain lines, put-backs inside the car, seats taken by others, and the receiver's own
+  ride-along lines.
 - **car notes:** the one-time probe (`probe: speed .. after SetPos .. after SetRot .. after SetSpeed`), SetSpeed and
   engine lines.
 - **NPCs** (guest): host NPCs in range and paired, the distance of ours from the host's, the NPCs most often more

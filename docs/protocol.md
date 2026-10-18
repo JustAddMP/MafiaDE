@@ -145,6 +145,9 @@ Message flow:
 2. **Ride along.** B presses E (pad Y) within 5 m of a car K driven by someone else: B's game seats B in the first free
    passenger seat (scripted: `LockControls(true)` + `GetOnVehicle`). B's PlayerState then carries K and his seat;
    the others seat B's puppet there (on A's game in A's real car). E in the car gets B out the normal way.
+   Since 0.15 A's puppet must sit at the wheel of B's entity first (B's game puts it there, else no ride): with the
+   driver seat empty the game slid B over to the wheel and both games had a driver for K. While B gets in, B reports
+   seat 9 (docs/game-api.md 17).
 3. **Get out / park.** A's PlayerState stops carrying K (on foot). The others stop moving K: their entity stays where
    it was (a parked car with normal physics, unlocked) and A's puppet climbs out. When A's car has stopped (speed
    < 0.3 m/s, or 8 s after getting out) A's game sends **CarParked** (reliable) with K and the final transform; the
