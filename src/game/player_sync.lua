@@ -977,7 +977,11 @@ function M.Drive(pp)
   local so = pp.so
   if not valid(so) then pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
-  if M.isHost and M.allyOn and not pp.ally then M.Ally(pp, so) end
+  -- (on a guest: the host's puppet, once our game has NPCs of its own that the host's has not: they fight him here and
+  -- their hits reach him, npc_sync.lua N.OnDamage)
+  if M.allyOn and not pp.ally and (M.isHost or (pp.id == "0" and M.Npc and M.Npc.owned and next(M.Npc.owned))) then
+    M.Ally(pp, so)
+  end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
@@ -1133,7 +1137,8 @@ function M.TraceLocal(p)
   trace("LR", line)
 end
 
--- Enemies react to guests (host only; ini enemies_target_guests = 0 turns it off). The
+-- Enemies react to guests (on the host; on a guest the host's puppet while that guest's game has NPCs of its own,
+-- npc_sync.lua "guest-owned NPCs"; ini enemies_target_guests = 0 turns it off). The
 -- game's enemies only target the player's side: a puppet is a civilian to them, and its spawn profile does not change
 -- that (an ai_ally_ profile reads AI type 1 but enemies still ignored it, even when told to Attack it). Its brain is
 -- switched to FRIEND (SwitchBrain(1)) 2 s after it spawned, on foot; from then on the host's enemies shoot at it, and
@@ -1146,8 +1151,8 @@ function M.Ally(pp, so)
   if pp.veh or pp.hidden or M.now - (pp.spawnT or M.now) < 2 or so:IsDeath() then return end
   pp.ally = true
   local good = pcall(so.SwitchBrain, so, 1)
-  log(string.format("puppet %s: friend brain %s (AI type %s): the host's enemies target it", pp.id,
-    good and "set" or "FAILED", tostring(so:GetAIType())))
+  log(string.format("puppet %s: friend brain %s (AI type %s): %s enemies target it", pp.id,
+    good and "set" or "FAILED", tostring(so:GetAIType()), M.isHost and "the host's" or "our own"))
 end
 
 -- NPC copies (npc_sync.lua, 10 Hz states): their AI walk (MoveVec) starts late and is slower than a running NPC, so
