@@ -49,7 +49,7 @@ on the other.
 | `AP` | both | each action played | Lua, on the puppet: `id kind anim=<animation name, - none accepted> ok=<1 AnimPlay accepted> dur=<s the puppet is left alone at most>` |
 | `AE` | both | each action ended | Lua: `id kind anim took=<s> done=<1 the animation reported done> why=<finished, time_up, next_action, he_is_in_a_car>`; the puppet walks again (its `PUP` lines show `have=0` while it played) |
 | `LR` | both | 20 Hz | our player read back: `p d spr hp`; in a car `car seat cp cv rb=<steer wish,power,brake,handbrake,steer linearity,front wheel angle (rad)> eng gear spd fixed rpm pwi` |
-| `PR` | both | 20 Hz per puppet | `id st p d hid veh seat own=<car it sits in> seated ejects tries anim phys spr dead hp mv mult moves snaps` |
+| `PR` | both | 20 Hz per puppet | `id st p d hid veh seat own=<car it sits in> seated ejects tries anim phys spr dead hp mv mult moves snaps sown=<who holds its seat: ours/free/other/?, - on foot> brain=<friend brain set> ai=<GetAIType> back=<put-backs into the seat> leaving=<out of its seat inside the car now> ejAll=<throw-outs this session>` (the last six since 0.15, docs/game-api.md 18) |
 | `CR` | both | 20 Hz per driven car copy | `key drv adopted fix pin p v rb=<as LR> eng gear spd fixed rpm pwi cmd=<steer,power,brake,handbrake,gear given> steerIn=<SetSteer value> vel speedHow=<vector/number/none: how SetSpeed works> seat0=<puppet/none/other> locked` |
 | `NHS` | host | 2 Hz | `sending hits kills` |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id> copy ai car host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` |
@@ -74,7 +74,9 @@ Per player as seen on the other game:
   how often its physics was retried; the copy's speed against the driver's; the steering wish on the copy against
   the driver's (did SetSteer stick) and the front wheel angle against the driver's car; engine states; how SetSpeed
   worked.
-- **seats:** "thrown out" lines of that player's puppet (with the car's speed, fix, physics state).
+- **seats:** "thrown out" lines of that player's puppet (with the car's speed, fix, physics state, brain, who holds
+  the seat); since 0.15 also its brain lines, put-backs inside the car, seats taken by others, and the receiver's own
+  ride-along lines.
 - **car notes:** the one-time probe (`probe: speed .. after SetPos .. after SetRot .. after SetSpeed`), SetSpeed and
   engine lines.
 - **NPCs** (guest): host NPCs in range and paired, the distance of ours from the host's, the NPCs most often more

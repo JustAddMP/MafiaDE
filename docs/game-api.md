@@ -174,12 +174,15 @@ for a long time.
 - A car the **local player has driven** throws an NPC out of its driver seat a few frames after every
   `GetOnVehicle` (with or without `MakeCarOwnership`, `DestroyController`, `FakePlayerCar`, and also without any
   `SetPos`). Passenger seats are fine. Fix: replace that car by a fresh copy (`Deactivate` the real car).
+  **These tests were made with civilian-brain puppets; section 18 explains the throw-outs by that brain** (a
+  friend-brain puppet stayed seated where a civilian was thrown out).
 - Making a hidden puppet DYNAMIC again (`SetPhysState(0)`) right before `GetOnVehicle` gets it thrown out; show it
   with `ShowModel(true)` only and let the seat command manage physics.
 - A puppet that was walking (`MoveVec` pending) sometimes gets out again right after being seated; retrying a
   second later sticks.
 - Player as passenger: `p:LockControls(true); p:GetOnVehicle(car, 2, false, "WALK")`, then `p:LockControls(false)`
-  when the sync object is done; E gets out normally.
+  when the sync object is done; E gets out normally. With the driver seat empty the game puts the player at the
+  wheel instead (0.13.0 two-PC test, section 18).
 
 ## 8. Misc
 
@@ -605,3 +608,74 @@ throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the rec
 (`PLAYER_USED_MEDKIT`), carrying bodies (`TakeBody` / `DropBody`), lockpicking, vaults and ladders (`USE_FENCE`,
 `USE_LADDER`; the puppet's walk takes its own way over them or snaps), jumping (only the in-air flag, the puppet does
 not jump), stalk (sneak) walking beyond crouch, and takedowns with their paired victim animation.
+## 18. Puppets thrown out of car seats: the civilian brain (0.15) - static + 0.13.0 logs, the fix NOT verified in game
+
+**What the logs show** (first two-PC test of 0.13.0, 2026-10-17, Free Ride, ~5 min; host `mafiacoop-adam.log`,
+guest `mafiacoop.log`):
+
+| | host's game: the guest's puppet | guest's game: the host's puppet |
+|---|---|---|
+| brain | switched to FRIEND 2 s after it spawned (`friend brain set (AI type 1)`, M.Ally, host only then) | the factory's civilian brain (never switched on guests) |
+| at the wheel of a fresh copy, car under its own physics, then pinned | seated at once, `seat0` in every status line for 20 s of own physics and 2 min pinned; two more copies (one a swap) the same | `seated` at 20.39, 21.39, 22.40 and `keeps getting thrown out` at 22.50 (thrown out 0.1-1 s after each GetOnVehicle); the same 41.6-43.7 for the second copy; it stayed only after the copy was pinned and the slow (4 s) retries came round |
+| passenger seat of a car the local player drives | - (not tried) | thrown out of seat 1 of the guest's own car again and again while he drove (hidden / seated alternating for 70 s) |
+
+Same game build, same factory, same seating code (GetOnVehicle(car, seat + 1, false, "WALK")), same copies; the
+only difference is the brain. Earlier findings fit: the mission taxi and "a car the local player has driven" threw
+out civilian-brain puppets (section 7, 15); the one civilian that stayed was in 0.10.0, at the wheel of the guest's
+own Salieri car (adopted, moved pinned, as every copy was before 0.13.0) with Salieri beside it.
+
+**Why (static, from the exe's AI class names):** the brain is a set of desires (`C_Desire*`, `/config/ai/brains`,
+`brain_friend` / `brain_enemy` / `brain_police`; `SwitchBrain(1)` = friend). The civilian set includes
+`C_DesireUseCar`, `C_DesirePanicInCar`, `C_DesireCivilPlayerReaction`, `C_DesireReactionToPlayer`,
+`C_DesireCivilHornReaction`, `C_DesireAvoidingPlayerCollision`, `C_DesireWander`, `C_DesireThrownPassengerReaction`,
+`C_DesireReactionToThrownFromCar` - a civilian decides for itself whether to stay in a car, and it leaves one the
+player drives, drove or that moves without it driving (our controls and corrections, bumps). The friend set is built
+around riding with the player (`C_DesireFriend`, `C_DesireFollowCar`, `C_DesireFollowGetInCar`,
+`C_DesireFollowGetOutCar`, `C_DesireFollowOnFoot`); the follow desires need a leader set by script (`Follow`), which
+puppets never get. Which civilian desire fires exactly was not traced (UNVERIFIED); the fix does not depend on it.
+
+**What MafiaCoop does since 0.15** (player_sync.lua M.Seat, M.Ally, M.RideAlong):
+
+- Every puppet gets the friend brain on **every** game where the game-sectors guard is in (the C++ side's `G` line,
+  last field = `sectors_guard::Active()`; re-notes 8: a freed friend-brain human crashed the game without it), not only
+  the guests' puppets on the host. It is switched 2 s after the spawn whenever the puppet is not in a car (hidden
+  included), and a puppet about to be seated waits for it (0.3 s after the switch). Side effects: the guest's own
+  enemies now target the host's puppet too (their hits on a puppet are ignored on a guest, as before); a friend-brain
+  puppet cannot be punched by the game's melee targeting (AI type 1, section 11: the swing fallback covers it, as on
+  the host since 0.9.0). With `enemies_target_guests = 0` the host still switches the brain (for the seats) but does
+  not send its enemies' hits to the guest.
+- The seat is checked every tick (`car:GetSeatOwner(seat)` against the puppet, not only `GetOwner()`): a puppet
+  still in the car but not in its seat (the AI starting to leave, or another seat) is put back with a non-animated
+  GetOnVehicle at once (every 0.5 s while it lasts; if the seat still reads wrong after 2.5 s the check is switched
+  off for that seat and GetOwner is trusted, as before). Whether an AI exit gives up the seat before GetOwner changes
+  is **UNVERIFIED** (logged: `puppet N is in car K but not in seat S (... leaving ...): put back at once`).
+- A puppet that did get out is put back on the next tick (0.2 s after the last command) for the first three
+  ejections of a seat, then once a second, then every 4 s hidden in between (the old pace).
+- Without the guard (another game build) the civilian is kept calm for its seat instead: `SetReactionOnSound(false)`
+  and `InterruptCivilWander()` (what keeps the factory driver in his car).
+- Ride along (E next to a car another player drives): the game slides a player who gets in beside an empty driver
+  seat over to the wheel (0.13.0: the guest got in while the host's puppet had just been thrown out and sat at the
+  wheel of the host's car: "we took the wheel while player 0 drove it", the host's game then saw two drivers). The
+  driver's puppet is now put at the wheel first (`ride along: put player N's puppet at the wheel ... first`); if it
+  cannot be, there is no ride (logged, press E again). If the game still seats us at the wheel, `p:SlideToSeat(seat
+  + 1)` is tried (below) and the seat we report stays "getting in" (9) until the ride is done, so nobody's car is
+  taken over; still at the wheel after 2 s, we drive it (as before).
+
+**Bindings looked at for this (static, exe):**
+
+| call | notes |
+|---|---|
+| `h:SlideToSeat(n)` | **UNVERIFIED**: one number; the binding (exe+0x23CCF90) calls the human's AI (`[human + 0x130]`, exe+0x2BA48C0), which returns a failed sync object for `n <= 0`, so `n` is 1-based like GetOnVehicle's seat. Used once when a ride along put the player at the wheel |
+| `h:PlayerShouldRemainPassenger(bool)` | player only: exe+0x2B99140 does nothing unless the entity type is 9 (player); writes a flag at `+0xB0` of a player-side object. Not for puppets |
+| `h:DisableAutoExitFromExplodedCar(bool)` | exists (exe+0x238FE30 -> exe+0x23E6E00); not used (copies have `DisableExplosion`) |
+| `h:SetHumanEscapeEnabled(bool)` | a byte at `+4` of an AI sub-object (exe+0x2BA4210); meaning unknown, not used |
+| `h:SwitchBrain(n)` | exe+0x2391B80 -> exe+0x2BA5820: skipped for the player (type 9) and for humans with the byte `+0x1F9` set |
+| `GetOnVehicle` 6-argument form | the 5th script argument (a bool) is passed through unchanged (exe+0x2B97A40); meaning unknown |
+
+**Logs and trace:** every throw-out is a `puppet N thrown out of car K seat S (#n, m this session): ...` line (time
+since seated, car speed, fix / pinned, phys state, who holds the seat now, friend brain yes/no, put-backs, distance
+from the car, who drives the car, adopted / we drove it); `puppet N sits in car K seat S (... friend brain ...)` when
+a seat holds; `puppet N: seat S of car K is taken here by ...` once per seat. The `PR` record has `sown` (who holds
+the puppet's seat: ours / free / other / ?), `brain` (friend brain set), `ai` (GetAIType), `back` (put-backs),
+`leaving` and `ejAll` (docs/sync-trace.md); `tools/sync_compare.py` lists the throw-outs, the brain / put-back lines
+and the ride-along lines per player.
