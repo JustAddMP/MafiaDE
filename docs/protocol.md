@@ -533,6 +533,57 @@ npc_sync.lua.
   controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
   through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves is not shared.
 
+### Explosions (0.16; not yet checked in game)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0240 | Explosion | the game where it happened -> everyone (`Broadcast`; a guest's is relayed by the host) | R | u32 seq (per sender; a new session starts elsewhere: `(GetTickCount() & 0xFFFF) << 16`), u8 kind (0 unknown, 1 grenade, 2 molotov, 3 dynamite `exp_satchel`, 4 crash object, 5 car blast), u8 flags (1 fire: the picture burns too; 2 one of the sender's NPCs threw it), f32 x y z, str weapon (`exp_grenade`, ...; "" unknown; at most 32 of `[A-Za-z0-9_-.:/]`), u32 npc (flag 2: the NPC's key on the sender's game: on the host its entity id, as in NpcStates; on a guest his own NPC's key, as in GuestNpcStates), str object (kind 4: the crash object's scene name, at most 64; "" none) |
+| 0x0241 | CarExploded | the car's authoritative game -> everyone (`Broadcast`) | R | u8 what (0 a shared player car; 1 a host traffic car, only from the host), str key (what 0: the shared car key `o:g`, Phase 3; what 1: its traffic net id, Traffic above), f32 x y z |
+
+Damage is decided by **one** game; the picture is shown on all (src/game/explosion_model.h, unit-tested by
+tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 20).
+
+- **Who sends.** The game where the explosion really happens and that is authoritative for its cause:
+  - our player threw it (grenade, molotov, dynamite) or set it off (a barrel he shot within 1.5 s; an explosion
+    inside his own blast within 2.5 s: a chain). The detector merges the HEAR_SOUND reports of one explosion (every
+    human that hears it gets one: same spot within 4 m and 0.6 s) and decides 0.2 s after the first: ours when the
+    sound's owner is our player, PLAYER_GRENADE_EXPLOSION came to our player within 0.6 s, or a throw of ours
+    (WEAPON_THROWN, the selected explosive) up to 12 s before within 70 m (one throw, one explosion; the oldest
+    pending throw first). Kind and weapon from the throw; a molotov also when a BURNING_FIRE sound is within 9 m and
+    2 s (flag 1);
+  - on the host one of its NPCs threw it, on a guest one of his own NPCs (guest-owned NPCs above): flag 2 with its
+    key. Receivers show those only where that NPC is shown by a spawned copy (which runs no fight of its own); a game
+    that runs its own copy of the NPC (a paired mission NPC) has that NPC's own grenades already;
+  - a car: the game whose player drives it (or, parked, whose own explosion blew it up; on the host any shared
+    traffic car), seen as CAR_HAVE_PROBLEM with `GetCarProblem() == EXPLODE`.
+  Nothing else is sent: explosions of a mission script (dynamite in a mission, scripted car bombs) happen on every
+  game by its own mission; an explosion of someone else's (an enemy of a guest's own fight) is that game's.
+- **Who is hurt, once.** The sender's own DAMAGE events decide, through the usual paths: a puppet in the blast or the
+  fire sends **Hit** (Phase 6; fire summed for 0.5 s into one Hit, like a ram) to its player; on a guest a copy of a
+  host NPC sends **NpcHit** (fire summed per NPC for 0.5 s; a copy that died of it makes the hit lethal); on the host
+  a guest's own NPC's copy sends **HostNpcHit**; the host's own NPCs and a guest's own NPCs on his own game simply
+  take it. An NPC's explosion on the host hurting a guest's puppet goes to him like any NPC hit (Hit, source 1).
+  The sender keeps an **own zone** where its explosion went off (blast 14 m / 2.5 s; molotov fire 9 m / 35 s;
+  UNVERIFIED reach and duration): explosion or fire damage there whose message names no attacker (or a non-human
+  one) counts as its player's, so it is sent on too.
+- **The picture.** Each receiver within 400 m shows `game.shotmgr:CreateScriptExplosion(nil, pos, weapon, 0, false,
+  0, 0, 1.5, fire)`: no owner, damage 0, no stun, both damage ranges 0, fire for a molotov (docs/game-api.md 20).
+  Before it goes off a **remote zone** is marked there (same sizes): explosion / fire damage inside it whose attacker
+  is nobody, a puppet, a spawned NPC copy or anything that is not one of this game's own fighters is **undone** (the
+  local player gets his health back on the next tick, minus what real Hits took meanwhile; an NPC its health from
+  just before the picture; puppets and copies need nothing). An NPC the picture killed cannot be brought back
+  (logged). A crash object the sender named is hidden (its own blast here would hurt people a second time).
+  Explosions are reliable and numbered: one relayed twice is shown once.
+- **Cars.** CarExploded: the receiver's entity for that car (the copy of a remote driver's car, his adopted mission
+  car, or the copy of a host traffic car) gets `DisableExplosion(false)` (copies have it disabled) and `SetExploded()`
+  (the wreck without a blast; UNVERIFIED), and a picture of the blast with a remote zone. A swapped car whose real car
+  is hidden behind the copy: when the real car comes back wrecked (CarParked, Phase 3) it is set exploded too, no
+  second blast. The driver's game takes a car that blew up as wrecked for CarParked whatever `GetDamage` says.
+- **Not carried:** the projectile's flight (no harmless projectile exists: `ThrowProjectileWeapon` throws a real
+  one; the throw animation shows on the thrower's puppet, the explosion appears where and when it happened); damage
+  to cars from another game's explosion (a copy cannot blow up: a remote player's grenade does not wreck your car);
+  how a fire spreads (each picture burns on its own game).
+
 ## Reconnect (no messages of its own)
 
 Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,

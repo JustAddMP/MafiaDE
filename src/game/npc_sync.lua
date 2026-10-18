@@ -76,6 +76,7 @@ local PULL_TIME = 1.5
 local PULL_DIST_FIGHT = 12  -- m: the same for hostile NPCs (they run and take cover on their own in a fight)
 local STALE = 3             -- s without a state: the host NPC is out of range (pairing kept, nothing enforced)
 local REPLAY_WAIT = 0.35    -- s a replayed guest bullet has to land on the host's NPC before DoDamage is used
+local FIRE_SUM = 0.5        -- s over which our fire damage on one NPC is summed into one hit
 -- spawned copies (guest)
 local COPY_WAIT = 3         -- s a host NPC with a job stays unpaired (after the LOOSE_WAIT pairing) before it gets a copy
 local COPY_RANGE = 90       -- m from our player: host NPCs farther away get no copy (and lose theirs at COPY_RANGE + 20)
@@ -112,6 +113,7 @@ N.byLocal = N.byLocal or {}  -- guest: local id -> host key
 N.sent = N.sent or {}      -- host: key -> last dead flag sent
 N.replays = N.replays or {}
 N.hitq = N.hitq or {}      -- guest: hits from the DAMAGE callbacks, sent with the next update
+N.fireq = N.fireq or {}    -- key -> { t, amount, weapon }: our fire on (our copy of) that NPC, summed (N.FireFlush)
 N.lethal = N.lethal or {}  -- host: guests' lethal hits waiting for the NPC to die
 N.copies = N.copies or {}  -- guest: host key -> spawned copy { key, so, id, st, prof, ... } (also a puppet-like table)
 N.copyIds = N.copyIds or {}  -- guest: local id of a spawned copy -> host key
@@ -486,6 +488,13 @@ function N.OnDamage(m, receiverId)
   if amount > 0 then
     local s = N.host[key]
     if s then s.ourHitT, s.ourHit, s.ourType, s.ourZone, s.ourWeapon = M.now, amount, dtype, zone, weapon end
+    if dtype == 8 then
+      -- FIRE burns in many small steps (our molotov, docs/game-api.md 20): summed over FIRE_SUM s into one hit
+      local f = N.fireq[key]
+      if not f then f = { t = M.now, amount = 0, weapon = weapon }; N.fireq[key] = f end
+      f.amount = f.amount + amount
+      return true
+    end
     N.hitq[#N.hitq + 1] = N.HitLine(key, amount, dtype, zone, weapon, false)
     N.hitsOut = (N.hitsOut or 0) + 1
     if N.hitsOut <= 30 or N.hitsOut % 50 == 0 then
@@ -1227,7 +1236,24 @@ function N.CopyList(ev)
 end
 
 -- ---- update -----------------------------------------------------------------------------------------------------------
+-- Our fire on NPCs of the other game, summed: one hit line per NPC every FIRE_SUM s.
+function N.FireFlush()
+  for key, f in pairs(N.fireq) do
+    if M.now - f.t >= FIRE_SUM then
+      N.fireq[key] = nil
+      if f.amount > 0 then
+        N.hitq[#N.hitq + 1] = N.HitLine(key, f.amount, 8, 0, f.weapon, false)
+        N.hitsOut = (N.hitsOut or 0) + 1
+        if N.hitsOut <= 30 or N.hitsOut % 50 == 0 then
+          log(string.format("our fire burnt %s: %.1f (hit #%d)", N.Who(key), f.amount, N.hitsOut))
+        end
+      end
+    end
+  end
+end
+
 function N.Update(dt, cmds)
+  pcall(N.FireFlush)
   local ev = N.hitq
   N.hitq = {}
   local active, host = false, false
@@ -1299,7 +1325,7 @@ function N.Update(dt, cmds)
     if n > 0 then log(n .. " spawned copies went with the old world") end
     N.ents, N.host, N.byLocal, N.sent, N.replays, N.lethal = {}, {}, {}, {}, {}, {}
     N.copies, N.copyIds, N.cgrave, N.shots, N.spawners = {}, {}, {}, {}, {}
-    N.owned, N.tcrew = {}, {}
+    N.owned, N.tcrew, N.fireq = {}, {}, {}
     N.cfac = { st = "none", t = 0 }  -- its car went with the world
     N.shotWatch, N.spT = nil, nil
     N.scanT = -10

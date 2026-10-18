@@ -44,6 +44,10 @@ src/game/
                          InterestManager, net ids, spawn/despawn/packed states); a guest near the host turns his
                          own traffic off and drives crewed copies with core's VehicleController
   traffic_model.{h,cpp}  the game-free part of it (wire format, host tracking, guest table), tests/traffic_test.cpp
+  explosion_sync.{h,cpp,lua} 0.16 explosions: grenades, molotovs, barrels, blown-up cars sent by the game where they
+                         happened (Explosion / CarExploded), shown elsewhere as visual-only explosions; the damage guard
+                         that undoes a picture's damage (damage stays with the sender's hit paths)
+  explosion_model.{h,cpp} the game-free part (wire, detector, zones, guard), tests/explosion_test.cpp
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
                          stay untouched)

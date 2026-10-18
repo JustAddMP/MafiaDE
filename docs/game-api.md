@@ -734,8 +734,8 @@ DAMAGE events, section 5), the Hit of a real punch still applies (`M.HurtScript`
 also blocks other damage for that time (an enemy NPC's bullet during a puppet's swing next to us).
 
 Not carried yet (seen while looking, not cheap with this mechanism): door kicks (`DOOR_KICK` 458857, the door's state
-is not synced either), the explosion of a thrown grenade or molotov on the other games (the puppet only shows the
-throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the receiver's game), medkit use
+is not synced either), the flight of a thrown grenade or molotov (its explosion and fire are shown since 0.16,
+section 20; `game.game:ThrowProjectileWeapon` would throw a real one, hurting people on the receiver's game), medkit use
 (`PLAYER_USED_MEDKIT`), carrying bodies (`TakeBody` / `DropBody`), lockpicking, vaults and ladders (`USE_FENCE`,
 `USE_LADDER`; the puppet's walk takes its own way over them or snaps), jumping (only the in-air flag, the puppet does
 not jump), stalk (sneak) walking beyond crouch, and takedowns with their paired victim animation.
@@ -832,3 +832,57 @@ each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
 | `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on |
 | `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7) |
 | `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |
+
+## 20. Explosions, fires and blown-up cars on every game (0.16) - static only, NOT verified in game
+
+Found by reading the exe, its Lua binding thunks and the game's own scripts (`tables/scripts.sds`, HKS bytecode)
+without running the game. Used by src/game/explosion_sync.lua (MafiaCoop.Boom), src/game/explosion_model.h and
+docs/protocol.md "Explosions". Every call and event below needs the in-game check.
+
+**How the game reports an explosion (on the game where it happens).**
+
+| what | notes |
+|---|---|
+| `HumanMessages.HEAR_SOUND` (458774), `C_HearSoundMessage` | sent to every human that hears a sound (the puppets' "avoiding car" messages of section 11 were these). Getters: `GetSoundType()` (`enums.ActorSoundType`, 0x5A93E30: SHOT 5, EXPLOSIVE_BOUNCE 10, EXPLOSION 11, BURNING_FIRE 12, ...), `GetSoundPos()` (a vector), `GetSoundOwnerGUID()`, `GetSecondEntityGUID()`. One blanket HUMAN subscription gets them all; the glue drops everything but types 10-12 at once and the copies of one sound (same type and metre cell within 0.5 s). Who the owner of an explosion's sound is (the thrower, the projectile, nobody) is NOT known; it is logged for the first 40 explosions. The cost of this subscription (it also fires for every footstep and shot every human hears) is counted in the status line ("sounds N of M heard") |
+| `HumanMessages.WEAPON_THROWN` (458830) | our player's throw (player_sync.lua counts it as action kind 5, section 17); the glue reads `p:InventoryGetSelectedExplosive()` (no arguments, thunk 0x23BE430; a name or an id, `GetWeaponNameFromID` then) right after: only `exp_*` names (and unreadable ones) count as an explosive throw |
+| `HumanMessages.PLAYER_GRENADE_EXPLOSION` (458831) | by its name sent when the player's grenade explodes; to whom and with which message class is not known (the glue takes it when the receiver is our player and logs the sender) |
+| DAMAGE type `EXPLOSION` (1) / `FIRE` (8) | `enums.DamageType`; who the enemy GUID is for a grenade's blast and for a molotov's fire is not known (fire may name nobody) |
+| `CarMessages.CAR_HAVE_PROBLEM` (655365) + `m:GetCarProblem()` | the game's `common_vehicle_events.lua` (OnCarProblem) reads `GetCarProblem()` from this message; `enums.CarProblem`: EXPLODE 1, MOTOR_CRASH 2, POSITION 3, FUEL, TYRE_CRASH, AI_LOST. The glue subscribes for all cars (EventType.CAR) |
+| entity ids | the low byte of an entity id is its type (section 15: 8 human, 9 player, 10 car); 12 = crash object as in the `ActorMessages` entity type enum (UNVERIFIED for ids). A crash object (a barrel) has its scene name (`GetName()`), the same on every game: `game.entitywrapper:GetEntityByName(name)` finds it there |
+
+**A visual-only explosion.**
+
+| call | notes |
+|---|---|
+| `game.shotmgr:CreateScriptExplosion(entity, pos, weapon, damage, stun, fullDamageRange, damageRange, n, createFire)` | thunk 0x239D8F0: adaptor with 9 arguments, then #2 an entity wrapper (fetched with 0x1ABD980, which returns null for nil/none), #3 vector, #4 string, #5 number, #6 bool, #7 #8 #9 numbers, #10 bool; native 0x23E59E0. **Argument order** from the game's own `CreateScriptExplosion` nodes in `game.lua` (their HKS bytecode: the parameters nodeID, inWeapon, inPositionEntity, inPositionVector, inDamage, inStun, inDamageRange, inFullDamageRange, inIgnoreColl, inCreateFire are R0..R9 and the call moves R2, R3, R1, R4, R5, **R7, R6**, R8, R9 into the argument slots): entity, position, weapon, damage, stun (bool), **full damage range, then damage range**, the "ignore collision" number (the node variants without that input pass the constant **1.5**), create fire. The entity is both the position anchor and the explosion's owner: for an entity of one type (the check against 0xC) the vector is relative to it, for two other types (2, 4) the entity's own position is used, nil = no owner and the vector is absolute. 0x23E5740 turns the weapon name into its id (0x23EA260), builds the explosion descriptor (position, weapon id, owner twice, the owner's GUID, damage, stun, the two ranges, the 9th number, create fire, a constant 300/50/10 block) and hands it to the explosion manager (0x26A1FB0 -> 0x269CEE0). **Used** for every picture: `(nil, pos, weapon, 0, false, 0, 0, 1.5, fire)`. UNVERIFIED: that damage 0 with both ranges 0 hurts nobody and still shows the weapon's effect and sound, that physics (cars, ragdolls, glass) is not pushed, that `createFire` makes a molotov's fire |
+| `game.shotmgr:CreateExplosion(pos, weapon)` | thunk 0x239CCE0 (vector, string); the game's "Grenade" node calls it with `"Grenade"`. A real explosion with the weapon's damage: not used |
+| `game.shotmgr:ScriptSetExplosionsEnabled(b)` | thunk 0x239E1F0; the nodes explosionsEnable / explosionsDisable. Global: not used |
+| `game.game:ThrowProjectileWeapon(weapon, fromVec, toVec, angle, owner)` | thunk 0x267E4C0 (string, vector, vector, number, entity wrapper); node inputs inWeapon, inEntity, inStartPos, inEndEnt, inEndPos, inThrowAngle, "entity not created" on failure. A real projectile that explodes with real damage, so it is **not** used for the receivers' picture: the flight of a thrown grenade is not shown on the other games (only the thrower puppet's throw animation, section 17, and the explosion where and when it happened). `MafiaCoop.Boom.TestThrow()` calls it in front of us for a signature check |
+| particles | `C_WrapperParticle` (Run, Stop, StopImmediately) works on particle entities placed in a scene; no script call spawns an effect by name |
+
+**Cars.**
+
+| call | notes |
+|---|---|
+| `car:Explode()` / `car:SetExploded()` | thunks 0x239B550 / 0x239BCC0; both call 0x2540380(car, t, true): Explode with a tunable value (read from a config once), SetExploded with **-1**. In 0x2540380 a positive t arms a timer (the car blows up t later); t <= 0 sets the wrecked state at once, and only t >= 0 runs the block that builds an explosion at the car (the blast with its damage): so SetExploded is the wreck **without the blast** [likely, from the code]. The first test there (car+0x1280, bit 16) returns at once; probably the DisableExplosion flag [guess], so the glue calls `DisableExplosion(false)` before `SetExploded()` on copies. Used: a receiver's copy of a car that blew up on its driver's game, and a hidden real car that comes back wrecked (CarParked, section 15; before 0.16 that was `Explode()`, a second real blast) |
+| `car:DisableExplosion(true)` | copies (player car copies, traffic copies) keep it: a copy never blows up by itself; so a remote player's grenade cannot wreck a car the other game drives (not carried) |
+
+**The damage guard** (explosion_model.h Judge; player_sync.lua M.OnDamageEvent asks `MafiaCoop.Boom.OnDamage` first
+for every DAMAGE): explosion or fire damage inside a remote zone (where another game's explosion is shown, marked
+right before the picture) whose attacker is nobody, a puppet, a spawned NPC copy or something that is not a human of
+ours is undone: the local player through M.CopyUndoTick (health back to what it was at the end of the last tick,
+lowered by whatever a real Hit took meanwhile), an NPC by writing back the health it had just before the picture
+(`h.health` is writable on NPCs, section 11; the healths of NPCs within 20 m are remembered when the picture goes off,
+and anew after any real hit on them). Inside an own zone (where our explosion went off) such damage without a named
+attacker counts as our player's (`M.boomOurs` makes M.IsLocalAttacker say yes for that one dispatch), so puppets and
+NPC copies hurt by our fire still send Hit / NpcHit. FIRE damage on puppets and NPC copies is summed over 0.5 s into
+one hit (it comes in many small steps, UNVERIFIED how many).
+
+**Dev console** (`tools\devlua.ps1`): `return MafiaCoop.Boom.Test()` shows a picture 8 m in front of us
+(`Test(x, y, z, "exp_molotov", true)` for a fire); watch whether it is seen and heard, whether the player and NPCs near
+it take damage (the log says "another game's explosion hurt us here: given back" if so) and whether cars get pushed.
+`return MafiaCoop.Boom.TestThrow()` checks ThrowProjectileWeapon's signature (a real grenade: step back).
+
+Not carried (known): the projectile's flight; car damage from another game's explosion; fire spreading (each
+picture's fire burns by itself on its game); mission dynamite and scripted car bombs (each game's own mission sets
+them off); door kicks.

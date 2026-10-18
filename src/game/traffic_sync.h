@@ -9,6 +9,7 @@
 #include "net/session.h"
 #include "render/overlay.h"
 
+#include <cstdint>
 #include <vector>
 
 namespace mc::game {
@@ -21,6 +22,9 @@ public:
     static void OnPlayerLeft(net::PlayerId id);
     static void Tick(float dt);
     static void GetStatus(std::vector<render::OverlayLine>& out);
+    // Host, render thread: the traffic net id of our car with entity id `key` (0: not shared traffic). Used by
+    // explosion_sync (CarExploded for a traffic car).
+    static uint16_t NetOfKey(uint32_t key);
 };
 
 }  // namespace mc::game
