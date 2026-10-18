@@ -1,5 +1,5 @@
 #pragma once
-// Explosions, fires and blown-up cars on every game (0.16; docs/game-api.md 23, docs/protocol.md "Explosions").
+// Explosions, fires and blown-up cars on every game (0.15.0; docs/game-api.md 23, docs/protocol.md "Explosions").
 // The game where an explosion really happens and that is authoritative for its cause sends it; the others show a
 // visual-only explosion and undo any damage it does there; damage is decided by the sender's game alone and travels
 // through the existing hit paths (Hit 0x0400, NpcHit 0x0410, HostNpcHit 0x0422). Logic: game/explosion_model.h

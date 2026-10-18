@@ -1,4 +1,4 @@
--- MafiaCoop throw glue (0.16 "grenade arc": the flight of a thrown grenade / molotov / dynamite on every game). Runs in
+-- MafiaCoop throw glue (0.15.0 "grenade arc": the flight of a thrown grenade / molotov / dynamite on every game). Runs in
 -- the game's Lua state on GameMainThread, called once per script tick by src/game/throw_sync.cpp
 -- (MafiaCoop.Arc.Update). Embedded into the dll; a copy at <dll dir>\throw_arc.lua overrides it.
 -- docs/game-api.md 23 "The flight", docs/protocol.md "Explosions" (Throw 0x0242).

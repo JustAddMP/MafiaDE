@@ -1,5 +1,5 @@
 #pragma once
-// The flight of a thrown grenade / molotov / dynamite on every game (0.16, "grenade arc"): game-free logic, unit-tested
+// The flight of a thrown grenade / molotov / dynamite on every game (0.15.0, "grenade arc"): game-free logic, unit-tested
 // by tests/throw_arc_test.cpp. Used by src/game/throw_sync.cpp (the message, the mc_arc_* Lua functions, the
 // receivers' simulation, the overlay) and src/game/throw_arc.lua (MafiaCoop.Arc: the game calls).
 // docs/game-api.md 23 "The flight", docs/protocol.md "Explosions" (Throw 0x0242).

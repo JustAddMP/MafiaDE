@@ -91,38 +91,47 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- The new things in 0.15.0 (punches and other actions on the other players, car lights and signals, the host's
-  traffic and police, enemies only a friend's game has shown to the host, the mission car coming back, failed
-  missions in one load, every player on the map, reconnecting, JOIN FRIEND, gamepad buttons in the co-op panels)
-  were built without being tried in the game yet. Please send the logs when something looks wrong.
+- 0.15.0 had a first test on one PC (two copies of the game). Checked and working: car lights and signals, failed
+  missions in one loading screen, and the police no longer making the host wanted because of a friend. The rest of
+  what is new in 0.15.0 (punches and other actions on the other players, the host's traffic and police, doors,
+  items on the ground, explosions, car damage, enemies only a friend's game has shown to the host, the mission car
+  coming back, every player on the map, reconnecting, three or four players, JOIN FRIEND, gamepad buttons in the
+  co-op panels) is built but not yet confirmed in game. Please send the logs when something looks wrong.
+- Punches and throws do not show on the other player's character yet (the hit itself still counts).
+- The other player's marker could not be seen on the minimap in the test, although the mod places it.
+- A player's car looks different on the other screen: the same model, but another variant and colour.
+- After a car blew up, the host's game sometimes takes the other game's damage report as a repair.
+- After a friend's game reloads at a new checkpoint while both are in a car, the host may see the friend's
+  character hidden in the car instead of seated.
+- A wanted friend's police level runs down on his own game even while the host's police chase him.
+- A co-op CHAPTER changes the player's garage (garage.pf in the game's profile folder is written). Your story saves
+  are never loaded or changed.
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
-  both ways (since 0.11.0 a friend's kill also kills the host's enemy, so a friend can clear a fight on his own),
-  health follows the host's game, and the host's enemies also aim at the other players. Since 0.12.0 an enemy that
-  only the host's game spawned (the host got somewhere first) shows on a friend's game as a copy that moves and
-  fires with it and can be killed. Since 0.15.0 an enemy that only a friend's game spawned shows on the host's game too (not yet tested).
-  Tested in one chapter's shootout (Bon Appetit's restaurant, cleared to the last enemy, the chapter not played past
-  it); other chapters' fights were not tried. enemies_target_guests = 0 in MafiaCoop.ini
-  turns the enemies-aim-at-friends part off if it causes trouble.
+  both ways (a friend's kill also kills the host's enemy, so a friend can clear a fight on his own), health follows
+  the host's game, and the host's enemies also aim at the other players. An enemy that only the host's game spawned
+  shows on a friend's game as a copy that moves and fires with it and can be killed; since 0.15.0 an enemy that only
+  a friend's game spawned shows on the host's game too (not yet tested). Tested in one chapter's shootout (Bon
+  Appetit's restaurant, cleared to the last enemy, the chapter not played past it); other chapters' fights were not
+  tried. enemies_target_guests = 0 in MafiaCoop.ini turns the enemies-aim-at-friends part off if it causes trouble.
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
-  screen (checked in Taxi and Bon Appetit). Where each player starts in his own mission car, the host's character
-  waits hidden until the cars have parted. Since 0.15.0 the mission car comes back when the driver parks and gets out (not yet tested). Only a
-  few chapters were checked.
-- Near the host a friend sees the host's traffic and police cars (0.15.0, not yet tested); away from the host
-  traffic is each player's own. Pedestrians are each player's own.
-- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit); other chapters and checkpoints may behave
-  differently. A friend who falls behind the host's checkpoint is reloaded at the host's checkpoint.
+  screen (checked in Taxi and Bon Appetit). Since 0.15.0 the mission car comes back when the driver parks and gets
+  out (not yet tested). Only a few chapters were checked.
+- Near the host a friend sees the host's traffic and police cars (seen in the first test, not yet confirmed);
+  away from the host traffic is each player's own. Pedestrians are each player's own.
+- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit, the start of Salieri); other chapters and
+  checkpoints may behave differently. A friend who falls behind the host's checkpoint is reloaded at the host's
+  checkpoint.
 - A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the last co-op
-  checkpoint. Since 0.15.0 that takes one loading screen (before: a short stop in a Free Ride world first); not yet
-  tested in game. Your own story saves are never loaded or changed.
+  checkpoint in one loading screen (checked in Taxi; other kinds of failure not yet).
 - If a player's connection drops, the others see that after about 4.5 seconds (net_timeout_s in MafiaCoop.ini).
-  Since 0.15.0 his game then reconnects by itself for up to a minute and he gets his place back (not yet tested).
-  Closing the game normally tells everyone at once.
+  Since 0.15.0 his game then reconnects by itself for up to a minute and he gets his place back (seen once on
+  one PC, not yet confirmed, nor over Steam between two PCs). Closing the game normally tells everyone at once.
 - Punches do not work near Salieri's bar (where Free Ride starts) or at some story checkpoints: the game itself
   turns fists off there.
 - Your own new character shows once you close the pause menu (the others see it at once).
 - The co-op panels work with keyboard, gamepad and mouse. They were tested with a virtual gamepad; 0.15.0 fixes
-  real controllers (any slot, plugging in and out, sticks) and shows gamepad buttons in the footers, not yet tested
-  with a real one.
+  real controllers (any slot, plugging in and out, sticks) and shows gamepad buttons in the footers (the footers
+  were seen switching in the test), not yet tested with a real controller.
 - A Steam invite between two PCs worked in the 0.13.0 test; JOIN FRIEND between two PCs has not been tested yet.
 - Only the Steam version of the game (build 16502642) is supported.
 

@@ -1,5 +1,5 @@
 #pragma once
-// Explosions, fires and blown-up cars on every game (0.16): game-free logic, unit-tested by tests/explosion_test.cpp.
+// Explosions, fires and blown-up cars on every game (0.15.0): game-free logic, unit-tested by tests/explosion_test.cpp.
 // Used by src/game/explosion_sync.cpp (messages, the mc_boom_* Lua functions) and src/game/explosion_sync.lua
 // (MafiaCoop.Boom: the game calls). docs/game-api.md 23, docs/protocol.md "Explosions".
 //

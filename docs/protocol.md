@@ -15,26 +15,26 @@ startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x020
 at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet). 0.12.0:
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
-ends with the driver's controls (6 bytes). 0.15.0 (core 0.11.0, `kProtocolVersion` 8: the reconnect trailers and
-PeerDropped, core docs/protocol.md "Reconnect"): guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd (0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
+ends with the driver's controls (6 bytes). 0.15.0 (core 0.11.0, `kProtocolVersion` 9: the reconnect trailers and
+PeerDropped (8), lanes and the session clock (9), core docs/protocol.md "Reconnect" / "Latency"): guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd (0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
 TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
 (0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
-its end (both always sent); CarParked with a trailing flags byte (wrecked). World items (not yet released): ItemStates (0x0270),
-ItemTake (0x0271), ItemGone (0x0272), Collectible (0x0273), additive (see "World items"). Traversal (not yet in a release): action
+its end (both always sent); CarParked with a trailing flags byte (wrecked). World items (0.15.0): ItemStates (0x0270),
+ItemTake (0x0271), ItemGone (0x0272), Collectible (0x0273), additive (see "World items"). Traversal (0.15.0): action
 kinds 7..17 and the pose block (u8 [+ u32]) after the action block, both optional on the wire (see "PlayerState").
-Doors (not yet in a release): DoorEvent (0x0230), DoorApply (0x0231), DoorSnapshot (0x0232), DoorSnapRequest
+Doors (0.15.0): DoorEvent (0x0230), DoorApply (0x0231), DoorSnapshot (0x0232), DoorSnapRequest
 (0x0233), additive (see "Doors"); action kinds 18 door kick, 19 lock pull, 20 door open, read as none by older builds.
-Police (not yet in a release): PoliceState (0x0260), PoliceEvent (0x0261), PoliceChase (0x0262), additive (see
+Police (0.15.0): PoliceState (0x0260), PoliceEvent (0x0261), PoliceChase (0x0262), additive (see
 "Police"); TrafficStates flag 2 (siren) of police cars now from their real siren / beacon when it can be read.
-Explosions (0.16, not yet in a release): Explosion (0x0240), CarExploded (0x0241), additive (see "Explosions").
-Grenade arc (0.16, not yet in a release): Throw (0x0242), ThrowFix (0x0243), additive; Explosion gets an optional
+Explosions (0.15.0): Explosion (0x0240), CarExploded (0x0241), additive (see "Explosions").
+Grenade arc (0.15.0): Throw (0x0242), ThrowFix (0x0243), additive; Explosion gets an optional
 trailing u32 throwSeq (older senders end before it) (see "Explosions").
-Car damage (not yet in a release): CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252),
+Car damage (0.15.0): CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252),
 additive (see "Car damage").
-Several guests (3-4 players; not yet in a release): HostNpcHit (0x0422) gets a trailing u8 attacker (read as the
+Several guests (3-4 players; 0.15.0): HostNpcHit (0x0422) gets a trailing u8 attacker (read as the
 host when missing), NpcStates carry the other guests' own NPCs under relay keys (see "Several guests").
 
-Latency (not yet in a release; core `kProtocolVersion` 9: lanes, session clock, app message send stamps, core
+Latency (0.15.0; core `kProtocolVersion` 9: lanes, session clock, app message send stamps, core
 docs/protocol.md "Latency"): no message of ours changes; PlayerState's u32 time is now the moment the state was
 sampled (was: sent), which only shifts the receiver's timeline. See "Latency budget" at the end.
 
@@ -717,7 +717,7 @@ Additive: a peer without these messages ignores them (each game then keeps its o
   is sent. Physics props (crates, barrels) stay local.
 - A new world on either game (checkpoint, reload, following the host) starts the books over (ids are per world).
 
-### Doors (unreleased; not yet checked in game)
+### Doors (0.15.0; not yet checked in game)
 
 Doors are the same on every game: a door a player opens, closes, kicks open, unlocks or lockpicks (the lock pull)
 changes on the other games too, and his puppet plays the kick / lock pull / door opening (the action block above).
@@ -772,7 +772,7 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
 - UNVERIFIED in game: all of it (docs/game-api.md 21): that `mc_entity_ids(21)` lists the doors of houses, shops,
   garages and gates, that names and positions match across games, the door calls, the door messages.
 
-### Police (unreleased; not yet checked in game)
+### Police (0.15.0; the offence fix checked in game, the rest not yet)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
@@ -803,7 +803,7 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
 - Additive: a peer without these messages ignores them. Logs `police: ...`; trace records POL / POE / POR / POT /
   POC (docs/sync-trace.md).
 
-### Explosions (0.16; not yet checked in game)
+### Explosions (0.15.0; messages seen in game, the pictures not yet)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|

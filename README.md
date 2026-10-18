@@ -4,12 +4,12 @@
 server, Steam invites. Players see each other walking, running, armed and driving, can shoot, punch and run each
 other over, and each picks the character he plays as. Weather, time and the story follow the host (chapter,
 checkpoint, objectives, cutscenes); mission NPCs are kept in step with the host's (deaths, your hits on them) and
-mission cars are not doubled. Enemies on the host's screen do not aim at the other players yet, and ambient traffic
-is each player's own.
+mission cars are not doubled. The host's enemies aim at every player; since 0.15.0 a friend near the host sees the
+host's traffic and police (not yet verified in game).
 
 ## Download
 
-The current version is the **0.8.0 pre-release**: download `MafiaCoop-0.8.0.zip` from
+The current version is the **0.15.0 pre-release**: download `MafiaCoop-0.15.0.zip` from
 [Releases](https://github.com/JustAddMP/MafiaDE/releases), extract it anywhere and read its `README.txt` (requirements,
 how to play, known issues, uninstall). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -44,20 +44,19 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- Enemies: shared in fights (deaths both ways, health, the host's enemies aim at friends too; an enemy only the
-  host's game spawned shows on a friend's game as a copy) but tested in one chapter's shootout only (Bon Appetit's
-  restaurant, cleared, but the chapter was not played past it). Enemies only a friend's game spawned (he got
-  somewhere first) are his alone: the host does not see them. Pedestrians and police are each player's own.
-- Mission cars are partly shared (the host sits at the wheel of a mission car on a friend's screen, checked in Taxi
-  and Bon Appetit; handing the car back when he gets out is not checked); ambient traffic, pedestrians and police are
-  each player's own.
-- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only.
-- A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the checkpoint
-  in two loads: a short stop in a Free Ride world (confirmed for you and kept black, if the game window has focus),
-  then the checkpoint. Leaving the area and a destroyed mission car were tested; a mission timer was not.
-- A killed game (not closed) makes the others wait about 4.5 s; there is no automatic reconnect.
-- The co-op panels were tested with a virtual gamepad and mouse messages, not a physical gamepad; Steam invites
-  between two PCs not fully tested.
+- 0.15.0 is a pre-release with a first test on one PC only. Verified there: car lights and signals, failed missions
+  in one load, the police fix. The rest that is new in 0.15.0 (punches on the other players, the host's traffic and
+  police on a friend's game, doors, items, explosions, car damage, enemies only a friend's game spawned, the mission
+  car coming back, players on the map, reconnect, three or four players, JOIN FRIEND, real gamepads) is built but
+  not yet verified in game. See [CHANGELOG.md](CHANGELOG.md) for the details.
+- Found in the test: punches and throws do not show on the other player's character; the other player's map marker
+  was not seen on the minimap; a player's car shows as another variant and colour on the other screen; a car's
+  damage after an explosion can be read back as a repair; after a friend's reload his character may sit hidden in a
+  car; a wanted friend's police level runs down during a chase; a co-op chapter writes the player's garage
+  (`garage.pf`).
+- Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only; enemy
+  fights in one chapter's shootout (Bon Appetit's restaurant).
+- JOIN FRIEND and a physical gamepad have not been tested between two PCs / with a real controller yet.
 
 ## For developers
 

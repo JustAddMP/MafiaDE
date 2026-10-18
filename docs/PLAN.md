@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-18 (0.15.0 built, not yet tested in game).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-18 (0.15.0 pre-release after a first in-game test on one PC; most of it not yet verified).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -34,7 +34,7 @@ interest.md).
 - Generic fixes go to core first: change and commit them in the core repo (its `build.cmd` + tests must pass, see
   its README.md), release it as a core version tag (core README "Versions"), then move this repo to that tag with
   `tools\update_core.cmd vX.Y.Z` (builds + tests) and commit `external/core`. This repo only ever pins core release
-  tags (currently core main 8c9c0fd = 0.11.0, tagged v0.11.0 with the 0.15.0 release after its in-game test). Never edit core files only inside this repo's submodule checkout without committing them to core.
+  tags (currently core v0.11.0 = 8577314, released with mod 0.15.0). Never edit core files only inside this repo's submodule checkout without committing them to core.
 - Build with `build.cmd` (warning-free /W4; it also builds core). Core's tests must pass
   (`external\core\build.cmd`, then `external\core\out\net_loopback.exe` and the others), and `out\proxy_test.exe`.
   Commit on main after each tested step; no Claude attribution lines; push when the user asks.
@@ -360,6 +360,27 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    TRL. Both built, need the in-game test: the "mission car coming back" and "traffic and police each player's own"
    points above are built, needs the in-game test. Pedestrians stay local.
    In-game 2026-10-18 (0.15.0, one PC): traffic near the host shown on the guest (`the host's traffic shows here`, back to his own beyond 250 m, copies p95 1.1 m off the host's cars, bumps put back and reported). Police: a guest's wanted state reaches the host; the 0.15.0 offence announced from his puppet made the HOST wanted (fixed 968d300: no announce, cops attack a hunted guest's puppet; retested: `our cop ... set on guest 1's puppet: ok`, host stayed clean). Mission car back: the swap and the real car restored at the copy's place when the guest's world went (`our own car 3102474 is back at the copy's place`); the parked case not reached. A player's car copy is another variant/colour of the model (no colours/plate for player cars on the wire).
+- [ ] **World sync added in 0.15.0, not yet verified in game** (built 2026-10-18 from static research, each with
+   unit tests; README-dev.md "Test checklist: 0.15.0 features"):
+   - Doors (protocol.md "Doors", game-api.md 21): doors shared on every game, the host decides story doors, door
+     kick / lock pull / door open on the puppet. Not reached in the 2026-10-18 test (no doors near).
+   - World items (protocol.md "World items", game-api.md 20): weapons on the ground and pickups shared, the host
+     decides takes, collectibles per player. Not reachable in Free Ride (no item both games have).
+   - Traversal on puppets (game-api.md 17): jumps, vaults, ledges, ladders, cover slides, sneaking, medkit, bodies.
+     2026-10-18: teleport drops played as jumps / hard landings; the rest not tried.
+   - Explosions and the grenade arc (game-api.md 23): explosions on every game as harmless pictures, a throw's
+     flight drawn on the others. 2026-10-18: the messages and the flight numbers arrived (0.0 m off at the
+     explosion), the pictures were not seen on screen.
+   - Car damage (protocol.md "Car damage", game-api.md 24): dents, parts, tyres, fire and explosions on every game.
+     2026-10-18: crash damage and a blown-up car reached the copy; the copy's wreck damage came back to the host as
+     a report and was read as a repair (to fix).
+   - Police (protocol.md "Police"): wanted states shared, the host's police chase a wanted guest's puppet near the
+     host. The offence fix (968d300) is checked in game; the guest's level still runs down during a chase.
+   - Several guests (protocol.md "Several guests"): 3-4 players, other guests' NPCs relayed, seat rules, driver
+     claims. Only unit tests (core four-player lobby and reconnect tests); no in-game test with three games.
+   - Latency (protocol.md "Latency budget", core 0.11.0): lanes and priorities per system, adaptive playout delay,
+     LAT / CLK trace. 2026-10-18 (one PC): playout delay 33-40 ms, jitter p95 9-15 ms; menu waits now listed as
+     `LAT held=1` (48f827c, not yet checked in game).
 - [x] **Cutscenes** (research: docs/research-world-sync.md): guests see host cutscenes (trigger the same cutscene id) or a "cutscene playing" screen.
   Done 2026-10-15 (game-api.md 14): the host polls his chapter's cutscene objects and sends the one that plays; the
   guest plays his own copy (`PlayCutscene2` with four empty strings) or lets his own flow play it, stops it when the
@@ -501,9 +522,12 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   catch-up, animated get-in; sync trace + tools/sync_compare.py; core v0.10.0), fixes not yet tested in game. Done
   2026-10-17: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.14.0.
 - [ ] GitHub pre-release v0.15.0 (melee actions, car signals, seat keeping, mission car back, guest-owned NPCs,
-  traffic and police, failed missions in one load, players on the map, reconnect, JOIN FRIEND panel, physical pad
-  and button prompts; core v0.11.0, protocol 8), after the in-game test of README-dev.md "Test checklist: 0.15.0
-  features".
+  traffic and police, doors, world items, traversal, explosions and the grenade arc, car damage, several guests,
+  latency, failed missions in one load, players on the map, reconnect, JOIN FRIEND panel, physical pad and button
+  prompts; core v0.11.0, protocol 9). Published 2026-10-18 as a pre-release after the first in-game test on one PC
+  (verified: car signals, failed missions in one load, the police fix; the rest not yet verified):
+  https://github.com/JustAddMP/MafiaDE/releases/tag/v0.15.0. Not ticked until the remaining checks of README-dev.md
+  "Test checklist: 0.15.0 features" are done.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
@@ -526,7 +550,7 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   keeps running and rejoins the same host with backoff for 60 s and gets his slot back with the resume token from
   the Welcome; banners on both sides, the dropped player's puppet removed, the world re-sent keyed by (id,
   joinSeq), the guest keeps following the host's point (no reload unless the host moved), trace RCN; kProtocolVersion
-  8; unit test net_reconnect. Gate: a guest whose network is cut for 10-30 s comes back as the same player without
+  8 (9 since core 0.11.0's lanes and session clock); unit test net_reconnect. Gate: a guest whose network is cut for 10-30 s comes back as the same player without
   a reload, NPC copies and traffic return; also over Steam P2P. Built, needs the in-game test.
   In-game 2026-10-18 (one PC, UDP, guest process suspended): 15 s -> host `lost the connection (timed out); slot held 60 s`, banner `... WAITING FOR THE PLAYER TO RECONNECT... 55 S`, puppet removed; on resume `reconnected after 0.5 s: same slot, still player 1`, no reload, puppets back, trace RCN. 66 s -> host `did not reconnect within 60 s; slot freed`. Not yet: Steam P2P, LEAVE CO-OP during the retries, the guest-side banner (a suspended game draws nothing).
 - [x] **Bandwidth and player desync** (user, 2026-10-16: "there was some desync with the players loaded"). Done

@@ -1,4 +1,4 @@
--- MafiaCoop explosion glue (0.16: grenades, molotovs, dynamite, exploding barrels and cars on every game). Runs in the
+-- MafiaCoop explosion glue (0.15.0: grenades, molotovs, dynamite, exploding barrels and cars on every game). Runs in the
 -- game's Lua state on GameMainThread after the other glue files, called once per script tick by
 -- src/game/explosion_sync.cpp (MafiaCoop.Boom.Update). Embedded into the dll; a copy at <dll dir>\explosion_sync.lua
 -- overrides it. docs/game-api.md 23, docs/protocol.md "Explosions".

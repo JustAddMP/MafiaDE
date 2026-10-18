@@ -3,56 +3,92 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
-## 0.15.0 (unreleased), not yet tested in game
+## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 
-A big step for the shared world and the co-op menus: fights and car details you can see on the other screen, the
-host's traffic and police on a friend's game, enemies only a friend's game has shown to the host, failed missions
-in one load, every player on the map, reconnecting after a lost connection, a JOIN FRIEND list and real gamepad
-support in the co-op panels. Everything here was built from reading the game's code and the logs of the 0.13.0
-test, with automated tests where the logic can run without the game; none of it has been tried in game yet
-(README-dev.md "Test checklist: 0.15.0 features").
+A big step for the shared world: fights, doors, items, explosions and car details you can see on the other screen,
+the host's traffic and police on a friend's game, enemies only a friend's game has shown to the host, failed
+missions in one load, every player on the map, reconnecting after a lost connection, three or four players, lower
+latency, a JOIN FRIEND list and real gamepad support in the co-op panels. Everything here was built from reading the
+game's code and the logs of earlier tests, with automated tests where the logic can run without the game.
 
-Fights:
+A first in-game test ran on 2026-10-18 on one PC (two instances, Free Ride, CHAPTER 2: TAXI and CHAPTER 13:
+SALIERI). **Verified in game:** car signals, failed missions in one load (the host's and the guest's failure), and
+the police fix below. **Everything else is written but not yet verified in game**, and some of it showed problems
+(see Known issues). The next checks are in README-dev.md "Test checklist: 0.15.0 features".
+
+Verified in game:
+- Car signals: headlights, indicators, horn, siren and police beacon of the car another player drives show on your
+  screen (tunnel headlights on and off, indicators, horn, siren and beacon, each once, nothing flickered). A real
+  police car was not driven.
+- A failed mission takes one loading screen instead of two: no more short stop in a Free Ride world. When the host
+  fails, everyone goes back to his checkpoint with him; when a friend fails, the host decides whether he rejoins at
+  the host's checkpoint at once or waits for the host. Checked with a blown-up mission taxi in Taxi, by the host and
+  by the guest. Both failing at once and the other fail kinds (timer, ally dead, target escaped, arrested) were not
+  tried.
+- Police: a wanted friend's character no longer makes the host wanted. In the test the offence announced from the
+  friend's character made the host's own game create a police zone around it; now no offence is announced, the
+  host's police simply go after a hunted friend's character (retested: the host stayed clean).
+
+Written, not yet verified in game:
+
+Fights and moving around:
 - Punches, charged punches, counters, takedowns, throws (grenades, molotovs, knives) and being hit in a fist fight
-  now show on the other players' characters with the game's own animations. The character stops walking while it
-  plays and its swing cannot hurt anyone on your screen; the real hit still counts on the victim's game as before.
-- Enemies that only a friend's game spawned (he got somewhere first) now show on the host's game: they move, fight
-  and can be hurt and killed there, their hits on the host count, and when the host's own game spawns the same
-  enemy later the two are matched up instead of doubled.
+  are sent to the other players' characters with the game's own animations; the character stops walking while it
+  plays and its swing cannot hurt anyone on your screen (the real hit still counts on the victim's game). In the
+  test the punches arrived and the real hit landed, but the punch itself did not show (Known issues).
+- Jumps, vaults, ledge climbs, drops, ladders, cover slides, sneaking, the medkit and carrying bodies are shown on
+  the other players' characters.
+- Enemies that only a friend's game spawned (he got somewhere first) show on the host's game: they move, fight and
+  can be hurt and killed there, their hits on the host count, and when the host's own game spawns the same enemy
+  later the two are matched up instead of doubled.
 
 Cars:
-- Headlights, indicators, horn, siren and police beacon of the car another player drives show on your screen.
-- The other player's character stays in its car seat: the game's civilian behaviour made it climb out (the cause of
-  the throw-outs in the 0.13.0 test); it now gets the same "friend" behaviour on every game, its seat is checked
-  every moment and it is put straight back if it starts to leave. Riding along with a friend waits until his
-  character sits at the wheel, so you are not put in the driver's seat of his car.
+- The other player's character stays in its car seat: it gets the game's "friend" behaviour on every game (the
+  civilian one made it climb out, the cause of the throw-outs in the 0.13.0 test), its seat is checked every moment
+  and it is put straight back if it starts to leave. Riding along with a friend waits until his character sits at
+  the wheel, so you are not put in the driver's seat of his car.
 - A mission car (or the host's own car) that was replaced by a copy while another player drove it comes back when
-  the driver parks and gets out, where he left it (and wrecked if he wrecked it), so the mission carries on with
-  its own car. The copy is locked meanwhile, so you do not get into the wrong car.
-- Traffic and police: near the host, a friend's game shows the host's traffic and police cars (the nearest 20,
-  driven like the host's, police with siren and beacon) instead of its own, so the streets and chases look the same
-  on both screens. Away from the host each game keeps its own traffic.
+  the driver parks and gets out, where he left it (and wrecked if he wrecked it). The copy is locked meanwhile.
+- Traffic and police: near the host (250 m), a friend's game shows the host's traffic and police cars (the nearest
+  20, driven like the host's, police with siren and beacon) instead of its own; away from the host each game keeps
+  its own traffic.
+- Car damage: dents, broken parts, tyres, fire and explosions of cars show on every game; the game that holds a car
+  decides its damage.
+- Explosions: grenades, molotovs, dynamite, exploding barrels and blown-up cars are sent to every game and shown
+  there as a picture that hurts no one; the real damage stays on the game where it happened. A grenade's or
+  molotov's flight is drawn on the other games (one Throw message plus a few corrections at bounces).
 
-Story:
-- A failed mission takes one loading screen instead of two: no more short stop in a Free Ride world. The chapter
-  host goes straight back to his last co-op checkpoint, a STORY host gets the game's own fail screen; when a friend
-  fails, the host decides whether he rejoins at the host's checkpoint at once or waits for the host; when the host
-  fails, everyone goes back with him. Every fail kind (leaving the area, losing the mission car, a timer, an ally
-  dead, a target escaped, arrested) goes this way.
+The world:
+- Doors are the same on every game: a door a player opens, closes, kicks open, unlocks or lockpicks changes on the
+  other games too, and his character plays the kick, lock pull or door opening. The host's game decides the story
+  doors.
+- Weapons lying on the ground and ground pickups (medkits) are shared; the host decides who takes them.
+  Collectibles are counted per player.
+- Police: each player's wanted level is shared; the host's police go after a wanted friend's character near the
+  host, and the friend's game holds his level while they chase him. Police copies' sirens come from the host's cars.
 
 Map:
 - Every other player is on your minimap and map all the time, with his name: on his character on foot, at his car
   while he drives, and at his position while his character is hidden, respawning or not spawned yet.
 
-Connection:
+Connection and players:
 - Reconnect: when a player's connection drops he is not thrown out. His game keeps running and rejoins the host on
   its own for up to a minute ("CONNECTION LOST - RECONNECTING... 12 S"), the others see "<NAME> LOST THE CONNECTION -
   WAITING FOR THE PLAYER TO RECONNECT" and he gets his place back (same player, same character, the host's world
   re-sent). LEAVE CO-OP stops the retries.
+- Three or four players: other guests' enemies are relayed, enemies can hit any player's character, seat rules for
+  three or four in one car, and conflicts when two players claim the same car's wheel are settled.
+- Lower latency (core 0.11.0): messages leave at the end of the frame they were made in, lost ones are resent after
+  about one round trip, the systems that do not depend on each other (world / mission, doors, items, police) have
+  their own lanes so a big message no longer holds the others back, and bulk data gives way when the link is full.
+  Other players' characters and traffic copies are shown with an adaptive delay instead of a fixed one.
+- Latency stats: the time a guest waits in the menus or on a loading screen (a world message received in the menu
+  and applied once the world loaded) is no longer counted as latency; it is listed apart (`LAT held=1`).
 - JOIN FRIEND (main menu CO-OP) opens a list of your Steam friends who play Mafia DE and what they are doing:
   hosting (with players / maximum and whether they are in the lobby or playing), in a friend's game, not hosting,
   another mod version, full. Pick one to join. The version is checked before connecting (Steam invites too), and
-  Steam's join errors are said in words.
+  Steam's join errors are said in words. (The panel opened and refreshed in the test; listing and joining a friend
+  needs two PCs.)
 
 Co-op panels and the gamepad:
 - A physical gamepad works in the co-op panels: any controller slot, plugged in or out while playing, sticks that
@@ -61,12 +97,36 @@ Co-op panels and the gamepad:
 - The panels' footers show the right buttons for what you use, like the game's own menus: gamepad buttons after
   you use the pad, key names after keys or the mouse. The pad's X / Y / LB / RB do what the footer says (lobby: X
   START / READY / JOIN GAME, Y INVITE; JOIN FRIEND: Y REFRESH; text boxes: X delete, Y paste).
+- Fix from the test: after a pad button closed a co-op panel, the keyboard no longer stays blocked while the game is
+  not reading the pad (the loading screen after the lobby ignored Enter for minutes).
+
+Known issues (from the 2026-10-18 test):
+- Melee: the punch, charged punch and throw animations do not show on the other player's character (it keeps
+  walking or standing; the real hit still lands). The game's melee animations seem not to play on an AI character
+  outside a fight, and any animation played this way starts about 2 s late. Needs another way to play them.
+- Map markers: the logs show one marker per player at all times, but no marker for the other player could be found
+  on the minimap.
+- A player's car looks different on the other screen: same model, but another variant and colour (and plate);
+  player cars carry no colours or plate yet (traffic cars do).
+- Car damage after an explosion: the wreck damage of the copy came back to the host's game as a report, and the
+  host's game took the lower numbers as a repair.
+- Seats after a guest's reload: after the guest's game reloaded (following the host to a new checkpoint), the host
+  saw the guest's character hidden in his taxi, not seated, for minutes.
+- Police: a wanted guest's level runs down on his own game even while the host's police are after him (holding
+  his level during the chase does not work yet).
+- `garage.pf` (the player's garage, a profile file) is written by the host's and the guest's game during a co-op
+  chapter, so a co-op chapter can change your garage. Your story saves stay untouched.
+- Not reached in the test: doors, world items (Free Ride has no item both games share), guest-owned enemies, the
+  mission car coming back after parking, three or four players, two PCs, a real gamepad, JOIN FRIEND with a friend.
+- Once in CHAPTER 13 the guest's scripts stopped about 10 s after the opening cutscene (no error in the log; not
+  seen again).
 
 Technical notes:
 - Melee: PlayerState action block (u8 actSeq, u8 act) at the end, after the vehicle block's signals byte; the puppet
   plays `AnimPlay` with the controller paused, a swing shield keeps its swing harmless (docs/game-api.md 17).
-  New unit test player_actions_test. Still missing: door kicks, grenade explosions, medkit, carrying bodies,
-  lockpick, vault / ladder, jump, stalk, paired takedowns.
+  Unit test player_actions_test. Still missing: grenade explosions on the puppet, lockpick, stalk, paired takedowns.
+- Traversal: action kinds 7..17 and an optional pose block (u8 [+ u32]) after the action block (docs/game-api.md 17;
+  trace TE / TL / TP / TVC / CB).
 - Car signals: read from the vehicle part (+0xD00 / +0xA88 / +0x119C; `mc_car_signals` / `mc_car_set_signals`),
   u8 signals at the end of the PlayerState vehicle block, re-set on the copy when its game changes them back; trace
   field `sig` (T field 64). Unit test car_signals.
@@ -82,20 +142,41 @@ Technical notes:
   `traffic_sync.*` (unit test traffic_test); the guest's own ambient traffic and police spawning go off within
   250 m of the host; trace records TRH / TRP / TRG / TRC / TRL; hidden traffic cars are never adopted as a player's
   car.
+- Doors: DoorEvent / DoorApply / DoorSnapshot / DoorSnapRequest (0x0230-0x0233), `door_model.h` (unit test
+  door_test); action kinds 18 door kick, 19 lock pull, 20 door open (docs/game-api.md 21; trace DR / DL / DA).
+- World items: ItemStates / ItemTake / ItemGone / Collectible (0x0270-0x0273), `world_items.h` (unit test
+  world_items_test; trace ITH / ITG / ITE / ITL / COL).
+- Police: PoliceState / PoliceEvent / PoliceChase (0x0260-0x0262), `police_model.h` (unit test police_test); no
+  offence is announced from a guest's puppet (it made the host wanted); cops are set on a hunted guest's puppet at
+  any level (trace POL / POE / POR / POT / POC).
+- Explosions and the grenade arc: Explosion / CarExploded (0x0240-0x0241), Throw / ThrowFix (0x0242-0x0243;
+  receivers simulate the flight with `lua::RayCast`), a damage guard for the pictures; a car blows up only on the
+  game that holds its damage, another game's blast is applied there (docs/game-api.md 23).
+- Car damage: CarDamage / CarDamageReport / CarDamageRequest (0x0250-0x0252), native part / tyre / fire / explosion
+  reads and writes, raise-only merge with repair detection (unit test car_damage_test; docs/game-api.md 24; trace
+  CDS / CDT / CDR / CDA / CDX / CDQ).
 - Failed missions: the save system's FreeRoamRetry (exe+0x21E8B20) is skipped in co-op chapters, FailFlow
   (`src/game/fail_flow.h`, unit test fail_flow_test), the director's GameOver hooked (log), MissionFail 0x0205 /
-  FailVerdict 0x0206; 75 patterns; trace record FAIL. No fail role while a guest is reconnecting (the game's own way
-  then, the usual follow afterwards).
+  FailVerdict 0x0206; 75 patterns; trace record FAIL. No fail role while a guest is reconnecting.
 - Map markers: one navigation icon per player, moved between puppet and position (`ChangeIconTargetToPos` /
   `ChangeIconTargetToEntityDirect`), names with `SetIconTextByNavId`; decision in `src/game/map_markers.h` (unit
   test map_markers_test); trace records MK / MKE.
 - Reconnect: core's slot hold, resume token and PeerDropped; newcomer re-send keyed by (id, joinSeq) in PlayerSync
   and MissionSync; the trace stays open (RCN records, listed by tools/sync_compare.py). No app message changed.
-- Core 0.11.0 (unreleased): JOIN FRIEND (`net/steam_friends`), pad fixes (`pad_nav`), button prompts (`ui_prompts`),
-  reconnect; protocol version 8. The main menu's CO-OP page keeps the game's own footer.
+- Several guests: HostNpcHit gets a trailing u8 attacker; NpcStates carry the other guests' own NPCs under relay
+  keys (the owner's human id with its type byte replaced by 0xF0 + owner, exact in the game's float Lua); NpcStates
+  taken in turns from each player's nearest (docs/protocol.md "Several guests"; trace NRL / NRH / SEA / DRV).
+- Latency: `src/game/latency.cpp` sets core's lanes and send priorities per system; player states are sent in the
+  frame the sample is first seen, stamped with the sample time and shown with core's adaptive playout delay on a
+  Hermite curve; traffic copies use an adaptive delay instead of a fixed 120 ms; doors / items / police / car damage
+  / NPC states polled at higher rates. Trace LAT (send -> applied per system, `held=1` for a message that waited for
+  the game's tick) and CLK; `tools/sync_compare.py` Bandwidth and Latency sections (unit test latency_test).
+- Core 0.11.0 (`external/core` v0.11.0): JOIN FRIEND (`net/steam_friends`), pad navigation (`pad_nav`, `PadHold`),
+  button prompts (`ui_prompts`), reconnect, lanes, send priorities, session clock, playout; protocol version 9.
+  The main menu's CO-OP page keeps the game's own footer.
 
-Everyone needs 0.15.0: the PlayerState tail, the new messages and the protocol version changed (0.14.0 cannot join
-it).
+Everyone needs 0.15.0: the PlayerState tail, the new messages and the protocol version (9) changed (0.14.0 cannot
+join it).
 
 ## 0.14.0 (2026-10-17), pre-release, fixes not yet tested in game
 

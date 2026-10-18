@@ -648,7 +648,7 @@ when a guest drove it, used to stay hidden for good. When it comes back is decid
 | the driver gets back in before ours is back | the copy is driven again, nothing restored |
 | a remote player drives ours after it came back | swapped for a copy at once (`c.noNpc`: it threw his puppet out before) instead of after two throw-outs |
 | we drive the copy ourselves (we rode along, the lock did not hold) | it is our car until we park it; our own CarParked counts like his, and ours comes back where we left the copy once we are out |
-| CarParked says the car was destroyed (new flags byte, docs/protocol.md) | ours comes back there and is set exploded (`car:SetExploded()`, the wreck without a second blast; since 0.16, section 23: the blast itself is shown as a picture) so this game's mission sees what the driver's saw. The driver's game takes a car as destroyed when `car:GetDamage()` is 100 or more: its scale is 0..100 percent and **100 = exploded** (read from the exe, section 24 / re-notes 11; the raw `GetDamage` / `GetMotorDamage` are still logged with every CarParked). Since the car damage sync (section 24) ours also gets the car's damage when it comes back, and its explosion if it blew up meanwhile |
+| CarParked says the car was destroyed (new flags byte, docs/protocol.md) | ours comes back there and is set exploded (`car:SetExploded()`, the wreck without a second blast; since 0.15.0, section 23: the blast itself is shown as a picture) so this game's mission sees what the driver's saw. The driver's game takes a car as destroyed when `car:GetDamage()` is 100 or more: its scale is 0..100 percent and **100 = exploded** (read from the exe, section 24 / re-notes 11; the raw `GetDamage` / `GetMotorDamage` are still logged with every CarParked). Since the car damage sync (section 24) ours also gets the car's damage when it comes back, and its explosion if it blew up meanwhile |
 | the copy could not be spawned, or the game removed it | ours comes back at once at the driver's last transform (no further swaps of that car if spawning failed) |
 | a new world (checkpoint load, reload after a death or a failed mission, following the host, quit) | ours, if the entity survived the load (same GUID), is shown where it is (`Activate`), else forgotten; the old world's copy is not touched (its traffic id may belong to a new car). A copy that is still valid means it was only a loading screen in the same world: nothing happens |
 | the session ends | ours comes back at the copy's place at once; if we sit in the copy it stays (a normal car) and ours comes back when we got out (`M.leftCars`) |
@@ -1108,7 +1108,7 @@ local pp = MafiaCoop.pup["1"]
 return tostring(pcall(pp.so.AnnouncePoliceOffence, pp.so, enums.OffenceType.STREET_SHOOTING))
 ```
 
-## 23. Explosions, fires and blown-up cars on every game (0.16) - static only, NOT verified in game
+## 23. Explosions, fires and blown-up cars on every game (0.15.0) - static only, NOT verified in game
 
 Found by reading the exe, its Lua binding thunks and the game's own scripts (`tables/scripts.sds`, HKS bytecode)
 without running the game. Used by src/game/explosion_sync.lua (MafiaCoop.Boom), src/game/explosion_model.h and
@@ -1139,7 +1139,7 @@ docs/protocol.md "Explosions". Every call and event below needs the in-game chec
 
 | call | notes |
 |---|---|
-| `car:Explode()` / `car:SetExploded()` | thunks 0x239B550 / 0x239BCC0; both call 0x2540380(car, t, true): Explode with a tunable value (read from a config once), SetExploded with **-1**. In 0x2540380 a positive t arms a timer (the car blows up t later); t <= 0 sets the wrecked state at once, and only t >= 0 runs the block that builds an explosion at the car (the blast with its damage): so SetExploded is the wreck **without the blast** [likely, from the code]. The first test there (car+0x1280, bit 16) returns at once; probably the DisableExplosion flag [guess], so the glue calls `DisableExplosion(false)` before `SetExploded()` on copies. Used: a receiver's copy of a car that blew up on its driver's game, and a hidden real car that comes back wrecked (CarParked, section 15; before 0.16 that was `Explode()`, a second real blast) |
+| `car:Explode()` / `car:SetExploded()` | thunks 0x239B550 / 0x239BCC0; both call 0x2540380(car, t, true): Explode with a tunable value (read from a config once), SetExploded with **-1**. In 0x2540380 a positive t arms a timer (the car blows up t later); t <= 0 sets the wrecked state at once, and only t >= 0 runs the block that builds an explosion at the car (the blast with its damage): so SetExploded is the wreck **without the blast** [likely, from the code]. The first test there (car+0x1280, bit 16) returns at once; probably the DisableExplosion flag [guess], so the glue calls `DisableExplosion(false)` before `SetExploded()` on copies. Used: a receiver's copy of a car that blew up on its driver's game, and a hidden real car that comes back wrecked (CarParked, section 15; before 0.15.0 that was `Explode()`, a second real blast) |
 | `car:DisableExplosion(true)` | copies (player car copies, traffic copies) keep it: a copy never blows up by itself; so a remote player's grenade cannot wreck a car the other game drives (not carried) |
 
 **The damage guard** (explosion_model.h Judge; player_sync.lua M.OnDamageEvent asks `MafiaCoop.Boom.OnDamage` first

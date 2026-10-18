@@ -1,5 +1,5 @@
 #pragma once
-// The flight of thrown explosives on every game (0.16 "grenade arc"; docs/game-api.md 23 "The flight",
+// The flight of thrown explosives on every game (0.15.0 "grenade arc"; docs/game-api.md 23 "The flight",
 // docs/protocol.md "Explosions": Throw 0x0242). The thrower's game logs the aim while its player
 // lines up a throw, then measures the real projectile's launch in the first 0.3 s and sends it once; the others
 // simulate the flight against their own world (ray casts, bounces, rolling) and draw it (a marker and a fading trail
