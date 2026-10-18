@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-16 (0.12.0).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-18 (0.14.0).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -10,7 +10,7 @@ interest.md).
 | Phase | State |
 |---|---|
 | 1 Skeleton (launcher, injection, Present hook, crash dumps) | Done |
-| 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts untested |
+| 2 Connection (UDP + Steam lobby, handshake, overlay) | Done; Steam P2P between two real accounts works (2026-10-17 test) |
 | 3 Second player (Lua bridge, puppets) | Done: on foot, weapons, shared cars, characters (picker in the CO-OP panel), damage (bullets, punches, rams) and respawns |
 | 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs works (2026-10-17); lobby: Free Ride, Story and chapter select |
 | 4 Shared world | Weather/time, story (chapter, checkpoint, objectives), cutscenes and mission NPCs done (pairing, deaths and hits both ways, copies of host-only enemies; one chapter's fight checked); mission cars partly |
