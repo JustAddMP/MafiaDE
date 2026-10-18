@@ -105,6 +105,8 @@ Per player as seen on the other game:
 - **traffic:** host cars near the guest, bytes per second, unchanged states skipped, budget deferrals; on the guest
   how often the host's traffic showed, copies, the copy-vs-target error and the copies most often off, pins, bumps,
   and how many of the guest's own traffic cars were hidden or still drove near him.
+- **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
+  resumed).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.
