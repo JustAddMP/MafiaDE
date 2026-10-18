@@ -85,15 +85,18 @@ end
 -- blow up on one game only). While our game holds the car's damage (we drive it, or drove it last) it must be able
 -- to blow up like any car; when another game holds it again, off again.
 local function explosionFor(key, c, ours)
-  if not c.qid then return end
-  if ours and not D.expl[key] then
-    D.expl[key] = true
+  local id = c.qid and entId(c.ent)
+  if not id then return end
+  if ours and D.expl[key] ~= id then
+    D.expl[key] = id  -- by entity: a fresh copy (M.Swap) starts with its explosion off again
     try("DisableExplosion", c.ent.DisableExplosion, c.ent, false)
-    log("car " .. key .. ": we hold its damage, our copy can blow up now")
+    log("car " .. key .. ": we hold its damage, our copy " .. id .. " can blow up now")
   elseif not ours and D.expl[key] then
+    if D.expl[key] == id then
+      try("DisableExplosion", c.ent.DisableExplosion, c.ent, true)
+      log("car " .. key .. ": another game holds its damage, our copy does not blow up by itself again")
+    end
     D.expl[key] = nil
-    try("DisableExplosion", c.ent.DisableExplosion, c.ent, true)
-    log("car " .. key .. ": another game holds its damage, our copy does not blow up by itself again")
   end
 end
 
