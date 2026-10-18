@@ -33,6 +33,8 @@ src/game/
                          rows of the CO-OP panel (module.cpp, GameModule::PanelOptions) and PlayerModel. The
                          puppets' walk and the car copies' controls/corrections come from core's net/remote_motion
                          controllers (one pair per remote player), fed by the glue's "PS"/"VS" reports (0.13.0)
+  car_swap.{h,cpp}       when a real car hidden behind a copy comes back (parked, new world, session end); pure
+                         logic, called from player_sync.lua as mc_carswap, unit-tested in tests/car_swap_test.cpp
   mission_sync.{h,cpp}   phase 4 story: the host's chapter/checkpoint/objective/cutscene and checkpoint save to the
   mission_sync.lua       guests, guests load and follow it (lobby STORY / CHAPTER); the chapter loader hooks;
                          deaths / failed missions in chapter loads reload the checkpoint (never a save outside the session)
@@ -43,6 +45,8 @@ src/game/
                          stay untouched)
   menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch;
                          the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
+tests/                   our unit tests of game-free logic (car_swap_test.cpp); build.cmd builds them into out\,
+                         tools\make_release.cmd runs them
 docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
                          research-*.md, re-tools/, screenshots/
 tools/                   devlua.ps1 (run Lua in a running game), make_release.cmd + release-readme.txt

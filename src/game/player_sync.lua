@@ -340,8 +340,8 @@ function M.Swap(c, why)
   log("car " .. c.key .. ": replaced by a fresh copy for the new driver (" .. tostring(why or "-") .. ")"
     .. (hid and (", ours (" .. tostring(c.origId) .. " at " .. c.origAt .. ") hidden meanwhile")
       or (c.orig and ", ours stays hidden" or "")))
-  trace("SWR", string.format("key=%s ev=swap orig=%s at=%s why=%s", c.key, tostring(c.origId), tostring(c.origAt),
-    tostring(why or "-")))
+  trace("SWR", string.format("key=%s ev=swap orig=%s at=%s why=%s", c.key, tostring(c.origId),
+    (tostring(c.origAt):gsub(" ", ",")), (tostring(why or "-"):gsub(" ", "_"))))
 end
 
 -- true when `e` is a real car hidden behind a copy (it must not be adopted or count as standing in the way)
@@ -1071,8 +1071,9 @@ function M.Seat(pp, c)
         tostring(pp.hidden)))
     end
     -- A mission car of this game (adopted, M.FindLocalCar) does not keep an NPC at its wheel either: it is swapped
-    -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice.
-    if pp.ejects == 2 and pp.seat == 0 and c.adopted and not c.qid and not c.localIn and c.st == "ready"
+    -- for a copy (ours hidden until the copy is parked, M.Restore) the moment the driver is thrown out twice. The
+    -- same for a real car that came back from a swap (noNpc; e.g. our copy was lost while he drove).
+    if pp.ejects == 2 and pp.seat == 0 and (c.adopted or c.noNpc) and not c.qid and not c.localIn and c.st == "ready"
       and not c.swapFailed then
       log("puppet " .. pp.id .. " is thrown out of our mission car " .. c.key .. ": a copy takes its place")
       M.Swap(c, "puppet " .. pp.id .. " thrown out twice")

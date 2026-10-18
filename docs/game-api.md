@@ -139,7 +139,7 @@ for a long time.
 | `car:FixCarPos(true)` | freezes the car (no gravity); `SetPos/SetRot` still move it. **Not usable for cars people sit in**, see "Seating" below. Only the puppet factory car (crew seated by the spawner before the freeze) uses it |
 | `car:SetDespawnImmunity(true)`, `car:DisableExplosion(true)`, `car:Lock()` / `Unlock()` | |
 | `car:LockPlayerEntryPoints()` / `UnlockPlayerEntryPoints()` | no args; the player cannot get in by E while locked (scripted `GetOnVehicle` still works) |
-| `car:Deactivate()` (entity) | the car disappears (stays a valid object, `IsActive()` false). Used to hide a real car that is replaced by a copy |
+| `car:Deactivate()` (entity) | the car disappears (stays a valid object, `IsActive()` false). Used to hide a real car that is replaced by a copy; `car:Activate()` brings it back (0.15, UNVERIFIED; section 15 "Mission car back") |
 | `car:GetSeatOwner(i)` | 0-based seat (0 = driver); the human or nil |
 | `car:SetSpeed(n)` | takes a number (AI speed), not a velocity vector; there is no velocity setter |
 | `carpls(model)` (global, game_structure_console.lua) | spawns a car next to the player and seats him as driver. Worked in some sessions and did nothing in others (cause not found); the tests now use the recipe in "Seating" |
@@ -529,3 +529,37 @@ begin with a drive or a walk the tests cannot follow).
   Taxi mission does not let the player out). In chapters that start with each player in his own mission car (Lost
   Heaven chase, Taxi cp_020) the guest sits in his own car where the host's would be: the host's puppet waits hidden
   until the cars have parted, as before.
+
+**Mission car back (0.15; built from the code paths above, NOT checked in game).** The swap keeps the real car
+(`c.orig` in player_sync.lua): this game's mission scripts reference that entity, not the copy. Since 0.15 every
+real car is kept this way, not only an adopted mission car: the host's own mission car, swapped on the host's game
+when a guest drove it, used to stay hidden for good. When it comes back is decided by a small machine in C++
+(`src/game/car_swap.h`, unit-tested in `tests/car_swap_test.cpp`; Lua `mc_carswap(key, now, bits, speed, parkedAt)`
+-> action, lock, phase, reason), fed every tick by `M.SwapTick` with what the game shows:
+
+| situation | what happens |
+|---|---|
+| somebody drives the copy (the remote player, or we ourselves) | nothing; the copy is the car |
+| nobody drives it (the driver got out) | the copy is locked for the local player (`LockPlayerEntryPoints`; he would get into the copy, not his mission's car) until ours is back |
+| the copy is empty (no puppet, not us, no remote player getting in/out or riding along; NPCs alone are waited for 8 s) and the last driver's **CarParked** arrived (the copy is put at that final transform first) | ours comes back at the copy's place: the copy is despawned, ours `SetPos`/`SetRot` (before and after `Activate`, since it is not known whether a deactivated car takes a teleport), `Activate()`; the driver's puppet climbs out of the copy before that (the restore waits for it) and stands beside the car |
+| no CarParked (lost, or the driver left the session) | ours comes back once the copy has stood still (< 0.5 m/s) for 1 s, 10 s after the driver got out; after 20 s at the latest |
+| a CarParked up to 3 s before the driver's state shows him out | counts (CarParked is reliable, the state is not: either may come first); an older one does not |
+| the driver gets back in before ours is back | the copy is driven again, nothing restored |
+| a remote player drives ours after it came back | swapped for a copy at once (`c.noNpc`: it threw his puppet out before) instead of after two throw-outs |
+| we drive the copy ourselves (we rode along, the lock did not hold) | it is our car until we park it; our own CarParked counts like his, and ours comes back where we left the copy once we are out |
+| CarParked says the car was destroyed (new flags byte, docs/protocol.md) | ours comes back there and is blown up (`car:Explode()`) so this game's mission sees what the driver's saw. The driver's game takes a car as destroyed when `car:GetDamage()` is 100 or more: **its scale is not known** (the raw `GetDamage` / `GetMotorDamage` are logged with every CarParked to calibrate it); a 0..1 scale never says destroyed, and then the mission's own failure reload still brings everyone back |
+| the copy could not be spawned, or the game removed it | ours comes back at once at the driver's last transform (no further swaps of that car if spawning failed) |
+| a new world (checkpoint load, reload after a death or a failed mission, following the host, quit) | ours, if the entity survived the load (same GUID), is shown where it is (`Activate`), else forgotten; the old world's copy is not touched (its traffic id may belong to a new car). A copy that is still valid means it was only a loading screen in the same world: nothing happens |
+| the session ends | ours comes back at the copy's place at once; if we sit in the copy it stays (a normal car) and ours comes back when we got out (`M.leftCars`) |
+| a car record is dropped (model changed, trimmed) | ours comes back first; copies with ours hidden behind them are never trimmed |
+
+Log lines: `car K: replaced by a fresh copy for the new driver (why), ours (id at x y z) hidden meanwhile`,
+`swapped car K: parking, a puppet is still in the copy (...)` (every change of the machine's state, from the dll),
+`car K: our own car id is back at the copy's place (x y z; hidden at ...), activate ok, active true, copy despawned:
+parked`. Sync trace: `SWP` (machine) and `SWR` (swap / restore / forget), docs/sync-trace.md.
+
+Unverified: `Activate()` on a deactivated car (and a teleport of it) showing it again where we put it, with its
+mission state; `DespawnEntityImmediately` of a copy right after its occupants got out; `GetDamage`'s scale;
+whether a deactivated car survives a checkpoint load deactivated (it is shown again then); a checkpoint **save**
+made while a car is hidden (the host's own car while a guest drives it, or a guest's while the host does): the save
+may store it deactivated; mission NPCs that board the hidden car meanwhile (Taxi customers) were not looked at.

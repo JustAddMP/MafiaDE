@@ -954,10 +954,13 @@ int McCarSwap(lua_State* L) {
         MC_LOG_INFO("sync: swapped car %s: %s, %s%s%s (bits 0x%x, copy %.1f m/s, CarParked %s, copy %s)", k.c_str(),
                     carswap::PhaseName(o.phase), o.why, acted ? " -> " : "", acted ? carswap::ActionName(o.action) : "",
                     in.bits, in.copySpeed, parked, o.lockCopy ? "locked" : "open");
-        if (core::trace::IsOpen())
+        if (core::trace::IsOpen()) {
+            std::string why = o.why;  // one token in the trace (key=value fields are split at spaces)
+            std::replace(why.begin(), why.end(), ' ', '_');
             core::trace::Line("SWP", "key=%s phase=%s act=%s lock=%d bits=0x%x spd=%.2f parked=%.2f why=%s", k.c_str(),
                               carswap::PhaseName(o.phase), carswap::ActionName(o.action), o.lockCopy ? 1 : 0, in.bits,
-                              in.copySpeed, in.parkedAt >= 0 ? in.now - in.parkedAt : -1.0, o.why);
+                              in.copySpeed, in.parkedAt >= 0 ? in.now - in.parkedAt : -1.0, why.c_str());
+        }
     }
     if (o.phase == carswap::Phase::Done) _swaps.erase(k);
     lua::PushString(L, carswap::ActionName(o.action));

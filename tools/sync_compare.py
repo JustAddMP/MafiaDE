@@ -13,6 +13,7 @@ seen on the other's game:
   copy's speed against the driver's, the steering wish and front wheel angle against the driver's, engine and gear
 - seats: puppets thrown out of cars (from the copied log lines)
 - NPCs: how far the guest's NPCs were from the host's
+- swapped cars: real cars hidden behind a copy and how they came back (SWR / SWP records)
 - the worst moments with the wall-clock time of both games, to look them up in a video or the logs
 
 --csv DIR writes the lined-up time series (one file per player and kind) for plotting.
@@ -369,6 +370,29 @@ def npcs(guest):
         print("  NPCs most often more than 3 m off: %s" % ", ".join("%s (%d)" % kv for kv in far.most_common(5)))
 
 
+def swapped_cars(tr):
+    """Real cars hidden behind a copy on this game and how they came back (SWR events, SWP machine steps)."""
+    events = [(t, "SWR", f) for t, f in tr.records["SWR"]] + [(t, "SWP", f) for t, f in tr.records["SWP"]]
+    if not events:
+        return
+    section("Swapped cars on %s's game (%s)" % (tr.name, tr.role))
+
+    def why(f):
+        return f.get("why", "").replace("_", " ")
+
+    swaps = sum(1 for _, k, f in events if k == "SWR" and f.get("ev") == "swap")
+    back = [f for _, k, f in events if k == "SWR" and f.get("ev") == "restore"]
+    gone = sum(1 for _, k, f in events if k == "SWR" and f.get("ev") == "forget")
+    print("  %d swapped, %d brought back (%s), %d forgotten" % (
+        swaps, len(back), ", ".join("%s: %d" % kv for kv in Counter(why(f) for f in back).items()) or "-", gone))
+    for t, k, f in sorted(events, key=lambda e: e[0])[:40]:
+        if k == "SWR":
+            print("    %s %s %s %s %s" % (tr.wall(t), f.get("key"), f.get("ev"),
+                                         (f.get("from") or f.get("at") or "").replace("_", " "), why(f)))
+        else:
+            print("    %s %s machine: %s, %s (%s)" % (tr.wall(t), f.get("key"), f.get("phase"), f.get("act"), why(f)))
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -412,6 +436,8 @@ def main():
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
+    for tr in (a, b):
+        swapped_cars(tr)
     if worst:
         section("Worst moments (at least a second apart)")
         shown = []
