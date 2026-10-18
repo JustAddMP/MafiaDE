@@ -9,14 +9,19 @@
 --                                                                                (load his model before he shows up)
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
 --     inair gait mult reissue mx my mz fix nx ny turn fx fy
---     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz
+--     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
 --                                                                                "tommy" = story Tommy; M.Profile),
 --                                                                                then what to do with his puppet on
 --                                                                                foot and with the car he drives
 --                                                                                (src/game/player_sync.cpp, core
---                                                                                net/remote_motion.h)
+--                                                                                net/remote_motion.h); act: an
+--                                                                                action his puppet plays now
+--                                                                                (0 none, 1 light punch, 2 heavy,
+--                                                                                3 counter, 4 takedown, 5 throw,
+--                                                                                6 melee hit reaction;
+--                                                                                player_actions.h)
 --   K vkey model x y z qx qy qz qw                                               a car was parked (CarParked)
 --   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
@@ -31,14 +36,16 @@
 --   X                                                                            remove everything
 -- Output: sample, status, events
 --   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
---             aim reload shots ax ay az cover ctl steer power brake handbrake gear" or ""
+--             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind" or ""
+--            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction)
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
---            for the C++ side's controllers: "PS id x y z hx hy" (puppet of player id on foot, after this tick's
---            commands), "VS id vkey x y z vx vy vz qx qy qz qw" (the car copy player id drives);
+--            for the C++ side's controllers: "PS id x y z hx hy busy" (puppet of player id on foot, after this tick's
+--            commands; busy 1 while it plays one of his actions: the controller leaves it alone),
+--            "VS id vkey x y z vx vy vz qx qy qz qw" (the car copy player id drives);
 --            not for the network: "NT id x y dist" (name tag: the puppet's head on screen, x/y -1..1 with y up, dist
 --            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
 -- Sync trace (docs/sync-trace.md): mc_trace(type, text) writes readbacks of what the game really did, 20 times a
@@ -61,6 +68,8 @@ M.events = {}
 M.shots = M.shots or 0  -- shots the local player fired (mod 256), counted from his ammo
 M.env = M.env or {}
 M.hitq = M.hitq or {}   -- hits on puppets by the local player, filled by the DAMAGE event callbacks
+M.actSeq = M.actSeq or 0   -- visible actions of the local player so far (mod 256; M.LocalAction), sent in every state
+M.actKind = M.actKind or 0 -- the latest one (player_actions.h codes)
 
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
@@ -979,6 +988,8 @@ function M.Drive(pp)
   if M.PuppetLife(pp) then return end
   if M.isHost and M.allyOn and not pp.ally then M.Ally(pp, so) end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
+    pp.act = nil  -- his punches / throws from a car seat are not shown
+    if pp.actRun then M.ActionEnd(pp, so, "he is in a car") end
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
     if pp.seatKey ~= sk then
@@ -1007,12 +1018,24 @@ function M.Drive(pp)
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
     so:SetDir(V(pp.hx, pp.hy, 0))
   end
-  M.Walk(pp, so)
-  M.Weapon(pp)
-  M.Combat(pp)
+  if pp.act then
+    local kind = pp.act
+    pp.act = nil
+    -- an action that came while the puppet could not show it (not spawned yet, dead, hidden) is history by now
+    if not pp.hidden and M.now - (pp.actAt or 0) < 0.5 then M.PlayAction(pp, so, kind) end
+  end
+  -- while it plays one of his actions (a punch, a throw) nothing else is asked of it: a walk, turn, weapon or aim
+  -- command is an AI command too and would cut the animation short (the C++ side's controller pauses as well)
+  local busy = M.ActionBusy(pp, so)
+  if not busy then
+    M.Walk(pp, so)
+    M.Weapon(pp)
+    M.Combat(pp)
+  end
   -- where it is now, for the C++ side's controller (measured speed, error, next walk point)
   local q, d = so:GetPos(), so:GetDir()
-  M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f", pp.id, q.x, q.y, q.z, d.x, d.y)
+  M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f %d", pp.id, q.x, q.y, q.z, d.x, d.y,
+    busy and 1 or 0)
 end
 
 -- On foot: the puppet walks with the game's own locomotion (MoveVec: AI path following with the walk/run/sprint
@@ -1349,6 +1372,21 @@ function M.OnLocalDamage(m)
   for _, r in ipairs(M.replays) do
     if not r.landed and r.guid == enemy then r.landed = true return end
   end
+  -- a puppet's swing (M.PlayAction) landed on us here although we were shielded: only a picture, given back (the
+  -- real punch, if it hit us on his screen, comes as a Hit)
+  if tonumber(m:GetDamageType()) == 3 then
+    for _, pp in pairs(M.pup) do
+      if pp.guid and pp.guid == enemy then
+        M.undoTo = math.max(M.undoTo or 0, M.lastHealth or 0)
+        M.swingHits = (M.swingHits or 0) + 1
+        if M.swingHits <= 10 or M.swingHits % 50 == 0 then
+          log("puppet " .. pp.id .. "'s swing hit us here (" .. tostring(m:GetDamageAmount()) .. "): undone (#" ..
+            M.swingHits .. ")")
+        end
+        return
+      end
+    end
+  end
 end
 
 function M.OnDamageEvent(m)
@@ -1380,13 +1418,19 @@ function M.WatchDamage(p)
   if M.dmg.key == key then return end
   M.UnwatchDamage()
   local ids = {}
-  for _, ev in ipairs({ { "DAMAGE", M.OnDamageEvent }, { "DEATH", M.OnDeathEvent },
-      { "MELEE_LIGHT_ATTACK", M.OnMeleeEvent, false }, { "MELEE_HEAVY_ATTACK", M.OnMeleeEvent, true } }) do
+  local subs = { { "DAMAGE", M.OnDamageEvent }, { "DEATH", M.OnDeathEvent },
+    { "MELEE_LIGHT_ATTACK", M.OnMeleeEvent, false }, { "MELEE_HEAVY_ATTACK", M.OnMeleeEvent, true } }
+  for _, ae in ipairs(M.ACTION_EVENTS or {}) do subs[#subs + 1] = { ae[1], M.OnActionEvent, ae } end
+  for _, ev in ipairs(subs) do
     local name, fn, arg = ev[1], ev[2], ev[3]
-    local good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
-      local ok, err = pcall(fn, m, arg)
-      if not ok then logErr("damage event", err) end
-    end, enums.EventType.HUMAN, enums.HumanMessages[name])
+    local msg = enums.HumanMessages[name]
+    local good, id = false, "no HumanMessages." .. name .. " in this build"
+    if msg then
+      good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
+        local ok, err = pcall(fn, m, arg)
+        if not ok then logErr("damage event", err) end
+      end, enums.EventType.HUMAN, msg)
+    end
     if good and tonumber(id) and tonumber(id) >= 0 then
       ids[#ids + 1] = id
     else
@@ -1395,7 +1439,7 @@ function M.WatchDamage(p)
   end
   M.dmg = { key = key, ids = ids }
   M.swings = {}
-  log("watching damage, deaths and our punches (" .. #ids .. " subscriptions)")
+  log("watching damage, deaths, our punches and actions (" .. #ids .. " subscriptions)")
 end
 
 -- Puppet health and death, every tick before driving it. True while the puppet is (being made) dead.
@@ -1450,6 +1494,187 @@ function M.OnMeleeEvent(m, heavy)
   if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
   local good, opp = pcall(m.GetOpponentGUID, m)
   M.swings[#M.swings + 1] = { t = M.now, heavy = heavy, opp = good and tostring(opp) or "" }
+  M.LocalAction(heavy and 2 or 1, good and tostring(opp) or "-")
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Visible actions (docs/protocol.md "PlayerState" action block, docs/game-api.md 17). What our player does that his
+-- position, flags and weapon do not show: punches (light, charged), a counter, a takedown, a throw (grenade, molotov,
+-- knife) and a melee hit reaction. Each one counts up M.actSeq; every state carries the counter and the latest kind,
+-- so a lost state does not lose it (src/game/player_actions.h). The others' games play the matching animation on his
+-- puppet (M.PlayAction): only a picture, the damage of a punch still comes as a Hit (M.MeleeTick, docs/protocol.md
+-- "Hit"), and a puppet's swing must not hurt anyone here (M.ShieldFromSwing).
+-- ---------------------------------------------------------------------------------------------------------------
+local ACTION_NAMES = { [1] = "light punch", [2] = "heavy punch", [3] = "counter", [4] = "takedown", [5] = "throw",
+  [6] = "hit reaction" }
+-- Our player's HUMAN messages that are actions (besides MELEE_LIGHT/HEAVY_ATTACK, M.OnMeleeEvent): name, kind, and
+-- whether the message is about him being the victim (MELEE_HIT_REACT) rather than the attacker.
+local ACTION_EVENTS = { { "MELEE_COUNTER_ATTACK", 3 }, { "MELEE_COMBAT_TAKEDOWN", 4 },
+  { "MELEE_STEALTH_TAKEDOWN", 4 }, { "WEAPON_THROWN", 5 }, { "MELEE_HIT_REACT", 6, true } }
+M.ACTION_EVENTS = ACTION_EVENTS
+
+function M.LocalAction(kind, opp)
+  -- the same action reported twice in a row (two messages for one swing) counts once
+  if M.actKind == kind and M.now - (M.actT or -1) < 0.12 then return end
+  M.actSeq = (M.actSeq + 1) % 256
+  M.actKind, M.actT = kind, M.now
+  M.actsDone = (M.actsDone or 0) + 1
+  if M.actsDone <= 40 or M.actsDone % 100 == 0 then
+    log(string.format("we did a %s (action #%d, seq %d, opponent %s)", ACTION_NAMES[kind] or "?", M.actsDone,
+      M.actSeq, tostring(opp)))
+  end
+  trace("AL", string.format("kind=%d seq=%d opp=%s", kind, M.actSeq, tostring(opp)))
+end
+
+function M.OnActionEvent(m, ev)
+  local victim = ev[3]
+  if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
+  local good, opp = pcall(m.GetOpponentGUID, m)
+  opp = good and tostring(opp) or "-"
+  -- a takedown / counter message about us as the target of somebody else's move is not our action
+  if not victim and opp == M.localGuid then return end
+  M.LocalAction(ev[2], opp)
+end
+
+-- What a puppet plays for each kind: AnimPlay(name, false) on the puppet (Human.Anim.Play's call, an AI command
+-- like MoveVec), names from the game's animation sets (sds_retail/basic_anim: hitmelee_anim, basic_anim), so they
+-- exist in the game but none of them was checked in game (UNVERIFIED): the first name that the call accepts is
+-- used; a name the call rejects, or whose animation ends at once, is dropped after two tries (logged). Light
+-- punches go through the combo (1-2-3) when they come less than ACTION_COMBO s apart. With a gun in hand the 1h
+-- (pistol-whip) variants are tried first. dur: s the puppet is left alone for it at most (the animation may end
+-- earlier). The lists can be changed from the dev console (MafiaCoop.actionAnims[kind]) for tests.
+local ACTION_COMBO = 1.2
+M.actionAnims = M.actionAnims or {
+  [1] = { dur = 0.7, combo = {
+    { "hero_nw_alert_melee_attack_light_1_v1", "hero_nw_alert_melee_punch_1", "hero_nw_alert_melee_punch1_v1" },
+    { "hero_nw_alert_melee_attack_light_2_v1", "hero_nw_alert_melee_punch_2", "hero_nw_alert_melee_punch2_v5" },
+    { "hero_nw_alert_melee_attack_light_3_v1", "hero_nw_alert_melee_punch_3", "hero_nw_alert_melee_punch_3_v2" } },
+    armed = { "hero_1h_alert_melee_punch_1", "hero_1h_alert_melee_punch_2", "hero_1h_alert_melee_punch_3" } },
+  [2] = { dur = 1.0, list = { "hero_nw_alert_melee_attack_heavy_v2_01_release_hero",
+    "hero_nw_alert_melee_charge_punch3_v6", "hero_nw_alert_melee_punch3_ko_l_v2" },
+    armed = { "hero_1h_alert_melee_attack_heavy_charge", "hero_1h_alert_melee_punch2" } },
+  [3] = { dur = 0.9, list = { "hero_nw_alert_melee_dodge_down_l_hero", "hero_nw_alert_melee_punch_2_v2",
+    "hero_nw_alert_melee_punch2_v5" } },
+  [4] = { dur = 1.4, list = { "hero_nw_alert_melee_punch3_ko_l_v2", "hero_nw_alert_melee_attack_kick",
+    "hero_nw_alert_melee_attack_heavy_v2_01_release_hero" } },
+  [5] = { dur = 1.1, list = { "hero_1h_alert_grenade_throw_cf", "trig_1h_idle_to_grenade_throw",
+    "hero_nw_alert_throw_knife_f" } },
+  [6] = { dur = 0.6, list = { "hero_nw_alert_melee_hitreact2_v1", "hero_nw_alert_melee_hitreact2_v2",
+    "enemy_nw_alert_melee_hitreact1_v1" } },
+}
+M.badAnims = M.badAnims or {}  -- name -> failed tries (2 = not used again this session)
+local SWING_SHIELD = 3.0  -- m: a puppet swinging this close makes the local player a demigod for the swing
+
+local function actionCandidates(pp, kind)
+  local a = M.actionAnims[kind]
+  if not a then return {} end
+  local out = {}
+  local function add(list)
+    for _, name in ipairs(list or {}) do
+      if (M.badAnims[name] or 0) < 2 then out[#out + 1] = name end
+    end
+  end
+  local armed = (pp.weapon or "") ~= ""
+  if kind == 1 and a.combo then
+    local step = 1
+    if pp.lastLight and M.now - pp.lastLight.t < ACTION_COMBO then step = pp.lastLight.step % #a.combo + 1 end
+    pp.lastLight = { t = M.now, step = step }
+    if armed then add({ a.armed and a.armed[step] }) end
+    add(a.combo[step])
+    for i = 1, #a.combo do if i ~= step then add(a.combo[i]) end end
+  else
+    if armed then add(a.armed) end
+    add(a.list)
+  end
+  return out
+end
+
+-- A puppet's swing is only a picture, but it is a real animation on a human standing next to us: so that nothing of
+-- it can land here, the local player is a demigod while a puppet within SWING_SHIELD m swings (M.DemigodTick; a Hit
+-- that arrives meanwhile still applies, M.HurtScript).
+function M.ShieldFromSwing(pp, so, dur)
+  local p = M.Player()
+  if not p then return end
+  local a, b = so:GetPos(), p:GetPos()
+  local d = math.sqrt((a.x - b.x) ^ 2 + (a.y - b.y) ^ 2 + (a.z - b.z) ^ 2)
+  if d > SWING_SHIELD then return end
+  M.shieldUntil = math.max(M.shieldUntil or 0, M.now + dur + 0.3)
+end
+
+function M.PlayAction(pp, so, kind)
+  if pp.actRun then M.ActionEnd(pp, so, "next action") end
+  local names = actionCandidates(pp, kind)
+  local spec = M.actionAnims[kind] or {}
+  local dur = spec.dur or 0.8
+  -- face where he faces (his swing goes that way), drop the aim (an aim command would cut the animation)
+  pcall(so.SetDir, so, V(pp.hx or 0, pp.hy or 1, 0))
+  if pp.cb and pp.cb.aim then try("AimAtStop", so.DbgTesting_AimAtStop, so); pp.cb.aim = false end
+  local used, aso, why
+  for _, name in ipairs(names) do
+    local good, r = pcall(so.AnimPlay, so, name, false)
+    if good then
+      used, aso = name, r
+      break
+    end
+    M.badAnims[name] = (M.badAnims[name] or 0) + 1
+    why = tostring(r)
+    log(string.format("puppet %s: AnimPlay(%s) failed: %s (try %d)", pp.id, name, why, M.badAnims[name]))
+  end
+  pp.actsPlayed = (pp.actsPlayed or 0) + 1
+  trace("AP", string.format("id=%s kind=%d anim=%s ok=%d dur=%.2f", pp.id, kind, used or "-", used and 1 or 0, dur))
+  if not used then
+    if pp.actsPlayed <= 20 then
+      log(string.format("puppet %s: no animation for a %s (%d names left)", pp.id, ACTION_NAMES[kind] or "?", #names))
+    end
+    return
+  end
+  if pp.actsPlayed <= 40 or pp.actsPlayed % 100 == 0 then
+    log(string.format("puppet %s plays a %s: %s (#%d)", pp.id, ACTION_NAMES[kind] or "?", used, pp.actsPlayed))
+  end
+  pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + dur }
+  if kind <= 4 then M.ShieldFromSwing(pp, so, dur) end
+end
+
+-- The animation is over (or its time is up, or something else needs the puppet): it walks again.
+function M.ActionEnd(pp, so, why)
+  local r = pp.actRun
+  if not r then return end
+  pp.actRun = nil
+  local done = false
+  if r.so then
+    local good, d = pcall(r.so.IsDone, r.so)
+    done = good and d == true
+  end
+  if not done and valid(so) then pcall(so.AnimStop, so) end
+  local took = M.now - r.t
+  -- an animation that is over right away did not play: after two of those its name is not used again
+  if done and took < 0.1 then
+    M.badAnims[r.name] = (M.badAnims[r.name] or 0) + 1
+    log(string.format("puppet %s: %s ended at once (%.2f s): not played? (try %d)", pp.id, r.name, took,
+      M.badAnims[r.name]))
+  elseif (pp.actsPlayed or 0) <= 40 then
+    log(string.format("puppet %s: %s over after %.2f s (%s)", pp.id, r.name, took, done and "finished" or why))
+  end
+  trace("AE", string.format("id=%s kind=%d anim=%s took=%.3f done=%d why=%s", pp.id, r.kind, r.name, took,
+    done and 1 or 0, done and "finished" or tostring(why):gsub(" ", "_")))
+end
+
+-- True while the puppet plays an action: nothing else is asked of it.
+function M.ActionBusy(pp, so)
+  local r = pp.actRun
+  if not r then return false end
+  if M.now >= r.untilT then
+    M.ActionEnd(pp, so, "time up")
+    return false
+  end
+  if r.so and M.now - r.t >= 0.1 then
+    local good, d = pcall(r.so.IsDone, r.so)
+    if good and d == true then
+      M.ActionEnd(pp, so, "finished")
+      return false
+    end
+  end
+  return true
 end
 
 -- The puppet our swing reaches: on foot, within SWING_REACH, in front of us (45 degrees either side), nearest first.
@@ -1534,7 +1759,11 @@ function M.HurtScript(p, from, amount, dtype, zone, how)
   local raw = amount
   if not M.isHost then raw = math.min(raw, math.max(0, (h0 - 1) / (M.dmgScale or 1))) end
   if raw <= 0 then return end
+  -- shielded right now (a puppet fired or swings near us, M.DemigodTick): the Hit is real, so it goes through
+  local shielded = M.demi and not M.down
+  if shielded then try("SetDemigod", p.SetDemigod, p, false) end
   pcall(p.DoDamage, p, raw)
+  if shielded then try("SetDemigod", p.SetDemigod, p, true) end
   local h1 = tonumber(p.health) or h0
   if raw > 0.5 and h0 - h1 > 0 then M.dmgScale = (h0 - h1) / raw end  -- the game scales damage (difficulty)
   logHit(from, amount, dtype, zone, how or "DoDamage", h0, h1)
@@ -1862,8 +2091,8 @@ function M.Sample(aimInput)
       log("our car's controls cannot be read: the others see the car move, its wheels straight")
     end
   end
-  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d", aim, reload, M.shots, ad.x, ad.y,
-    ad.z, cover, ctl, steer, power, brake, hb, gear)
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d", aim, reload, M.shots, ad.x,
+    ad.y, ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind)
   if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
   if aim == 0 then M.aimLogged = nil end
   if inCar then
@@ -2060,6 +2289,8 @@ function M.Update(dt, cmds)
         qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
         ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0 }
+      local act = n(f[63]) or 0
+      if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
