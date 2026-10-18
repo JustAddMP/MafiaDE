@@ -72,6 +72,11 @@ on the other.
 | `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
+| `ITH` | host | 2 Hz | world items (docs/game-api.md 20): `items=<shared items known> round=<in this round> sent=<in ItemStates> ours=<taken by the host> guests=<taken by guests> refused=<late takes refused> forgot=<despawned, no take> unknown=<takes of items we did not know>` (C++) |
+| `ITG` | guest | 2 Hz | `host=<host items known> paired unshown=<host items without ours> round=<our items in range> pairs moves hidden=<our new drops hidden> hiddenForHost=<ours hidden: taken on another game> takes confirmed lost` (C++) |
+| `ITE` | both | on event | C++: `ev=take from key type p granted by` (host: a guest's ItemTake), `ev=gonesent key by why to=<all/player>` (host), `ev=gone key by why ours` (guest: an ItemGone), `ev=localgone id host how gained` (guest: our item vanished), `ev=takesent key type p` (guest) |
+| `ITL` | both | on event | Lua: `ev=gone id type p d=<from us> name gained`, `ev=hide id type p ok active why`, `ev=clear id ok try` (ClearWeaponsInRadius after a Deactivate that did not take), `ev=move id from to ok off=<read back, m>`, `ev=undo weapon had ok still`, `ev=collect name d` |
+| `COL` | both | per collectible | `from name` (ours sent, or another player's) |
 | `END` | both | at the end | `why` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script

@@ -832,3 +832,60 @@ each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
 | `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on |
 | `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7) |
 | `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |
+
+## 20. Things lying in the world: dropped weapons, pickups, collectibles - static only, NOT verified in game
+
+Used by src/game/item_sync.* and src/game/world_items.h (messages in docs/protocol.md "World items"). Found
+statically in the exe (class registrations, enum tables, strings; the method of research-world-sync.md "Method") and
+the game's own scripts (`collectibles.lua`, `player.lua`, `game.lua` nodes). Nothing here has been run in the game;
+every call is wrapped in `pcall` and its failure logged (`items: ...`).
+
+**What the game has.** The item manager (`ItemManager`, `ue::C_Singleton<I_ItemManager,...>`) owns item entities:
+`C_ItemWeapon` (EntityType ITEM_WEAPON 63; data `C_ItemDataWeapon`, `S_ItemWeaponInitProps`), `C_ItemInventory`
+(ITEM_INVENTORY 66; data `C_ItemDataInventoryItem`, `C_ItemDataMedkitItem`), `C_ItemScriptAB` (64), `C_ItemUpgrade`
+(68), all `C_ItemBase`. The Lua wrapper `C_WrapperItemWeapon` (parent `C_WrapperActor`) has **no methods of its own**:
+what a script can do with an item is the entity/actor part (`GetPos`, `SetPos`, `GetName`, `Activate`, `Deactivate`,
+`IsActive`, `GetActionByType(enums.ActorActions.ITEM_PICK_UP = 8)`, `GetOwner`). A string `ItemWeaponDespawnDistance`
+says dropped weapons are removed at a distance. `C_Pinup` / `C_WrapperPinup` (`GetPinupID`, EntityType PINUP 54) is a
+Mafia II-era leftover; no Mafia DE script uses it.
+
+| call / fact | notes |
+|---|---|
+| `mc_entity_ids(63)`, `mc_entity_ids(66)` (ours, section 15) | every weapon on the ground / inventory item of this world. **UNVERIFIED**: that `mc_entity(id)` wraps items (it does humans, cars, dummies, spawners), that a dead enemy's weapon is such an entity (and not, say, still a child of the corpse until touched), what `GetName()` returns for a dropped weapon (we send it and pair by it when both names are known) |
+| `item:Deactivate()` | how an item is hidden (a guest's copy of an item taken elsewhere, the host's for a guest). **UNVERIFIED** for items (verified for cars and humans) |
+| `game.game:ClearWeaponsInRadius(pos, radius)` (thunk 0x267E370: vec, number) | the game's own clean-up of dropped weapons around a point (a visual-script node, `game.lua` `gameClearWeaponsInRadius`); used when a hidden weapon is still active a moment after `Deactivate`, radius 0.3 m. **UNVERIFIED** what exactly it clears |
+| `item:SetPos(v)` | a guest's paired item put where the host's lies. **UNVERIFIED** for a physics item (the read-back distance is logged) |
+| picking up | no event names the item. `HumanMessages.PLAYER_WEAPON_PICKUP` (458800, class `C_HumanMessagePlayerWeaponPickup`: GetWeaponID, GetWeaponName; `player.lua` registers it on the player), `PLAYER_WEAPON_ADDED_ON_EMPTY_SLOT` (458801, GetSlotType), `PLAYER_USED_MEDKIT` (458802), `LOOT_CASH` / `LOOT_GRENADE` / `LOOT_MOLOTOV` (458875-7, `C_HumanMessageLoot`: GetPos, GetAmount) exist. MafiaCoop detects a take by the item entity vanishing (gone or switched off) within 2.5 m of the player instead, which works for every item kind. **UNVERIFIED**: that a picked item's entity goes away (and is not just hidden and kept) and that walking over a weapon only for its ammo leaves it lying (then it is no take) |
+| a weapon swap | picking a weapon with a full slot drops the old one at the player's feet (a new item there; **UNVERIFIED**). It is his own drop: never hidden on his game (within 2.5 m of him when it appears); not shown on the other games (no spawn) |
+| spawning an item | no binding. `h:InventoryDrop()` (no args, the human drops what it holds) would be the way: give a puppet the weapon (`DbgTesting_HelperInventory_AddWeapon`) and drop it. Not used: a host item without a partner on a guest's game is not shown there |
+| `p:InventoryRemoveWeapon(name)` | a guest whose take the host refused (another player was first) gives the weapons he gained in the last 2 s back. **UNVERIFIED** for the player (research-world-sync A6 lists it) |
+| `p:GetInventoryWeapons()` | the player's weapons (varargs, section 2): polled each round to know what a take gave him |
+| medkits | `InventoryGetMedkitCount/Capacity`, `HealByMedkit`, `InventoryAddItem("Medkit")` (the shop test node). Wall first-aid boxes in missions (`lh_wall_medkit_a_scripted_v1`, interaction `interact_first_aid_box`) are mission-script interactions, no item entities: per player |
+| money | `InventoryGetMoney/AddMoney/RemoveMoney`, `LOOT_CASH`, `hud:MoneyShow` are Mafia III-era bindings; Mafia DE has no money pickups (**UNVERIFIED**). Not shared |
+
+**Collectibles** (`/scripts/common/commands_library/system/game/collectibles.lua`, module `collectibles`). Each is a
+scene entity named `lh_pickup_<kind>_<id>_bv01`: kinds `bm` (Black Mask), `cc` (cigarette cards, 22), `comics` (10),
+`dd` (Dime Detective), `pc` (postcards = hidden car clues), `sss` (Super Science Stories), `tt` (Terror Tales), plus
+`lh_pickup_fox_a_bv01_NN`. The script gives each an actor action (`game.game:CreateScriptActorAction`, ACTION_HELD /
+ACTION_USABLE events); when it is picked (`CollectiblePicked`) it sets the save group in the datastore
+(`DatastoreSet`), shows the HUD (`OnShowCollectableCollected`), calls `getp():AddToCollection(name, bool)` and
+`Deactivate()`s the entity; at load (`InitCollectible`) a collected one is deactivated at once (`DatastoreExists`).
+MafiaCoop looks each name up once a second (`game.entitywrapper:GetEntityByName(name)`) and takes "was active, now
+switched off, within 4 m of us" as our pickup. **Decision: per player.** Each player collects his own copy for his own
+save; nothing is hidden on the other games, no other game's datastore or collection is written (writing the host's
+save from a guest's action, or deciding for a guest, is not safe without knowing the datastore layout). The others
+only hear about it (Collectible message, log, status line). Note: a guest's saves (and a CHAPTER host's) go to the
+scratch tree during co-op (save_guard.h), so what he collects there is not kept in his real save. **UNVERIFIED**:
+that the entities have exactly these names in the world (they are in the mission SDS string tables, e.g.
+`lh_pickup_cc_04_ennio_salieri_bv01` in mm_120_mansion), that `GetEntityByName` finds them, the fox count.
+
+**Choices for shared pickups.** Weapons on the ground and inventory items: one game's take removes them on every game
+(the host decides who was first). The game may respawn some pickups (**UNVERIFIED**); a respawned one is a new entity,
+paired again on its own. Physics props (crates, barrels) stay local to each game.
+
+Log lines: `items: guest N took his copy of our item K ...: his; ours is hidden`, `items: item I (type T, name) at
+x y z hidden: <why>`, `items: item I (...) moved from ... to the host's spot ... (read back D m off)`,
+`items: our item I (host item K) vanished: taken by us, asking the host`, `items: the host's item K: taken by player
+P (ours: I)`, `items: another player took that item first: W taken away again (...)`, `items: we collected <name>`,
+`items: player P found <name> (<kind>) on his game; ours stays for our own save`. Sync trace: `ITH`, `ITG`, `ITE`,
+`ITL`, `COL` (docs/sync-trace.md).
