@@ -9,7 +9,7 @@
 --                                                                                (load his model before he shows up)
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
 --     inair gait mult reissue mx my mz fix nx ny turn fx fy
---     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act sig
+--     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act sig nz pose body
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
 --                                                                                "tommy" = story Tommy; M.Profile),
@@ -20,8 +20,13 @@
 --                                                                                action his puppet plays now
 --                                                                                (0 none, 1 light punch, 2 heavy,
 --                                                                                3 counter, 4 takedown, 5 throw,
---                                                                                6 melee hit reaction;
---                                                                                player_actions.h)
+--                                                                                6 melee hit reaction, 7..14 the
+--                                                                                traversal moves, 15 medkit, 16/17
+--                                                                                body picked up / dropped;
+--                                                                                player_actions.h); nz: the height
+--                                                                                part of the nudge (traversal);
+--                                                                                pose: 1 sneaking, 2 carrying body
+--                                                                                (its key), 4 on a ladder
 --   K vkey model x y z qx qy qz qw wrecked                                       a car was parked (CarParked;
 --                                                                                wrecked 1 = it is destroyed)
 --   W time flow weather                                                          the host's time of day and weather
@@ -43,16 +48,22 @@
 --   X                                                                            remove everything
 -- Output: sample, status, events
 --   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
---             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind sig" or ""
+--             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind sig
+--             travev stealth carry body" or ""
 --            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction;
---             sig: our car's signals byte, src/game/car_signals.h, 0 = unknown or not the driver)
+--             sig: our car's signals byte, src/game/car_signals.h, 0 = unknown or not the driver;
+--             travev: the traversal messages seen for us since the last sample, bits 1 USE_FENCE, 2 USE_LADDER,
+--             4 PICKUP_BODY, 8 DROP_BODY, 16 PLAYER_USED_MEDKIT (the C++ side makes moves of them,
+--             src/game/traversal.h); stealth / carry: IsStealthMove / IsCarryingBody; body: the carried body's
+--             key as the host numbers NPCs, 0 = unknown)
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw wrecked" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
 --            for the C++ side's controllers: "PS id x y z hx hy busy" (puppet of player id on foot, after this tick's
---            commands; busy 1 while it plays one of his actions: the controller leaves it alone),
+--            commands; busy 1 while it plays one of his actions: the controller leaves it alone; busy 2 while it
+--            plays a traversal move or he is on a ladder: it is drawn along his path, src/game/traversal.h),
 --            "VS id vkey x y z vx vy vz qx qy qz qw" (the car copy player id drives);
 --            not for the network: "NT id x y dist" (name tag: the puppet's head on screen, x/y -1..1 with y up, dist
 --            = metres from the camera; only puppets in front of the camera), "WS inWorld saveId" (twice a second)
@@ -287,11 +298,16 @@ function M.SpawnTick()
     -- The civilian AI steps out of the way of cars; the real player cannot see the remote car coming that way, so the
     -- puppet stands its ground and a ram hits it like it would hit him (docs/game-api.md 11)
     try("InterruptAvoidingCar", so.InterruptAvoidingCar, so)
+    -- its walk (MoveVec, AI path following) may use the path objects its player uses: climbs, ladders, doors
+    -- (C_WrapE_PathObjectType ALL = 15; human.lua's SetCanTraverse node: inPathObjectType, inCanTraverse). UNVERIFIED
+    -- that puppets cannot by default, and that it makes their walk vault / climb instead of stopping at a fence.
+    try("SetCanTraverse", so.SetCanTraverse, so, (enums.PathObjectType and enums.PathObjectType.ALL) or 15, true)
     pp.guid = tostring(so:GetGUID())  -- its DAMAGE events are found by this (M.OnDamageEvent)
     pp.deadShown = nil
     pp.so, pp.st, pp.weapon, pp.lastMove, pp.moving, pp.hidden = so, "alive", nil, -1, false, false
     pp.seatTries, pp.exitSo = 0, nil
     pp.cb = nil
+    pp.carry, pp.stealthOn = nil, nil  -- a fresh human carries nothing, walks normally
     pp.mult, pp.noMult = nil, nil  -- a fresh human: its speed multiplier is 1
     pp.ally, pp.spawnT = nil, M.now
     -- a fresh human: its brain and seat state anew (M.Ally, M.Seat)
@@ -1449,6 +1465,7 @@ function M.Combat(pp)
   if pp.veh then  -- in a car: drop the stance
     if c.aim then try("AimAtStop", so.DbgTesting_AimAtStop, so); c.aim = false end
     if c.crouch then try("SetStalkMove", so.SetStalkMove, so, false); c.crouch = false end
+    if c.stealth then try("SetStealthMove", so.SetStealthMove, so, false); c.stealth = false end
     c.shots, c.op = pp.shots, nil
     return
   end
@@ -1478,6 +1495,14 @@ function M.Combat(pp)
   if crouch ~= c.crouch then
     try("SetStalkMove", so.SetStalkMove, so, crouch)
     c.crouch = crouch
+  end
+  -- his sneak walk (IsStealthMove on his game, pose bit 1): SetStealthMove on the puppet (docs/game-api.md 17;
+  -- UNVERIFIED what it looks like on an AI human)
+  local stealth = M.PoseBit(pp, 1) and not c.aim
+  if stealth ~= (c.stealth or false) then
+    try("SetStealthMove", so.SetStealthMove, so, stealth)
+    c.stealth = stealth
+    log("puppet " .. pp.id .. (stealth and " sneaks" or " stops sneaking"))
   end
   cmdTick(pp)
   if c.op then return end
@@ -1511,6 +1536,8 @@ function M.Drive(pp)
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     pp.act = nil  -- his punches / throws from a car seat are not shown
     if pp.actRun then M.ActionEnd(pp, so, "he is in a car") end
+    if pp.carry then M.CarryEnd(pp, so, "he is in a car") end
+    pp.onLadder = nil
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
     if pp.seatKey ~= sk then
@@ -1549,15 +1576,21 @@ function M.Drive(pp)
   -- while it plays one of his actions (a punch, a throw) nothing else is asked of it: a walk, turn, weapon or aim
   -- command is an AI command too and would cut the animation short (the C++ side's controller pauses as well)
   local busy = M.ActionBusy(pp, so)
-  if not busy then
+  -- a traversal move (jump, vault, climb, ladder), or he is still on a ladder: drawn along his path (busy 2)
+  local move = busy and pp.actRun and pp.actRun.move
+  local ladder = M.LadderHold(pp, busy)
+  if move or ladder then
+    M.Follow(pp, so)
+  elseif not busy then
     M.Walk(pp, so)
     M.Weapon(pp)
     M.Combat(pp)
   end
+  M.CarryTick(pp, so)
   -- where it is now, for the C++ side's controller (measured speed, error, next walk point)
   local q, d = so:GetPos(), so:GetDir()
   M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f %d", pp.id, q.x, q.y, q.z, d.x, d.y,
-    busy and 1 or 0)
+    (move or ladder) and 2 or (busy and 1 or 0))
 end
 
 -- On foot: the puppet walks with the game's own locomotion (MoveVec: AI path following with the walk/run/sprint
@@ -1581,7 +1614,7 @@ function M.Walk(pp, so)
     if pp.snaps <= 5 or pp.snaps % 50 == 0 then log("puppet " .. pp.id .. " put at its player's spot (#" .. pp.snaps .. ")") end
   elseif lc.fix == 1 then
     local q = so:GetPos()
-    so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z))
+    so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z + (lc.nz or 0)))  -- nz: after a traversal move (a ledge, a ladder)
   end
   if lc.reissue then
     if lc.gait == 0 then  -- stop: walk the last bit to his spot and stand there
@@ -1980,6 +2013,7 @@ function M.WatchDamage(p)
   local subs = { { "DAMAGE", M.OnDamageEvent }, { "DEATH", M.OnDeathEvent },
     { "MELEE_LIGHT_ATTACK", M.OnMeleeEvent, false }, { "MELEE_HEAVY_ATTACK", M.OnMeleeEvent, true } }
   for _, ae in ipairs(M.ACTION_EVENTS or {}) do subs[#subs + 1] = { ae[1], M.OnActionEvent, ae } end
+  for _, te in ipairs(M.TRAV_EVENTS or {}) do subs[#subs + 1] = { te[1], M.OnTravEvent, te } end
   for _, ev in ipairs(subs) do
     local name, fn, arg = ev[1], ev[2], ev[3]
     local msg = enums.HumanMessages[name]
@@ -2065,7 +2099,10 @@ end
 -- "Hit"), and a puppet's swing must not hurt anyone here (M.ShieldFromSwing).
 -- ---------------------------------------------------------------------------------------------------------------
 local ACTION_NAMES = { [1] = "light punch", [2] = "heavy punch", [3] = "counter", [4] = "takedown", [5] = "throw",
-  [6] = "hit reaction" }
+  [6] = "hit reaction", [7] = "jump", [8] = "vault", [9] = "climb up", [10] = "drop down", [11] = "hard landing",
+  [12] = "ladder up", [13] = "ladder down", [14] = "slide into cover", [15] = "medkit", [16] = "body pickup",
+  [17] = "body drop" }
+local MOVE_FIRST, MOVE_LAST = 7, 14  -- traversal moves: the puppet is drawn along his path while it plays one
 -- Our player's HUMAN messages that are actions (besides MELEE_LIGHT/HEAVY_ATTACK, M.OnMeleeEvent): name, kind, and
 -- whether the message is about him being the victim (MELEE_HIT_REACT) rather than the attacker.
 local ACTION_EVENTS = { { "MELEE_COUNTER_ATTACK", 3 }, { "MELEE_COMBAT_TAKEDOWN", 4 },
@@ -2083,6 +2120,51 @@ function M.LocalAction(kind, opp)
       M.actSeq, tostring(opp)))
   end
   trace("AL", string.format("kind=%d seq=%d opp=%s", kind, M.actSeq, tostring(opp)))
+end
+
+-- Traversal (src/game/traversal.h, docs/game-api.md 17): the HumanMessages about how our player gets over things and
+-- what he does with bodies and medkits. The glue only collects them (a bit each, sent with the next sample: M.travEv);
+-- the C++ side turns them, with his height and vertical speed, into moves (vault or climb, ladder up or down, jumps
+-- and drops have no message) and counts them into the action block. Which human receives these messages was not
+-- checked (UNVERIFIED): taken to be the player himself like the melee ones; the IsCarryingBody edge covers a pickup
+-- whose message goes elsewhere.
+local TRAV_EVENTS = { { "USE_FENCE", 1 }, { "USE_LADDER", 2 }, { "PICKUP_BODY", 4 }, { "DROP_BODY", 8 },
+  { "PLAYER_USED_MEDKIT", 16 } }
+M.TRAV_EVENTS = TRAV_EVENTS
+M.travEv = M.travEv or 0
+
+function M.OnTravEvent(m, ev)
+  if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
+  local bit = ev[2]
+  if M.travEv % (bit + bit) < bit then M.travEv = M.travEv + bit end
+  M.travSeen = (M.travSeen or 0) + 1
+  if M.travSeen <= 40 or M.travSeen % 100 == 0 then log("we got " .. ev[1] .. " (#" .. M.travSeen .. ")") end
+  trace("TE", "msg=" .. ev[1])
+end
+
+-- The carried body's key as the host numbers NPCs (npc_sync.lua: the host's own id; a guest's NPC paired with a host
+-- NPC goes by that one's key), 0 when not known.
+function M.BodyKey(body)
+  if not valid(body) then return 0 end
+  local good, g = pcall(body.GetGUID, body)
+  local id = good and tonumber(tostring(g):match("(%d+)%s*$"))
+  if not id then return 0 end
+  if M.isHost then return id end
+  local N = M.Npc
+  return (N and N.byLocal and tonumber(N.byLocal[id])) or 0
+end
+
+-- That body on this game (the other way round), or nil.
+function M.BodyByKey(key)
+  local N = M.Npc
+  if not N or not key or key == 0 then return nil end
+  local id = key
+  if not M.isHost then
+    local s = N.host and N.host[key]
+    id = s and s.loc
+  end
+  local e = id and N.ents and N.ents[id]
+  return e and valid(e.h) and e.h or nil
 end
 
 function M.OnActionEvent(m, ev)
@@ -2120,6 +2202,28 @@ M.actionAnims = M.actionAnims or {
     "hero_nw_alert_throw_knife_f" } },
   [6] = { dur = 0.6, list = { "hero_nw_alert_melee_hitreact2_v1", "hero_nw_alert_melee_hitreact2_v2",
     "enemy_nw_alert_melee_hitreact1_v1" } },
+  -- traversal (basic_anim / anim_project; there is no plain jump-off animation in these sets: the ledge jump and the
+  -- landing stand in for it). With a rifle in hand the rifle variants first.
+  [7] = { dur = 0.9, list = { "hero_nw_alert_jump_over_ledge_medium_r", "hero_nw_alert_jump_land_soft" } },
+  [8] = { dur = 1.1, list = { "hero_nw_alert_move_run_vault_wall_thin_140cm", "hero_nw_alert_move_run_vault_wall_140cm",
+    "hero_nw_cov_vault_wall_90cm" },
+    armed = { "hero_1h_alert_move_run_vault_wall_thin_90cm_step_up", "hero_rifle_alert_move_run_vault_wall_thin_90cm" } },
+  [9] = { dur = 1.6, list = { "hero_trench_alert_idle_climb_up_180cm", "hero_rifle_alert_idle_climb_up_180cm",
+    "hero_trench_alert_idle_climb_up_130cm" } },
+  [10] = { dur = 0.8, list = { "hero_nw_alert_move_walk_lp_to_fall", "enemy_nw_alert_idle_climb_down_130cm" } },
+  [11] = { dur = 0.8, list = { "hero_nw_alert_jump_land_medium", "hero_rifle_alert_fall_land_hard",
+    "hero_nw_alert_jump_land_soft" } },
+  [12] = { dur = 3.0, list = { "hero_nw_alert_climb_up_ladders", "hero_nw_alert_climb_up_ladders_low",
+    "hero_nw_alert_climb_up_ladders_veryhigh" } },
+  [13] = { dur = 2.5, list = { "hero_nw_alert_climb_down_ladders_285cm",
+    "hero_nw_alert_climb_down_ladders_285cm_forward" } },
+  [14] = { dur = 0.8, list = { "hero_nw_cov_vault_wall_deep_90cm" } },
+  -- in place. No medkit animation was found in the sets (none named for it): the medkit only shows as a short
+  -- fidget, and in the log.
+  [15] = { dur = 1.0, list = { "hero_nw_stalk_idle_fidget_lookaround" } },
+  [16] = { dur = 1.6, list = { "hero_nw_alert_idle_carry_pickup_male", "hero_nw_alert_idle_carry_pickup_male_fast",
+    "hero_nw_stalk_idle_carry_pickup_male" } },
+  [17] = { dur = 1.4, list = { "hero_nw_alert_idle_carry_drop_male", "hero_nw_stalk_idle_carry_drop_male" } },
 }
 M.badAnims = M.badAnims or {}  -- name -> failed tries (2 = not used again this session)
 local SWING_SHIELD = 3.0  -- m: a puppet swinging this close makes the local player a demigod for the swing
@@ -2168,6 +2272,10 @@ function M.PlayAction(pp, so, kind)
   -- face where he faces (his swing goes that way), drop the aim (an aim command would cut the animation)
   pcall(so.SetDir, so, V(pp.hx or 0, pp.hy or 1, 0))
   if pp.cb and pp.cb.aim then try("AimAtStop", so.DbgTesting_AimAtStop, so); pp.cb.aim = false end
+  local move = kind >= MOVE_FIRST and kind <= MOVE_LAST
+  if kind == 16 and pp.carry and pp.carry.real then
+    names = {}  -- the puppet carries it with the game's own carry (TakeBody): that plays the pickup itself
+  end
   local used, aso, why
   for _, name in ipairs(names) do
     local good, r = pcall(so.AnimPlay, so, name, false)
@@ -2185,12 +2293,14 @@ function M.PlayAction(pp, so, kind)
     if pp.actsPlayed <= 20 then
       log(string.format("puppet %s: no animation for a %s (%d names left)", pp.id, ACTION_NAMES[kind] or "?", #names))
     end
+    -- a move without its animation is still followed along his path (no snap at its end)
+    if move then pp.actRun = { kind = kind, name = "-", t = M.now, untilT = M.now + dur, move = true } end
     return
   end
   if pp.actsPlayed <= 40 or pp.actsPlayed % 100 == 0 then
     log(string.format("puppet %s plays a %s: %s (#%d)", pp.id, ACTION_NAMES[kind] or "?", used, pp.actsPlayed))
   end
-  pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + dur }
+  pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + dur, move = move }
   if kind <= 4 then M.ShieldFromSwing(pp, so, dur) end
 end
 
@@ -2204,10 +2314,10 @@ function M.ActionEnd(pp, so, why)
     local good, d = pcall(r.so.IsDone, r.so)
     done = good and d == true
   end
-  if not done and valid(so) then pcall(so.AnimStop, so) end
+  if not done and valid(so) and r.name ~= "-" then pcall(so.AnimStop, so) end
   local took = M.now - r.t
   -- an animation that is over right away did not play: after two of those its name is not used again
-  if done and took < 0.1 then
+  if done and took < 0.1 and r.name ~= "-" then
     M.badAnims[r.name] = (M.badAnims[r.name] or 0) + 1
     log(string.format("puppet %s: %s ended at once (%.2f s): not played? (try %d)", pp.id, r.name, took,
       M.badAnims[r.name]))
@@ -2234,6 +2344,89 @@ function M.ActionBusy(pp, so)
     end
   end
   return true
+end
+
+function M.PoseBit(pp, b) return (pp.pose or 0) % (b + b) >= b end
+
+-- He is still on a ladder (pose bit 4) after the climb animation: the puppet stays drawn along his path (busy 2),
+-- at most LADDER_HOLD s.
+local LADDER_HOLD = 15
+function M.LadderHold(pp, busy)
+  if not M.PoseBit(pp, 4) then
+    if pp.onLadder then log("puppet " .. pp.id .. ": off the ladder") end
+    pp.onLadder = nil
+    return false
+  end
+  if not pp.onLadder then
+    pp.onLadder = M.now
+    log("puppet " .. pp.id .. ": its player is on a ladder")
+  end
+  return not busy and M.now - pp.onLadder < LADDER_HOLD
+end
+
+-- During a move the C++ side's Catchup sends a nudge toward his position each tick (x, y and height): applied as it
+-- is, nothing else (a walk, turn or aim command would cut the animation).
+function M.Follow(pp, so)
+  local lc = pp.lc
+  if not lc or lc.fix ~= 1 then return end
+  local q = so:GetPos()
+  so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z + (lc.nz or 0)))
+  pp.follows = (pp.follows or 0) + 1
+end
+
+-- His carried body (pose bit 2, its key): the puppet takes that body on this game with the game's own carry
+-- (TakeBody, the player.lua TakeBody node's call; UNVERIFIED on an AI human), so the body goes where the puppet goes;
+-- when he drops it, the puppet drops it (DropBody) and the body lies where the puppet is. When the body is not known
+-- here (not a synced NPC, key 0) or TakeBody does not take, the puppet only plays the pickup and drop animations.
+local CARRY_CHECK = 1.5  -- s after TakeBody: IsCarryingBody tells whether it took
+function M.CarryTick(pp, so)
+  local want = M.PoseBit(pp, 2) and not pp.hidden
+  local c = pp.carry
+  if not want then
+    if c then M.CarryEnd(pp, so, "he dropped it") end
+    return
+  end
+  if c and c.key == pp.body then
+    if c.real == nil and M.now - c.t >= CARRY_CHECK then
+      local good, carrying = pcall(so.IsCarryingBody, so)
+      c.real = good and carrying == true
+      log(string.format("puppet %s: TakeBody(%s) %s", pp.id, tostring(c.key), c.real and "took: the body follows it"
+        or "did not take (" .. tostring(carrying) .. "): only the animations show it"))
+      trace("CB", string.format("id=%s key=%s real=%d", pp.id, tostring(c.key), c.real and 1 or 0))
+    end
+    return
+  end
+  if c then M.CarryEnd(pp, so, "another body") end
+  local body = M.BodyByKey(pp.body)
+  pp.carry = { key = pp.body, t = M.now, body = body }
+  if not body then
+    log(string.format("puppet %s: its player carries body %s, not known here: only the animations show it", pp.id,
+      tostring(pp.body)))
+    pp.carry.real = false
+    return
+  end
+  local good, err = pcall(so.TakeBody, so, body)
+  log(string.format("puppet %s: its player carries body %s: TakeBody %s", pp.id, tostring(pp.body),
+    good and "called" or ("failed: " .. tostring(err))))
+  if not good then pp.carry.real = false end
+end
+
+function M.CarryEnd(pp, so, why)
+  local c = pp.carry
+  pp.carry = nil
+  if not c then return end
+  if c.real and valid(so) then
+    local good, err = pcall(so.DropBody, so)
+    if not good then log("puppet " .. pp.id .. ": DropBody failed: " .. tostring(err)) end
+  end
+  -- the body lies where its carrier is (on his game it lies at his feet)
+  if valid(c.body) and valid(so) and not c.real then
+    local q = so:GetPos()
+    local d = so:GetDir()
+    pcall(c.body.SetPos, c.body, V(q.x + d.x * 0.6, q.y + d.y * 0.6, q.z + 0.1))
+  end
+  log(string.format("puppet %s: body %s put down (%s)", pp.id, tostring(c.key), why))
+  trace("CB", string.format("id=%s key=%s end=%s", pp.id, tostring(c.key), tostring(why):gsub(" ", "_")))
 end
 
 -- The puppet our swing reaches: on foot, within SWING_REACH, in front of us (45 degrees either side), nearest first.
@@ -2661,8 +2854,23 @@ function M.Sample(aimInput)
   else
     M.sigLocal = nil
   end
-  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d %d", aim, reload, M.shots, ad.x, ad.y,
-    ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind, sig)
+  -- traversal (src/game/traversal.h): the messages since the last sample, the sneak walk, a carried body
+  local stealth, carry, bodyKey = 0, 0, 0
+  if not inCar then
+    local g1, st = pcall(p.IsStealthMove, p)
+    if g1 and st == true then stealth = 1 end
+    local g2, cb = pcall(p.IsCarryingBody, p)
+    if g2 and cb == true then
+      carry = 1
+      local g3, body = pcall(p.GetCarriedBody, p)
+      bodyKey = g3 and M.BodyKey(body) or 0
+    end
+  end
+  local travEv = M.travEv or 0
+  M.travEv = 0
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d %d %d %d %d %d", aim, reload,
+    M.shots, ad.x, ad.y, ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind, sig, travEv, stealth,
+    carry, bodyKey)
   if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
   if aim == 0 then M.aimLogged = nil end
   if inCar then
@@ -3060,6 +3268,8 @@ function M.Update(dt, cmds)
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
         ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0,
         sig = n(f[64]) or 0 }
+      pp.lc.nz = n(f[65]) or 0
+      pp.pose, pp.body = math.floor(n(f[66]) or 0), n(f[67]) or 0
       local act = n(f[63]) or 0
       if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now

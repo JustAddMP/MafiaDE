@@ -9,6 +9,7 @@
 #include "game/car_swap.h"
 #include "game/characters.h"
 #include "game/player_actions.h"
+#include "game/traversal.h"
 #include "game/lua.h"
 #include "game/map_markers.h"
 #include "mc/core_version.h"
@@ -45,7 +46,8 @@ constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker h
 // siren, beacon; game/car_signals.h) and the action block (u8 seq, u8 kind: player_actions.h) that ends every state.
 // A state without both reads as "unknown" signals and "no action"; a state with only one of them (a build that had
 // one feature but not the other) is misread in a car, which the modVersion handshake rules out. Older readers stop
-// before them.
+// before them. The pose block (u8 bits [, u32 body]: player_actions.h, traversal) follows the action block, also
+// optional: a state without it reads as "no pose", older readers stop before it.
 constexpr uint8_t kStateVersion = 4;
 // State rate and interpolation (docs/protocol.md "PlayerState"). Measured 2026-10-16 (position traces): at 20 Hz
 // with 100 ms delay a car copy trailed its driver by up to 1 m at 10 m/s; the state is ~60 bytes, so 60 Hz costs
@@ -95,6 +97,7 @@ struct PlayerState {
     int8_t gear = 0;      // GetGear(): < 0 reverse (as far as known)
     // visible one-shot actions (punches, throws ...): counter + latest kind, after everything else (player_actions.h)
     actions::State act;
+    actions::Pose pose;   // what he keeps doing: sneaking, carrying a body, on a ladder (after the action block)
     uint8_t signals = 0;  // car_signals bits (kValid unset = his game could not read them; then the copy is left alone)
 };
 
@@ -129,6 +132,8 @@ struct Remote {
     actions::Tracker acts;  // his action counter: which punches / throws his puppet still has to play
     uint32_t actsPlayed = 0;
     uint8_t signals = 0;   // car signals of the car he drives, as last logged
+    traversal::Catchup catchup;  // his puppet during and right after a traversal move (game/traversal.h)
+    actions::Pose pose;          // his pose as last logged
 };
 
 // Where the Lua glue last saw a puppet (on foot, visible: "PS") or the car copy a remote player drives ("VS").
@@ -139,7 +144,8 @@ struct CopyReport {
     float vel[3] = {};
     float rot[4] = {0, 0, 0, 1};
     std::string key;    // VS: the car key
-    bool busy = false;  // PS: the puppet plays an action (punch, throw): no walk commands, no fixes, no measuring
+    int busy = 0;  // PS: 1 the puppet plays an action on the spot (punch, throw): no walk commands, no fixes, no
+                   // measuring; 2 it plays a traversal move (jump, vault, ladder): followed along his path instead
 };
 
 struct Shared {
@@ -328,6 +334,7 @@ void Write(net::ByteWriter& w, const PlayerState& s, uint32_t timeMs) {
         car_signals::Write(w, s.signals);  // last: see kStateVersion
     }
     actions::Write(w, s.act);
+    actions::WritePose(w, s.pose);
 }
 
 // A remote string that becomes one whitespace-separated field of a Lua command line: printable ASCII, no spaces.
@@ -349,16 +356,17 @@ bool InRange(const float* v, int n, float lim) {
 
 // ---- sync trace (core/trace.h, docs/sync-trace.md) -------------------------------------------------------------------
 // The state fields of a TX / RX record: "p=x,y,z h=hx,hy v=vx,vy,vz m=mode f=flags hp=health sh=shots w=weapon
-// act=seq:kind"
+// act=seq:kind pose=bits:body" (pose: player_actions.h kStealth 1, kCarry 2, kLadder 4; body: the carried body)
 // plus, in a car, "car=key mdl=model seat=n cp=x,y,z q=qx,qy,qz,qw cv=x,y,z ctl=valid,steer,power,brake,hb,gear sig=n"
 // (sig: the car signals byte, game/car_signals.h; 0 = unknown).
 std::string TraceFields(const PlayerState& s) {
     char buf[640];
     int n = std::snprintf(buf, sizeof buf,
-                          "p=%.3f,%.3f,%.3f h=%.4f,%.4f v=%.3f,%.3f,%.3f m=%u f=%u hp=%u sh=%u w=%s act=%u:%s", s.pos[0],
-                          s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1], s.vel[2], s.mode, s.flags,
-                          s.health, s.shots, s.weapon.empty() ? "-" : s.weapon.c_str(), s.act.seq,
-                          actions::Name(s.act.last));
+                          "p=%.3f,%.3f,%.3f h=%.4f,%.4f v=%.3f,%.3f,%.3f m=%u f=%u hp=%u sh=%u w=%s act=%u:%s "
+                          "pose=%u:%u",
+                          s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1], s.vel[2], s.mode,
+                          s.flags, s.health, s.shots, s.weapon.empty() ? "-" : s.weapon.c_str(), s.act.seq,
+                          actions::Name(s.act.last), s.pose.bits, s.pose.body);
     if ((s.flags & kInVehicle) && n > 0 && n < static_cast<int>(sizeof buf))
         std::snprintf(buf + n, sizeof buf - n,
                       " car=%u:%u mdl=%s seat=%u cp=%.3f,%.3f,%.3f q=%.5f,%.5f,%.5f,%.5f cv=%.3f,%.3f,%.3f "
@@ -411,6 +419,7 @@ bool Read(net::ByteReader& r, PlayerState& s, uint32_t& timeMs) {
         s.signals = car_signals::Read(r);
     }
     actions::Read(r, s.act);  // optional: a state from a build without the action block has none
+    actions::ReadPose(r, s.pose);  // optional too (traversal)
     if (!r.Ok()) return false;
     // Everything below ends up in a Lua command line ("T ..."): one %S+ field per string, and numbers small enough
     // that the line fits its buffer. NaN fails every !(|v| <= lim) check.
@@ -564,7 +573,8 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   "T %u %s %.3f %.3f %.3f %.4f %.4f %.3f %.3f %.3f %u %s %s %s %u %.3f %.3f %.3f %.5f %.5f %.5f %.5f "
                   "%d %d %d %u %.3f %.3f %.3f %u "
                   "%d %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f "
-                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f %u %u\n",
+                  "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f %u %u "
+                  "%.4f %u %u\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
@@ -583,11 +593,15 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   // 63: a punch / throw ... his puppet plays now (player_actions.h; 0 = none)
                   static_cast<unsigned>(act),
                   // 64: his car signals (car_signals.h)
-                  veh && s.seat == 0 ? s.signals : 0u);
+                  veh && s.seat == 0 ? s.signals : 0u,
+                  // 65: the height part of the puppet's nudge (traversal: followed along his path / blended after a
+                  // move, game/traversal.h); 66, 67: his pose bits and the body he carries (player_actions.h)
+                  lc.nudge.z, static_cast<unsigned>(s.pose.bits), static_cast<unsigned>(s.pose.body));
 }
 
 // Report lines from the Lua glue: "PS id x y z hx hy [busy]" (puppet on foot, after this tick's commands; busy 1:
-// it plays one of his actions, a punch or a throw, and must not be walked or corrected meanwhile),
+// it plays one of his actions, a punch or a throw, and must not be walked or corrected meanwhile; busy 2: it plays
+// a traversal move, a jump, vault or ladder, and is followed along his path, game/traversal.h Catchup),
 // "VS id key x y z vx vy vz qx qy qz qw" (the car copy player id drives).
 void OnReport(Shared& sh, const std::string& line, double now) {
     CopyReport r;
@@ -599,7 +613,7 @@ void OnReport(Shared& sh, const std::string& line, double now) {
                         &r.dir[1], &busy) < 6 ||
             id >= net::kMaxPlayers || !InRange(r.pos, 3, kMaxCoord))
             return;
-        r.busy = busy != 0;
+        r.busy = std::clamp(busy, 0, 2);
         r.at = now;
         sh.pupReports[static_cast<net::PlayerId>(id)] = r;
     } else if (line.rfind("VS ", 0) == 0) {
@@ -633,14 +647,43 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     // While the puppet plays one of his actions (a punch, a throw) the controller must not fight it: no walk
     // re-aims, no nudges or snaps, and its standing still must not be measured as its walk speed. As if there were
     // no copy: the controller resets its walk state (keeps the calibration) and walks it again right after.
-    if (li.haveCopy && pr->second.busy) li.haveCopy = false;
+    // A traversal move (busy 2: a jump, vault, climb, ladder) pauses the controller the same way, and the puppet is
+    // drawn along his path meanwhile (height included); after the move a snap becomes a quick blend for a moment
+    // (game/traversal.h Catchup), so the puppet does not jump to its player when the move ends a few metres off.
+    const bool fresh = li.haveCopy;
+    const int busy = fresh ? pr->second.busy : 0;
+    const motion::Vec3 copyPos =
+        fresh ? motion::Vec3{pr->second.pos[0], pr->second.pos[1], pr->second.pos[2]} : motion::Vec3{};
+    if (li.haveCopy && busy) li.haveCopy = false;
     if (li.haveCopy) {
-        li.copy = {pr->second.pos[0], pr->second.pos[1], pr->second.pos[2]};
+        li.copy = copyPos;
         li.copyHeading[0] = pr->second.dir[0];
         li.copyHeading[1] = pr->second.dir[1];
     }
     li.dt = dt;
     lc = rem.loco.Update(li);
+    const bool wasSnap = lc.fix == motion::LocomotionCommand::Fix::Snap;
+    const traversal::Catchup::Info tc =
+        rem.catchup.Apply(busy == 2, fresh && busy != 1, copyPos, li.target, dt, lc);
+    if (tc.started)
+        MC_LOG_INFO("sync: player %u's puppet plays a traversal move (#%d): followed along his path", id,
+                    rem.catchup.Moves());
+    if (tc.ended)
+        MC_LOG_INFO("sync: player %u's puppet: move over, %.2f m off: catching up (blend, no snap)", id, lc.error);
+    if (tc.softened && (rem.catchup.Softened() <= 20 || rem.catchup.Softened() % 50 == 0))
+        MC_LOG_INFO("sync: player %u's puppet: snap after a move turned into a blend (%.2f m off, #%d)", id, lc.error,
+                    rem.catchup.Softened());
+    if (core::trace::IsOpen() && (tc.started || tc.ended || tc.softened))
+        core::trace::Line("TRC", "id=%u ev=%s err=%.3f dz=%.3f nudge=%.4f,%.4f,%.4f snap=%d", id,
+                          tc.started ? "start" : tc.ended ? "end" : "soft", lc.error, li.target.z - copyPos.z,
+                          lc.nudge.x, lc.nudge.y, lc.nudge.z, wasSnap ? 1 : 0);
+    if (s.pose != rem.pose) {
+        MC_LOG_INFO("sync: player %u: pose %s%s%s%s(body %u)", id, s.pose.bits ? "" : "normal ",
+                    s.pose.bits & actions::kStealth ? "sneaking " : "",
+                    s.pose.bits & actions::kCarry ? "carrying " : "", s.pose.bits & actions::kLadder ? "ladder " : "",
+                    s.pose.body);
+        rem.pose = s.pose;
+    }
     // his car, while he drives it
     char key[32] = "-";
     if (inCar) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
@@ -696,14 +739,16 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         core::trace::Line("PUP",
                           "id=%u rT=%.0f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f have=%d age=%.3f cp=%.3f,%.3f,%.3f "
                           "ch=%.3f,%.3f err=%.3f g=%u mult=%.3f want=%.3f meas=%.3f carry=%.3f base=%.2f,%.2f,%.2f "
-                          "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u",
+                          "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u busy=%d nz=%.4f tm=%d "
+                          "rec=%d pose=%u",
                           id, rT, li.target.x, li.target.y, li.target.z, li.targetVel.x, li.targetVel.y,
                           li.haveCopy ? 1 : 0, age, li.copy.x, li.copy.y, li.copy.z, li.copyHeading[0],
                           li.copyHeading[1], lc.error, static_cast<unsigned>(lc.gait), lc.speedMult, lc.want,
                           lc.measured, lc.carry, rem.loco.BaseSpeed(motion::Gait::Walk),
                           rem.loco.BaseSpeed(motion::Gait::Run), rem.loco.BaseSpeed(motion::Gait::Sprint),
                           static_cast<unsigned>(lc.fix), lc.nudge.x, lc.nudge.y, lc.reissue ? 1 : 0, lc.moveTo.x,
-                          lc.moveTo.y, lc.turn ? 1 : 0, s.mode, s.flags);
+                          lc.moveTo.y, lc.turn ? 1 : 0, s.mode, s.flags, busy, lc.nudge.z, tc.moving ? 1 : 0,
+                          tc.recovering ? 1 : 0, s.pose.bits);
     } else if (s.seat == 0) {
         core::trace::Line("VEH",
                           "id=%u key=%s rT=%.0f have=%d tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
@@ -882,9 +927,16 @@ void OnPlayerModel(net::PlayerId from, net::ByteReader& r) {
 
 // ---- local sample ---------------------------------------------------------------------------------------------------
 // "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz aim reload shots ax ay az
-//  cover ctl steer power brake handbrake gear actseq actkind [signals]"  (signals: car_signals.h byte, 0 = unknown /
-//  on foot)
-bool ParseSample(const std::string& line, PlayerState& s) {
+//  cover ctl steer power brake handbrake gear actseq actkind [signals [travev stealth carry body]]"  (signals:
+//  car_signals.h byte, 0 = unknown / on foot; travev: traversal::Event bits the glue saw since the last sample,
+//  stealth / carry: IsStealthMove / IsCarryingBody, body: the carried body's key, npc_sync numbering, 0 = unknown)
+struct LocalExtras {
+    uint32_t events = 0;
+    bool stealth = false, carrying = false;
+    uint32_t body = 0;
+};
+
+bool ParseSample(const std::string& line, PlayerState& s, LocalExtras& ex) {
     std::istringstream in(line);
     std::string tag, weapon, model, key;
     int sprint = 0, crouch = 0, health = 0, seat = 0, aim = 0, reload = 0, shots = 0, cover = 0, ctl = 0, gear = 0;
@@ -899,6 +951,14 @@ bool ParseSample(const std::string& line, PlayerState& s) {
         s.act.seq = static_cast<uint8_t>(actSeq & 0xFF);
         s.act.last = actions::FromCode(actKind);
         if (!(in >> sig)) sig = 0;  // an older glue (dev override) does not send it
+        unsigned ev = 0, stealth = 0, carry = 0;
+        double body = 0;
+        if (in >> ev >> stealth >> carry >> body) {
+            ex.events = ev;
+            ex.stealth = stealth != 0;
+            ex.carrying = carry != 0;
+            ex.body = body >= 0 && body < 4294967296.0 ? static_cast<uint32_t>(body) : 0;
+        }
     }
     s.ctlValid = ctl != 0 && std::isfinite(s.steer) && std::isfinite(s.power) && std::isfinite(s.brake) &&
                  std::isfinite(s.handbrake);
@@ -953,6 +1013,45 @@ void UpdateLocalMotion(PlayerState& s, double now) {
     const float spd = std::sqrt(s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]);
     s.mode = spd < 0.5f ? 0 : spd < 2.6f ? 1 : spd < 5.2f ? 2 : 3;
     if ((s.flags & kSprint) && spd >= 0.5f) s.mode = 3;
+}
+
+// Our traversal moves and pose (game/traversal.h), from the glue's messages and our vertical speed: the moves join the
+// glue's punches in the action block (actions::Merger), the pose goes into the pose block.
+traversal::LocalDetector _travDetect;
+actions::Merger _actMerge;
+actions::Pose _poseLogged;
+uint32_t _movesDetected = 0;
+
+void DetectTraversal(PlayerState& s, const LocalExtras& ex, double now) {
+    traversal::Sample ts;
+    ts.t = now;
+    ts.z = s.pos[2];
+    ts.vz = s.vel[2];
+    ts.speed = std::sqrt(s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]);
+    ts.onFoot = (s.flags & kInVehicle) == 0;
+    ts.events = ex.events;
+    ts.cover = (s.flags & kCover) != 0;
+    ts.stealth = ex.stealth;
+    ts.carrying = ex.carrying;
+    ts.body = ex.body;
+    const actions::Action a = _travDetect.Update(ts);
+    s.act = _actMerge.Update(s.act, a);
+    s.pose = _travDetect.CurrentPose();
+    if (a != actions::Action::None) {
+        ++_movesDetected;
+        if (_movesDetected <= 60 || _movesDetected % 100 == 0)
+            MC_LOG_INFO("sync: we did a %s (traversal #%u, seq %u; z %.2f, vz %.2f, events %u)", actions::Name(a),
+                        _movesDetected, s.act.seq, ts.z, ts.vz, ex.events);
+        core::trace::Line("TL", "kind=%s seq=%u z=%.3f vz=%.3f sp=%.3f ev=%u", actions::Name(a), s.act.seq, ts.z, ts.vz,
+                          ts.speed, ex.events);
+    }
+    if (s.pose != _poseLogged) {
+        MC_LOG_INFO("sync: our pose: %s%s%s%s(body %u)", s.pose.bits ? "" : "normal ",
+                    s.pose.bits & actions::kStealth ? "sneaking " : "", s.pose.bits & actions::kCarry ? "carrying " : "",
+                    s.pose.bits & actions::kLadder ? "ladder " : "", s.pose.body);
+        core::trace::Line("TP", "bits=%u body=%u", s.pose.bits, s.pose.body);
+        _poseLogged = s.pose;
+    }
 }
 
 // ---- Lua module --------------------------------------------------------------------------------------------------------
@@ -1169,9 +1268,13 @@ void MainTick(lua_State* L, float dt) {
     const char* status = lua::ToString(L, -2);
     const char* events = lua::ToString(L, -1);
     PlayerState local;
-    const bool ok = sample && *sample && ParseSample(sample, local);
+    LocalExtras extras;
+    const bool ok = sample && *sample && ParseSample(sample, local, extras);
     const double now = Now();
-    if (ok) UpdateLocalMotion(local, now);
+    if (ok) {
+        UpdateLocalMotion(local, now);
+        DetectTraversal(local, extras, now);
+    }
     {
         std::lock_guard lock(sh.mu);
         sh.luaStatus = status ? status : "";
