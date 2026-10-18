@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -407,6 +408,58 @@ int McEntityIds(lua_State* L) {
         for (size_t i = 0; i < n; ++i) {
             if (i) out += ' ';
             out += std::to_string(ids[i]);
+        }
+    }
+    PushString(L, out);
+    return 1;
+}
+
+// mc_entity_ids_of("25 26 88 90") -> the ids of every entity of any of those types (one walk over the table instead
+// of one per type: the table is indexed by id >> 8 whatever the type, exe+0x233AC10), space separated. Used for the
+// projectiles of a throw (docs/game-api.md 23: 25 grenade, 26 molotov, 88 projectile explosive, 90 satchel charge).
+size_t EntityIdsOfTypesGuarded(const bool (&want)[256], uint32_t* out, size_t cap) {
+    size_t n = 0;
+    __try {
+        void* mgr = _ent.mgr();
+        uint32_t misses = 0;
+        for (uint32_t idx = 1; idx < 0x100000 && misses < 65536 && n < cap; ++idx) {
+            uint8_t* e = _ent.find(mgr, idx << 8, 0);
+            if (!e) {
+                ++misses;
+                continue;
+            }
+            misses = 0;
+            const uint32_t guid = *reinterpret_cast<uint32_t*>(e + 0x18);
+            if (want[guid & 0xFF] && (guid >> 8) == idx) out[n++] = guid;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
+
+int McEntityIdsOf(lua_State* L) {
+    const char* list = TypeOf(L, 1) == TString ? ToString(L, 1) : nullptr;
+    std::string out;
+    if (_ent.find && list) {
+        bool want[256] = {};
+        bool any = false;
+        for (const char* p = list; *p;) {
+            char* end = nullptr;
+            const unsigned long t = std::strtoul(p, &end, 10);
+            if (end == p) {
+                ++p;
+                continue;
+            }
+            if (t < 256) want[t] = any = true;
+            p = end;
+        }
+        if (any) {
+            static uint32_t ids[2048];
+            const size_t n = EntityIdsOfTypesGuarded(want, ids, std::size(ids));
+            for (size_t i = 0; i < n; ++i) {
+                if (i) out += ' ';
+                out += std::to_string(ids[i]);
+            }
         }
     }
     PushString(L, out);
@@ -915,6 +968,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         if (_ent.push) {
             RegisterGlobal(L, "mc_entity", &McEntity);
             RegisterGlobal(L, "mc_entity_ids", &McEntityIds);
+            RegisterGlobal(L, "mc_entity_ids_of", &McEntityIdsOf);
             RegisterGlobal(L, "mc_memfind", &McMemFind);
             RegisterGlobal(L, "mc_memread", &McMemRead);
             RegisterGlobal(L, "mc_memdump", &McMemDump);
@@ -924,7 +978,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
         }
         if (_ray.cast) RegisterGlobal(L, "mc_raycast", &McRayCast);
         MC_LOG_INFO("lua: registered globals mc_log, mc_u64, mc_u64str, mc_pad%s%s%s",
-                    _ent.push ? ", mc_entity, mc_entity_ids, mc_car_controls" : "",
+                    _ent.push ? ", mc_entity, mc_entity_ids, mc_entity_ids_of, mc_car_controls" : "",
                     _ent.push && _sig.read ? ", mc_car_signals, mc_car_set_signals" : "", _ray.cast ? ", mc_raycast" : "");
     });
     MC_LOG_INFO("lua: bridge ready (dev console: F8 runs %s\\dev.lua; %s\\dev\\%s.in.lua is polled)",
@@ -933,6 +987,13 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
 }
 
 bool Available() { return _available.load() && !_disabled.load(); }
+
+int RayCast(const float from[3], const float to[3], float hit[3]) {
+    if (!_ray.cast || !Available()) return -1;
+    bool ok = false;
+    const bool got = RayCastGuarded(from, to, hit, ok);
+    return ok ? (got ? 1 : 0) : -1;
+}
 bool Disabled() { return _disabled.load(); }
 uint32_t MainThreadId() { return _mainThread.load(); }
 uint64_t TickCount() { return _ticks.load(); }

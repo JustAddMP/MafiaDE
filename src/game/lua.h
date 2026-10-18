@@ -79,6 +79,9 @@ void RegisterGlobal(lua_State* L, const char* name, CFunction fn);
 // The game's entity table (the lookup behind mc_entity): true when `entity` is a live entity, i.e. its id still
 // resolves to it. Never touches freed memory unguarded. GameMainThread.
 bool EntityLookupAvailable();
+// The game's physics ray cast (the one behind mc_raycast): 1 something is between from and to (its position in hit),
+// 0 nothing, -1 not available. GameMainThread.
+int RayCast(const float from[3], const float to[3], float hit[3]);
 bool EntityIsLive(const void* entity);
 // The entity whose id (its GUID number) is `id`, or nullptr. Guarded. GameMainThread.
 void* EntityByGuid(uint32_t id);

@@ -27,6 +27,8 @@ Doors (not yet in a release): DoorEvent (0x0230), DoorApply (0x0231), DoorSnapsh
 Police (not yet in a release): PoliceState (0x0260), PoliceEvent (0x0261), PoliceChase (0x0262), additive (see
 "Police"); TrafficStates flag 2 (siren) of police cars now from their real siren / beacon when it can be read.
 Explosions (0.16, not yet in a release): Explosion (0x0240), CarExploded (0x0241), additive (see "Explosions").
+Grenade arc (0.16, not yet in a release): Throw (0x0242), ThrowFix (0x0243), additive; Explosion gets an optional
+trailing u32 throwSeq (older senders end before it) (see "Explosions").
 Car damage (not yet in a release): CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252),
 additive (see "Car damage").
 Several guests (3-4 players; not yet in a release): HostNpcHit (0x0422) gets a trailing u8 attacker (read as the
@@ -801,8 +803,10 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0240 | Explosion | the game where it happened -> everyone (`Broadcast`; a guest's is relayed by the host) | R | u32 seq (per sender; a new session starts elsewhere: `(GetTickCount() & 0xFFFF) << 16`), u8 kind (0 unknown, 1 grenade, 2 molotov, 3 dynamite `exp_satchel`, 4 crash object, 5 car blast), u8 flags (1 fire: the picture burns too; 2 one of the sender's NPCs threw it), f32 x y z, str weapon (`exp_grenade`, ...; "" unknown; at most 32 of `[A-Za-z0-9_-.:/]`), u32 npc (flag 2: the NPC's key on the sender's game: on the host its entity id, as in NpcStates; on a guest his own NPC's key, as in GuestNpcStates), str object (kind 4: the crash object's scene name, at most 64; "" none) |
+| 0x0240 | Explosion | the game where it happened -> everyone (`Broadcast`; a guest's is relayed by the host) | R | u32 seq (per sender; a new session starts elsewhere: `(GetTickCount() & 0xFFFF) << 16`), u8 kind (0 unknown, 1 grenade, 2 molotov, 3 dynamite `exp_satchel`, 4 crash object, 5 car blast), u8 flags (1 fire: the picture burns too; 2 one of the sender's NPCs threw it), f32 x y z, str weapon (`exp_grenade`, ...; "" unknown; at most 32 of `[A-Za-z0-9_-.:/]`), u32 npc (flag 2: the NPC's key on the sender's game: on the host its entity id, as in NpcStates; on a guest his own NPC's key, as in GuestNpcStates), str object (kind 4: the crash object's scene name, at most 64; "" none), **[u32 throwSeq]** (grenade arc: the Throw 0x0242 whose explosion this is, 0 none; older senders end before it, older readers ignore it; 1-3 trailing bytes = malformed) |
 | 0x0241 | CarExploded | the car's authoritative game -> everyone (`Broadcast`) | R | u8 what (0 a shared player car; 1 a host traffic car, only from the host), str key (what 0: the shared car key `o:g`, Phase 3; what 1: its traffic net id, Traffic above), f32 x y z |
+| 0x0242 | Throw | the thrower's game -> everyone (`Broadcast`; relayed by the host) | R | u32 seq (per sender, below 2^24; a new session starts elsewhere: `(GetTickCount() & 0x3FF) << 12`), u8 kind (as Explosion: 0 other/unknown, 1 grenade, 2 molotov, 3 dynamite), u8 flags (1 fire: a molotov; 2 measured on the real projectile, else the aim model's guess), f32 origin x y z, f32 velocity x y z (m/s, at the origin; at most 80), f32 gravity (m/s^2, 0.5..50; sent 9.81), u16 delayMs (how old the origin was when sent), u16 fuseMs (origin to explosion, 0 unknown: sent 0 for now), str weapon (at most 32). About 40-50 bytes, **one per throw** |
+| 0x0243 | ThrowFix | the thrower's game -> everyone (`Broadcast`) | U (settled / gone: R) | u32 seq (the Throw's), u16 tMs (since the Throw's origin), u8 flags (1 bounce: our EXPLOSIVE_BOUNCE sound; 2 settled: it lies still here; 4 stop: it is gone, its last position; 8 turn: the readings left the predicted path; 16 position only: no projectile to read, keep your own velocity), f32 x y z, i16 vx vy vz (cm/s, clamped to +-327 m/s). **25 bytes**, at most 8 per throw (the 8th only for settled / gone), each sent the moment it is made |
 
 Damage is decided by **one** game; the picture is shown on all (src/game/explosion_model.h, unit-tested by
 tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 23).
@@ -847,10 +851,40 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   explosion of it; everywhere else it never blows up by itself (explosion off, a burning copy's countdown held) and
   CarExploded, car damage's exploded flag and a wrecked car coming back all go through one routine that runs once per
   car entity, whichever comes first (docs/game-api.md 24).
-- **Not carried:** the projectile's flight (no harmless projectile exists: `ThrowProjectileWeapon` throws a real
-  one; the throw animation shows on the thrower's puppet, the explosion appears where and when it happened); how a
-  fire spreads (each picture burns on its own game). Cars are not left out: the holder of a car puts another game's
-  blast on it itself ("Car damage", blasts on other games).
+- **The flight (grenade arc; Throw; src/game/throw_model.h, tests/throw_arc_test.cpp; the game side in
+  throw_arc.lua; docs/game-api.md 23 "The flight").** While the player lines up a throw his game only logs the aim
+  (GA trace records). On the release (WEAPON_THROWN) the throw gets its number at once; the explosion detector keeps
+  it with the throw, so the Explosion decided for it later carries it (`throwSeq`). The thrower's game looks for the
+  real projectile entity (types 25 grenade, 26 molotov, 88, 90; new or moved within 8 m of the hand) for at most
+  0.3 s and reads up to three positions: the first is the origin, the first and the last give the launch velocity
+  (the three also the gravity, logged). Then **one Throw** goes out (reliable). After it the projectile is followed
+  cheaply and corrected by **events, not a stream**: its position is read every 0.2 s (moved less than 5 cm twice in
+  a row = settled; more than 1 m off the path the last reading predicts = a sharp turn) and at each of our
+  EXPLOSIVE_BOUNCE sounds; at a bounce or a turn the next tick's reading gives the velocity out of it and one
+  **ThrowFix** goes out at once (unreliable), when it has settled or is gone one more (reliable), at most 8 per throw.
+  A typical grenade: Throw ~50 bytes + 2-3 bounce fixes + the settled fix (25 bytes each) = ~125-150 bytes, 4-5
+  messages per receiver. If fewer than two positions were read in 0.3 s, the aim model's launch is sent
+  instead (flag 2 clear: the camera direction turned up 15 degrees at 16 m/s from the hand; UNVERIFIED constants,
+  the GE record compares them with the measured launch). Receivers (`Book`, `Sim`) **simulate** the throw in their
+  own world from the origin's time (receive time - delayMs): ballistic steps with the sent gravity, one step per
+  script tick per flight (at most 0.1 s; a long tick catches up over the next ones), each step one ray cast along
+  its segment; on a hit one short probe down in front of it tells floor from wall; the bounce keeps 35 % of the
+  speed into the surface and 75 % of the speed along it; slower than 1.5 m/s into the floor it rolls (4 m/s^2), below
+  0.2 m/s it has settled and casts nothing more; a molotov stops at its first hit; hits next to the origin in the
+  first 0.15 s are the thrower's own body. A ThrowFix re-anchors the simulation: position and velocity at the fix's
+  time (a settled / gone fix: stopped there; position only: its own velocity, bounced), advanced to now by the
+  simulation; the marker slides there over 0.1 s instead of jumping; a fix older than the last one applied (late,
+  unreliable) is ignored, a lost one costs nothing (the next or the settled one corrects). So a receiver whose world
+  differs (a car parked there, a door closed) drifts for one bounce at most. It is shown as a marker with a fading trail drawn by our overlay (nothing
+  is spawned in the world: it cannot hurt anyone) until the Explosion naming its seq arrives: the marker then jumps
+  to the explosion's true position for 0.25 s (the simulated-vs-true offset is logged, GE); an Explosion without a
+  seq ends the sender's nearest flight within 30 m (never an NPC's explosion); without an explosion it goes after
+  its fuse + 1 s (if one was sent) or 15 s. Throws are reliable and numbered (one relayed twice is shown once).
+  NPCs' throws are not carried (only their explosions, above). Rolling does not fall off ledges (it settles on the
+  edge's height; the settled fix puts it where it really lies).
+- **Not carried:** how a fire spreads (each picture burns on its own game). Cars are not left out: the holder of
+  a car puts another game's blast on it itself ("Car damage", blasts on other games), so a remote player's grenade
+  does wreck your car, on every game, once; a copy never blows up by itself.
 
 ## Reconnect (no messages of its own)
 

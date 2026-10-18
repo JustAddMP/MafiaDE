@@ -81,6 +81,7 @@ std::vector<uint8_t> PackExplosion(const Explosion& e) {
     w.Str(SafeName(e.weapon, 32) ? e.weapon : std::string());
     w.U32(e.npc);
     w.Str(SafeName(e.object, 64) ? e.object : std::string());
+    w.U32(e.throwSeq);
     return std::vector<uint8_t>(w.Span().begin(), w.Span().end());
 }
 
@@ -93,6 +94,7 @@ bool ReadExplosion(net::ByteReader& r, Explosion& out) {
     e.weapon = r.Str(32);
     e.npc = r.U32();
     e.object = r.Str(64);
+    if (r.Ok() && r.Remaining() > 0) e.throwSeq = r.U32();  // optional (older senders end before it); 1-3 bytes fail
     if (r.Failed() || kind > kMaxKind || !Finite(e.pos)) return false;
     if (!e.weapon.empty() && !SafeName(e.weapon, 32)) return false;
     if (!e.object.empty() && !SafeName(e.object, 64)) return false;
@@ -396,6 +398,10 @@ void Detector::Tick(double now, uint32_t& nextSeq, std::vector<Seen>& out) {
         if (th && !th->weapon.empty()) {
             weapon = th->weapon;
             kind = KindOfWeapon(weapon);
+        }
+        if (th && ours) {
+            seen.e.throwSeq = th->seq;
+            seen.sinceThrow = c.t0 - th->t;
         }
         bool fire = false;
         for (const auto& f : fires_)
