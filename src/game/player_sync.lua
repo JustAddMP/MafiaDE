@@ -1265,10 +1265,21 @@ function M.SeatTick(p)
     M.seatYield = { key = my.key, from = my.seat, t = M.now, none = my.key }
     return
   end
+  -- SlideToSeat is UNVERIFIED (docs/game-api.md 18): after three slides that did not move us, we stay
+  local tries = (y and y.key == my.key and y.from == my.seat and y.tries or 0) + 1
+  if tries > 3 then
+    if not y.gaveUp then
+      y.gaveUp = true
+      log("seats: three slides out of seat " .. my.seat .. " of car " .. my.key .. " did not move us: we stay")
+    end
+    y.t = M.now
+    return
+  end
   local good, err = pcall(p.SlideToSeat, p, to + 1)
-  M.seatYield = { key = my.key, from = my.seat, t = M.now }
+  M.seatYield = { key = my.key, from = my.seat, t = M.now, tries = tries }
   log(string.format("seats: player with a lower id sits in our seat %d of car %s too (the others' seats: %s): we "
-    .. "slide to seat %d (%s)", my.seat, my.key, claims, to, good and "sent" or ("failed: " .. tostring(err))))
+    .. "slide to seat %d (%s, try %d)", my.seat, my.key, claims, to, good and "sent" or ("failed: " .. tostring(err)),
+    tries))
   trace("SEA", string.format("key=%s from=%d to=%d claims=%s ok=%d", my.key, my.seat, to, (claims:gsub(" ", ",")),
     good and 1 or 0))
 end
