@@ -3,6 +3,100 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## 0.15.0 (unreleased), not yet tested in game
+
+A big step for the shared world and the co-op menus: fights and car details you can see on the other screen, the
+host's traffic and police on a friend's game, enemies only a friend's game has shown to the host, failed missions
+in one load, every player on the map, reconnecting after a lost connection, a JOIN FRIEND list and real gamepad
+support in the co-op panels. Everything here was built from reading the game's code and the logs of the 0.13.0
+test, with automated tests where the logic can run without the game; none of it has been tried in game yet
+(README-dev.md "Test checklist: 0.15.0 features").
+
+Fights:
+- Punches, charged punches, counters, takedowns, throws (grenades, molotovs, knives) and being hit in a fist fight
+  now show on the other players' characters with the game's own animations. The character stops walking while it
+  plays and its swing cannot hurt anyone on your screen; the real hit still counts on the victim's game as before.
+- Enemies that only a friend's game spawned (he got somewhere first) now show on the host's game: they move, fight
+  and can be hurt and killed there, their hits on the host count, and when the host's own game spawns the same
+  enemy later the two are matched up instead of doubled.
+
+Cars:
+- Headlights, indicators, horn, siren and police beacon of the car another player drives show on your screen.
+- The other player's character stays in its car seat: the game's civilian behaviour made it climb out (the cause of
+  the throw-outs in the 0.13.0 test); it now gets the same "friend" behaviour on every game, its seat is checked
+  every moment and it is put straight back if it starts to leave. Riding along with a friend waits until his
+  character sits at the wheel, so you are not put in the driver's seat of his car.
+- A mission car (or the host's own car) that was replaced by a copy while another player drove it comes back when
+  the driver parks and gets out, where he left it (and wrecked if he wrecked it), so the mission carries on with
+  its own car. The copy is locked meanwhile, so you do not get into the wrong car.
+- Traffic and police: near the host, a friend's game shows the host's traffic and police cars (the nearest 20,
+  driven like the host's, police with siren and beacon) instead of its own, so the streets and chases look the same
+  on both screens. Away from the host each game keeps its own traffic.
+
+Story:
+- A failed mission takes one loading screen instead of two: no more short stop in a Free Ride world. The chapter
+  host goes straight back to his last co-op checkpoint, a STORY host gets the game's own fail screen; when a friend
+  fails, the host decides whether he rejoins at the host's checkpoint at once or waits for the host; when the host
+  fails, everyone goes back with him. Every fail kind (leaving the area, losing the mission car, a timer, an ally
+  dead, a target escaped, arrested) goes this way.
+
+Map:
+- Every other player is on your minimap and map all the time, with his name: on his character on foot, at his car
+  while he drives, and at his position while his character is hidden, respawning or not spawned yet.
+
+Connection:
+- Reconnect: when a player's connection drops he is not thrown out. His game keeps running and rejoins the host on
+  its own for up to a minute ("CONNECTION LOST - RECONNECTING... 12 S"), the others see "<NAME> LOST THE CONNECTION -
+  WAITING FOR THE PLAYER TO RECONNECT" and he gets his place back (same player, same character, the host's world
+  re-sent). LEAVE CO-OP stops the retries.
+- JOIN FRIEND (main menu CO-OP) opens a list of your Steam friends who play Mafia DE and what they are doing:
+  hosting (with players / maximum and whether they are in the lobby or playing), in a friend's game, not hosting,
+  another mod version, full. Pick one to join. The version is checked before connecting (Steam invites too), and
+  Steam's join errors are said in words.
+
+Co-op panels and the gamepad:
+- A physical gamepad works in the co-op panels: any controller slot, plugged in or out while playing, sticks that
+  do not drift or jump two rows, left / right on the sticks, a button held while a panel opens is ignored, B / START
+  / BACK go back. An unplugged pad no longer blocks the game's input.
+- The panels' footers show the right buttons for what you use, like the game's own menus: gamepad buttons after
+  you use the pad, key names after keys or the mouse. The pad's X / Y / LB / RB do what the footer says (lobby: X
+  START / READY / JOIN GAME, Y INVITE; JOIN FRIEND: Y REFRESH; text boxes: X delete, Y paste).
+
+Technical notes:
+- Melee: PlayerState action block (u8 actSeq, u8 act) at the end, after the vehicle block's signals byte; the puppet
+  plays `AnimPlay` with the controller paused, a swing shield keeps its swing harmless (docs/game-api.md 17).
+  New unit test player_actions_test. Still missing: door kicks, grenade explosions, medkit, carrying bodies,
+  lockpick, vault / ladder, jump, stalk, paired takedowns.
+- Car signals: read from the vehicle part (+0xD00 / +0xA88 / +0x119C; `mc_car_signals` / `mc_car_set_signals`),
+  u8 signals at the end of the PlayerState vehicle block, re-set on the copy when its game changes them back; trace
+  field `sig` (T field 64). Unit test car_signals.
+- Seats: friend brain on every puppet where the game-sectors guard is in, seat checked every tick (`GetSeatOwner`)
+  and put back, ride along puts the driver's puppet at the wheel first and tries `SlideToSeat` (docs/game-api.md
+  18). `enemies_target_guests = 0` no longer sends the host's enemies' hits.
+- Mission car back: the swapped-car machine `src/game/car_swap.h` (unit test car_swap_test); CarParked carries a
+  flags byte (bit 0 destroyed); trace records SWP / SWR.
+- Guest-owned NPCs: messages 0x0420-0x0423 (GuestNpcStates, GuestNpcEnd, HostNpcHit, NpcClaim), ownership rules in
+  `src/game/npc_owner.h` (unit test npc_owner_test); traffic copy crews are never guest-owned; trace records NM / NO /
+  NGO / NGE / NGC / NMC / NMX.
+- Traffic: messages 0x0220-0x0223 (TrafficSpawn, TrafficDespawn, TrafficStates, TrafficBump), `traffic_model.h` /
+  `traffic_sync.*` (unit test traffic_test); the guest's own ambient traffic and police spawning go off within
+  250 m of the host; trace records TRH / TRP / TRG / TRC / TRL; hidden traffic cars are never adopted as a player's
+  car.
+- Failed missions: the save system's FreeRoamRetry (exe+0x21E8B20) is skipped in co-op chapters, FailFlow
+  (`src/game/fail_flow.h`, unit test fail_flow_test), the director's GameOver hooked (log), MissionFail 0x0205 /
+  FailVerdict 0x0206; 75 patterns; trace record FAIL. No fail role while a guest is reconnecting (the game's own way
+  then, the usual follow afterwards).
+- Map markers: one navigation icon per player, moved between puppet and position (`ChangeIconTargetToPos` /
+  `ChangeIconTargetToEntityDirect`), names with `SetIconTextByNavId`; decision in `src/game/map_markers.h` (unit
+  test map_markers_test); trace records MK / MKE.
+- Reconnect: core's slot hold, resume token and PeerDropped; newcomer re-send keyed by (id, joinSeq) in PlayerSync
+  and MissionSync; the trace stays open (RCN records, listed by tools/sync_compare.py). No app message changed.
+- Core 0.11.0 (unreleased): JOIN FRIEND (`net/steam_friends`), pad fixes (`pad_nav`), button prompts (`ui_prompts`),
+  reconnect; protocol version 8. The main menu's CO-OP page keeps the game's own footer.
+
+Everyone needs 0.15.0: the PlayerState tail, the new messages and the protocol version changed (0.14.0 cannot join
+it).
+
 ## 0.14.0 (2026-10-17), pre-release, fixes not yet tested in game
 
 Fixes from the first test of 0.13.0 on two PCs (Steam invite, Free Ride, about five minutes), and a sync trace on

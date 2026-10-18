@@ -324,6 +324,89 @@ Dev console, to explore the API live:
   `tools\devlua.ps1 -Tag host -Code 'return game.game:GetActivePlayer():GetPos()'` does the round trip.
 - What was found this way is in `docs/game-api.md`.
 
+## Test checklist: 0.15.0 features
+
+Everything in 0.15.0 was built without starting the game (static research + the 0.13.0 logs); this is the in-game
+test before the release. Two instances side by side on one PC (host `--window left`, guest `--window right`,
+`--debug-overlay`, see "Two instances on one PC"), unless a step says two PCs. After each run compare the traces
+(`python tools/sync_compare.py <host trace> <guest trace>`: it lists actions, swapped cars, guest-owned NPCs,
+traffic, map markers and reconnects per game). Trace records: docs/sync-trace.md.
+
+Melee and other actions (docs/game-api.md 17):
+- [ ] Free Ride, Omerta park (-583.5, 121.5; fists are off near Salieri's bar). Tap Q, hold Q (charged), Left Alt
+  (counter), throw a grenade / molotov: the other window's puppet plays each. Host log `our light goes out`, the
+  other's `puppet 0 plays a light punch`; trace AL / ACS / ACT / AP / AE. No extra damage from the puppet's swing,
+  no sliding or snap during it.
+- [ ] If nothing plays: look for `AnimPlay failed` lines; try `DesirePlayAnimation(name, 1)` from the console and
+  the `MafiaCoop.actionAnims` table (F8).
+
+Seats (docs/game-api.md 18):
+- [ ] The host drives, the guest watches: the host's puppet stays at the wheel for several minutes of driving (no
+  `thrown out of car` lines; `puppet N sits in car K seat S (... friend brain ...)`). If it starts to leave:
+  `... is in car K but not in seat S ...: put back at once`. Trace PR `brain=1`, `back`, `ejAll`.
+- [ ] Ride along (E next to the other's car): the driver's puppet is put at the wheel first
+  (`ride along: put player N's puppet at the wheel ... first`), the rider ends up in the passenger seat.
+
+Car signals (docs/game-api.md 7 / 16):
+- [ ] The host drives at night or in a tunnel: headlights, left / right indicators, horn; a police car's siren and
+  beacon. Each shows on the guest's copy (`remote car K: signals ... -> ... (copy has ..., change #n)`; trace `sig`
+  in LR / CR). Nothing flickers (re-sets in CR stay low).
+
+Mission car back (docs/game-api.md 15 "Mission car back"):
+- [ ] Taxi (lobby CHAPTER 2): the host drives the mission taxi so the guest's is swapped for a copy, then parks and
+  gets out where the mission allows it (or a Free Ride car swapped the same way: the host drives the guest's car).
+  On the guest the real car comes back at the copy's place (`car K: our own car id is back at the copy's place ...
+  parked`), the copy is locked meanwhile; trace SWP / SWR. A wrecked car comes back blown up. The host's own car
+  is shown again on the host after a guest drove it.
+
+Guest-owned NPCs (docs/protocol.md "Guest-owned NPCs"):
+- [ ] A fight where the guest gets there first (Bon Appetit: the guest walks into the kitchen, the host stays
+  outside): the guest's enemies appear on the host (`guest N's own NPC ... : mirror M, AI type ..., profile ...`),
+  move and shoot; the host's hits reach the guest's NPC, the host's kill kills it; their hits on the host's puppet
+  reach the host (`our own NPC ... hit the host's puppet ...: sent to him`). When the host's game spawns that enemy
+  itself it is claimed (`guest N handed his NPC ... back`), no doubles. Trace NM / NO / NGO / NGE / NGC / NMC / NMX.
+
+Traffic and police (docs/game-api.md 19, protocol.md "Traffic"):
+- [ ] Free Ride, both on a busy street within 250 m: the guest's log `the host's traffic shows here (...)`, his own
+  traffic goes (spawning off, cars out of the way hidden), the host's cars drive past on both screens with the
+  same model, colours and plate. Walk the guest > 250 m away: `our own traffic is back (...)`. Trace TRH / TRP (host),
+  TRG / TRC / TRL (guest): `avg` / `max` error small, few pins.
+- [ ] Police: get a wanted level near the guest; the host's police cars show with siren and beacon. Bump a copy
+  with the guest's car: it is put back and a TrafficBump logged on the host.
+
+Failed missions in one load (docs/re-notes.md 7):
+- [ ] Taxi cp_010 (lobby CHAPTER 2): the host drives > 250 m away from the mission (or `car:Explode()` on the
+  mission car): one loading screen on each game, no `freeroam_before_quest_activated` load; both back at the
+  checkpoint. Trace FAIL `ev=freeroamretry ... skip=1`, `ev=gameover`.
+- [ ] The same failure by the guest: he loads the host's point (REJOIN) while the host plays on. Both fail at once
+  (a timer, or both drive away): one load each.
+
+Players on the map (docs/game-api.md 13):
+- [ ] The other player is on the minimap and the full map with his name: on foot, while he drives, during and
+  after a cutscene, after a respawn, after a checkpoint reload. Never two icons for one player. Trace MK / MKE.
+
+Reconnect (core docs/protocol.md "Reconnect", protocol.md "Reconnect"):
+- [ ] Cut the guest off for 10-30 s (one PC: suspend the guest's game in Resource Monitor > Suspend Process, then
+  resume it; two PCs: pull the guest's network cable / turn off his Wi-Fi, also over Steam P2P): guest banner `CONNECTION LOST - RECONNECTING... N S`, host banner `<NAME> LOST THE CONNECTION - WAITING ...`;
+  the guest's game keeps running. Back within 60 s: same player id, no reload at the same checkpoint, puppets, NPC
+  copies and traffic copies return. Logs `reconnect: ...`, `player N is new (joined or back after a lost
+  connection)`; trace RCN. LEAVE CO-OP during the retries ends them. Over 60 s the guest is out and the host's slot
+  is free.
+
+JOIN FRIEND and the physical gamepad (README-dev.md "Player flow", "Testing the co-op panels"):
+- [ ] Two PCs, two Steam accounts that are friends: one hosts; the other's main menu CO-OP > JOIN FRIEND lists him
+  as `HOSTING (1/4) - IN THE LOBBY`, then `... PLAYING` after START; pick him: joins through the lobby. A friend
+  with another mod version shows OTHER VERSION and is not joined.
+- [ ] A real controller (also one plugged in while the game runs, and one unplugged): d-pad and both sticks move
+  one row per push, left / right change values, A / B / START / BACK work, a button held while a panel opens does
+  nothing; after unplugging, the game still takes keyboard input. Log lines for connect / disconnect.
+
+Button prompts (docs/game-api.md 9 "Button prompts"):
+- [ ] Open the lobby, the pause CO-OP panel, JOIN FRIEND and a text box with the pad: footers show pad buttons;
+  press a key or move the mouse: key names (`ui_input: prompts now for ...`). X / Y / LB / RB do what the footer says
+  (lobby X START / READY, Y INVITE; JOIN FRIEND Y REFRESH; text box X delete, Y paste). The main menu's own CO-OP
+  page keeps the game's footer.
+
 ## Test checklist: animation and car controls (0.13.0; 0.14.0 fixes not yet tested in game)
 
 First two-PC test of 0.13.0 (2026-10-17): see docs/PLAN.md A/B. After each test, compare the two sync traces

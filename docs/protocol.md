@@ -15,8 +15,8 @@ startable yet). 0.6.0: MissionState (0x0201), HostSave (0x0202), Cutscene (0x020
 at up to 60 Hz, NpcStates at 10 Hz, Hit carries u8 source + u32 npc (an NPC of the sender's game hit the puppet). 0.12.0:
 NpcStates carry each NPC's spawn profile (u64) and a shot counter (u8): guests spawn copies of host NPCs that have no
 partner on their game. 0.13.0: PlayerState version 4: flags bit5 (in the air) and bit6 (in cover); the vehicle block
-ends with the driver's controls (6 bytes). After 0.14.0: guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd
-(0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
+ends with the driver's controls (6 bytes). 0.15.0 (core 0.11.0, `kProtocolVersion` 8: the reconnect trailers and
+PeerDropped, core docs/protocol.md "Reconnect"): guest-owned NPCs, GuestNpcStates (0x0420), GuestNpcEnd (0x0421), HostNpcHit (0x0422), NpcClaim (0x0423) (see "Guest-owned NPCs"); traffic, TrafficSpawn (0x0220),
 TrafficDespawn (0x0221), TrafficStates (0x0222), TrafficBump (0x0223) (see "Traffic"); failed missions, MissionFail
 (0x0205), FailVerdict (0x0206); PlayerState still version 4 but with the car signals byte and the action block at
 its end (both always sent); CarParked with a trailing flags byte (wrecked).
@@ -427,7 +427,7 @@ scripts may change things in between; the next WorldEnv puts them back.
   copy is looked for or spawned during a loading screen and for 4 s after it (a copy spawned before the mission had
   placed its car landed on it).
 
-### Guest-owned NPCs (next release after 0.14.0; not yet checked in game)
+### Guest-owned NPCs (0.15.0; not yet checked in game)
 
 The reverse of the copies above: NPCs that only a guest's game has. Every game spawns a checkpoint's waves for its
 own player, so a guest who got somewhere first has enemies the host's game has not spawned (yet); the host saw
@@ -481,7 +481,7 @@ npc_sync.lua.
   mirror without a state for 5 s ends on the host; a guest who leaves takes his mirrors along.
 - Bandwidth: at most 16 NPCs x 10 Hz x ~45 bytes = ~7 KB/s per guest (like the host's 48 x 10 Hz).
 
-### Traffic (next version after 0.14.0; not yet checked in game)
+### Traffic (0.15.0; not yet checked in game)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|

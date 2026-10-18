@@ -1,8 +1,8 @@
-Mafia: Definitive Edition - Co-op (MafiaCoop) 0.12.0, pre-release
+Mafia: Definitive Edition - Co-op (MafiaCoop) 0.15.0, pre-release
 ==================================================================
 
 An unofficial, fan-made co-op mod: play Mafia: Definitive Edition together with friends. One small DLL, no separate
-server, Steam invites. This is a PRE-RELEASE: playable, but parts of the world (traffic, pedestrians, police) are not shared.
+server, Steam invites. This is a PRE-RELEASE: playable, but parts of the world (pedestrians, traffic away from the host) are not shared.
 Read "Known issues" below before you play.
 
 Contents of this zip
@@ -50,6 +50,7 @@ HOST A GAME
 JOIN A GAME
 -----------
 - Accept your friend's Steam invite (or right-click him in the Steam friends list > Join Game), or
+- Main menu > CO-OP > JOIN FRIEND: your Steam friends playing Mafia DE and whether they host; pick one, or
 - Main menu > CO-OP > JOIN BY IP and type the host's address (ip or ip:port), Enter.
 You land in the lobby: pick your CHARACTER and OUTFIT and set READY. If the host is already playing, choose JOIN GAME.
 
@@ -90,36 +91,39 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
+- The new things in 0.15.0 (punches and other actions on the other players, car lights and signals, the host's
+  traffic and police, enemies only a friend's game has shown to the host, the mission car coming back, failed
+  missions in one load, every player on the map, reconnecting, JOIN FRIEND, gamepad buttons in the co-op panels)
+  were built without being tried in the game yet. Please send the logs when something looks wrong.
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
   both ways (since 0.11.0 a friend's kill also kills the host's enemy, so a friend can clear a fight on his own),
   health follows the host's game, and the host's enemies also aim at the other players. Since 0.12.0 an enemy that
   only the host's game spawned (the host got somewhere first) shows on a friend's game as a copy that moves and
-  fires with it and can be killed. An enemy only a friend's game spawned is his alone (the host does not see it).
+  fires with it and can be killed. Since 0.15.0 an enemy that only a friend's game spawned shows on the host's game too (not yet tested).
   Tested in one chapter's shootout (Bon Appetit's restaurant, cleared to the last enemy, the chapter not played past
   it); other chapters' fights were not tried. enemies_target_guests = 0 in MafiaCoop.ini
   turns the enemies-aim-at-friends part off if it causes trouble.
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
   screen (checked in Taxi and Bon Appetit). Where each player starts in his own mission car, the host's character
-  waits hidden until the cars have parted. The car being handed back when the host gets out was not checked. Only a
+  waits hidden until the cars have parted. Since 0.15.0 the mission car comes back when the driver parks and gets out (not yet tested). Only a
   few chapters were checked.
-- Ambient traffic, pedestrians and police are each player's own (not shared).
+- Near the host a friend sees the host's traffic and police cars (0.15.0, not yet tested); away from the host
+  traffic is each player's own. Pedestrians are each player's own.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit); other chapters and checkpoints may behave
   differently. A friend who falls behind the host's checkpoint is reloaded at the host's checkpoint.
 - A failed mission in a co-op CHAPTER (and a friend's failed mission in any co-op game) goes back to the last co-op
-  checkpoint in two loads: a short stop in a Free Ride world (its loading screen is confirmed for you and the screen
-  stays black, as long as the game window has focus), then the checkpoint. Your own story saves are never loaded or
-  changed. Failing by leaving the mission area and by losing the mission car were tested; running out of time was
-  not.
-- If a player's game is killed (Task Manager, crash) instead of closed, the others wait about 4.5 seconds before he
-  is shown as gone (net_timeout_s in MafiaCoop.ini). Closing the game normally tells everyone at once. There is no
-  automatic reconnect.
+  checkpoint. Since 0.15.0 that takes one loading screen (before: a short stop in a Free Ride world first); not yet
+  tested in game. Your own story saves are never loaded or changed.
+- If a player's connection drops, the others see that after about 4.5 seconds (net_timeout_s in MafiaCoop.ini).
+  Since 0.15.0 his game then reconnects by itself for up to a minute and he gets his place back (not yet tested).
+  Closing the game normally tells everyone at once.
 - Punches do not work near Salieri's bar (where Free Ride starts) or at some story checkpoints: the game itself
   turns fists off there.
 - Your own new character shows once you close the pause menu (the others see it at once).
-- The co-op panels work with keyboard, gamepad (d-pad, A, B) and mouse; they were tested with a virtual gamepad,
-  not a physical one.
-- Steam invites between two different PCs and accounts have not been fully tested; joining by IP is the tested
-  route.
+- The co-op panels work with keyboard, gamepad and mouse. They were tested with a virtual gamepad; 0.15.0 fixes
+  real controllers (any slot, plugging in and out, sticks) and shows gamepad buttons in the footers, not yet tested
+  with a real one.
+- A Steam invite between two PCs worked in the 0.13.0 test; JOIN FRIEND between two PCs has not been tested yet.
 - Only the Steam version of the game (build 16502642) is supported.
 
 

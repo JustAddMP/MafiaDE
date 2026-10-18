@@ -631,7 +631,7 @@ return table.concat(r, " ") .. " | now fire a gun next to it: it should not flee
 5. Blanket handlers run inside the game's message dispatch: keep them non-blocking. Avoid spawning or despawning
    from inside one; queue the work for the next tick.
 
-### Guest-owned NPCs (the reverse direction; after 0.14.0, not yet checked in game)
+### Guest-owned NPCs (the reverse direction; 0.15.0, not yet checked in game)
 
 Each game spawns a checkpoint's waves for its own player, so the guest's game can have enemies the host's has not
 spawned yet ("he got somewhere first"). Design (docs/protocol.md "Guest-owned NPCs"): the guest's job NPCs that stay
@@ -772,7 +772,7 @@ return "zones: " .. tostring(ok) .. " " .. tostring(z) .. " (" .. #zs .. " value
   .. " -- guest: pol:DisableOffencesGlobal(true); pol:ZoneCreate(pos, enums.PoliceZoneType.HUNT, 1)"
 ```
 
-### Implementation (next version after 0.14.0; not yet run in game)
+### Implementation (0.15.0; not yet run in game)
 
 The "start local" recommendation above is replaced: **the host's traffic is authoritative near the host.**
 `src/game/traffic_sync.lua` (game side), `src/game/traffic_sync.cpp` (session, Lua bridge) and
