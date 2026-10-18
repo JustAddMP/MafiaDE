@@ -212,8 +212,9 @@ function B.OnHear(m)
     end
   end
   if object == "-" then object = "" end
-  if st == 10 and owner == "us" then  -- our grenade bouncing: points of its flight (logged only; the others simulate it)
+  if st == 10 and owner == "us" then  -- our grenade bouncing: throw_arc.lua sends a ThrowFix for it
     trace("XB", string.format("p=%s", f3(x, y, z)))
+    if M.Arc and M.Arc.OnBounce then pcall(M.Arc.OnBounce, x, y, z) end
   end
   if st == 11 and B.stats.sounds <= 40 then
     log(string.format("explosion heard at %.1f %.1f %.1f, owner %s (%s), second %s%s", x, y, z, og, cls,

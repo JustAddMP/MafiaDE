@@ -57,7 +57,8 @@ struct Shared {
     uint32_t localId = 0;
     Book book;                    // other games' flights (render thread adds / ends, main thread simulates)
     std::vector<Ended> ended;     // flights over since the last main tick (for the Lua glue and the log)
-    std::vector<ThrowMsg> outbox; // main thread -> network
+    std::vector<Out> outbox;      // main thread -> network
+    std::vector<std::pair<uint32_t, FixMsg>> inFixes;  // network -> main thread (applied with ray casts there)
     std::vector<Dot> dots;        // Lua -> overlay
     double dotsAt = 0;
     std::string luaStatus, mainStatus;
@@ -71,7 +72,7 @@ Shared& S() {
 // render thread
 net::Session* _session = nullptr;
 boom::Inbox _inbox;
-uint64_t _throwsSent = 0, _throwsRecv = 0, _dropped = 0, _endedByBoom = 0;
+uint64_t _throwsSent = 0, _throwsRecv = 0, _fixesSent = 0, _fixesRecv = 0, _fixBytes = 0, _dropped = 0, _endedByBoom = 0;
 
 // main thread
 struct Main {
@@ -131,6 +132,22 @@ void OnThrowMsg(net::PlayerId from, net::ByteReader& r) {
                     (t.flags & kFromEntity) ? "measured on his projectile" : "his aim model's guess");
 }
 
+void OnFixMsg(net::PlayerId from, net::ByteReader& r) {
+    if (!_session || from == _session->LocalId()) return;
+    FixMsg f;
+    if (!ReadFix(r, f)) {
+        ++_dropped;
+        return;
+    }
+    ++_fixesRecv;
+    if (core::trace::IsOpen())
+        core::trace::Line("GX", "dir=in from=%u seq=%u t=%u flags=%u p=%.2f,%.2f,%.2f v=%.2f,%.2f,%.2f", from, f.seq, f.tMs,
+                          f.flags, f.pos.x, f.pos.y, f.pos.z, f.vel.x, f.vel.y, f.vel.z);
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (sh.inFixes.size() < kMaxQueue) sh.inFixes.push_back({from, f});
+}
+
 // ---- Lua functions (GameMainThread) ------------------------------------------------------------------------------------
 float Num(lua_State* L, int i, float def = 0) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : def; }
 const char* Str(lua_State* L, int i) { return lua::TypeOf(L, i) == lua::TString ? lua::ToString(L, i) : nullptr; }
@@ -164,7 +181,7 @@ void Queue(std::vector<Out>& outs) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     for (Out& o : outs)
-        if (sh.outbox.size() < kMaxQueue) sh.outbox.push_back(std::move(o.t));
+        if (sh.outbox.size() < kMaxQueue) sh.outbox.push_back(std::move(o));
     outs.clear();
 }
 
@@ -265,20 +282,49 @@ int McArcModel(lua_State* L) {
     return 0;
 }
 
-// mc_arc_sample(seq, x, y, z): the real projectile's position now (read until mc_arc_active says no)
+// mc_arc_sample(seq, x, y, z) -> next: the real projectile's position now; next = when to read it again (0 the next
+// tick, > 0 in that many s, < 0 never: let it go)
 int McArcSample(lua_State* L) {
     const uint32_t seq = SeqArg(L, 1);
     Vec3 p;
-    if (!ReadPos(L, 2, p)) return 0;
+    double next = 0.2;
+    if (ReadPos(L, 2, p)) {
+        std::vector<Out> outs;
+        std::vector<Summary> done;
+        next = G().tracker.Sample(seq, Now(), p, outs, done);
+        Queue(outs);
+        LogSummaries(done);
+    }
+    lua::PushNumber(L, static_cast<float>(next));
+    return 1;
+}
+
+// mc_arc_bounce(seq, x, y, z, entity) -> next: our EXPLOSIVE_BOUNCE sound while throw seq is followed; entity 1: x y z
+// is the projectile's own position read now (the velocity comes from the next reading), 0: the sound's position
+int McArcBounce(lua_State* L) {
+    const uint32_t seq = SeqArg(L, 1);
+    Vec3 p;
+    double next = -1;
+    if (ReadPos(L, 2, p)) {
+        std::vector<Out> outs;
+        next = G().tracker.Bounce(seq, Now(), p, Num(L, 5) != 0, outs);
+        Queue(outs);
+        if (core::trace::IsOpen())
+            core::trace::Line("GX", "dir=bounce seq=%u p=%.2f,%.2f,%.2f entity=%d", seq, p.x, p.y, p.z, Num(L, 5) != 0 ? 1 : 0);
+    }
+    lua::PushNumber(L, static_cast<float>(next));
+    return 1;
+}
+
+// mc_arc_gone(seq): the followed projectile cannot be read any more (a stop fix at its last position)
+int McArcGone(lua_State* L) {
     std::vector<Out> outs;
-    std::vector<Summary> done;
-    G().tracker.Sample(seq, Now(), p, outs, done);
+    G().tracker.Gone(SeqArg(L, 1), Now(), outs);
     Queue(outs);
-    LogSummaries(done);
     return 0;
 }
 
-// mc_arc_active(seq) -> bool: is throw seq still being measured (the glue reads its projectile while true)
+// mc_arc_active(seq) -> bool: is throw seq still measured or followed (the glue reads its projectile while true)
 int McArcActive(lua_State* L) {
     lua::PushBool(L, G().tracker.Active(SeqArg(L, 1)));
     return 1;
@@ -320,6 +366,8 @@ void Register(lua_State* L) {
     lua::RegisterGlobal(L, "mc_arc_model", &McArcModel);
     lua::RegisterGlobal(L, "mc_arc_sample", &McArcSample);
     lua::RegisterGlobal(L, "mc_arc_active", &McArcActive);
+    lua::RegisterGlobal(L, "mc_arc_bounce", &McArcBounce);
+    lua::RegisterGlobal(L, "mc_arc_gone", &McArcGone);
 }
 
 // ---- Lua module (main thread) ------------------------------------------------------------------------------------------
@@ -390,6 +438,18 @@ void MainTick(lua_State* L, float dt) {
     {
         std::lock_guard lock(sh.mu);
         active = sh.active;
+        for (const auto& [from, f] : sh.inFixes) {  // the others' corrections: re-anchor (ray casts: main thread)
+            const bool ok = active && sh.book.Fix(from, f, now, &Ray);
+            if (core::trace::IsOpen()) {
+                const Flight* fl = sh.book.Find(from, f.seq);
+                core::trace::Line("GX", "dir=applied from=%u seq=%u t=%u flags=%u ok=%d jump=%.2f", from, f.seq, f.tMs,
+                                  f.flags, ok ? 1 : 0,
+                                  fl ? std::sqrt(fl->blend.x * fl->blend.x + fl->blend.y * fl->blend.y +
+                                                 fl->blend.z * fl->blend.z)
+                                     : -1.0f);
+            }
+        }
+        sh.inFixes.clear();
         if (active) sh.book.Step(now, &Ray);  // one ray-cast segment per moving flight (+ a probe on a hit)
         sh.book.Tick(now, sh.ended);
         ended.swap(sh.ended);
@@ -497,17 +557,21 @@ uint32_t KindColor(uint8_t kind) {
 
 void ThrowSync::Install() {
     lua::AddTickCallback(&MainTick);
-    MC_LOG_INFO("arc: installed (message 0x%04x)", kMsgThrow);
+    MC_LOG_INFO("arc: installed (messages 0x%04x-0x%04x)", kMsgThrow, kMsgThrowFix);
 }
 
 void ThrowSync::Attach(net::Session& session) {
     _session = &session;
     _inbox.Clear();
     session.On(kMsgThrow, &OnThrowMsg);
+    session.On(kMsgThrowFix, &OnFixMsg);
 }
 
 void ThrowSync::Detach() {
-    if (_session) _session->Off(kMsgThrow);
+    if (_session) {
+        _session->Off(kMsgThrow);
+        _session->Off(kMsgThrowFix);
+    }
     _session = nullptr;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
@@ -515,6 +579,7 @@ void ThrowSync::Detach() {
     sh.book.Clear();
     sh.ended.clear();
     sh.outbox.clear();
+    sh.inFixes.clear();
     sh.dots.clear();
     sh.luaStatus.clear();
 }
@@ -570,7 +635,7 @@ void ThrowSync::OnOwnExplosion(uint32_t throwSeq, const boom::Vec3& pos, double 
 void ThrowSync::Tick(float) {
     if (!_session) return;
     Shared& sh = S();
-    std::vector<ThrowMsg> out;
+    std::vector<Out> out;
     {
         std::lock_guard lock(sh.mu);
         sh.active = _session->IsActive();
@@ -579,7 +644,21 @@ void ThrowSync::Tick(float) {
         out.swap(sh.outbox);
     }
     if (!_session->IsActive()) return;
-    for (const ThrowMsg& t : out) {
+    for (const Out& o : out) {
+        if (o.type == Out::Type::Fix) {  // sent the moment it is made (no batching)
+            const auto buf = PackFix(o.f);
+            const FixMsg& f = o.f;
+            if (_session->Broadcast(kMsgThrowFix, buf, o.reliable ? net::Reliability::Reliable : net::Reliability::Unreliable)) {
+                ++_fixesSent;
+                _fixBytes += buf.size();
+            }
+            if (core::trace::IsOpen())
+                core::trace::Line("GX", "dir=out seq=%u t=%u flags=%u p=%.2f,%.2f,%.2f v=%.2f,%.2f,%.2f rel=%d bytes=%zu",
+                                  f.seq, f.tMs, f.flags, f.pos.x, f.pos.y, f.pos.z, f.vel.x, f.vel.y, f.vel.z,
+                                  o.reliable ? 1 : 0, buf.size());
+            continue;
+        }
+        const ThrowMsg& t = o.t;
         const auto buf = PackThrow(t);
         if (_session->Broadcast(kMsgThrow, buf, net::Reliability::Reliable)) ++_throwsSent;
         float yaw = 0, pitch = 0;
@@ -608,8 +687,10 @@ void ThrowSync::GetStatus(std::vector<render::OverlayLine>& out) {
         flights = sh.book.Count();
     }
     char buf[512];
-    std::snprintf(buf, sizeof buf, "Throws: sent %llu, received %llu, simulated now %zu%s%s%s%s",
-                  static_cast<unsigned long long>(_throwsSent), static_cast<unsigned long long>(_throwsRecv), flights,
+    std::snprintf(buf, sizeof buf, "Throws: sent %llu (+%llu fixes, %llu B), received %llu (+%llu fixes), simulated now %zu%s%s%s%s",
+                  static_cast<unsigned long long>(_throwsSent), static_cast<unsigned long long>(_fixesSent),
+                  static_cast<unsigned long long>(_fixBytes), static_cast<unsigned long long>(_throwsRecv),
+                  static_cast<unsigned long long>(_fixesRecv), flights,
                   main.empty() ? "" : "; ", main.c_str(), lua.empty() ? "" : " | ", lua.c_str());
     out.push_back({buf, 0xFFE0B080});
 }

@@ -333,7 +333,7 @@ void TestTracker() {
     tr.Sample(7, 10.083, Ballistic(o, v, kGravity, 0.033), out, done);
     Check(out.empty() && tr.Active(7), "Tracker: two samples, still measuring");
     tr.Sample(7, 10.15, Ballistic(o, v, kGravity, 0.10), out, done);
-    Check(out.size() == 1 && !tr.Active(7), "Tracker: the third sample sends the Throw and ends the measure");
+    Check(out.size() == 1 && !tr.Measuring(7) && tr.Active(7), "Tracker: the third sample sends the Throw, then it is followed");
     if (!out.empty()) {
         const ThrowMsg& m = out[0].t;
         Check(m.seq == 7 && m.kind == Kind::Grenade && (m.flags & kFromEntity) && Near(m.origin, o, 1e-4f) &&
@@ -344,8 +344,8 @@ void TestTracker() {
               std::fabs(done[0].gravity - kGravity) < 0.1f && done[0].modelSpeed > 13.0f && done[0].samples == 3,
           "Tracker: summary (gravity measured, model vs real)", std::to_string(done[0].gravity));
     out.clear();
-    tr.Sample(7, 10.2, o, out, done);
-    Check(out.empty(), "Tracker: later samples of a sent throw are ignored");
+    tr.Sample(7, 10.35, Ballistic(o, v, kGravity, 0.30), out, done);
+    Check(out.empty(), "Tracker: following on the predicted path sends nothing");
 
     // two samples when the window ends: measured from those
     done.clear();
@@ -374,7 +374,7 @@ void TestTracker() {
     out.clear();
     tr.Begin(10, Kind::Unknown, "", 40.0, P(0, 0, 0));
     tr.Tick(40.4, out, done);
-    Check(out.empty() && !done.back().sent && std::string(done.back().why) == "no_projectile_no_model" && !tr.Any(),
+    Check(out.empty() && !done.back().sent && std::string(done.back().why) == "no_projectile_no_model" && !tr.Active(10),
           "Tracker: no projectile, no model -> nothing sent");
 
     // a jump in the first readings (the entity put into the hand first): re-anchored
@@ -393,6 +393,271 @@ void TestTracker() {
     tr.Sample(12, 60.10, P(0, 0.5f, 1.65f), out, done);
     tr.End(12, 60.12, out, done);
     Check(out.size() == 1 && !tr.Active(12), "Tracker: an explosion before the window ends sends at once");
+}
+
+// ---- ThrowFix: the correction events ---------------------------------------------------------------------------------
+void TestFixWire() {
+    FixMsg f;
+    f.seq = 0x00ABCDEF;
+    f.tMs = 1234;
+    f.flags = kFixBounce | kFixTurn;
+    f.pos = P(-943.5f, -233.25f, 5.5f);
+    f.vel = P(3.217f, -12.5f, 0.04f);
+    const auto b = PackFix(f);
+    FixMsg o;
+    mc::net::ByteReader r(b.data(), b.size());
+    Check(b.size() == 25 && ReadFix(r, o) && o.seq == f.seq && o.tMs == 1234 && o.flags == f.flags &&
+              Near(o.pos, f.pos, 1e-4f) && Near(o.vel, f.vel, 0.01f),
+          "ThrowFix round trip, 25 bytes, velocity to the cm/s", std::to_string(b.size()));
+    std::vector<uint8_t> cut(b.begin(), b.begin() + 20);
+    mc::net::ByteReader rc(cut.data(), cut.size());
+    Check(!ReadFix(rc, o), "ThrowFix: truncated refused");
+    f.vel = P(900, -900, 0);  // beyond the int16 cm/s range: clamped
+    const auto b2 = PackFix(f);
+    mc::net::ByteReader r2(b2.data(), b2.size());
+    Check(ReadFix(r2, o) && std::fabs(o.vel.x - 327.67f) < 0.01f && std::fabs(o.vel.y + 327.67f) < 0.01f,
+          "ThrowFix: velocity clamped to +-327 m/s");
+}
+
+void TestTrackerFixes() {
+    std::vector<Out> out;
+    std::vector<Summary> done;
+    auto fixes = [&](uint8_t flag) {
+        int n = 0;
+        for (const Out& o : out)
+            if (o.type == Out::Type::Fix && (o.f.flags & flag)) ++n;
+        return n;
+    };
+    // measured, then a bounce: the fix comes with the next reading (its velocity), unreliable
+    Tracker tr;
+    const Vec3 o = P(0, 0, 1.6f), v = P(6, 0, 4);
+    tr.Begin(1, Kind::Grenade, "exp_grenade", 0.0, P(0, 0, 0));
+    for (int i = 0; i < 3; ++i) tr.Sample(1, i / 30.0, Ballistic(o, v, kGravity, i / 30.0), out, done);
+    out.clear();
+    Check(tr.Bounce(1, 1.0, P(6.6f, 0, 0.05f), true, out) == 0 && out.empty(), "Tracker: a bounce -> read again next tick");
+    tr.Sample(1, 1.0 + 1 / 30.0, P(6.8f, 0, 0.12f), out, done);
+    Check(out.size() == 1 && out[0].type == Out::Type::Fix && (out[0].f.flags & kFixBounce) && !out[0].reliable &&
+              out[0].f.vel.x > 5.5f && out[0].f.vel.z > 0 && std::abs(static_cast<int>(out[0].f.tMs) - 1033) <= 1,
+          "Tracker: bounce fix with the measured velocity out of it, time since the origin",
+          out.empty() ? "" : std::to_string(out[0].f.vel.x) + " " + std::to_string(out[0].f.tMs));
+    // a sharp turn the readings show (no sound): pending, then a turn fix
+    out.clear();
+    double nx = tr.Sample(1, 1.25, P(8.2f, 0, 0.3f), out, done);
+    nx = tr.Sample(1, 1.45, P(7.0f, 2.0f, 0.3f), out, done);  // went sideways: far off the prediction
+    Check(nx == 0 && out.empty(), "Tracker: off the predicted path -> read again next tick");
+    tr.Sample(1, 1.48, P(6.95f, 2.2f, 0.28f), out, done);
+    Check(fixes(kFixTurn) == 1, "Tracker: a turn fix");
+    // settled: two still readings
+    out.clear();
+    tr.Sample(1, 2.0, P(6.5f, 3.0f, 0.05f), out, done);
+    tr.Sample(1, 2.2, P(6.5f, 3.01f, 0.05f), out, done);
+    Check(out.empty(), "Tracker: one still reading is not settled");
+    const double nxt = tr.Sample(1, 2.4, P(6.5f, 3.01f, 0.05f), out, done);
+    Check(nxt < 0 && fixes(kFixSettled) == 1 && !out.empty() && out.back().reliable && !tr.Active(1),
+          "Tracker: settled fix (reliable), then it is let go");
+    // gone: a stop fix at its last position
+    out.clear();
+    tr.Begin(2, Kind::Molotov, "exp_molotov", 10.0, P(0, 0, 0));
+    for (int i = 0; i < 3; ++i) tr.Sample(2, 10.0 + i / 30.0, Ballistic(o, v, kGravity, i / 30.0), out, done);
+    out.clear();
+    tr.Gone(2, 10.5, out);
+    Check(out.size() == 1 && (out[0].f.flags & kFixStop) && out[0].reliable && !tr.Active(2), "Tracker: gone -> stop fix (reliable)");
+    // no projectile (model): a bounce sound is a position-only fix at once
+    out.clear();
+    tr.Begin(3, Kind::Grenade, "exp_grenade", 20.0, P(0, 0, 0));
+    tr.Model(3, o, v);
+    tr.Tick(20.31, out, done);
+    out.clear();
+    tr.Bounce(3, 21.0, P(6, 0, 0), false, out);
+    Check(out.size() == 1 && (out[0].f.flags & kFixNoVel) && (out[0].f.flags & kFixBounce),
+          "Tracker: no projectile entity -> position-only bounce fix from the sound");
+    // the cap: at most 8 per throw, the last one kept for the settled fix
+    out.clear();
+    tr.Begin(4, Kind::Grenade, "exp_grenade", 30.0, P(0, 0, 0));
+    for (int i = 0; i < 3; ++i) tr.Sample(4, 30.0 + i / 30.0, Ballistic(o, v, kGravity, i / 30.0), out, done);
+    out.clear();
+    double t = 31.0;
+    for (int i = 0; i < 20; ++i) {
+        tr.Bounce(4, t, P(static_cast<float>(i), 0, 0.05f), true, out);
+        tr.Sample(4, t + 0.033, P(static_cast<float>(i) + 0.2f, 0, 0.2f), out, done);
+        t += 0.3;
+    }
+    const int bounceFixes = fixes(kFixBounce);
+    tr.Sample(4, t, P(30, 0, 0.05f), out, done);
+    tr.Sample(4, t + 0.2, P(30, 0, 0.05f), out, done);
+    tr.Sample(4, t + 0.4, P(30, 0, 0.05f), out, done);
+    Check(bounceFixes == static_cast<int>(kMaxFixes) - 1 && fixes(kFixSettled) == 1 && out.size() == kMaxFixes,
+          "Tracker: 20 bounces -> 7 fixes + the settled one (cap 8)", std::to_string(out.size()));
+}
+
+void TestBookFixes() {
+    World w;
+    RayFn ray = [&w](const Vec3& a, const Vec3& b, Vec3& hit) { return w(a, b, hit); };
+    Book b;
+    ThrowMsg t = SampleThrow();
+    t.kind = Kind::Grenade;
+    t.flags = kFromEntity;
+    t.seq = 5;
+    t.delayMs = 0;
+    t.fuseMs = 0;
+    t.origin = P(0, 0, 1.6f);
+    t.vel = P(6, 0, 4);
+    b.Add(2, t, 0.0);
+    for (double now = 0; now <= 0.5; now += 1.0 / 30) b.Step(now, ray);
+    std::vector<Visual> vis;
+    b.Visuals(0.5, vis);
+    const Vec3 before = vis[0].pos;
+    // a fix at 0.45 s: re-anchored there, advanced to now by the simulation, the marker slides
+    FixMsg f;
+    f.seq = 5;
+    f.tMs = 450;
+    f.flags = kFixTurn;
+    f.pos = P(1, 2, 3);
+    f.vel = P(0, 5, 0);
+    Check(b.Fix(2, f, 0.5, ray), "Book: a fix applied");
+    const Flight* fl = b.Find(2, 5);
+    Check(Near(fl->sim.pos, Ballistic(P(1, 2, 3), P(0, 5, 0), kGravity, 0.05), 1e-3f),
+          "Book: re-anchored at the fix and advanced from its time to now", Str(fl->sim.pos));
+    vis.clear();
+    b.Visuals(0.5, vis);
+    Check(Near(vis[0].pos, before, 1e-3f), "Book: the marker does not jump (starts where it was shown)");
+    vis.clear();
+    b.Visuals(0.55, vis);
+    const Vec3 half = vis[0].pos;
+    vis.clear();
+    b.Visuals(0.5 + kBlendTime + 0.001, vis);
+    Check(!Near(half, before, 0.1f) && !Near(half, fl->sim.pos, 0.1f) && Near(vis[0].pos, fl->sim.pos, 1e-4f),
+          "Book: slides over 0.1 s to the re-anchored position");
+    // late / copied fixes are ignored, unknown flights too
+    FixMsg old = f;
+    old.tMs = 300;
+    Check(!b.Fix(2, old, 0.6, ray) && !b.Fix(2, f, 0.6, ray), "Book: an older or repeated fix is ignored");
+    FixMsg other = f;
+    other.seq = 99;
+    Check(!b.Fix(2, other, 0.6, ray), "Book: a fix for an unknown throw is ignored");
+    // settled: stops there
+    FixMsg st;
+    st.seq = 5;
+    st.tMs = 2000;
+    st.flags = kFixSettled;
+    st.pos = P(4, 4, 0.05f);
+    Check(b.Fix(2, st, 2.1, ray) && fl->sim.settled && Near(fl->sim.pos, P(4, 4, 0.05f), 1e-5f), "Book: settled fix stops it there");
+    for (double now = 2.1; now < 3.0; now += 1.0 / 30) b.Step(now, ray);
+    vis.clear();
+    b.Visuals(3.0, vis);
+    Check(Near(vis[0].pos, P(4, 4, 0.05f), 1e-5f) && vis[0].held, "Book: and it stays there");
+    // after the explosion, fixes do nothing
+    Ended e;
+    b.EndByExplosion(2, 5, P(4, 4, 0), 3.0, e);
+    FixMsg late = st;
+    late.tMs = 2500;
+    Check(!b.Fix(2, late, 3.05, ray), "Book: no fixes after the explosion");
+}
+
+// the sender's real projectile (a Sim in the sender's world) drives the Tracker exactly as the glue would: a reading
+// when Sample says, one at each bounce; the receiver's world has an extra wall the sender's has not
+struct Hybrid {
+    float maxDriftAfterFix = 0;
+    Vec3 realEnd, shownEnd, noFixEnd;
+    size_t fixesSent = 0, bytes = 0, receiverCasts = 0;
+    int fixesApplied = 0;
+};
+
+Hybrid RunHybrid(bool loseFirstFix) {
+    Hybrid h;
+    World senderW, receiverW;
+    receiverW.wallX = 6.0f;  // only on the receiver's game (a parked car, a door closed there)
+    RayFn sRay = [&senderW](const Vec3& a, const Vec3& b, Vec3& hit) { return senderW(a, b, hit); };
+    RayFn rRay = [&receiverW](const Vec3& a, const Vec3& b, Vec3& hit) { return receiverW(a, b, hit); };
+    const Vec3 o = P(0, 0, 1.6f), v = P(7, 0, 4);
+    Sim real;
+    real.Start(o, v, kGravity, false);
+    Tracker tr;
+    Book book, noFix;
+    std::vector<Out> out;
+    std::vector<Summary> done;
+    const double latency = 0.08, tick = 1.0 / 30;
+    struct InFlight {
+        double at;
+        Out o;
+    };
+    std::vector<InFlight> wire;
+    tr.Begin(1, Kind::Grenade, "exp_grenade", 0.0, P(0, 0, 0));
+    double nextRead = 0;
+    int lastBounces = 0;
+    bool lostOne = false;
+    double firstFixAt = -1;
+    for (double now = 0; now < 8.0; now += tick) {
+        real.Step(now, sRay);
+        if (tr.Active(1)) {
+            if (real.bounces != lastBounces) {  // the EXPLOSIVE_BOUNCE sound: read it now
+                lastBounces = real.bounces;
+                const double nx = tr.Bounce(1, now, real.pos, true, out);
+                if (nx >= 0) nextRead = now + nx + 1e-6;
+            } else if (now >= nextRead) {
+                const double nx = tr.Sample(1, now, real.pos, out, done);
+                nextRead = nx < 0 ? 1e9 : now + nx;
+            }
+            tr.Tick(now, out, done);
+        }
+        for (Out& x : out) {
+            if (x.type == Out::Type::Fix) {
+                ++h.fixesSent;
+                h.bytes += PackFix(x.f).size();
+                if (loseFirstFix && !lostOne && !x.reliable) {
+                    lostOne = true;
+                    continue;
+                }
+            } else {
+                h.bytes += PackThrow(x.t).size();
+            }
+            wire.push_back({now + latency, x});
+        }
+        out.clear();
+        for (auto it = wire.begin(); it != wire.end();) {
+            if (it->at > now) {
+                ++it;
+                continue;
+            }
+            if (it->o.type == Out::Type::Throw) {
+                book.Add(1, it->o.t, now);
+                noFix.Add(1, it->o.t, now);
+            } else if (book.Fix(1, it->o.f, now, rRay)) {
+                ++h.fixesApplied;
+                if (firstFixAt < 0) firstFixAt = now;
+            }
+            it = wire.erase(it);
+        }
+        book.Step(now, rRay);
+        noFix.Step(now, rRay);
+        // once the first fix has blended in: how far the shown marker is from the real one
+        if (firstFixAt >= 0 && now >= firstFixAt + kBlendTime && book.Find(1, 1)) {
+            std::vector<Visual> vis;
+            book.Visuals(now, vis);
+            h.maxDriftAfterFix = std::max(h.maxDriftAfterFix, boom::Dist(vis[0].pos, real.pos));
+        }
+    }
+    h.realEnd = real.pos;
+    if (const Flight* f = book.Find(1, 1)) {
+        h.shownEnd = f->sim.pos;
+        h.receiverCasts = f->sim.casts;
+    }
+    if (const Flight* f = noFix.Find(1, 1)) h.noFixEnd = f->sim.pos;
+    return h;
+}
+
+void TestHybrid() {
+    const Hybrid h = RunHybrid(false);
+    Check(boom::Dist(h.noFixEnd, h.realEnd) > 2.0f, "hybrid: without fixes the receiver's extra wall sends it elsewhere",
+          Str(h.noFixEnd) + " vs " + Str(h.realEnd));
+    Check(Near(h.shownEnd, h.realEnd, 0.05f), "hybrid: with fixes it ends where the real one settled",
+          Str(h.shownEnd) + " vs " + Str(h.realEnd));
+    Check(h.maxDriftAfterFix < 2.0f, "hybrid: drift bounded by one bounce once fixes come", std::to_string(h.maxDriftAfterFix));
+    Check(h.fixesSent >= 2 && h.fixesSent <= kMaxFixes, "hybrid: a few fixes (bounces + settled)", std::to_string(h.fixesSent));
+    Check(h.bytes <= 50 + kMaxFixes * 25, "hybrid: bytes per throw (launch + fixes)", std::to_string(h.bytes) + " bytes");
+    const Hybrid lost = RunHybrid(true);
+    Check(Near(lost.shownEnd, lost.realEnd, 0.05f), "hybrid: a lost fix is tolerated (the next / settled one corrects)",
+          Str(lost.shownEnd));
 }
 
 void TestDetectorNamesThrow() {
@@ -508,6 +773,10 @@ int main() {
     TestSim();
     TestBook();
     TestTracker();
+    TestFixWire();
+    TestTrackerFixes();
+    TestBookFixes();
+    TestHybrid();
     TestDetectorNamesThrow();
     TestExchange();
     TestAimLog();

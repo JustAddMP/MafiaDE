@@ -14,8 +14,10 @@
 --     aim model's launch; then the real projectile is looked for (mc_entity_ids_of PROJ_TYPES: a grenade 25, molotov
 --     26, projectile explosive 88 or satchel charge 90 entity within SEARCH_REACH of our hand, new since the aim
 --     started or moved since) for SEARCH_TIME and, once found, its position goes to mc_arc_sample every tick only
---     while the C++ side still measures the launch (mc_arc_active: 3 positions or 0.3 s). Then it is let go: the one
---     Throw message carries the launch, the others simulate the rest.
+--     while the C++ side measures the launch (3 positions or 0.3 s: the one Throw message). Then it is followed
+--     cheaply: read again when mc_arc_sample says (every 0.2 s, or the next tick after a bounce / turn), and at each of
+--     our EXPLOSIVE_BOUNCE sounds (explosion_sync.lua B.OnHear -> A.OnBounce -> mc_arc_bounce); the C++ Tracker sends
+--     a ThrowFix at a bounce, a sharp turn, when it has settled and when it is gone (mc_arc_gone), at most 8.
 -- On the other games:
 --   - "F" commands: each flight of another game, where it is now (the C++ Book simulates it: arc, ray casts against
 --     this world, bounces, rolling, settled; at the explosion's true position once that came). Shown with a
@@ -313,23 +315,51 @@ function A.SearchTick()
   mc_arc_sample(c.seq, bestP.x, bestP.y, bestP.z)
 end
 
+-- the projectile's position now, or nil when it cannot be read (gone)
+local function readProjectile(c)
+  local e = mc_entity(c.id)
+  local q = valid(e) and try("projectile GetPos", e.GetPos, e)
+  if q then
+    local good, act = pcall(e.IsActive, e)
+    if good and act == false then q = nil end
+  end
+  return q
+end
+
 function A.TrackTick()
   local c = A.cur
   if not c then return end
-  if not mc_arc_active(c.seq) then  -- the launch is measured (or the model sent): the projectile is let go
+  if not mc_arc_active(c.seq) then  -- settled, gone, exploded, timed out: let go
     A.cur = nil
     return
   end
-  if not c.id or c.sampledAt == M.now then return end
-  local e = mc_entity(c.id)
-  local q = valid(e) and try("projectile GetPos", e.GetPos, e)
-  if not q then  -- gone already (an impact): the C++ side sends from what it has when the window is over
+  if not c.id or c.sampledAt == M.now or M.now < (c.nextRead or 0) then return end
+  local q = readProjectile(c)
+  if not q then
     if A.stats.found <= 30 then log(string.format("throw #%s: projectile gone after %.2f s", c.seq, M.now - c.t0)) end
+    mc_arc_gone(c.seq)
     A.cur = nil
     return
   end
   c.sampledAt = M.now
-  mc_arc_sample(c.seq, q.x, q.y, q.z)
+  local nextIn = mc_arc_sample(c.seq, q.x, q.y, q.z) or 0.2
+  if nextIn < 0 then A.cur = nil else c.nextRead = M.now + nextIn end
+end
+
+-- an EXPLOSIVE_BOUNCE sound of ours (explosion_sync.lua B.OnHear): read the projectile now (its velocity comes from
+-- the next tick's reading); without one the sound's position is the fix
+function A.OnBounce(x, y, z)
+  local c = A.cur
+  if not (c and mc_arc_active(c.seq)) then return end
+  local q = c.id and readProjectile(c)
+  local nextIn
+  if q then
+    nextIn = mc_arc_bounce(c.seq, q.x, q.y, q.z, 1)
+    c.sampledAt = M.now
+  else
+    nextIn = mc_arc_bounce(c.seq, x, y, z, 0)
+  end
+  if nextIn and nextIn >= 0 then c.nextRead = M.now + nextIn end
 end
 
 -- ---------------------------------------------------------------------------------------------------------------

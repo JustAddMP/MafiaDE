@@ -887,8 +887,12 @@ src/game/throw_model.h and docs/protocol.md "Explosions" (Throw 0x0242). The thr
 projectile's launch in its first 0.3 s (or sends the aim model's guess) and sends it once; every other game
 simulates the flight itself against its own world with `lua::RayCast` (the physics ray cast behind `mc_raycast`,
 src/game/lua.cpp: one segment per script tick per flight, a probe on a hit; bounce 35 %, friction 25 %, rolling,
-settling) until the Explosion naming the throw arrives. The simulation's numbers are ours, not the game's grenade
-physics (UNVERIFIED: compare the GE `off` between the simulated and the true explosion position).
+settling) until the Explosion naming the throw arrives. The thrower keeps following its projectile cheaply (a
+position read every 0.2 s and at each of our EXPLOSIVE_BOUNCE sounds, which explosion_sync.lua forwards) and sends a
+25-byte ThrowFix (0x0243) at each bounce, sharp turn, when it settles and when it is gone (at most 8): the receivers
+re-anchor their simulation there and slide the marker over 0.1 s. The simulation's numbers are ours, not the game's
+grenade physics (UNVERIFIED: compare the GE `off` between the simulated and the true explosion position, and the GX
+`jump` of each applied fix).
 
 | what | notes |
 |---|---|
