@@ -186,7 +186,10 @@ public:
         MissionSync::Detach();
         NpcSync::Detach();
     }
-    void OnPlayerLeft(net::PlayerId id) override { PlayerSync::OnPlayerLeft(id); }
+    void OnPlayerLeft(net::PlayerId id) override {
+        PlayerSync::OnPlayerLeft(id);
+        NpcSync::OnPlayerLeft(id);
+    }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
         MissionSync::Tick(dt);
@@ -207,6 +210,10 @@ public:
         case 0x0211: return "NpcDeath";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
+        case 0x0420: return "GuestNpcStates";
+        case 0x0421: return "GuestNpcEnd";
+        case 0x0422: return "HostNpcHit";
+        case 0x0423: return "NpcClaim";
         default: return nullptr;
         }
     }

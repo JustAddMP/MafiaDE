@@ -2,7 +2,7 @@
 rem MafiaCoop build: JustAddMP core (external\core, a git submodule) + the Mafia DE game layer.
 rem Usage: build.cmd   (runnable from any directory; builds only, runs nothing)
 rem Output in out\: MafiaCoop.exe, mafiacoop.dll, mafiacoop_proxy.dll, proxy_test.exe (core's test against our
-rem descriptor), PDBs next to them; core objects and libraries in out\obj\core, ours in out\obj\.
+rem descriptor), npc_owner_test.exe (our unit tests), PDBs next to them; core objects and libraries in out\obj\core, ours in out\obj\.
 setlocal EnableExtensions EnableDelayedExpansion
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
@@ -67,6 +67,14 @@ if errorlevel 1 ( echo [build] ERROR: compiling proxy_test failed & goto :fail )
 link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\proxy_test.exe" /PDB:"%OUT%\proxy_test.pdb" ^
   "%OBJ%\tests\proxy_test.obj" %INFO% "%CB%\mc_core.lib" %MC_SYSLIBS%
 if errorlevel 1 ( echo [build] ERROR: linking proxy_test.exe failed & goto :fail )
+
+rem ---- our own unit tests (no game): tests\*.cpp, each against the game layer objects it tests ----
+echo [build] npc_owner_test.exe
+cl %CXXFLAGS% /Fd"%OBJ%\tests\vc.pdb" /Fo"%OBJ%\tests\npc_owner_test.obj" "%ROOT%\tests\npc_owner_test.cpp"
+if errorlevel 1 ( echo [build] ERROR: compiling npc_owner_test failed & goto :fail )
+link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\npc_owner_test.exe" /PDB:"%OUT%\npc_owner_test.pdb" ^
+  "%OBJ%\tests\npc_owner_test.obj" "%OBJ%\game\npc_owner.obj" "%CB%\mc_core.lib" %MC_SYSLIBS%
+if errorlevel 1 ( echo [build] ERROR: linking npc_owner_test.exe failed & goto :fail )
 
 echo [build] OK -^> %OUT%
 endlocal

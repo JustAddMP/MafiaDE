@@ -21,6 +21,8 @@ for %%T in (net_loopback net_password net_kick net_lobby net_interest net_motion
 )
 "%ROOT%\out\proxy_test.exe" >nul 2>&1 || ( echo proxy_test failed. & exit /b 1 )
 echo proxy_test: ok
+"%ROOT%\out\npc_owner_test.exe" >nul 2>&1 || ( echo npc_owner_test failed. & exit /b 1 )
+echo npc_owner_test: ok
 set "REL=%ROOT%\out\release"
 set "STAGE=%REL%\MafiaCoop-%VER%"
 set "SYMS=%REL%\MafiaCoop-%VER%-symbols"
