@@ -113,7 +113,8 @@ void OnExplosion(net::PlayerId from, net::ByteReader& r) {
         MC_LOG_INFO("boom: player %u's %s at %.1f %.1f %.1f (%s%s%s, seq %u)", from, KindName(e.kind), e.pos.x, e.pos.y,
                     e.pos.z, e.weapon.empty() ? "weapon unknown" : e.weapon.c_str(), (e.flags & kFire) ? ", fire" : "",
                     (e.flags & kNpcOwner) ? ", thrown by one of his NPCs" : "", e.seq);
-    ThrowSync::OnExplosion(from, e.throwSeq, e.pos);  // the flight of the throw it ends (if shown here) is over
+    if (!(e.flags & kNpcOwner))  // the flight of the player's throw it ends (if shown here) is over
+        ThrowSync::OnExplosion(from, e.throwSeq, e.pos);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (sh.inExplosions.size() < kMaxQueue) sh.inExplosions.push_back({from, std::move(e)});
