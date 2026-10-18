@@ -196,7 +196,7 @@ scripts and still work.
   the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only (JOIN FRIEND's
   BACK returns to it).
   While hosting, Up from the first entry selects a guest in the player list; Enter offers **KICK** / **KICK AND BAN**
-  with a confirmation ("Kick <name>? Enter = yes, Esc = no"). The guest sees "You were kicked by the host" and goes
+  with a confirmation ("Kick <name>?", A / Enter = yes, B / Esc = no). The guest sees "You were kicked by the host" and goes
   back to idle; a banned guest's rejoin (same IP, or same SteamID over Steam) is refused with "You are banned from
   this session" until the host stops hosting (core Session::Kick / KickAndBan).
 - **Steam invites:** accepting an invite (or *Join Game* in the friends list) at the main menu or in the world leaves
@@ -421,7 +421,12 @@ How a physical gamepad reaches the panels (core `dll/ui_input.cpp`, `dll/pad_nav
   `disconnected` in the log.
 - Navigation: d-pad or left stick (stick: dominant axis only, pressed beyond 16000, released below 11000, so a stick
   resting near the edge does not chatter), first repeat after 0.4 s then every 0.15 s, a long frame gives one step;
-  Left/Right change `< VALUE >` rows; A selects (in a text box: submits); B, START or BACK go back.
+  Left/Right change `< VALUE >` rows; A selects (in a text box: submits); B, START or BACK go back; X / Y do what
+  the footer shows (lobby: X START / READY / JOIN GAME, Y INVITE; JOIN FRIEND: Y REFRESH; text boxes: X delete,
+  Y paste; pause CO-OP while hosting: Y INVITE), nothing on panels whose footer has no X / Y.
+- Footer prompts: pad glyphs after pad input, key names after a key / click / mouse move, like the game's own footer
+  (docs/game-api.md 9 "Button prompts"; core `dll/ui_prompts.h`, automated part: core `tests/ui_prompts.cpp`).
+  Each switch is logged (`ui_input: prompts now for gamepad ...`); `dump` prints the footer.
 - Only presses act: the A that picked the menu entry, or a stick still pushed when a panel opens, does nothing until
   released (the old code ignored a held A but not a held stick, and took a stick held through the open as a step).
 - The game sees an empty pad on every user while a panel is open and until A/B/START/BACK are released on every pad

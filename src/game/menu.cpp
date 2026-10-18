@@ -591,7 +591,11 @@ std::string Poll(int location) {
 
 std::string Select(int id) {
     switch (id) {
-    case kItemCoop: return "open";
+    case kItemCoop:
+        // the page gets the game's own sub-page footer (setupInfoBarBack: A / Enter Select, B / Esc Back, the game
+        // switches the glyphs between pad and keyboard), docs/game-api.md 9 "Button prompts"
+        MC_LOG_INFO("menu: opening the CO-OP page (game footer: A Select, B Back)");
+        return "open";
     case kItemHost: {
         {
             std::lock_guard lock(_mutex);

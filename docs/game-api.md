@@ -244,6 +244,40 @@ the expected classes/methods the patch is skipped (logged) and the menu loads un
   open over the game (gameoverlayrenderer64.dll is loaded in game processes started by MafiaCoop.exe;
   with two instances on one account the dialog showed in both windows).
 
+**Button prompts (footer) and the gamepad** (static, from the ActionScript of `main_menu_main.gfx` and the shared
+`scripts.infobar` classes; how they look with a pad NOT checked in game):
+- The menus' footer is `scripts.infobar::Infobar` (CLIK component, laid out bottom right). A page builds a
+  `Vector.<infobar_item>` of `infobar_item_new(game, padButton, pcType, label, command, keyStringId)` and hands it to
+  `menu_parent.setupInfoBar(vec)`. Pad buttons are strings (`Infobar.CTRL_A` = "a", `CTRL_B` "b", `CTRL_X`, `CTRL_Y`,
+  `CTRL_LB`/`RB`, `CTRL_LT`/`RT`, `CTRL_LS`/`RS`, `_CLICK`, `CTRL_BACK`), `pcType` `CTRL_KEY` = "key" with a key
+  name string id (`ENTER_STRING_ID` `$59280027`, `ESC_STRING_ID` `$59280000`, `X_STRING_ID` `$59280044`,
+  `Y_STRING_ID` `$59280020`, `H_STRING_ID`, `UP`/`DOWN`/`LEFT`/`RIGHT_STRING_ID`), `command(page, this.Select)`.
+  `Infobar.onKeyEvent` hands every input event to its items, so the footer's buttons are what run the commands.
+  Glyphs come from `prompt_icons.swf` (`UEIcon` frames such as `enter-gamepad_A`, `escape-gamepad_B`, `gamepad_X`,
+  `gamepad_L1`, ...); the device switch is `UEIcon.deviceType`: on PC it follows the engine's data binding
+  `CONTROLLER_DEVICE` / `ControllerDeviceType` (`controlSettings.PlayerControllerDeviceType`: `KEYBOARD_MOUSE` or
+  `JOYSTICK_CLASS`), i.e. the C++ input layer decides and every prompt redraws.
+- `main_menu_page_main.setupInfoBar()` = A / Enter `$menu_select` -> `Select()`; `setupInfoBarBack()` = that plus
+  B / Esc `$menu_back` -> `Back()`. `UpdateMenu()` calls `setupInfoBar()` only for ROOT_MENU; every sub page gets
+  `setupInfoBarBack()` from `ActivateButton` before it switches `menuLocation`, and `Back()` restores `setupInfoBar()`
+  when it returns to ROOT. Our CO-OP page does exactly that (the `open` answer calls `setupInfoBarBack`, BACK and the
+  pad's B run the game's `Back()`), so on the native page the footer, its glyph switching and A / B are the game's
+  own; nothing else is needed there (a "refresh" rebuild goes through `UpdateMenu`, whose default case leaves the
+  footer alone). The pause menu's GAME page keeps its own footer; our fifth entry only adds a `Select()` case.
+- **Our panels** (core `dll/coop_ui.cpp`: LOBBY, CO-OP SETTINGS, JOIN FRIEND, JOIN BY IP / PASSWORD / NAME boxes,
+  PLAYER / KICK dialogs, the pause CO-OP panel) are drawn by our overlay, so they cannot use the Infobar; they copy
+  its behaviour (core `dll/ui_prompts.h`): the footer shows pad glyphs after pad input and key names after a key, a
+  click or a real mouse move (core `ui_input` follows every XInput read and the window messages all the time, so a
+  panel opens with the device the game used last; log `ui_input: prompts now for gamepad (pad buttons 0x1000)` /
+  `keyboard/mouse (key 0xD)`). Glyphs are drawn Xbox style (coloured A/B/X/Y discs, LB/RB bars, a d-pad cross for
+  Left/Right), not the game's `prompt_icons.swf` art (UNVERIFIED how close they look). One prompt list per panel
+  drives both the footer and the pad, so a button does what its prompt says and nothing without one:
+  A / Enter Select (Join, Connect, Save, Set, Yes), B / Esc Back (Cancel, No), d-pad / Left-Right Change on
+  `< VALUE >` rows; lobby: X Start (host) / Ready or Join game (guest), Y Invite (host); pause CO-OP panel while
+  hosting: Y Invite; JOIN FRIEND: Y / F5 Refresh; text boxes: X / Backspace Delete, Y / Ctrl+V Paste. X / Y are pad
+  shortcuts for list entries and are not shown with the keyboard. The panel-open log line and the test `dump` print
+  the footer (`footer gamepad:  [A] Select  [X] Start  [Y] Invite  [B] Back`).
+
 ## 10. Combat on a human: aim, shoot, crouch, reload — verified 2026-10-14
 
 What the puppets use (src/game/player_sync.lua `M.Combat`). The puppet is a civilian-archetype AI human with a pistol.
