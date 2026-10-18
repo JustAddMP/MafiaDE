@@ -129,17 +129,31 @@ bool InstallSwap() {
     return true;
 }
 
-// ---- mission failures: the director's GameOver (docs/re-notes.md 7, "Every mission failure") -------------------------
-// The Lua binding game.director:GameOver(reasonId) (exe+0x2245970) reads its string argument, turns it into a number
-// (strtoul, base 10) and calls virtual function 1 of the director interface at [G] + 8, G = the global at the
-// RIP-relative operand inside the binding (exe+0x635A740 in this build):
+// ---- mission failures (docs/re-notes.md 7, "Failed missions: where the game answers them") ---------------------------
+// In a replay-style load (every co-op chapter load) the game answers a failed mission, and a death it handles itself,
+// with the save system's FreeRoamRetry (exe+0x21E8B20): bool FreeRoamRetry() looks up the free roam save from before
+// the quest ("freeroam_before_quest_activated") and asks the save system to load it (exe+0x2209E60), true when asked.
+// Its callers: the game-over controller C_GameOverController2 (exe+0x2386920: after a death or a failure it tries
+// Retry, i.e. the last checkpoint, or Restart Chapter, and when that is not possible FreeRoamRetry, then the main
+// menu), the Lua binding game.savesystem:FreeRoamRetry (the flows' free_roam_retry node) and a menu handler
+// (exe+0x3018B20). That load (the "Free Ride stop") and our reload of the checkpoint after it were the two loads of
+// a failed mission. The hook lets FailFlow skip it (answering "asked") and go straight to the main menu and the
+// checkpoint instead: one load.
+constexpr const char* kPatFreeRoamRetry =
+    "40 53 48 83 EC 20 48 8B 0D ?? ?? ?? ?? 48 8D 54 24 30 48 C7 44 24 30 00 00 00 00 E8 ?? ?? ?? ?? 48 85 C0 74 14 41 "
+    "B0 01 48 8D 54 24 30 48 8B C8 E8 ?? ?? ?? ?? B3 01 EB 02 32 DB";
+using FreeRoamRetryFn = bool (*)();
+FreeRoamRetryFn _origFreeRoamRetry = nullptr;
+std::atomic<bool> _freeRoamFallback{false};  // GameMainThread (MainTick): run the skipped FreeRoamRetry after all
+
+// The director's GameOver(reason id): the Lua binding game.director:GameOver(id) (exe+0x2245970) turns its string
+// into a number (strtoul, base 10) and calls virtual function 1 of the director interface at [G] + 8, G = the global
+// at the RIP-relative operand inside the binding (exe+0x635A740 in this build):
 //     mov rcx, [G] ; lea rdi, [rcx+8] ; mov rbx, [rdi] ; ... ; mov edx, eax ; mov rcx, rdi ; call [rbx+8]
-// Every failure the mission scripts raise ends there: RangeCheckStart's distance check (containers.lua, "you
-// abandoned the objective"), timer.lua SimpleFail ("you have failed to make it in time", id 0059310003) and the flow
-// node gameOver (game_director/other.lua), which the chapters' fail branches call (mission car lost, target escaped,
-// ally died: [likely], only the abandoned objective and the lost car were seen in game). The function itself is
-// found at run time (once the director exists) the same way the binding finds it, and hooked: so a C++ caller of it
-// is covered too. FailFlow decides whether the game's own answer runs.
+// Callers: the flows' gameOver node (game_director/other.lua), timer.lua SimpleFail ("0059310003"), containers.lua's
+// distance check. Called by hand in a co-op chapter it showed nothing (docs/game-api.md 14), so it is not what loads
+// anything; it is hooked (found at run time the way the binding finds it) to log the reason of a failure, and so
+// that a STORY host's failure (his game shows its fail screen, FreeRoamRetry is not called) reaches the guests.
 constexpr const char* kPatGameOverBinding =
     "40 53 48 83 EC 20 BA 01 00 00 00 48 8B D9 44 8B C2 E8 ?? ?? ?? ?? BA 02 00 00 00 48 8B CB E8 ?? ?? ?? ?? BA 02 00 "
     "00 00 48 8B CB 85 C0 75 2E 44 8D 42 01 E8 ?? ?? ?? ?? BA 04 00 00 00 48 8B CB E8 ?? ?? ?? ?? 4C 8B C0 BA 02 00 00 "
@@ -153,8 +167,10 @@ uintptr_t _directorGlobal = 0;               // &G
 std::atomic<void*> _directorIface{nullptr};  // [G] + 8 when hooked (the only `this` we act on)
 bool _gameOverHooked = false, _gameOverGaveUp = false;
 double _gameOverTryAt = 0;
+std::atomic<uint32_t> _lastReason{0};        // the last GameOver reason (logged with the next failure)
+std::atomic<ULONGLONG> _lastReasonAt{0};
 
-// FailFlow and what the hook needs to know (updated every render tick; the hook runs on GameMainThread)
+// FailFlow and what the hooks need to know (updated every render tick; the hooks run on GameMainThread)
 std::mutex _failMu;
 FailFlow _fail;
 FailRole _failRole = FailRole::None;
@@ -186,26 +202,63 @@ const char* RoleName(FailRole r) {
     }
 }
 
+bool FreeRoamRetryDetour() {
+    FailFlow::LocalFailResult r;
+    FailRole role;
+    std::vector<std::string> lines;
+    uint32_t reason = 0;
+    if (GetTickCount64() - _lastReasonAt.load() < 60000) reason = _lastReason.load();
+    {
+        std::lock_guard lock(_failMu);
+        role = _failRole;
+        // only where our loads run the chapter (replay flags): a chapter host and every guest
+        if (role == FailRole::HostChapter || role == FailRole::Guest)
+            r = _fail.OnLocalFail(role, _failCanReload, reason, NowS());
+        lines = _fail.TakeLog();
+    }
+    MC_LOG_INFO("mission: the game answers a failed mission (or a death) with the free roam state before the quest "
+                "(FreeRoamRetry, last GameOver reason %u) as %s: %s%s, from%s",
+                reason, RoleName(role), r.skipGame ? "skipped, we go straight back to the checkpoint" : "the game's way",
+                r.fresh || !r.skipGame ? "" : " (a repeat)", ExeCallers().c_str());
+    for (const auto& l : lines) MC_LOG_INFO("mission: %s", l.c_str());
+    if (core::trace::IsOpen())
+        core::trace::Line("FAIL", "ev=freeroamretry reason=%u role=%u skip=%d fresh=%d", reason,
+                          static_cast<unsigned>(role), r.skipGame ? 1 : 0, r.fresh ? 1 : 0);
+    if (r.skipGame) return true;  // "the load was asked for": the game-over controller is done with it
+    return _origFreeRoamRetry();
+}
+
 uint64_t GameOverDetour(void* self, uint32_t reason, void* a3, void* a4) {
     if (self != _directorIface.load()) return _origGameOver(self, reason, a3, a4);  // another class sharing the code
+    _lastReason = reason;
+    _lastReasonAt = GetTickCount64();
     FailFlow::LocalFailResult r;
     FailRole role;
     std::vector<std::string> lines;
     {
         std::lock_guard lock(_failMu);
         role = _failRole;
-        r = _fail.OnLocalFail(role, _failCanReload, reason, NowS());
+        if (role == FailRole::HostStory) r = _fail.OnLocalFail(role, _failCanReload, reason, NowS());
         lines = _fail.TakeLog();
     }
-    MC_LOG_INFO("mission: GameOver(%u) (the mission failed) as %s: %s%s, from%s", reason, RoleName(role),
-                r.skipGame ? "the game's own fail flow is skipped" : "the game's own fail flow runs",
-                r.fresh ? "" : " (a repeat)", ExeCallers().c_str());
+    MC_LOG_INFO("mission: GameOver(%u) as %s, from%s", reason, RoleName(role), ExeCallers().c_str());
     for (const auto& l : lines) MC_LOG_INFO("mission: %s", l.c_str());
     if (core::trace::IsOpen())
-        core::trace::Line("FAIL", "ev=gameover reason=%u role=%u skip=%d fresh=%d", reason, static_cast<unsigned>(role),
-                          r.skipGame ? 1 : 0, r.fresh ? 1 : 0);
-    if (r.skipGame) return 0;
-    return _origGameOver(self, reason, a3, a4);
+        core::trace::Line("FAIL", "ev=gameover reason=%u role=%u fresh=%d", reason, static_cast<unsigned>(role),
+                          r.fresh ? 1 : 0);
+    return _origGameOver(self, reason, a3, a4);  // never skipped: it loads nothing
+}
+
+void InstallFreeRoamRetry() {
+    const uintptr_t a = core::mem::FindPattern(kPatFreeRoamRetry);
+    if (!a || !core::hook::Install("SaveSys_FreeRoamRetry", reinterpret_cast<void*>(a), &FreeRoamRetryDetour,
+                                   &_origFreeRoamRetry)) {
+        MC_LOG_WARN("mission: FreeRoamRetry not hooked: a failed mission takes the game's way back (two loads)");
+        core::compat::Failed("one-load failed missions", false);
+        return;
+    }
+    MC_LOG_INFO("mission: FreeRoamRetry hooked at exe+%llx",
+                static_cast<unsigned long long>(a - core::mem::MainModule().base));
 }
 
 // Install(): where the binding reads the director from.
@@ -214,8 +267,8 @@ void FindGameOver() {
     const uintptr_t binding = core::mem::FindPattern(kPatGameOverBinding);
     if (!binding) {
         _gameOverGaveUp = true;
-        MC_LOG_WARN("mission: GameOver binding not found: failed missions take the game's way back (two loads)");
-        core::compat::Failed("one-load failed missions", false);
+        MC_LOG_WARN("mission: GameOver binding not found: failure reasons are not logged, a story host's failure "
+                    "is not told to the guests");
         return;
     }
     _directorGlobal = core::mem::ResolveRip(binding + kGameOverGlobalAt, 3, 7);
@@ -231,7 +284,7 @@ void TryHookGameOver(double now) {
     const auto& exe = core::mem::MainModule();
     if (!core::mem::IsReadable(reinterpret_cast<void*>(_directorGlobal), 8)) {
         _gameOverGaveUp = true;
-        MC_LOG_WARN("mission: the director global is not readable: failed missions take the game's way back");
+        MC_LOG_WARN("mission: the director global is not readable: GameOver not hooked");
         return;
     }
     const uintptr_t director = *reinterpret_cast<const uintptr_t*>(_directorGlobal);
@@ -245,16 +298,14 @@ void TryHookGameOver(double now) {
     if (!fn || !exe.text.Contains(fn)) {
         _gameOverGaveUp = true;
         MC_LOG_WARN("mission: the director's GameOver is not where the binding calls it (vtable %p, function %p): "
-                    "failed missions take the game's way back",
+                    "not hooked",
                     static_cast<const void*>(vtable), reinterpret_cast<void*>(fn));
-        core::compat::Failed("one-load failed missions", false);
         return;
     }
     _directorIface = reinterpret_cast<void*>(iface);
     if (!core::hook::Install("Director_GameOver", reinterpret_cast<void*>(fn), &GameOverDetour, &_origGameOver)) {
         _directorIface = nullptr;
         _gameOverGaveUp = true;
-        core::compat::Failed("one-load failed missions", false);
         return;
     }
     _gameOverHooked = true;
@@ -403,6 +454,7 @@ struct Shared {
     Point target;                 // the chapter and checkpoint our last follow load should start (Lua "T")
     Spot targetSpot;              // where that load's save puts the player (Lua "T" moves him there first)
     bool quitPending = false;     // Lua: quit to the main menu
+    bool cancelQuit = false;      // Lua: forget a quit asked for (the game loads another world itself after all)
     std::string notice;
 };
 
@@ -442,6 +494,7 @@ std::vector<uint8_t> _selfBytes;        // host: its save
 double _selfMenuSince = -1;
 uint32_t _abortsSeen = 0;               // save_guard::MissionAborts() handled (host and guest)
 bool _failHolds = false;                // FailFlow::HoldsFollow() this tick (guest: no follow loads meanwhile)
+uint32_t _failAbortsSeen = 0;           // save_guard::MissionAborts() seen by FailTick
 std::string _failNotice;                // FailFlow::Notice() this tick
 bool _selfQuitWanted = false;           // host: leave the world the game loaded after a failed mission
 bool _abortReloadWanted = false;        // guest: the same, then load the host's point
@@ -1126,12 +1179,17 @@ void FailTick(bool isHost) {
         std::lock_guard lock(_sessionMu);
         canReload = !_sessionPoint.quest.empty() && !_sessionBytes.empty();
     }
+    const uint32_t aborts = save_guard::MissionAborts();
+    const bool gameLoads = aborts != _failAbortsSeen;
+    _failAbortsSeen = aborts;
+    bool gaveUp = false;
     std::vector<FailFlow::Action> actions;
     std::vector<std::string> lines;
     {
         std::lock_guard lock(_failMu);
         _failRole = role;
         _failCanReload = canReload;
+        if (gameLoads) gaveUp = _fail.OnGameLoads(NowS());
         _fail.Update(v, NowS());
         actions = _fail.TakeActions();
         lines = _fail.TakeLog();
@@ -1139,6 +1197,17 @@ void FailTick(bool isHost) {
         _failNotice = _fail.Notice();
     }
     LogFail(lines);
+    if (gameLoads)
+        MC_LOG_INFO("mission: the game loads the free roam state before the quest%s", gaveUp
+                    ? " although we skipped its answer: our quit is cancelled, its way back (Free Ride stop, reload) runs"
+                    : "");
+    if (gaveUp) {
+        _selfPoint = {};
+        _selfBytes.clear();
+        std::lock_guard lock(sh.mu);
+        sh.quitPending = false;
+        sh.cancelQuit = true;
+    }
     for (const auto& a : actions) {
         if (core::trace::IsOpen())
             core::trace::Line("FAIL", "ev=action kind=%u seq=%u reason=%u", static_cast<unsigned>(a.kind), a.seq,
@@ -1206,6 +1275,18 @@ void FailTick(bool isHost) {
             MC_LOG_INFO("mission: after the failed mission we are still in that world: reloading the host's point");
             _forceReload = true;
             break;
+        case FailFlow::ActionKind::GameFallback: {
+            MC_LOG_WARN("mission: still in the failed world %.0f s after skipping the game's answer: running it after "
+                        "all (FreeRoamRetry; the Free Ride stop and a reload follow)",
+                        FailFlow::kStuckTimeout);
+            _selfPoint = {};
+            _selfBytes.clear();
+            _freeRoamFallback = true;
+            std::lock_guard lock(sh.mu);
+            sh.quitPending = false;
+            sh.cancelQuit = true;
+            break;
+        }
         }
     }
 }
@@ -1353,10 +1434,18 @@ void MainTick(lua_State* L, float dt) {
             cmds += "B\n";
             sh.blackout = false;
         }
+        if (sh.cancelQuit) {
+            cmds += "QC\n";
+            sh.cancelQuit = false;
+        }
         if (sh.quitPending) {
             cmds += "Q\n";
             sh.quitPending = false;
         }
+    }
+    if (_freeRoamFallback.exchange(false) && _origFreeRoamRetry) {
+        const bool ok = _origFreeRoamRetry();
+        MC_LOG_INFO("mission: the game's FreeRoamRetry run after all: %s", ok ? "load asked for" : "nothing to load");
     }
     if (_moduleFailed) return;
     if (!_moduleLoaded) {
@@ -1425,6 +1514,7 @@ void MainTick(lua_State* L, float dt) {
 // ---- public ------------------------------------------------------------------------------------------------------------
 void MissionSync::Install() {
     InstallSwap();
+    InstallFreeRoamRetry();
     FindGameOver();
     lua::AddTickCallback(&MainTick);
     MC_LOG_INFO("mission: installed (messages 0x%04x-0x%04x, 0x%04x-0x%04x)", kMsgMissionState, kMsgCutscene,
@@ -1459,6 +1549,8 @@ void MissionSync::Attach(net::Session& session) {
     _hostSaveId.clear();
     _scanAccum = kScanInterval;
     _abortsSeen = save_guard::MissionAborts();  // missions failed before this session are not ours to answer
+    _failAbortsSeen = _abortsSeen;
+    _freeRoamFallback = false;
     _abortReloadWanted = _selfQuitWanted = false;
     _hostFail = _guestFail = {};
     {
@@ -1689,8 +1781,8 @@ void MissionSync::GetStatus(std::vector<render::OverlayLine>& out) {
     out.push_back({buf, 0xFFB0C4DE});
     {
         std::lock_guard flock(_failMu);
-        std::snprintf(buf, sizeof buf, "Failed missions: %s, %u handled, GameOver hook %s",
-                      FailFlow::StateName(_fail.GetState()), _fail.Failures(),
+        std::snprintf(buf, sizeof buf, "Failed missions: %s, %u handled, FreeRoamRetry hook %s, GameOver hook %s",
+                      FailFlow::StateName(_fail.GetState()), _fail.Failures(), _origFreeRoamRetry ? "on" : "off",
                       _gameOverHooked ? "on" : (_gameOverGaveUp ? "not found" : "waiting"));
     }
     out.push_back({buf, 0xFFB0C4DE});

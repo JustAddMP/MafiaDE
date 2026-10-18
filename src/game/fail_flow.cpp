@@ -34,6 +34,7 @@ void FailFlow::Enter(State s, double now, const char* why) {
     Log(buf);
     state_ = s;
     since_ = now;
+    if (s == State::Idle) skipped_ = false;
 }
 
 FailFlow::LocalFailResult FailFlow::OnLocalFail(FailRole role, bool canReload, uint32_t reason, double now) {
@@ -44,17 +45,19 @@ FailFlow::LocalFailResult FailFlow::OnLocalFail(FailRole role, bool canReload, u
     const bool fresh = state_ == State::Idle || (state_ == State::GuestLoading && lastInWorld_ && sawOut_);
     if (!fresh) {
         r.skipGame = state_ != State::HostGameFail;  // the story host's game handles its own duplicates
-        std::snprintf(buf, sizeof buf, "fail flow: GameOver %u again while %s: %s", reason, StateName(state_),
-                      r.skipGame ? "skipped" : "left to the game");
+        std::snprintf(buf, sizeof buf, "fail flow: failure (reason %u) again while %s: %s", reason, StateName(state_),
+                      r.skipGame ? "the game's answer skipped" : "left to the game");
         Log(buf);
         return r;
     }
     reason_ = reason;
     sawOut_ = false;
     hostSawOut_ = false;
+    skipped_ = false;
+    failAt_ = now;
     switch (role) {
     case FailRole::None:
-        std::snprintf(buf, sizeof buf, "fail flow: GameOver %u outside a co-op story: the game's own flow", reason);
+        std::snprintf(buf, sizeof buf, "fail flow: failure (reason %u) outside a co-op story: the game's own flow", reason);
         Log(buf);
         return r;
     case FailRole::HostChapter:
@@ -62,7 +65,7 @@ FailFlow::LocalFailResult FailFlow::OnLocalFail(FailRole role, bool canReload, u
         r.fresh = true;
         Push(ActionKind::SendHostFailed, 0, reason);
         if (canReload) {
-            r.skipGame = true;
+            r.skipGame = skipped_ = true;
             Push(ActionKind::SelfReload, 0, reason);
             Enter(State::HostReloading, now, "our mission failed: straight back to the session's checkpoint");
         } else {
@@ -78,7 +81,7 @@ FailFlow::LocalFailResult FailFlow::OnLocalFail(FailRole role, bool canReload, u
     case FailRole::Guest:
         ++failures_;
         r.fresh = true;
-        r.skipGame = true;
+        r.skipGame = skipped_ = true;
         ++seq_;
         Push(ActionKind::SendReport, seq_, reason);
         if (lastInWorld_) Push(ActionKind::Quit, seq_, reason);
@@ -100,6 +103,8 @@ void FailFlow::OnVerdict(FailVerdict v, uint32_t seq, uint32_t reason, double no
         if (state_ == State::GuestWaitHost) return;
         if (state_ == State::Idle || state_ == State::GuestLoading) {
             reason_ = reason;
+            skipped_ = false;  // nothing of the game's was skipped for the host's failure
+            failAt_ = now;
             sawOut_ = !lastInWorld_;
             if (lastInWorld_) Push(ActionKind::Quit, 0, reason);
         }
@@ -140,11 +145,26 @@ void FailFlow::Release(bool inWorld, double now, const char* why) {
     }
 }
 
+bool FailFlow::OnGameLoads(double now) {
+    if (state_ == State::Idle || !skipped_ || sawOut_) return false;
+    Enter(State::Idle, now, "the game loads the free roam state itself after all: its own way back runs");
+    skipped_ = false;
+    return true;
+}
+
 void FailFlow::Update(const View& v, double now) {
     lastInWorld_ = v.inWorld;
     if (state_ == State::Idle) return;
     if (!v.inWorld) sawOut_ = true;
     const double age = now - since_;
+    // We skipped the game's own answer and are still in the failed world long after (the quit did not happen): let
+    // the game's way back run after all (the Free Ride stop and the reload after it, as before 0.15).
+    if (skipped_ && !sawOut_ && now - failAt_ > kStuckTimeout && state_ != State::GuestLoading) {
+        skipped_ = false;
+        Push(ActionKind::GameFallback, seq_, reason_);
+        Enter(State::Idle, now, "still in the failed world: the game's own way back after all");
+        return;
+    }
     switch (state_) {
     case State::HostReloading:
         if (sawOut_ && v.inWorld) Enter(State::Idle, now, "back in the world after the reload");
@@ -158,15 +178,16 @@ void FailFlow::Update(const View& v, double now) {
         if (age > kAskTimeout) Enter(State::GuestRejoin, now, "no verdict from the host: loading his point");
         return;
     case State::GuestRejoin:
-        if (sawOut_ || age > 15) Release(v.inWorld, now, "loading the host's point");
+        if (sawOut_ || (!skipped_ && age > 15)) Release(v.inWorld, now, "loading the host's point");
         return;
     case State::GuestWaitHost:
         if (!v.hostKnown || !v.hostInWorld || !v.hostAtStoryPoint) hostSawOut_ = true;
-        if (hostSawOut_ && v.hostInWorld && v.hostAtStoryPoint) {
+        if (hostSawOut_ && v.hostInWorld && v.hostAtStoryPoint)
             Release(v.inWorld, now, "the host is back at his checkpoint: loading it");
-        } else if (age > kGuestWaitTimeout) {
-            Enter(State::Idle, now, "the host did not come back: the normal follow takes over");
-        }
+        else if (!hostSawOut_ && age > kHostStayTimeout)
+            Release(v.inWorld, now, "the host never left his world: loading his point");
+        else if (age > kGuestWaitTimeout)
+            Release(v.inWorld, now, "the host did not come back: loading his point, the normal follow waits for him");
         return;
     case State::GuestLoading:
         if (sawOut_ && v.inWorld && age > 1) Enter(State::Idle, now, "at the host's point again");
@@ -196,7 +217,7 @@ void FailFlow::Reset() {
     if (state_ != State::Idle) Log(std::string("fail flow: reset while ") + StateName(state_));
     state_ = State::Idle;
     since_ = 0;
-    sawOut_ = hostSawOut_ = false;
+    sawOut_ = hostSawOut_ = skipped_ = false;
     actions_.clear();
 }
 

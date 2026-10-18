@@ -2,20 +2,23 @@
 // A failed mission in co-op: one path for every kind of failure, one load on every game (docs/protocol.md "Failed
 // missions", docs/re-notes.md 7).
 //
-// Every mission failure the scripts raise ends in the director's GameOver(reason id) (the area check of
-// containers.lua RangeCheckStart, timer.lua SimpleFail, the flows' gameOver node in game_director/other.lua; a lost
-// mission car, a target that escaped, an ally that died are flow nodes too [likely]). mission_sync hooks it and asks
-// this state machine what to do:
-//   - host of a lobby CHAPTER (his saves are kept out of his slots): the game's own answer (a load of the free roam
-//     state before the quest, then our reload of the checkpoint: two loads) is skipped; he leaves for the main menu
-//     at once and loads the session's checkpoint (one load). The guests are told (HostFailed) and follow;
-//   - host of a STORY session: the game's fail screen stays (Load Last Checkpoint is one load); the guests are told;
+// In a chapter loaded through the menu's chapter loader (every co-op load: replay flags) the game answers every
+// failure (the objective abandoned, the mission car lost, a timer run out, an ally dead, arrested ...) and a death it
+// handles itself with one function, the save system's FreeRoamRetry (exe+0x21E8B20: load the free roam state from
+// before the quest), called by the game-over controller (C_GameOverController2, when a checkpoint retry is not
+// possible) and by the flows' free_roam_retry node. That load, then our reload of the checkpoint from the main menu,
+// were the two loads of a failed mission (docs/re-notes.md 7). mission_sync hooks it and asks this state machine:
+//   - host of a lobby CHAPTER (his saves are kept out of his slots): the game's answer is skipped; he leaves for the
+//     main menu at once and loads the session's checkpoint (one load). The guests are told (HostFailed) and follow;
+//   - host of a STORY session (normal story loads: the game shows its fail screen, Load Last Checkpoint is one load):
+//     nothing is skipped; when the director's GameOver tells us of the failure the guests are told too;
 //   - guest: the game's answer is skipped, he leaves for the main menu at once and reports the failure to the host,
 //     who decides: REJOIN (the host plays on: load his point now) or WAIT (the host failed too: load his point once he
 //     is back in his world). No answer within kAskTimeout: REJOIN.
-// Duplicates (the game raises GameOver more than once per failure; a death during a failure) are skipped while a
-// failure is handled. Pure logic, no game calls: unit-tested in tests/fail_flow_test.cpp. Not thread-safe: the
-// caller locks (the GameOver hook runs on GameMainThread, the rest on the render thread).
+// Duplicates (the game asks twice per failure; a death during a failure) are skipped while a failure is handled. If
+// we are still in the failed world kStuckTimeout after skipping (the quit did not happen), the game's own answer runs
+// after all (GameFallback). Pure logic, no game calls: unit-tested in tests/fail_flow_test.cpp. Not thread-safe: the
+// caller locks (the hooks run on GameMainThread, the rest on the render thread).
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -58,6 +61,7 @@ public:
         Quit,            // guest: leave the world for the main menu now
         LoadHostPoint,   // guest (out of the world): load the host's point (forget which point we loaded)
         ReloadInWorld,   // guest still in a pre-failure world at release time: quit and load the host's point
+        GameFallback,    // the quit did not happen: run the game's own answer that was skipped (FreeRoamRetry)
     };
     struct Action {
         ActionKind kind;
@@ -83,6 +87,8 @@ public:
     static constexpr double kHostGameTimeout = 900;    // s a story host may sit at the fail screen
     static constexpr double kGuestWaitTimeout = 600;   // s a guest waits for the failed host to come back
     static constexpr double kGuestLoadTimeout = 180;   // s a guest's load of the host's point may take
+    static constexpr double kHostStayTimeout = 90;     // s a guest waits for a failed host who never leaves his world
+    static constexpr double kStuckTimeout = 20;        // s after a skipped answer we may still be in the failed world
 
     // The GameOver hook. role: what this game is now; canReload: host chapter: a checkpoint of this session is
     // known (else the game's own flow runs).
@@ -93,6 +99,9 @@ public:
     FailVerdict Decide(bool inWorld, bool atStoryPoint) const;
     // every tick (render thread)
     void Update(const View& v, double now);
+    // the game loads the free roam state although we skipped its answer (another caller): true = our flow gave up
+    // (the old way back, the Free Ride stop and a reload, takes over)
+    bool OnGameLoads(double now);
     // the session ended / a new one started
     void Reset();
 
@@ -121,6 +130,8 @@ private:
     bool sawOut_ = false;       // we left our world since the failure
     bool hostSawOut_ = false;   // guest: the host left his world (or his point) since we started waiting
     bool lastInWorld_ = false;  // from the last Update (the hook runs between them)
+    bool skipped_ = false;      // the game's own answer to this failure was skipped
+    double failAt_ = 0;
     uint32_t failures_ = 0;
     std::vector<Action> actions_;
     std::vector<std::string> log_;

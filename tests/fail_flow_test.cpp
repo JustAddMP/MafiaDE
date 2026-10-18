@@ -35,7 +35,7 @@ struct Game {
     FailFlow flow;
     FailRole role;
     bool inWorld = true;
-    int quits = 0, loads = 0, reports = 0, hostFailedSent = 0;
+    int quits = 0, loads = 0, reports = 0, hostFailedSent = 0, fallbacks = 0;
     uint32_t lastReportSeq = 0;
     std::vector<FailFlow::Action> all;
 
@@ -51,6 +51,7 @@ struct Game {
             case Kind::Quit: ++quits; break;
             case Kind::LoadHostPoint: ++loads; break;
             case Kind::ReloadInWorld: ++quits; ++loads; break;
+            case Kind::GameFallback: ++fallbacks; break;
             }
         }
         flow.TakeLog();
@@ -239,7 +240,8 @@ void StaleVerdict() {
     Check(g.flow.GetState() == State::GuestAsking, "guest: a verdict for another report is ignored");
 }
 
-// The quit did not happen (still in the failed world 15 s after a REJOIN): reload from the world.
+// The quit did not happen (still in the failed world long after skipping the game's answer): the game's own answer
+// runs after all, our flow steps aside.
 void GuestQuitFailed() {
     Game g(FailRole::Guest);
     g.Tick(0);
@@ -247,9 +249,65 @@ void GuestQuitFailed() {
     g.flow.OnVerdict(FailVerdict::Rejoin, g.lastReportSeq, 1, 1.2);
     g.Apply();
     g.Tick(10);
-    Check(g.loads == 0, "guest: rejoin waits for the quit");
+    Check(g.loads == 0 && g.fallbacks == 0, "guest: rejoin waits for the quit");
     g.Tick(17);
-    Check(Count(g.all, Kind::ReloadInWorld) == 1 && g.loads == 1, "guest: still in the world -> reload from there");
+    Check(g.loads == 0 && g.fallbacks == 0, "guest: no reload of ours on top of a skipped answer");
+    g.Tick(1 + FailFlow::kStuckTimeout + 0.5);
+    Check(g.fallbacks == 1 && g.loads == 0 && g.flow.GetState() == State::Idle,
+          "guest: stuck in the failed world -> the game's own answer once, flow idle");
+    g.Tick(40);
+    Check(g.fallbacks == 1, "guest: the fallback only once");
+}
+
+// The same for the chapter host.
+void HostQuitFailed() {
+    Game h(FailRole::HostChapter);
+    h.Tick(0);
+    h.Fail(1, 1);
+    h.Tick(15);
+    Check(h.fallbacks == 0, "host: waits for the quit");
+    h.Tick(1 + FailFlow::kStuckTimeout + 0.5);
+    Check(h.fallbacks == 1 && h.flow.GetState() == State::Idle, "host: stuck -> the game's own answer, flow idle");
+}
+
+// A HostFailed notice (nothing skipped here) and a quit that did not happen: reload from the world, no fallback.
+void NoticeQuitFailed() {
+    Game g(FailRole::Guest);
+    g.Tick(0);
+    g.flow.OnVerdict(FailVerdict::HostFailed, 0, 1, 1);
+    g.Apply();
+    g.Tick(5, false, false);  // the host left; we did not
+    g.Tick(30, true, true);   // he is back, we are still in our old world
+    Check(g.fallbacks == 0 && Count(g.all, Kind::ReloadInWorld) == 1, "guest: never left -> reload from the world");
+}
+
+// The game loads the free roam state although we skipped its answer (another caller): our flow steps aside.
+void GameLoadsAnyway() {
+    Game h(FailRole::HostChapter);
+    h.Tick(0);
+    h.Fail(1, 1);
+    Check(h.flow.OnGameLoads(1.3) && h.flow.GetState() == State::Idle, "host: the game loads itself -> flow idle");
+    Check(!h.flow.OnGameLoads(1.4), "host: idle flow: nothing to give up");
+    Game g(FailRole::Guest);
+    g.Tick(0);
+    g.Fail(1, 1);
+    g.inWorld = false;
+    g.Tick(2);
+    Check(!g.flow.OnGameLoads(2.1) && g.flow.Busy(), "guest already out of the failed world: our flow stays");
+}
+
+// The host failed (notice) but never leaves his world: after a while the guest loads his point anyway.
+void HostNeverLeaves() {
+    Game g(FailRole::Guest);
+    g.Tick(0);
+    g.flow.OnVerdict(FailVerdict::HostFailed, 0, 1, 1);
+    g.Apply();
+    g.inWorld = false;
+    g.Tick(2, true, true);
+    g.Tick(60, true, true);
+    Check(g.loads == 0, "guest: waits a while for the host's reload");
+    g.Tick(2 + FailFlow::kHostStayTimeout, true, true);
+    Check(g.loads == 1 && g.flow.GetState() == State::GuestLoading, "guest: the host never left -> his point loads");
 }
 
 // A failure while our load of the host's point is under way is the same failure; once in the world again a new one.
@@ -311,7 +369,10 @@ void Timeouts() {
     g.inWorld = false;
     g.Tick(2, false, false);
     g.Tick(2 + FailFlow::kGuestWaitTimeout + 1, false, false);
-    Check(g.flow.GetState() == State::Idle && g.loads == 0, "guest: the host never came back -> idle, normal follow");
+    Check(g.flow.GetState() == State::GuestLoading && g.loads == 1 && !g.flow.HoldsFollow(),
+          "guest: the host never came back -> follow free (it waits for him at the menu)");
+    g.Tick(2 + FailFlow::kGuestWaitTimeout + FailFlow::kGuestLoadTimeout + 2, false, false);
+    Check(g.flow.GetState() == State::Idle, "guest: then idle");
     Game h(FailRole::HostChapter);
     h.Tick(0);
     h.Fail(1, 1);
@@ -332,6 +393,10 @@ int main() {
     GuestNoVerdict();
     StaleVerdict();
     GuestQuitFailed();
+    HostQuitFailed();
+    NoticeQuitFailed();
+    GameLoadsAnyway();
+    HostNeverLeaves();
     GuestFailsAgainAfterLoad();
     HostFailsWhileGuestLoads();
     BusyAndReset();
