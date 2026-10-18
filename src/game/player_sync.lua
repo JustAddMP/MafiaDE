@@ -1021,7 +1021,8 @@ function M.Drive(pp)
   if pp.act then
     local kind = pp.act
     pp.act = nil
-    if not pp.hidden then M.PlayAction(pp, so, kind) end
+    -- an action that came while the puppet could not show it (not spawned yet, dead, hidden) is history by now
+    if not pp.hidden and M.now - (pp.actAt or 0) < 0.5 then M.PlayAction(pp, so, kind) end
   end
   -- while it plays one of his actions (a punch, a throw) nothing else is asked of it: a walk, turn, weapon or aim
   -- command is an AI command too and would cut the animation short (the C++ side's controller pauses as well)
@@ -1422,13 +1423,15 @@ function M.WatchDamage(p)
   for _, ae in ipairs(M.ACTION_EVENTS or {}) do subs[#subs + 1] = { ae[1], M.OnActionEvent, ae } end
   for _, ev in ipairs(subs) do
     local name, fn, arg = ev[1], ev[2], ev[3]
-    local good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
-      local ok, err = pcall(fn, m, arg)
-      if not ok then logErr("damage event", err) end
-    end, enums.EventType.HUMAN, enums.HumanMessages[name])
-    if not enums.HumanMessages[name] then
-      log("no HumanMessages." .. name .. " in this build: not watched")
-    elseif good and tonumber(id) and tonumber(id) >= 0 then
+    local msg = enums.HumanMessages[name]
+    local good, id = false, "no HumanMessages." .. name .. " in this build"
+    if msg then
+      good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
+        local ok, err = pcall(fn, m, arg)
+        if not ok then logErr("damage event", err) end
+      end, enums.EventType.HUMAN, msg)
+    end
+    if good and tonumber(id) and tonumber(id) >= 0 then
       ids[#ids + 1] = id
     else
       log("could not watch " .. name .. " events (" .. tostring(id) .. ")")
@@ -2287,7 +2290,7 @@ function M.Update(dt, cmds)
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
         ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0 }
       local act = n(f[63]) or 0
-      if act > 0 then pp.act = act end  -- played by M.Drive (kept until then: one T line per tick)
+      if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
