@@ -848,9 +848,9 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   CarExploded, car damage's exploded flag and a wrecked car coming back all go through one routine that runs once per
   car entity, whichever comes first (docs/game-api.md 24).
 - **Not carried:** the projectile's flight (no harmless projectile exists: `ThrowProjectileWeapon` throws a real
-  one; the throw animation shows on the thrower's puppet, the explosion appears where and when it happened); damage
-  to cars from another game's explosion (a copy cannot blow up: a remote player's grenade does not wreck your car);
-  how a fire spreads (each picture burns on its own game).
+  one; the throw animation shows on the thrower's puppet, the explosion appears where and when it happened); how a
+  fire spreads (each picture burns on its own game). Cars are not left out: the holder of a car puts another game's
+  blast on it itself ("Car damage", blasts on other games).
 
 ## Reconnect (no messages of its own)
 

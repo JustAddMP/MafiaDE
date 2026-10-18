@@ -1158,7 +1158,7 @@ one hit (it comes in many small steps, UNVERIFIED how many).
 it take damage (the log says "another game's explosion hurt us here: given back" if so) and whether cars get pushed.
 `return MafiaCoop.Boom.TestThrow()` checks ThrowProjectileWeapon's signature (a real grenade: step back).
 
-Not carried (known): the projectile's flight; car damage from another game's explosion; fire spreading (each
+Not carried (known): the projectile's flight; fire spreading (each
 picture's fire burns by itself on its game); mission dynamite and scripted car bombs (each game's own mission sets
 them off).
 
