@@ -1,5 +1,6 @@
-// player_actions_test: unit tests for the action block of PlayerState (src/game/player_actions.h): the wire encoding
-// (round trip, a state from a build without the block, a truncated block, unknown kinds), the receiver's tracker
+// player_actions_test: unit tests for the action and pose blocks of PlayerState (src/game/player_actions.h): the wire
+// encoding (round trip, a state from a build without the block, a truncated block, unknown kinds and pose bits, the
+// traversal kinds), the sender's merge of the glue's counter with detected moves, the receiver's tracker
 // (first state adopts the counter, one play per step, wrap-around at 256, an older state does not replay, missed
 // steps play only the latest kind) and a run of states through a lossy, reordering link. Prints PASS/FAIL per check;
 // exits non-zero on any failure. Built by build.cmd (out\player_actions_test.exe), run by tools\make_release.cmd.
@@ -82,8 +83,22 @@ void TestWire() {
     Check(r.Ok() && r.Remaining() == 2, "an older reader is not upset by the block");
 
     Check(FromCode(0) == Action::None && FromCode(1) == Action::LightPunch && FromCode(6) == Action::HitReact &&
-              FromCode(7) == Action::None && FromCode(255) == Action::None,
+              FromCode(7) == Action::Jump && FromCode(17) == Action::DropBody && FromCode(18) == Action::None &&
+              FromCode(255) == Action::None,
           "codes from the Lua sample");
+    bool named = true;
+    for (unsigned k = 1; k <= kLastAction; ++k) named &= std::string(Name(static_cast<Action>(k))) != "none";
+    Check(named, "every kind has a name");
+    Check(!IsMove(Action::HitReact) && IsMove(Action::Jump) && IsMove(Action::Vault) && IsMove(Action::LadderDown) &&
+              IsMove(Action::CoverSlide) && !IsMove(Action::Medkit) && !IsMove(Action::PickupBody) &&
+              !IsMove(Action::None),
+          "traversal moves vs. actions on the spot");
+    // a receiver from before the traversal kinds read kinds 7.. as unknown: the step moved its counter, it played
+    // nothing; ours reads kinds beyond its own the same way
+    unk = StateBytes(nullptr);
+    unk.push_back(10);
+    unk.push_back(40);
+    Check(ReadState(unk, back) && back.seq == 10 && back.last == Action::None, "a kind beyond ours reads as none");
     Check(std::string(Name(Action::HeavyPunch)) == "heavy" && std::string(Name(Action::None)) == "none",
           "names for the log and the trace");
 }
@@ -156,12 +171,119 @@ void TestLossyLink() {
     Check(r.play == Action::HeavyPunch && r.missed == 2, "a long gap: the latest plays, two counted as missed");
 }
 
+// The pose block after the action block: round trip, absent (older sender), truncated, unknown bits.
+void TestPose() {
+    auto bytes = [](const State& a, const Pose* p) {
+        ByteWriter w;
+        w.U8(42);
+        w.F32(1.5f);
+        Write(w, a);
+        if (p) WritePose(w, *p);
+        return w.Take();
+    };
+    auto read = [](const std::vector<uint8_t>& b, State& a, Pose& p) {
+        ByteReader r(b.data(), b.size());
+        if (r.U8() != 42 || r.F32() != 1.5f) return false;
+        Read(r, a);
+        ReadPose(r, p);
+        return r.Ok() && r.AtEnd();
+    };
+    const State act{9, Action::Vault};
+    bool ok = true;
+    for (unsigned bits = 0; bits < 8; ++bits) {
+        const Pose p{static_cast<uint8_t>(bits), (bits & kCarry) ? 0xDEADBEEFu : 0u};
+        State a;
+        Pose q;
+        ok &= read(bytes(act, &p), a, q) && q == p && a.seq == 9 && a.last == Action::Vault;
+    }
+    Check(ok, "pose round trip, every bit combination");
+    const Pose plain{kStealth | kLadder, 0};
+    Check(bytes(act, &plain).size() == bytes(act, nullptr).size() + 1, "no body: the block is one byte");
+    const Pose carry{kCarry, 7};
+    Check(bytes(act, &carry).size() == bytes(act, nullptr).size() + 5, "carrying: one byte plus the body");
+    {
+        State a;
+        Pose q{kCarry, 5};
+        Check(read(bytes(act, nullptr), a, q) && q.bits == 0 && q.body == 0, "a state without the pose block: no pose");
+    }
+    {
+        std::vector<uint8_t> b = bytes(act, nullptr);
+        b.push_back(kCarry);
+        b.push_back(1);  // body cut short
+        ByteReader r(b.data(), b.size());
+        r.U8();
+        r.F32();
+        State a;
+        Pose q;
+        Read(r, a);
+        ReadPose(r, q);
+        Check(r.Failed(), "a truncated pose block fails the state");
+    }
+    {
+        std::vector<uint8_t> b = bytes(act, nullptr);
+        b.push_back(0xF8 | kStealth);  // bits from a newer build
+        State a;
+        Pose q;
+        Check(read(b, a, q) && q.bits == kStealth, "unknown pose bits are dropped");
+    }
+    {
+        // an older reader (action block only) is not upset by the pose block
+        const std::vector<uint8_t> b = bytes(act, &carry);
+        ByteReader r(b.data(), b.size());
+        r.U8();
+        r.F32();
+        State a;
+        Read(r, a);
+        Check(r.Ok() && r.Remaining() == 5 && a.last == Action::Vault, "an older reader stops before the pose block");
+    }
+}
+
+// The sender's merge of the glue's counter and the detected moves.
+void TestMerger() {
+    Merger m;
+    State out = m.Update({30, Action::LightPunch}, Action::None);
+    Check(out.seq == 30 && out.last == Action::LightPunch, "the first sample takes the glue's counter as it is");
+    out = m.Update({30, Action::LightPunch}, Action::None);
+    Check(out.seq == 30, "nothing new: the counter stays");
+    out = m.Update({30, Action::LightPunch}, Action::Jump);
+    Check(out.seq == 31 && out.last == Action::Jump, "a detected move counts one step");
+    out = m.Update({31, Action::HeavyPunch}, Action::None);
+    Check(out.seq == 32 && out.last == Action::HeavyPunch, "a glue step after it still counts (its own counter)");
+    out = m.Update({33, Action::Counter}, Action::Vault);
+    Check(out.seq == 35 && out.last == Action::Vault, "both in one sample: all steps, the move is the latest");
+    out = m.Update({33, Action::Counter}, Action::None);
+    Check(out.seq == 35, "... and nothing replays");
+    m.Update({120, Action::LightPunch}, Action::None);  // the glue went ahead (a burst of punches)
+    out = m.Update({200, Action::LightPunch}, Action::None);
+    m.Update({255, Action::LightPunch}, Action::None);
+    out = m.Update({1, Action::LightPunch}, Action::None);
+    Check(out.seq == static_cast<uint8_t>(35 + 87 + 80 + 55 + 2), "the glue's counter wraps at 256");
+    // through to a receiver: every step is seen
+    Merger s;
+    Tracker t;
+    t.Update(s.Update({0, Action::None}, Action::None));
+    int plays = 0, moves = 0;
+    for (int i = 1; i <= 20; ++i) {
+        const State st = s.Update({static_cast<uint8_t>(i / 2), Action::LightPunch},
+                                  i % 3 == 0 ? Action::LadderUp : Action::None);
+        const Tracker::Result r = t.Update(st);
+        if (r.play != Action::None) ++plays;
+        if (r.play == Action::LadderUp) ++moves;
+    }
+    char d[64];
+    std::snprintf(d, sizeof d, "plays %d moves %d", plays, moves);
+    // 10 punches + 6 moves, 3 of them in the same sample as a punch (the move plays, the punch is a missed step)
+    Check(plays == 13 && moves == 6, "punches and moves through the merger and the tracker", d);
+}
+
 }  // namespace
 
 int main() {
     TestWire();
     TestTracker();
     TestLossyLink();
+    TestPose();
+    TestMerger();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -735,10 +735,93 @@ also blocks other damage for that time (an enemy NPC's bullet during a puppet's 
 
 Not carried yet (seen while looking, not cheap with this mechanism): door kicks (`DOOR_KICK` 458857, the door's state
 is not synced either), the explosion of a thrown grenade or molotov on the other games (the puppet only shows the
-throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the receiver's game), medkit use
-(`PLAYER_USED_MEDKIT`), carrying bodies (`TakeBody` / `DropBody`), lockpicking, vaults and ladders (`USE_FENCE`,
-`USE_LADDER`; the puppet's walk takes its own way over them or snaps), jumping (only the in-air flag, the puppet does
-not jump), stalk (sneak) walking beyond crouch, and takedowns with their paired victim animation.
+throw; `game.game:ThrowProjectileWeapon` exists but would hurt people on the receiver's game), lockpicking (left to
+the doors work), and takedowns with their paired victim animation. Medkits, bodies, vaults, ladders, jumps and the
+sneak walk: "Traversal" below.
+
+### Traversal: jumps, vaults, ledges, drops, ladders, cover slides, sneaking, bodies, medkits - static only, NOT verified in game
+
+Found the same way (exe Lua bindings re2/human_methods.txt, the enums dump re3/enums.txt, the game's script and
+animation archives); no game launch. Code: src/game/traversal.h/.cpp (pure, tests/traversal_test.cpp), the action
+kinds 7..17 and the pose block in player_actions.h (docs/protocol.md "PlayerState"), player_sync.lua
+"Traversal" / `M.Follow` / `M.LadderHold` / `M.CarryTick`.
+
+**Detecting it on our player.** `HumanMessages` has these (C_WrapE_FightHint enum, re3/enums.txt line 97); the glue
+subscribes to each with one blanket HUMAN subscription, keeps those whose receiver is our player (UNVERIFIED that he
+is the receiver, as for the melee messages) and only collects them as bits for the next sample; the C++ side
+(`traversal::LocalDetector`, fed with every sample: height, smoothed vertical speed, ground speed, cover flag and
+the getters below) decides:
+
+| source | value | becomes |
+|---|---|---|
+| `USE_FENCE` | 458865 | climb up (kind 9) when he rose 0.6 m within 0.3 s of it, else vault (8) after 0.3 s |
+| `USE_LADDER` | 458864 | ladder up (12) / down (13) by the first 0.15 m he moved within 0.3 s (else up); pose bit "ladder" until his vertical speed stays under 0.3 m/s for 0.6 s (at least 0.8 s, at most 15 s) |
+| no message: vertical speed above 2 m/s up, no fence / ladder within 1.2 s | - | jump (7) |
+| no message: falling faster than 2.5 m/s without a jump | - | drop down (10); a hard landing (11) when he fell faster than 5 m/s for 0.3 s or more |
+| `IsInCover()` going on at 2.5 m/s or more | - | slide into cover (14) |
+| `PLAYER_USED_MEDKIT` | 458802 | medkit (15) (player.lua's OnMedkitUsed node registers this one on the player) |
+| `PICKUP_BODY` / `DROP_BODY`, or `IsCarryingBody()` going on / off | 458853 / 458854 | body picked up (16) / dropped (17), message and getter edge within 1 s count once |
+| `IsStealthMove()` | getter | pose bit "sneaking" |
+| `IsCarryingBody()`, `GetCarriedBody()` | getters (player.lua TakeBody / IsCarryingBody nodes) | pose bit "carrying" + the body's key (npc_sync numbering) |
+
+There is no jump message or getter in the bindings (none in `human_methods.txt`, none in the enum); the flags' "in
+air" bit stays as it was. `USE_CORNER` (458866), `PLAYER_COVER_LEAN_*` and `IN_DEEP_WATER` were seen and are not used.
+The thresholds are guesses for a 60 Hz sample with the C++ side's smoothed speed: the trace (`TL`, `TE`, docs/sync-trace.md)
+shows what was detected with which height and speed, to tune them.
+
+Crouching was already shown (flags bit1 from `IsStalkMove() or IsCoverCrouch()`, `SetStalkMove` on the puppet,
+section 10); the sneak walk is `SetStealthMove` / `IsStealthMove`, a separate pair in the bindings: what it looks like
+on an AI human is not known.
+
+**Playing it on the puppet.** The same `AnimPlay(name, false)` as the punches, from `MafiaCoop.actionAnims[kind]`
+(changeable from the dev console). Names from `basic_anim.sds` / `anim_project.sds` (unpacked with re2/sds.py):
+
+| kind | names (in order; armed: tried first with a gun in hand) | time |
+|---|---|---|
+| jump | `hero_nw_alert_jump_over_ledge_medium_r`, `hero_nw_alert_jump_land_soft` (no plain jump-off animation in the sets: the jump is probably a state of the animation graph) | 0.9 s |
+| vault | `hero_nw_alert_move_run_vault_wall_thin_140cm`, `hero_nw_alert_move_run_vault_wall_140cm`, `hero_nw_cov_vault_wall_90cm`; armed `hero_1h_alert_move_run_vault_wall_thin_90cm_step_up`, `hero_rifle_alert_move_run_vault_wall_thin_90cm` | 1.1 s |
+| climb up | `hero_trench_alert_idle_climb_up_180cm`, `hero_rifle_alert_idle_climb_up_180cm`, `hero_trench_alert_idle_climb_up_130cm` (no `hero_nw_` climb-up in the sets) | 1.6 s |
+| drop down | `hero_nw_alert_move_walk_lp_to_fall`, `enemy_nw_alert_idle_climb_down_130cm` | 0.8 s |
+| hard landing | `hero_nw_alert_jump_land_medium`, `hero_rifle_alert_fall_land_hard`, `hero_nw_alert_jump_land_soft` | 0.8 s |
+| ladder up / down | `hero_nw_alert_climb_up_ladders` (`_low`, `_veryhigh`) / `hero_nw_alert_climb_down_ladders_285cm` (`_forward`) | 3.0 / 2.5 s |
+| cover slide | `hero_nw_cov_vault_wall_deep_90cm` (no slide animation found; a stand-in) | 0.8 s |
+| medkit | `hero_nw_stalk_idle_fidget_lookaround` (no medkit animation found in the sets) | 1.0 s |
+| body pickup / drop | `hero_nw_alert_idle_carry_pickup_male` (`_fast`, stalk) / `hero_nw_alert_idle_carry_drop_male` (stalk) | 1.6 / 1.4 s |
+
+Others for later: the `_s`/`_fem` carry variants, the trunk / van body drops (`hero_nw_alert_idle_carry_drop_trunk_*`),
+`hero_rifle_alert_move_run_vault_wall_*cm` per height, `hero_rifle_alert_fall_loop`, `hero_nw_stalk_move_walk`.
+
+While a move (7..14) plays, or while his pose says "ladder" after the climb animation (at most 15 s), the puppet's
+`PS` report says busy 2: the C++ locomotion controller is paused as for a punch (it sees no copy) and
+`traversal::Catchup` sends a nudge toward his position every tick instead, height included (10 x dt of the gap);
+the glue applies it with `SetPos` and nothing else (no walk, turn, aim). Whether `SetPos` during `AnimPlay` keeps
+the animation playing is UNVERIFIED (nudges during a walk do not stop the walk). A move whose animation `AnimPlay`
+refused is still followed for its time. For 1.5 s after a move a snap the controller asks for (it starts from
+"stand" with the puppet maybe metres off) becomes a blend (6 x dt) when the error is under 8 m and 6 m in height, the
+part of the error beyond 0.9 m is blended away faster than the controller's own nudge, and a height difference over
+0.25 m is blended too (the walk cannot climb a ledge); the T line carries that height part (`nz`). Farther off it
+still snaps. Logged ("plays a traversal move", "move over, x m off: catching up", "snap after a move turned into a
+blend") and traced (`TVC`, `PUP busy= tm= rec=`).
+
+Every puppet also gets `SetCanTraverse(PathObjectType.ALL, true)` at spawn (`C_WrapE_PathObjectType`: CLIMB 1,
+CAR_ROOF 3, CAR 5, DOOR 11, LADDER 13, ALL 15; human.lua's SetCanTraverse node takes inPathObjectType,
+inCanTraverse), so its own walk (`MoveVec`, AI path following) may climb and use ladders where its player went
+instead of stopping at the fence. UNVERIFIED what the default is and whether the AI's traversal then plays its own
+vault (it would make the walk the better picture of a vault).
+
+**Sneaking**: pose bit 1 -> `SetStealthMove(true/false)` on the puppet when it changes (dropped while it aims, like
+the crouch). **Carrying a body**: pose bit 2 with the body's key. The body is a mission NPC in the entity table
+(npc_sync.lua): on the host its own id, on a guest the host key its NPC is paired with (`N.byLocal`); the receiver
+finds its own copy of that NPC (`N.ents`, on a guest via `N.host[key].loc`) and calls `puppet:TakeBody(body)`
+(player.lua's TakeBody node calls it on the player with inEntity after `CanCarryBody`); 1.5 s later
+`IsCarryingBody()` tells whether it took (logged, traced `CB`). If it took, the game carries the body along with the
+puppet and `DropBody()` puts it down when the pose bit goes; if not (an AI human may not carry, the body is not
+known here, key 0), only the pickup / drop animations show it, and the body is put at the puppet's feet when he
+drops it. UNVERIFIED: all of it, and whether `DropBody` needs an argument (the node has inDropAnim). The dead NPC's
+position is not synced otherwise (npc_sync keeps live copies in line).
+
+**Medkit**: `HealByMedkit` exists on the human, but the health already comes with the state; only the action is
+shown.
 
 ## 18. Puppets thrown out of car seats: the civilian brain (0.15) - static + 0.13.0 logs, the fix NOT verified in game
 

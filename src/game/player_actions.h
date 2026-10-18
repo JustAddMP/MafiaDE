@@ -1,6 +1,7 @@
 #pragma once
-// Visible one-shot actions of a player (punches, a counter, a takedown, a throw, a melee hit reaction) for his
-// puppet on the other games (docs/protocol.md "PlayerState", action block). They ride at the end of every
+// Visible one-shot actions of a player (punches, a counter, a takedown, a throw, a melee hit reaction, and the
+// traversal moves: jump, vault, climb up, drop down, landing, ladders, a slide into cover; a medkit, picking up and
+// dropping a body) for his puppet on the other games (docs/protocol.md "PlayerState", action block). They ride at the end of every
 // PlayerState as a sequence counter plus the kind of the latest action, so a lost or reordered state does not lose
 // one: the next state carries the same counter, and the receiver plays an action once for each counter step it
 // sees (only the latest kind when it missed several). Pure logic, header-only: tests/player_actions_test.cpp.
@@ -19,8 +20,22 @@ enum class Action : uint8_t {
     Takedown = 4,    // MELEE_COMBAT_TAKEDOWN / MELEE_STEALTH_TAKEDOWN by our player
     Throw = 5,       // WEAPON_THROWN: a grenade, molotov or knife left our player's hand
     HitReact = 6,    // MELEE_HIT_REACT on our player: an NPC punched him on his own game
+    // traversal moves (game/traversal.h LocalDetector: from HumanMessages USE_FENCE / USE_LADDER and his vertical
+    // speed). The puppet follows its player's path while it plays one (IsMove) and catches up without a snap after.
+    Jump = 7,        // he went up fast without a fence or ladder (there is no jump message or getter)
+    Vault = 8,       // USE_FENCE, about level after it: over a fence, a low wall
+    ClimbUp = 9,     // USE_FENCE and he rose: up onto a ledge / a high wall
+    DropDown = 10,   // he fell without jumping (stepped off a ledge)
+    Land = 11,       // a hard landing after a long fall
+    LadderUp = 12,   // USE_LADDER, going up
+    LadderDown = 13, // USE_LADDER, going down
+    CoverSlide = 14, // into cover at a run
+    // in place
+    Medkit = 15,     // PLAYER_USED_MEDKIT
+    PickupBody = 16, // PICKUP_BODY (or IsCarryingBody went on)
+    DropBody = 17,   // DROP_BODY (or IsCarryingBody went off)
 };
-constexpr uint8_t kLastAction = 6;
+constexpr uint8_t kLastAction = 17;
 
 inline const char* Name(Action a) {
     switch (a) {
@@ -31,9 +46,24 @@ inline const char* Name(Action a) {
         case Action::Takedown: return "takedown";
         case Action::Throw: return "throw";
         case Action::HitReact: return "hitreact";
+        case Action::Jump: return "jump";
+        case Action::Vault: return "vault";
+        case Action::ClimbUp: return "climbup";
+        case Action::DropDown: return "dropdown";
+        case Action::Land: return "land";
+        case Action::LadderUp: return "ladderup";
+        case Action::LadderDown: return "ladderdown";
+        case Action::CoverSlide: return "coverslide";
+        case Action::Medkit: return "medkit";
+        case Action::PickupBody: return "pickupbody";
+        case Action::DropBody: return "dropbody";
     }
     return "none";
 }
+
+// A traversal move: the puppet changes place while it plays it (the receiver's PS report says busy 2: the puppet
+// follows its player's path, game/traversal.h Catchup), as opposed to an action played on the spot.
+inline bool IsMove(Action a) { return a >= Action::Jump && a <= Action::CoverSlide; }
 
 // A kind from the wire or from the Lua sample; anything unknown is None (newer senders may add kinds).
 inline Action FromCode(unsigned v) { return v >= 1 && v <= kLastAction ? static_cast<Action>(v) : Action::None; }
@@ -88,5 +118,67 @@ private:
     bool have_ = false;
     uint8_t seen_ = 0;
 };
+
+// Sender side: our state's action block from two sources, the Lua glue's counter (punches, throws ...: the glue
+// counts them, M.LocalAction) and the moves the C++ side detects (game/traversal.h LocalDetector). The block's
+// counter goes up by every step of the glue's counter and by one for every detected move; the kind is the latest of
+// them (a punch and a move in the same sample: the move plays, the punch is a missed step on the receiver).
+class Merger {
+public:
+    State Update(const State& lua, Action detected) {
+        if (!have_) {
+            have_ = true;
+            luaSeen_ = lua.seq;
+            out_ = lua;
+        } else {
+            const uint8_t d = static_cast<uint8_t>(lua.seq - luaSeen_);
+            if (d != 0 && d < 128) {
+                out_.seq = static_cast<uint8_t>(out_.seq + d);
+                out_.last = lua.last;
+            }
+            luaSeen_ = lua.seq;
+        }
+        if (detected != Action::None) {
+            out_.seq = static_cast<uint8_t>(out_.seq + 1);
+            out_.last = detected;
+        }
+        return out_;
+    }
+    void Reset() { have_ = false; }
+
+private:
+    bool have_ = false;
+    uint8_t luaSeen_ = 0;
+    State out_;
+};
+
+// ---- the pose block: what he keeps doing (after the action block) ------------------------------------------------
+// Wire (optional, after the action block): u8 bits, then u32 body if bits & kCarry. A state from a build without it
+// ends before the block: no bits, still valid; an older reader stops before it. Unknown bits are dropped.
+constexpr uint8_t kStealth = 1;  // IsStealthMove (the crouched sneak walk, IsStalkMove, is flags bit kCrouch)
+constexpr uint8_t kCarry = 2;    // IsCarryingBody
+constexpr uint8_t kLadder = 4;   // on a ladder (from USE_LADDER until he stops climbing, game/traversal.h)
+constexpr uint8_t kPoseBits = kStealth | kCarry | kLadder;
+
+struct Pose {
+    uint8_t bits = 0;
+    uint32_t body = 0;  // kCarry: the body he carries, as the host numbers its NPCs (npc_sync.lua key); 0 = unknown
+    bool operator==(const Pose& o) const { return bits == o.bits && body == o.body; }
+    bool operator!=(const Pose& o) const { return !(*this == o); }
+};
+
+inline void WritePose(net::ByteWriter& w, const Pose& p) {
+    const uint8_t bits = p.bits & kPoseBits;
+    w.U8(bits);
+    if (bits & kCarry) w.U32(p.body);
+}
+
+// A truncated block (carry bit without its body) fails the reader.
+inline void ReadPose(net::ByteReader& r, Pose& p) {
+    p = {};
+    if (r.AtEnd()) return;
+    p.bits = r.U8() & kPoseBits;
+    if (p.bits & kCarry) p.body = r.U32();
+}
 
 }  // namespace mc::game::actions
