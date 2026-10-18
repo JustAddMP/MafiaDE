@@ -279,6 +279,58 @@ void TestChanged() {
 
 }  // namespace
 
+namespace {
+
+// ---- three players in one copy: driver + two passengers (a remote one and us, or two remote ones) ----
+void TestThreeInCopy() {
+    Sim s;
+    s.Set(kRemoteAboard, true);  // another player rides along in it
+    s.Set(kPuppetInside, true);
+    s.Set(kLocalInside, true);   // and so do we
+    s.Run(2);
+    Check(s.m.phase() == Phase::Driven, "3 in the copy: driven");
+    // the driver gets out and parks (CarParked); one passenger (a remote player) and we still sit in it
+    s.Set(kRemoteDriver, false);
+    s.speed = 0;
+    s.parkedAt = s.now;
+    Check(s.Run(30) == Action::None, "3 in the copy: driver out, two passengers still in: waits", Why(s));
+    // we get out; the other passenger is still in
+    s.Set(kLocalInside, false);
+    Check(s.Run(30) == Action::None && s.last.lockCopy, "3 in the copy: we are out, a remote passenger stays: waits, locked",
+          Why(s));
+    // the remote passenger slides over to the wheel and drives off: driven again
+    s.Set(kRemoteAboard, false);
+    s.Set(kRemoteDriver, true);
+    s.speed = 9;
+    Check(s.Run(5) == Action::None && s.m.phase() == Phase::Driven, "3 in the copy: a passenger takes the wheel: driven");
+    // he parks it and gets out: now it is empty: restore
+    s.speed = 0;
+    s.Set(kRemoteDriver, false);
+    s.Set(kPuppetInside, false);
+    s.parkedAt = s.now;
+    Check(s.Run(3) == Action::Restore, "3 in the copy: empty after the last CarParked: restore", Why(s));
+}
+
+// Two remote passengers getting out one after the other while the driver already left: never restored (despawned)
+// with anyone in it.
+void TestTwoRemotePassengers() {
+    Sim s;
+    s.Set(kRemoteAboard, true);
+    s.Set(kPuppetInside, true);
+    s.Run(1);
+    s.Set(kRemoteDriver, false);
+    s.speed = 0;
+    s.parkedAt = s.now;
+    // passenger A is out (his state no longer names the car) but passenger B's puppet still sits in it
+    Check(s.Run(20) == Action::None, "2 remote passengers: both in: waits");
+    s.Set(kRemoteAboard, false);  // no state names it any more, but B's puppet is still seated (his exit not seen yet)
+    Check(s.Run(3) == Action::None, "2 remote passengers: a puppet still inside: waits");
+    s.Set(kPuppetInside, false);
+    Check(s.Run(3) == Action::Restore, "2 remote passengers: all out: restore");
+}
+
+}  // namespace
+
 int main() {
     TestHostParks();
     TestParkedBeforeExit();
@@ -294,6 +346,8 @@ int main() {
     TestSessionOver();
     TestBeginResets();
     TestChanged();
+    TestThreeInCopy();
+    TestTwoRemotePassengers();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

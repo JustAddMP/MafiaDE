@@ -121,6 +121,20 @@ private:
     uint32_t totalOwned_ = 0, totalBack_ = 0;
 };
 
+// ---- relay of a guest's own NPCs to the other guests (several guests) ----------------------------------------------------
+// With two or more guests, an NPC only guest A's game has must also reach guest B (else B's game shows nothing of it,
+// or B's own game spawned it too and both guests own the same NPC). The host sends B its mirrors of A's NPCs in the
+// usual NpcStates, keyed by a relay key that encodes (A, A's key): B treats it like any host NPC (pairs his own version
+// with it, so he does not own it as well, or shows a spawned copy), his hits on it come back to the host as an NpcHit
+// for the relay key and the host forwards them to A (HostNpcHit, with B as the attacker). The relay key lies above
+// every entity id (bit 31 set; ids are < 2^24, docs/game-api.md "mc_entity_ids"): it never collides with a host NPC.
+constexpr uint32_t kRelayBit = 0x80000000u;
+constexpr uint32_t kRelayKeyBits = 24;
+// 0 when it cannot be encoded (key >= 2^24, or from >= 128).
+uint32_t RelayKey(PlayerId from, uint32_t key);
+bool IsRelayKey(uint32_t k);
+bool DecodeRelayKey(uint32_t k, PlayerId& from, uint32_t& key);  // false for a key without the relay bit
+
 // ---- host ---------------------------------------------------------------------------------------------------------------
 struct MirrorCmd {  // for the Lua side
     enum class Kind { State, Died, End, KillNative } kind = Kind::State;
@@ -163,6 +177,19 @@ public:
     void ObserveNatives(double now, const std::vector<NpcState>& natives);
     void Expire(double now);
     bool Lookup(uint32_t mid, PlayerId& from, uint32_t& key) const;
+    bool Has(PlayerId from, uint32_t key) const { return byKey_.count({from, key}) != 0; }
+
+    // Relay (several guests): guest `to`'s share of the other guests' mirrors this round, keyed by RelayKey: live ones
+    // with a state of the last kRelayFresh s and dead ones (so his copy dies too), none with a claim under way (it is
+    // the host's NPC in a moment). A mirror of guest F that matches one of guest `to`'s own mirrors (the same NPC, both
+    // games spawned it before the host's: the same spot, or the same tag within kClaimDist) goes to `to` only when
+    // to > F: the lower player id keeps the NPC, the other pairs his own version with the relayed one and hands it back
+    // (NpcStates hostKey = the relay key), so the two never hand each other's back in a loop.
+    static constexpr double kRelayFresh = 1.0;
+    static constexpr size_t kMaxRelay = 48;  // states per guest and round (3 messages)
+    std::vector<NpcState> RelayStates(PlayerId to, double now) const;
+    // The mids of guest hi's mirrors that are the same NPC as one of guest lo's (lo < hi), nearest pairs first.
+    std::set<uint32_t> Duplicates(PlayerId lo, PlayerId hi) const;
 
     std::vector<MirrorCmd> TakeCmds() { return std::move(cmds_); }
     std::vector<Claim> TakeClaims() { return std::move(claims_); }

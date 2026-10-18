@@ -115,6 +115,18 @@ local function ourCar(e, mine)
   return false
 end
 
+-- Is car `e` ambient traffic of this game (one of the host's shared traffic cars, or a car a traffic/police generator
+-- driver sits at the wheel of)? player_sync.lua asks when it adopts a car (M.CarTick): such a car gets its despawn
+-- immunity back off when player_sync is done with it.
+function T.IsTraffic(e)
+  if not valid(e) then return false end
+  local good, g = pcall(e.GetGUID, e)
+  local id = good and tonumber(tostring(g):match("(%d+)%s*$")) or nil
+  if id and T.list[id] then return true end
+  local okd, drv = pcall(e.GetSeatOwner, e, 0)
+  return okd and valid(drv) and generatorHuman(drv) or false
+end
+
 local function crewOf(car)
   local out = {}
   for s = 0, 3 do
@@ -406,7 +418,8 @@ function T.CopyTick(c, p)
       try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
       -- an explosion here only would leave the host's car driving on: copies do not explode
       try("DisableExplosion", car.DisableExplosion, car, true)
-      for _, m in ipairs(crewOf(car)) do
+      c.crew = crewOf(car)
+      for _, m in ipairs(c.crew) do
         pcall(m.DespawnImmunity, m, true)
         pcall(m.SetReactionOnSound, m, false)
         pcall(m.InterruptCivilWander, m)
@@ -439,8 +452,22 @@ function T.CopyTick(c, p)
       end
       if c.rv and M.RV then M.RV.Idle(c.rv, c.ent) end
       pcall(c.ent.SetDespawnImmunity, c.ent, true)
+      -- its crew got out: they belong to no copy any more, the game may clean them up like any pedestrian (they kept
+      -- their despawn immunity and locked controls for good before)
+      for _, m in ipairs(c.crew or {}) do
+        if valid(m) then
+          pcall(m.DespawnImmunity, m, false)
+          pcall(m.LockControls, m, false)
+        end
+      end
+      -- player_sync's record takes the obtain id along: the car is a copy of a host car, not one of this game, so
+      -- player_sync despawns it like its own copies (session end, a lost connection, the record dropped) instead of
+      -- leaving it in the world with despawn immunity (player_sync.lua M.RemoveAll, M.LeftCopiesTick)
+      local _, pc = M.KeyOf(c.ent)
+      if pc and not pc.qid and not pc.orig and c.qid then pc.qid, pc.fromTraffic = c.qid, c.net end
       log("copy of host car " .. c.net .. " is car " .. tostring(key) .. " of player_sync now (a player took it): "
-        .. "handed over")
+        .. "handed over" .. ((pc and pc.fromTraffic == c.net) and ", with its obtain id (player_sync despawns it when "
+        .. "it is done with it)" or ""))
       T.ev[#T.ev + 1] = "TH " .. c.net
       T.copies[c.net] = nil
       return

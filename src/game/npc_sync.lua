@@ -123,18 +123,38 @@ N.badProfiles = N.badProfiles or {}
 N.owned = N.owned or {}    -- guest: local id -> true while it is our own NPC (sent to the host)
 N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sync.lua): never our own NPCs
 
--- Who a pairing key stands for in the log: on a guest a host NPC; on the host a guest's own NPC (its mirror id).
+-- Relay keys (several guests, src/game/npc_owner.h "relay"): the host sends a guest the other guests' own NPCs in its
+-- NpcStates under the key 2^31 + owner x 2^24 + the owner's entity id (always above any entity id). They are host NPCs
+-- here like any other (paired, copied, hit: the host forwards hits to the owner). Keys are written with %.0f, never %d
+-- (a relay key does not fit a 32-bit signed integer).
+local RELAY_BIT, RELAY_SHIFT = 2147483648, 16777216
+function N.RelayKey(from, key)
+  local f, k = tonumber(from), tonumber(key)
+  if not f or not k or k <= 0 or k >= RELAY_SHIFT or f < 0 or f >= 128 then return nil end
+  return RELAY_BIT + f * RELAY_SHIFT + k
+end
+function N.FromRelay(key)  -- -> owner id (string), his key; nil for a plain host key
+  key = tonumber(key)
+  if not key or key < RELAY_BIT then return nil end
+  local r = key - RELAY_BIT
+  return tostring(math.floor(r / RELAY_SHIFT)), r % RELAY_SHIFT
+end
+
+-- Who a pairing key stands for in the log: on a guest a host NPC (or another guest's, relayed); on the host a guest's
+-- own NPC (its mirror id).
 function N.Who(key)
   local s = N.host[key]
   if N.isHost and s then return string.format("guest %s's NPC %s (mirror %s)", tostring(s.from), tostring(s.gkey),
     tostring(key)) end
+  local of, ok = N.FromRelay(key)
+  if of then return string.format("guest %s's own NPC %.0f (relayed by the host as %.0f)", of, ok, key) end
   return "host NPC " .. tostring(key)
 end
 local function owner() return N.isHost and "the guest" or "the host" end
 
 -- The hit line for the C++ side: on a guest an NpcHit for a host NPC, on the host a HostNpcHit for a mirror.
 function N.HitLine(key, amount, dtype, zone, weapon, lethal)
-  return string.format("%s %d %.2f %d %d %.0f %d", N.isHost and "GH" or "NH", key, amount or 0, dtype or 0, zone or 0,
+  return string.format("%s %.0f %.2f %d %d %.0f %d", N.isHost and "GH" or "NH", key, amount or 0, dtype or 0, zone or 0,
     weapon or 0, lethal and 1 or 0)
 end
 
@@ -425,14 +445,16 @@ end
 function N.OnDamage(m, receiverId)
   local enemyId = tonumber(tostring(m:GetEnemyGUID()):match("(%d+)%s*$"))
   if not M.isHost and enemyId and N.owned[enemyId] then
-    -- our own NPC (the host's game has none of it) hit the host's puppet: the host takes it (M.HurtByNpc there)
+    -- our own NPC (the host's game has none of it) hit a player's puppet, the host's or another guest's (every puppet
+    -- has the friend brain, so our NPCs fire at all of them): that player takes it (M.HurtByNpc on his game; another
+    -- guest skips it when his own version of this NPC, paired with the host's relay of ours, fights him there)
     for id, pp in pairs(M.pup or {}) do
-      if id == "0" and pp.so and valid(pp.so) and idOf(pp.so) == receiverId then
+      if pp.so and valid(pp.so) and idOf(pp.so) == receiverId then
         N.ownHits = (N.ownHits or 0) + 1
         local amount = tonumber(m:GetDamageAmount()) or 0
         if N.ownHits <= 20 or N.ownHits % 50 == 0 then
-          log(string.format("our own NPC %d hit the host's puppet (%.1f, type %s; #%d): sent to him", enemyId, amount,
-            tostring(m:GetDamageType()), N.ownHits))
+          log(string.format("our own NPC %d hit player %s's puppet (%.1f, type %s; #%d): sent to him", enemyId, id,
+            amount, tostring(m:GetDamageType()), N.ownHits))
         end
         if pp.st == "alive" and M.SendNpcHit then
           M.SendNpcHit(pp, amount, tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0,
@@ -496,10 +518,12 @@ function N.OnDamage(m, receiverId)
   return true
 end
 
--- Guest: host NPC `key` hit our puppet on the host's game. True when our copy of it is alive and hostile here: then it
--- fights us on our own game and its hits land here already (player_sync.lua M.ApplyHit skips the relayed one).
-function N.FightsUs(key)
+-- Guest: NPC `key` of player `from`'s game hit our puppet there (the host's NPC, or another guest's own NPC). True when
+-- our copy of it is alive and hostile here: then it fights us on our own game and its hits land here already
+-- (player_sync.lua M.ApplyHit skips the relayed one). Another guest's NPC is known here by its relay key.
+function N.FightsUs(key, from)
   if N.isHost then return false end  -- (the host's N.host holds mirrors: a guest's NPC that hit us never fights here)
+  if from and tostring(from) ~= "0" then key = N.RelayKey(from, key) end
   local s = key and N.host[key]
   local e = s and s.loc and N.ents[s.loc]
   if not (e and valid(e.h)) or e.h:IsDeath() then return false end
@@ -687,7 +711,7 @@ function N.Enforce(s, e, p)
         pcall(h.SetPos, h, V(s.x, s.y, s.z))
         pcall(h.SetDir, h, V(s.hx, s.hy, 0))
         N.pulls = (N.pulls or 0) + 1
-        if N.pulls <= 20 then log(string.format("our %d was %.1f m off host NPC %d: put back", e.id, d, s.key)) end
+        if N.pulls <= 20 then log(string.format("our %d was %.1f m off %s: put back", e.id, d, N.Who(s.key))) end
       end
     else
       s.offSince = nil
@@ -1110,7 +1134,7 @@ function N.OwnRound(p, ev)
       local good, pr = pcall(N.ProfileOf, e)
       prof = good and pr or "0"
     end
-    ev[#ev + 1] = string.format("GO %.1f %d %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s %s %d", list[i].d,
+    ev[#ev + 1] = string.format("GO %.1f %.0f %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s %s %d", list[i].d,
       N.byLocal[e.id] or 0, e.id, q.x, q.y, q.z, d.x, d.y, dead and 0 or healthOf(h),
       (dead and 1 or 0) + (h:GetOwner() and 2 or 0), e.ai, e.tag or 0, weaponOf(h), prof, N.shots[e.id] or 0)
   end
@@ -1280,8 +1304,10 @@ function N.Update(dt, cmds)
       local good, err = pcall(N.Claimed, tonumber(f[2]), tonumber(f[3]), f[4] == "1")
       if not good then log("claim error: " .. tostring(err)) end
     elseif f[1] == "X" then
-      -- the host hit his copy of our own NPC: replayed from his puppet here (N.HostHit, "0" = the host)
-      local good, err = pcall(N.HostHit, "0", tonumber(f[2]), tonumber(f[3]) or 0, tonumber(f[4]) or 0,
+      -- the host hit his copy of our own NPC, or another guest hit his copy of it (the host relays it to him): replayed
+      -- from that player's puppet here (N.HostHit; f[8] the attacker, "0" = the host)
+      local by = (f[8] and f[8] ~= "0" and M.pup and M.pup[f[8]]) and f[8] or "0"
+      local good, err = pcall(N.HostHit, by, tonumber(f[2]), tonumber(f[3]) or 0, tonumber(f[4]) or 0,
         tonumber(f[5]) or 0, tonumber(f[6]) or 0, f[7] == "1")
       if not good then log("host hit error: " .. tostring(err)) end
     elseif f[1] == "H" then
@@ -1400,7 +1426,7 @@ function N.Trace(host)
         matched = matched + 1
         sumD, maxD = sumD + d, math.max(maxD, d)
       end
-      mc_trace("NP", string.format("key=%d loc=%s copy=%d ai=%s car=%d host=%.2f,%.2f,%.2f our=%s d=%.2f hp=%s/%s "
+      mc_trace("NP", string.format("key=%.0f loc=%s copy=%d ai=%s car=%d host=%.2f,%.2f,%.2f our=%s d=%.2f hp=%s/%s "
         .. "dead=%d/%d age=%.2f", key, tostring(s.loc), s.copy and 1 or 0, tostring(s.ai), s.car and 1 or 0, s.x, s.y,
         s.z, q and string.format("%.2f,%.2f,%.2f", q.x, q.y, q.z) or "-", d, tostring(s.hp),
         h and valid(h) and string.format("%.0f", tonumber(h.health) or -1) or "-", s.dead and 1 or 0,

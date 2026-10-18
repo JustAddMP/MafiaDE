@@ -546,6 +546,67 @@ void TestEndToEnd() {
 
 }  // namespace
 
+namespace {
+
+// ---- several guests: each guest his own interest set, net ids shared, a drop or a reconnect touches only him ----
+void TestHostThreeGuests() {
+    HostTraffic h;
+    std::vector<HostCar> cars;
+    for (uint32_t i = 0; i < 40; ++i) cars.push_back(Car(2000 + i, i * 12.0f, 0, 0, 8));  // 0 .. 468 m, moving
+    std::vector<PeerOut> out;
+    HostRun r1, r2, r3;
+    auto tick = [&](double t, bool g1 = true, bool g2 = true, float g3x = 5000) {
+        for (auto& c : cars) c.st.pos.y += 0.4f;
+        h.SetCars(cars);
+        if (g1) h.SetView(1, {0, 0, 5}, t);
+        if (g2) h.SetView(2, {300, 0, 5}, t);
+        h.SetView(3, {g3x, 0, 5}, t);
+        h.Tick(t, static_cast<uint32_t>(t * 1000), out);
+        r1.Apply(out, 1);
+        r2.Apply(out, 2);
+        r3.Apply(out, 3);
+    };
+    double t = 0;
+    for (int i = 0; i < 20; ++i) tick(t += 0.05);
+    Check(r1.live.size() == 22 && r2.live.size() == 24 && r3.live.empty(),
+          "3 guests: each gets the cars near him (guest 3 far away: none)",
+          Fmt("%.0f / %.0f / %.0f", r1.live.size(), r2.live.size(), r3.live.size()));
+    size_t shared = 0;
+    for (uint16_t n : r1.live) shared += r2.live.count(n);
+    Check(shared > 0 && h.NetOf(2015) != 0 && r1.live.count(h.NetOf(2015)) && r2.live.count(h.NetOf(2015)),
+          "3 guests: a car near two guests has one net id for both", Fmt("%.0f shared", shared));
+    const auto* s1 = h.Stats(1);
+    const auto* s2 = h.Stats(2);
+    const auto* s3 = h.Stats(3);
+    Check(s1 && s2 && s3 && s1->bytes > 0 && s2->bytes > 0 && s3->bytes == 0 && s1->states > 0,
+          "3 guests: per-guest byte totals", Fmt("%.0f / %.0f bytes", s1 ? s1->bytes : 0, s2 ? s2->bytes : 0));
+    // guest 1 loses his connection (OnPlayerDropped -> RemovePeer): guest 2 sees no change
+    const uint32_t d2 = r2.despawns, sp2 = r2.spawns;
+    h.RemovePeer(1);
+    for (int i = 0; i < 10; ++i) tick(t += 0.05, false);
+    Check(!h.Stats(1) && r2.despawns == d2 && r2.spawns == sp2 && r2.live.size() == 24,
+          "3 guests: one drops, the others' cars stay as they were");
+    // he is back: a fresh peer, all his cars spawned again (he removed his copies when the connection went)
+    HostRun back;
+    r1 = back;
+    for (int i = 0; i < 10; ++i) tick(t += 0.05);
+    Check(r1.live.size() == 22 && r1.spawns == 22, "3 guests: back after a reconnect, his cars are spawned anew",
+          Fmt("%.0f live, %.0f spawns", r1.live.size(), r1.spawns));
+    // guest 3 drives over to the others: he gets cars too, nobody else loses any
+    const uint32_t d1 = r1.despawns;
+    for (int i = 0; i < 10; ++i) tick(t += 0.05, true, true, 150);
+    Check(!r3.live.empty() && r1.despawns == d1 && r2.live.size() == 24, "3 guests: a guest who comes near gets cars too",
+          Fmt("%.0f", r3.live.size()));
+    // with 4 players (3 guests) the state budget is per guest: each stays within it
+    const double secs = t;
+    bool within = true;
+    for (uint32_t p = 1; p <= 3; ++p)
+        if (const auto* s = h.Stats(p)) within &= s->bytes / secs <= HostConfig{}.bytesPerSecond * 1.5;
+    Check(within, "3 guests: every guest within his own state budget");
+}
+
+}  // namespace
+
 int main() {
     TestQuat();
     TestStates();
@@ -554,6 +615,7 @@ int main() {
     TestHostCap();
     TestGuest();
     TestEndToEnd();
+    TestHostThreeGuests();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }
