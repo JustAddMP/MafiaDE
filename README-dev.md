@@ -151,8 +151,16 @@ scripts and still work.
   - **LOBBY (n PLAYERS)** (while hosting or connected) opens the lobby again; **SETTINGS** opens CO-OP SETTINGS.
   - The page updates by itself when the co-op state changes (a join completes, players come and go): the patched
     menu polls the dll every frame (docs/game-api.md 13).
-  - **JOIN FRIEND** opens the Steam overlay's friends list: right-click a friend who hosts and pick *Join Game*, or
-    accept their invite.
+  - **JOIN FRIEND** opens a list of your Steam friends who are playing Mafia DE (core `net/steam_friends.h`, core
+    docs/protocol.md "JOIN FRIEND"): each with what they do, e.g. `HOSTING (1/4) - IN THE LOBBY`, `HOSTING (2/4) -
+    PLAYING FREE RIDE`, `IN MILES'S CO-OP GAME (2/4)` (a guest: you join that host), `PLAYING, NOT HOSTING`,
+    `VERSION 0.13.0 - YOU HAVE 0.14.0`, `FULL (4/4)`, `CHECKING THEIR GAME...`. Joinable friends come first; Enter /
+    A / click joins (the same Steam lobby path as an invite), on the others a banner says why not and what to do.
+    REFRESH asks Steam again; STEAM FRIENDS LIST opens the overlay (right-click a host, *Join Game*) as before; BACK
+    returns to the CO-OP page. With no friends online / none in the game / no Steam the panel says so. The lobby the
+    friend is in comes from Steam's "game played" info, else from their rich presence `connect` (set on hosts and
+    guests); the version check uses the lobby data, so a mismatch is shown before anyone connects (and an invite
+    from another version stops with the same message).
   - **JOIN BY IP** opens a text box (type `ip` or `ip:port`, Ctrl+V pastes; Enter connects, Esc cancels).
   - While hosting: **INVITE FRIENDS** (Steam invite dialog), **STOP HOSTING**; while joined: **LEAVE CO-OP**; **BACK**.
   - Idle or hosting: **SET PASSWORD** (a text box like JOIN BY IP, shown masked; **CHANGE PASSWORD** once set) and
@@ -180,7 +188,8 @@ scripts and still work.
   busy keeps its peers from the transport's keepalive thread (core v0.8.0).
 - **Pause menu:** GAME page (Esc opens the pause menu on MAP; `=` / `-` switch pages, gamepad LB/RB) has a fifth entry
   **CO-OP**. It opens a panel over the pause menu with the players and their ping and the same actions (host from
-  the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only.
+  the middle of a game, invite friends, join friend / by IP, leave). Esc / B closes the panel only (JOIN FRIEND's
+  BACK returns to it).
   While hosting, Up from the first entry selects a guest in the player list; Enter offers **KICK** / **KICK AND BAN**
   with a confirmation ("Kick <name>? Enter = yes, Esc = no"). The guest sees "You were kicked by the host" and goes
   back to idle; a banned guest's rejoin (same IP, or same SteamID over Steam) is refused with "You are banned from
@@ -386,6 +395,29 @@ Checked 2026-10-16 (two instances, Free Ride): pause CO-OP panel d-pad up/down, 
 SETTINGS, B back, mouse hover and click (into SETTINGS), wheel; CO-OP SETTINGS d-pad; the lobby (host: d-pad to
 MODE; guest: mouse hover and click on SETTINGS). Real window mouse messages (`PostMessage` WM_MOUSEMOVE /
 WM_LBUTTONDOWN to the game window) selected a row and clicked BACK too. Not checked: a physical gamepad.
+
+`open friends` opens JOIN FRIEND the same way (its rows are the friends, then REFRESH, STEAM FRIENDS LIST, BACK).
+
+How a physical gamepad reaches the panels (core `dll/ui_input.cpp`, `dll/pad_nav.h`; automated part: core
+`tests/pad_nav.cpp`):
+
+- Every XInput user 0-3 counts (a pad that Windows put on slot 2, or two pads: buttons combined, the stick pushed
+  furthest wins). Empty slots are probed again once a second, not every frame. `ui_input: gamepad N connected` /
+  `disconnected` in the log.
+- Navigation: d-pad or left stick (stick: dominant axis only, pressed beyond 16000, released below 11000, so a stick
+  resting near the edge does not chatter), first repeat after 0.4 s then every 0.15 s, a long frame gives one step;
+  Left/Right change `< VALUE >` rows; A selects (in a text box: submits); B, START or BACK go back.
+- Only presses act: the A that picked the menu entry, or a stick still pushed when a panel opens, does nothing until
+  released (the old code ignored a held A but not a held stick, and took a stick held through the open as a step).
+- The game sees an empty pad on every user while a panel is open and until A/B/START/BACK are released on every pad
+  (+250 ms); a pad unplugged while a button is held no longer keeps the game blocked (its held buttons are
+  cleared when the read fails; before, an unplugged pad with B down blocked the game's input for good). The XInput
+  packet number changes when blocking starts and ends, so a game that skips "unchanged" packets cannot keep the
+  last real stick position.
+- DirectInput joysticks (if the game reads one): blocked with buttons released, POVs centred and the axes frozen at
+  their last value (zeroing them would read as a stick pushed to its end); only button releases of their buffered
+  data pass. Mafia DE imports XInput 9.1.0 for the pad, so this is a safety net. UNVERIFIED with real hardware: Steam
+  Input (a PlayStation / Switch pad mapped to XInput by Steam) going through the same `XInputGetState` hook.
 
 ## Player sync (phase 3)
 

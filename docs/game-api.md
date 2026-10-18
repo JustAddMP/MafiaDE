@@ -236,7 +236,8 @@ the expected classes/methods the patch is skipped (logged) and the menu loads un
   kept; XInput zeroed; window key/mouse messages swallowed; key releases always pass so Scaleform sees balanced
   key up/down) and blocking continues until the confirm/back keys are released plus 250 ms.
 - Steam: `ISteamFriends::ActivateGameOverlayInviteDialog(lobby)` (INVITE FRIENDS) and `ActivateGameOverlay("Friends")`
-  (JOIN FRIEND) open over the game (gameoverlayrenderer64.dll is loaded in game processes started by MafiaCoop.exe;
+  (JOIN FRIEND > STEAM FRIENDS LIST; JOIN FRIEND itself is core's friends panel, core docs/protocol.md "JOIN FRIEND")
+  open over the game (gameoverlayrenderer64.dll is loaded in game processes started by MafiaCoop.exe;
   with two instances on one account the dialog showed in both windows).
 
 ## 10. Combat on a human: aim, shoot, crouch, reload — verified 2026-10-14
