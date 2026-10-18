@@ -115,6 +115,7 @@ struct Apply {
     bool burn = false;                                 // start the countdown (burnLeft s)
     float burnLeft = 0;
     bool explode = false;                              // blow it up now
+    bool copy = false;  // on a copy: its explosion only through the one explode routine (ExplodeOnce), never native
     bool Empty() const { return !repair && parts.empty() && wheels.empty() && !burn && !explode; }
 };
 // What a copy (`local`) needs to show `auth`, raise-only; `done` remembers what was set already (so a part the game
@@ -128,6 +129,27 @@ Apply Plan(const Snapshot& local, const Snapshot& auth, Applied& done);
 // What `local` has beyond `auth` (index, local value), the wheels and flags it has beyond: a copy's own damage.
 Update Excess(const CarRef& ref, uint16_t epoch, const Snapshot& local, const Snapshot& auth);
 bool Empty(const Update& u);  // no parts, no wheel and no flag beyond
+
+// ---- a copy never blows up by itself --------------------------------------------------------------------------------
+// Only the game that holds a car's damage has a real explosion of it. On every other game the car (a copy, or a real
+// car another game holds) blows up only when the holder's game says so: car damage's exploded flag (CarDamage) or the
+// explosions sync's CarExploded, whichever arrives first, and a wrecked car coming back (CarParked). All of them end in
+// one routine (car_damage.lua D.Explode: SetExploded and a visual-only picture with the damage guard's zone), which
+// asks this book first: the first ask for an entity goes through, every later one is refused. A copy that burns keeps
+// burning (the flames show) but its countdown is held above zero (HoldFire) so it never ends in a blast of its own.
+class ExplodeOnce {
+public:
+    bool First(uint32_t entity) { return entity != 0 && done_.insert(entity).second; }
+    bool Done(uint32_t entity) const { return done_.count(entity) != 0; }
+    void Clear() { done_.clear(); }  // a new world (entity ids are per world), the session's end
+    size_t Size() const { return done_.size(); }
+
+private:
+    std::set<uint32_t> done_;
+};
+constexpr float kHoldFire = 3.0f;  // s: a burning copy's countdown is put back up to this whenever it falls below
+// The countdown value a held copy gets: `left` when it is above `hold`, else `hold` (also for NaN / negative values).
+float HoldFire(float left, float hold = kHoldFire);
 
 // ---- the per-game book of every car's damage ------------------------------------------------------------------------
 enum class Role : uint8_t { Authority, Copy };
@@ -148,6 +170,7 @@ struct Outbox {
     std::vector<std::pair<int, Update>> reports;      // CarDamageReport to the authority
     std::vector<std::pair<int, CarRef>> requests;     // CarDamageRequest to the authority
     std::vector<Apply> applies;
+    std::vector<uint32_t> holdFire;                   // copies that burn here: their countdown is held (HoldFire)
     std::vector<std::string> logs;
     std::vector<std::string> trace;                   // "CDx ..." record bodies (type first)
 };

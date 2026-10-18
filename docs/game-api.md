@@ -1218,14 +1218,28 @@ left. Same model = same part list: a layout hash of the part types tells whether
 - **A new entity for a car** (our own car back from behind a copy, section 15 "Mission car back"; a fresh copy for
   a new driver): it gets the authority's damage at once; if it has damage the car does not (the driver had it
   repaired while ours was hidden), it is repaired first. The authority's own new entity gets what everyone was told.
-- **The fire and the explosion:** a copy of a burning car burns with the same seconds left (the native explosion
-  function with that delay), and blows up with it when the authority's car is exploded (at once, native; if the
-  exploded bit does not show right after, `DisableExplosion(false)` + `SetExploded()` from Lua). One explosion on
-  every game: the copies' own explosions stay switched off, and the CarParked wrecked flag / car_swap's
-  `restore_wrecked` (section 15) set a hidden real car that comes back exploded (`SetExploded`, no second blast:
-  the blast is the explosions sync's picture, section 23; both paths end in an exploded car, the second is a
-  no-op on an exploded car). A player car copy we drive ourselves (we hold its damage now) has
-  its explosion switched back on, and off again when another game holds it.
+- **The fire and the explosion - one explosion, on the holder's game only.** A car blows up for real only on the
+  game that holds its damage. On every other game (a copy, or a real car another game holds) it never blows up by
+  itself:
+  - its explosion is switched off (`DisableExplosion(true)`), re-asserted every round (4 times a second), after a
+    `Repair()` and after parts were set on it (car_damage.lua `keepOff`; traffic copies too);
+  - a copy of a burning car burns (the native explosion function with the holder's seconds left, at least 3 s: the
+    flames show), but its countdown (entity + 0x1FB8) is held at 3 s or more every tick while it burns
+    (car_damage.h `HoldFire`, car_damage_sync.cpp `HoldFireGuarded`), so the countdown never ends in a blast of its
+    own. UNVERIFIED: that +0x1FB8 counts down to the blast and that raising it keeps the flames;
+  - it blows up only when the holder's game says so: car damage's exploded flag (CarDamage) or the explosions sync's
+    CarExploded (section 23), whichever arrives first, or a wrecked car of ours coming back (CarParked / car_swap's
+    `restore_wrecked`, section 15). All of them call one routine, car_damage.lua `D.Explode`: it asks the dll's
+    one-explosion book (`mc_car_explode_first(entity)`, car_damage.h `ExplodeOnce`: the first ask per entity goes
+    through, every later one is refused; cleared with a new world, `mc_car_explode_reset`), then `DisableExplosion(false)`
+    + `SetExploded()` (the wreck; never `Explode()`, which is a real blast with the game's countdown) and a visual-only
+    picture of the blast with the damage guard's remote zone (explosion_sync.lua `B.Picture`; none when CarExploded's
+    picture was shown for that car already). Traced `CDB` (the book's answer) and `CDE` (what was done).
+  On the holder's game (the driver's, the last driver's while parked, the host for his traffic) the car blows up the
+  game's own way; a player car copy we drive ourselves (we hold its damage now) has its explosion switched back on,
+  and off again when another game holds it. Known consequence (UNVERIFIED in game): a parked car another game holds
+  does not blow up on this game from a blast here (an explosion of this game near it only shows as a picture on the
+  holder's game, which does not damage cars).
 - **Traffic:** the host's traffic cars (traffic_sync, section 19) are named by his entity id on his game and by their
   net id on the wire and on the guests' games; a guest's copy is a copy like any other (it asks the host, reports
   its own damage to him). A traffic car a player takes over becomes a player car (its damage goes on with it: the

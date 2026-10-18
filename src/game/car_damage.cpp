@@ -354,6 +354,10 @@ Update Excess(const CarRef& ref, uint16_t epoch, const Snapshot& local, const Sn
     return u;
 }
 
+float HoldFire(float left, float hold) {
+    return std::isfinite(left) && left > hold ? left : hold;
+}
+
 bool Empty(const Update& u) {
     if (!u.parts.empty() || u.flags) return false;
     for (uint8_t w : u.wheels)
@@ -498,6 +502,10 @@ void Book::Round(const std::vector<CarInput>& cars, double now, Outbox& out) {
             ++stats_.copies;
         if (!in.read) continue;
         if (in.local.Damaged()) ++stats_.damaged;
+        // a copy that burns here (the holder's fire shown on it, or a fire of its own): its countdown is held, it
+        // never blows up by itself (ExplodeOnce)
+        if (in.role == Role::Copy && (in.local.flags & kBurning) && !(in.local.flags & kExploded))
+            out.holdFire.push_back(in.entity);
         if (in.role == Role::Authority)
             AuthorityRound(in, c, rebound, now, out);
         else
@@ -700,6 +708,7 @@ void Book::CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbo
         Apply a;
         a.entity = in.entity;
         a.repair = true;
+        a.copy = true;
         out.applies.push_back(a);
         c.appliedEpoch = c.epoch;
         c.done.Clear();
@@ -718,6 +727,7 @@ void Book::CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbo
     Apply a = Plan(local, c.auth, c.done);
     if (!a.Empty()) {
         a.entity = in.entity;
+        a.copy = true;
         std::snprintf(buf, sizeof buf, "car %s: damage set on our copy (%zu parts: %s; %zu wheels%s%s): the authority "
                                        "has %s",
                       ref.c_str(), a.parts.size(), PartsText(a.parts, 8).c_str(), a.wheels.size(),

@@ -14,11 +14,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -260,6 +262,22 @@ bool ExplodeGuarded(uint8_t* e, float delay) {
     }
 }
 
+// A copy's fire countdown held up (car_damage.h HoldFire): only while it burns and has not exploded. Guarded.
+// 1 = held (raised), 0 = nothing to do, -1 = not burning any more / exploded / fault.
+int HoldFireGuarded(uint8_t* e) {
+    __try {
+        if (*reinterpret_cast<uint32_t*>(e + kEntFlags) & kExplodedBit) return -1;
+        if (!(*reinterpret_cast<uint8_t*>(e + kBurnFlags) & kBurningBit)) return -1;
+        float* left = reinterpret_cast<float*>(e + kBurnLeft);
+        const float held = HoldFire(*left);
+        if (held == *left) return 0;
+        *left = held;
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
 // read back: did it take? (exploded bit / fire bit)
 bool HasBitGuarded(uint8_t* e, bool fire) {
     __try {
@@ -326,6 +344,33 @@ uint64_t _txDamage = 0, _txReport = 0, _txRequest = 0, _rxDamage = 0, _rxReport 
 bool _moduleLoaded = false, _moduleFailed = false, _wasActive = false;
 uint32_t _luaErrors = 0;
 std::string _luaCmds;  // for the next Lua call (repairs, explosions)
+ExplodeOnce _once;     // one explosion per car entity here, whichever path asks first (mc_car_explode_first)
+std::set<uint32_t> _hold;  // burning copies whose countdown is held (Outbox::holdFire, renewed every round)
+uint64_t _held = 0;        // countdown refreshes so far (status)
+
+// Lua: mc_car_explode_first(entity id as a string or number) -> true for the first ask per entity (car_damage.lua
+// D.Explode, the one explode routine of car damage, CarExploded and a wrecked car coming back)
+uint32_t EntityArg(lua_State* L, int idx) {
+    const char* s = lua::ToString(L, idx);
+    if (!s) return 0;
+    char* end = nullptr;
+    const double v = std::strtod(s, &end);
+    if (end == s || !(v >= 1) || v > 4294967295.0) return 0;
+    return static_cast<uint32_t>(v);
+}
+int McCarExplodeFirst(lua_State* L) {
+    const uint32_t id = EntityArg(L, 1);
+    const bool first = _once.First(id);
+    if (core::trace::IsOpen()) core::trace::Line("CDB", "ent=%u first=%d", id, first ? 1 : 0);
+    lua::PushBool(L, first);
+    return 1;
+}
+// Lua: mc_car_explode_reset() - a new world (entity ids are per world)
+int McCarExplodeReset(lua_State*) {
+    _once.Clear();
+    _hold.clear();
+    return 0;
+}
 std::map<std::string, double> _traceAt;
 std::map<uint32_t, std::string> _readWarned;
 uint32_t _logs = 0;
@@ -522,16 +567,32 @@ void Carry(const Apply& a, uint32_t entity) {
         for (const auto& [i, v] : a.wheels)
             if (SetWheelGuarded(e, i, v)) ++wheels;
     bool fire = false, boom = false;
-    // a copy has its explosion switched off (DisableExplosion): whether that also stops this call is not known; when
-    // the bit does not show right after, the script's SetExploded is tried (with the explosion switched on first)
-    if (a.burn && _g.explode) fire = ExplodeGuarded(e, a.burnLeft) && HasBitGuarded(e, true);
+    // The fire: the native countdown shows the flames; on a copy it is held above zero from now on (MainTick) so it
+    // never ends in a blast of the copy's own.
+    if (a.burn && _g.explode) {
+        fire = ExplodeGuarded(e, a.copy ? HoldFire(a.burnLeft) : a.burnLeft) && HasBitGuarded(e, true);
+        if (fire && a.copy) _hold.insert(entity);
+    }
     if (a.explode) {
-        if (_g.explode)
-            boom = ExplodeGuarded(e, -1.0f) && HasBitGuarded(e, false);
-        if (!boom) {
-            std::snprintf(buf, sizeof buf, "EX %u\n", entity);
+        if (a.copy) {
+            // a copy blows up only through the one explode routine (car_damage.lua D.Explode: once per entity, whether
+            // this or the explosions sync's CarExploded comes first; SetExploded + a visual-only picture)
+            std::snprintf(buf, sizeof buf, "EX %u 1 0\n", entity);
             _luaCmds += buf;
+            _hold.erase(entity);
+        } else if (_once.First(entity)) {
+            // our own car (we hold its damage): the real explosion, here only
+            if (_g.explode) boom = ExplodeGuarded(e, -1.0f) && HasBitGuarded(e, false);
+            if (!boom) {
+                std::snprintf(buf, sizeof buf, "EX %u 0 1\n", entity);  // no picture, already claimed
+                _luaCmds += buf;
+            }
         }
+    }
+    // a copy's explosion stays switched off whatever was done to it (Repair, the part energy setter)
+    if (a.copy && !a.explode) {
+        std::snprintf(buf, sizeof buf, "DX %u\n", entity);
+        _luaCmds += buf;
     }
     if (!a.parts.empty() || !a.wheels.empty() || a.burn || a.explode) {
         std::snprintf(buf, sizeof buf, "car entity %u", entity);
@@ -540,7 +601,9 @@ void Carry(const Apply& a, uint32_t entity) {
                       "%s: %d of %zu parts set (%d refused by the game, %d failed), %d of %zu wheels%s%s", buf, setOk,
                       a.parts.size(), refused, failed, wheels, a.wheels.size(),
                       a.burn ? (fire ? ", fire started" : ", fire NOT started") : "",
-                      a.explode ? (boom ? ", blown up" : ", blown up through the script") : "");
+                      a.explode ? (a.copy ? ", blown up through the one explode routine"
+                                          : boom ? ", blown up" : ", blown up through the script")
+                                : "");
         Log(line);
     }
 }
@@ -561,10 +624,25 @@ void MainTick(lua_State* L, float dt) {
         sh.out.clear();
         _traceAt.clear();
         _readWarned.clear();
+        _once.Clear();
+        _hold.clear();
     }
     _wasActive = active;
+    // burning copies: the countdown held above zero every tick (they burn, they never blow up by themselves)
+    for (auto it = _hold.begin(); it != _hold.end();) {
+        auto* e = static_cast<uint8_t*>(lua::EntityByGuid(*it));
+        const int r = e ? HoldFireGuarded(e) : -1;
+        if (r < 0) {
+            it = _hold.erase(it);
+        } else {
+            if (r > 0) ++_held;
+            ++it;
+        }
+    }
     if (_moduleFailed) return;
     if (!_moduleLoaded) {
+        lua::RegisterGlobal(L, "mc_car_explode_first", &McCarExplodeFirst);
+        lua::RegisterGlobal(L, "mc_car_explode_reset", &McCarExplodeReset);
         if (!LoadModule(L)) {
             _moduleFailed = true;
             return;
@@ -645,6 +723,8 @@ void MainTick(lua_State* L, float dt) {
         for (auto& [p, u] : out.reports) push(Net{Net::Report, p, std::move(u), {}});
         for (auto& [p, r] : out.requests) push(Net{Net::Request, p, {}, r});
     }
+    _hold.clear();
+    _hold.insert(out.holdFire.begin(), out.holdFire.end());
     for (const Apply& a : out.applies) Carry(a, a.entity);
     for (const auto& l : out.logs) Log(l);
     if (core::trace::IsOpen()) {

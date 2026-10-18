@@ -650,7 +650,9 @@ u8  n                     parts listed
   asks (CarDamageRequest, every 3 s) until it has a full state. A copy whose own damage stands above the holder's for
   0.4 s reports it (CarDamageReport, only what it did not report yet); not while it was moved by SetPos in the last
   second (pinned or snapped by the car controller), except tyres and the fire / explosion bits; such bumps are
-  undone by a repair once they add up (see docs/game-api.md 24).
+  undone by a repair once they add up (see docs/game-api.md 24). A copy never blows up by itself: a burning copy
+  burns with its countdown held, and the holder's exploded flag (or the explosions sync's CarExploded, whichever comes
+  first) sets it exploded once, with a visual-only picture ("Explosions"; docs/game-api.md 24 "One explosion").
 - **The host's traffic:** CarDamage goes out by net id to all guests (a guest without that copy ignores it); a
   traffic car nobody has a copy of is not sent. Reports and requests for it go to the host, who maps the net id back
   to his car.
@@ -837,6 +839,10 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   (the wreck without a blast; UNVERIFIED), and a picture of the blast with a remote zone. A swapped car whose real car
   is hidden behind the copy: when the real car comes back wrecked (CarParked, Phase 3) it is set exploded too, no
   second blast. The driver's game takes a car that blew up as wrecked for CarParked whatever `GetDamage` says.
+  **One explosion per car on every game:** only the game that holds the car's damage ("Car damage") has a real
+  explosion of it; everywhere else it never blows up by itself (explosion off, a burning copy's countdown held) and
+  CarExploded, car damage's exploded flag and a wrecked car coming back all go through one routine that runs once per
+  car entity, whichever comes first (docs/game-api.md 24).
 - **Not carried:** the projectile's flight (no harmless projectile exists: `ThrowProjectileWeapon` throws a real
   one; the throw animation shows on the thrower's puppet, the explosion appears where and when it happened); damage
   to cars from another game's explosion (a copy cannot blow up: a remote player's grenade does not wreck your car);

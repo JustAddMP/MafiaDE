@@ -438,12 +438,20 @@ function M.Restore(c, how, wrecked, why, failed)
   if wrecked then
     -- set exploded (the wreck, no blast: SetExploded, docs/game-api.md 23, UNVERIFIED); the blast happened on the
     -- driver's game and was shown here as a picture (CarExploded) or is shown now; a real Explode here would hurt
-    -- people a second time
-    pcall(orig.DisableExplosion, orig, false)
-    local g3, e3 = pcall(orig.SetExploded, orig)
-    if not c.boomShown and M.Boom and M.Boom.Picture then
-      local q = orig:GetPos()
-      pcall(M.Boom.Picture, q.x, q.y, q.z, "exp_grenade", false, 255, 0, 5)
+    -- people a second time. Through the one explode routine (car_damage.lua D.Explode, once per entity) when it is there.
+    local shown = c.boomShown
+    c.boomShown = nil
+    local g3, e3
+    if M.CarDamage and M.CarDamage.Explode then
+      local good, ok, how = pcall(M.CarDamage.Explode, orig, not shown, false, "255")
+      g3, e3 = good and (ok or how == "already"), good and how or ok
+    else
+      pcall(orig.DisableExplosion, orig, false)
+      g3, e3 = pcall(orig.SetExploded, orig)
+      if not shown and M.Boom and M.Boom.Picture then
+        local q = orig:GetPos()
+        pcall(M.Boom.Picture, q.x, q.y, q.z, "exp_grenade", false, 255, 0, 5)
+      end
     end
     c.boomShown = nil
     log("car " .. c.key .. ": destroyed on the last driver's game: ours set exploded too" .. (g3 and "" or (" (failed: " .. tostring(e3) .. ")")))

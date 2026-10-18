@@ -10,7 +10,9 @@
 -- Input (cmds, one line per command):
 --   S active host local          session running, we host, our player id
 --   RP ent                       repair car entity `ent` (C_WrapperCar::Repair): a copy whose car was repaired
---   EX ent                       blow car entity `ent` up (SetExploded; only when the dll has no native explosion)
+--   EX ent pic claimed           blow car entity `ent` up through D.Explode (pic 1: a visual-only picture of the
+--                                blast, a copy; claimed 1: mc_car_explode_first was asked already, our own car)
+--   DX ent                       a copy's explosion switched off again (after a repair or parts set on it)
 -- Output (events, one per line; a round every ROUND s while a session runs):
 --   CD ref ent role auth quiet gd md
 --                                one car: ref = its network name ("o:g" player car key, "t<net>" a host traffic car's
@@ -31,6 +33,8 @@ local ROUND = 0.25        -- s between rounds
 local QUIET = 1.0         -- s after a SetPos (pin / snap) a copy's own damage is not reported
 D.last = D.last or {}     -- player car key -> id of its last driver (the game that holds its damage while parked)
 D.expl = D.expl or {}     -- player car key -> true: our copy's explosion was switched back on (we hold the car)
+D.off = D.off or {}       -- entity id -> true: a car another game holds, its explosion switched off by us
+D.blown = D.blown or {}   -- entity id -> true: blown up by D.Explode (nothing to switch off any more)
 
 local function log(s) if mc_log then mc_log("damage: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -63,40 +67,90 @@ local function carOf(ent)
   return nil
 end
 
+-- a car another game holds: its explosion off (re-asserted every round, after a repair and after parts were set:
+-- only the holder's game has a real explosion of it, docs/game-api.md 24 "One explosion")
+local function keepOff(e, id)
+  if not id or D.blown[id] then return end
+  try("DisableExplosion", e.DisableExplosion, e, true)
+  D.off[id] = true
+end
+
 function D.Repair(ent)
   local e = carOf(ent)
   if not e then return end
   local _, ok = try("Repair", e.Repair, e)
+  keepOff(e, entId(e))  -- repairs are only ever done on copies
   local g, d = pcall(e.GetDamage, e)
   log(string.format("car %s repaired (%s): GetDamage now %s", tostring(ent), ok and "ok" or "failed",
     g and num(d) or "?"))
 end
 
-function D.Explode(ent)
-  local e = carOf(ent)
-  if not e then return end
-  pcall(e.DisableExplosion, e, false)
+-- The one way a car is blown up here because another game says so (docs/game-api.md 24 "One explosion"): car
+-- damage's exploded flag for a copy ("EX"), the explosions sync's CarExploded (explosion_sync.lua B.OnRemoteCar) and a
+-- wrecked car of ours coming back (player_sync.lua M.Restore) all call this. mc_car_explode_first lets the first one
+-- per entity through and refuses the rest, whichever comes first. `ent`: an entity id (string or number) or the car.
+-- picture: show the blast as a visual-only explosion (CreateScriptExplosion without damage, with the damage guard's
+-- remote zone: explosion_sync.lua B.Picture); claimed: the dll asked mc_car_explode_first already (our own car).
+-- Never Explode(): that is a real blast with the game's own countdown. Returns ok, what ("set_exploded", "already",
+-- "no_car", "failed:...").
+function D.Explode(ent, picture, claimed, from)
+  local e = ent
+  if type(ent) ~= "userdata" and type(ent) ~= "table" then e = carOf(ent) end
+  if not (e and valid(e)) then return false, "no_car" end
+  local good, g = pcall(e.GetGUID, e)
+  local idText = good and tostring(g):match("(%d+)%s*$") or nil
+  local id = idText and tonumber(idText)
+  if not claimed and mc_car_explode_first and not mc_car_explode_first(idText or "0") then
+    log("car " .. tostring(idText) .. ": blown up already (one explosion per car)")
+    return false, "already"
+  end
+  if id then
+    D.blown[id] = true
+    -- its CAR_HAVE_PROBLEM here is not ours to send on (explosion_sync.lua B.OnCarProblem skips known ones)
+    if M.Boom and M.Boom.exploded then M.Boom.exploded[id] = true end
+  end
+  pcall(e.DisableExplosion, e, false)  -- (switched off on copies; it may block SetExploded too)
   local _, ok = try("SetExploded", e.SetExploded, e)
-  if not ok then try("Explode", e.Explode, e) end
-  log("car " .. tostring(ent) .. " blown up through the script binding (" .. (ok and "SetExploded" or "Explode") .. ")")
+  local shown = false
+  if picture and M.Boom and M.Boom.Picture then
+    local q = e:GetPos()
+    shown = M.Boom.Picture(q.x, q.y, q.z, "exp_grenade", false, from or 255, 0, 5) and true or false
+    if M.KeyOf then
+      local _, c = M.KeyOf(e)
+      if c then c.boomShown = true end  -- our hidden real car of it comes back set exploded without a second picture
+    end
+  end
+  log(string.format("car %s set exploded (%s%s)", tostring(idText), ok and "SetExploded" or "SetExploded failed",
+    picture and (shown and ", with a picture" or ", picture failed") or ""))
+  if mc_trace then
+    mc_trace("CDE", string.format("ent=%s ok=%d picture=%d claimed=%d from=%s", tostring(idText), ok and 1 or 0,
+      shown and 1 or 0, claimed and 1 or 0, tostring(from or "-")))
+  end
+  return ok, ok and "set_exploded" or "failed:SetExploded"
 end
 
 -- A copy we spawned for a player car (c.qid) has its explosion switched off (player_sync M.CarTick: a copy must not
--- blow up on one game only). While our game holds the car's damage (we drive it, or drove it last) it must be able
--- to blow up like any car; when another game holds it again, off again.
+-- blow up on one game only), and so has every car another game holds (keepOff, every round). While our game holds
+-- the car's damage (we drive it, or drove it last) it must be able to blow up like any car; when another game holds
+-- it again, off again.
 local function explosionFor(key, c, ours)
-  local id = c.qid and entId(c.ent)
+  local id = entId(c.ent)
   if not id then return end
-  if ours and D.expl[key] ~= id then
-    D.expl[key] = id  -- by entity: a fresh copy (M.Swap) starts with its explosion off again
-    try("DisableExplosion", c.ent.DisableExplosion, c.ent, false)
-    log("car " .. key .. ": we hold its damage, our copy " .. id .. " can blow up now")
-  elseif not ours and D.expl[key] then
+  if ours then
+    if (c.qid and D.expl[key] ~= id) or D.off[id] then
+      D.expl[key] = id  -- by entity: a fresh copy (M.Swap) starts with its explosion off again
+      D.off[id] = nil
+      if not D.blown[id] then
+        try("DisableExplosion", c.ent.DisableExplosion, c.ent, false)
+        log("car " .. key .. ": we hold its damage, our entity " .. id .. " can blow up now")
+      end
+    end
+  else
     if D.expl[key] == id then
-      try("DisableExplosion", c.ent.DisableExplosion, c.ent, true)
-      log("car " .. key .. ": another game holds its damage, our copy does not blow up by itself again")
+      log("car " .. key .. ": another game holds its damage, our entity does not blow up by itself again")
     end
     D.expl[key] = nil
+    keepOff(c.ent, id)
   end
 end
 
@@ -139,6 +193,7 @@ function D.Round(ev)
     else
       for net, c in pairs(T.copies or {}) do
         if c.st == "ready" and valid(c.ent) then
+          keepOff(c.ent, entId(c.ent))  -- the host's traffic car: only the host's game blows it up for real
           line(ev, "t" .. net, c.ent, "C", "0", quietOf(c.rv))
           n, copies = n + 1, copies + 1
         end
@@ -159,11 +214,22 @@ function D.Update(dt, cmds)
     elseif f[1] == "RP" then
       D.Repair(f[2])
     elseif f[1] == "EX" then
-      D.Explode(f[2])
+      local good, err = pcall(D.Explode, f[2], f[3] == "1", f[4] == "1")
+      if not good then log("explode error: " .. tostring(err)) end
+    elseif f[1] == "DX" then
+      local e = carOf(f[2])
+      if e then keepOff(e, entId(e)) end
     end
   end
+  -- a new world: entity ids start over (the dll's one-explosion book too)
+  local world = tostring(M.inWorldAt)
+  if D.world ~= world then
+    D.world = world
+    D.off, D.blown = {}, {}
+    if mc_car_explode_reset then mc_car_explode_reset() end
+  end
   if not D.active then
-    if next(D.last) or next(D.expl) then D.last, D.expl = {}, {} end
+    if next(D.last) or next(D.expl) or next(D.off) or next(D.blown) then D.last, D.expl, D.off, D.blown = {}, {}, {}, {} end
     return ""
   end
   D.t = (D.t or 0) + (dt or 0)

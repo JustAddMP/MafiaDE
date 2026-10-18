@@ -126,7 +126,14 @@ function B.ShowsNpc(from, key)
   local n = N()
   if not n or not n.host then return false end
   if not M.isHost then
-    local s = n.host[key]
+    -- another guest's own NPC is known here by the host's relay key for it (npc_sync.lua N.RelayKey, several guests);
+    -- the host's NPCs (from "0") by their own key
+    local s
+    if tostring(from) ~= "0" and n.RelayKey then
+      local rk = n.RelayKey(from, key)
+      s = rk and n.host[rk]
+    end
+    s = s or n.host[key]
     return s ~= nil and s.copy ~= nil and s.copy ~= false
   end
   for mid, s in pairs(n.host) do
@@ -355,7 +362,14 @@ function B.OnRemoteCar(f)
     ent, label = tc and tc.ent, "traffic copy " .. tostring(key)
   end
   local act = "none"
-  if valid(ent) then
+  local D = M.CarDamage
+  if valid(ent) and D and D.Explode then
+    -- the one explode routine (car_damage.lua D.Explode): once per entity, whether this or car damage's exploded
+    -- flag came first; SetExploded and the picture with its damage guard zone
+    local good, ok, how = pcall(D.Explode, ent, true, false, from)
+    act = good and tostring(how) or ("failed:" .. tostring(ok):gsub("%s", "_"):sub(1, 60))
+    if good and ok then B.stats.cars = B.stats.cars + 1 end
+  elseif valid(ent) then
     local id = idOf(guidStr(ent))
     if not B.exploded[id] then
       B.exploded[id] = true

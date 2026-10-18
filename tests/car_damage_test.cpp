@@ -365,6 +365,82 @@ void TestBookExplosion() {
     Check(n.b.GetStats().explosions == 1 && n.b.GetStats().reports == 0, "once, nothing reported back");
 }
 
+// The one explode routine (car_damage.lua D.Explode) as the test sees it: the guard first, then one blast picture.
+int ExplodeRoutine(ExplodeOnce& once, uint32_t entity, int& blasts) {
+    if (!once.First(entity)) return 0;
+    ++blasts;
+    return 1;
+}
+
+void TestExplodeOnce() {
+    ExplodeOnce once;
+    Check(once.First(22) && !once.First(22) && once.Done(22), "first ask per entity goes through, the next is refused");
+    Check(once.First(33) && !once.First(0) && once.Size() == 2, "per entity; entity 0 never");
+    once.Clear();
+    Check(once.First(22), "a new world starts over");
+
+    Check(HoldFire(5.0f) == 5.0f && HoldFire(1.0f) == kHoldFire && HoldFire(0.0f) == kHoldFire &&
+              HoldFire(-2.0f) == kHoldFire && HoldFire(NAN) == kHoldFire,
+          "a held countdown never falls below the hold");
+
+    // a burning car: the copy burns, its countdown is held (never a blast of its own), the authority's is not
+    Net n;
+    Snapshot a = Car(), b = Car();
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    a.flags = kBurning;
+    a.burnLeft = 0.6f;
+    bool burnApply = false, held = false, authorityHeld = false;
+    for (int i = 0; i < 4; ++i) {
+        Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+        for (const Apply& ap : n.ob.applies)
+            if (ap.burn) burnApply = ap.copy;
+        for (uint32_t e : n.ob.holdFire) held |= e == 22;
+        for (uint32_t e : n.oa.holdFire) authorityHeld |= e == 11;
+    }
+    Check(burnApply && held && !authorityHeld, "copy's fire shown and held, the authority's runs");
+
+    // the authority's car explodes: car damage's exploded flag (an Apply with explode on the copy) and the explosions
+    // sync's CarExploded both reach the copy's game; whichever comes first blows it up, the other does nothing
+    a.flags = kExploded;
+    bool explodeApply = false;
+    for (int i = 0; i < 3; ++i) {
+        Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+        for (const Apply& ap : n.ob.applies)
+            if (ap.explode) explodeApply = ap.copy && ap.entity == 22;
+    }
+    Check(explodeApply, "the copy's explosion comes as a copy apply (the one routine, never native)");
+    {
+        ExplodeOnce g;
+        int blasts = 0;
+        ExplodeRoutine(g, 22, blasts);  // car damage's flag first
+        ExplodeRoutine(g, 22, blasts);  // then CarExploded
+        Check(blasts == 1, "flag first, CarExploded second: one explosion");
+    }
+    {
+        ExplodeOnce g;
+        int blasts = 0;
+        ExplodeRoutine(g, 22, blasts);  // CarExploded first
+        ExplodeRoutine(g, 22, blasts);  // then car damage's flag
+        ExplodeRoutine(g, 22, blasts);  // and a keyframe repeating it
+        Check(blasts == 1, "CarExploded first, the flag second: one explosion");
+    }
+    {
+        // the hidden real car coming back wrecked is another entity: set exploded once too
+        ExplodeOnce g;
+        int blasts = 0;
+        ExplodeRoutine(g, 22, blasts);
+        ExplodeRoutine(g, 11, blasts);
+        ExplodeRoutine(g, 11, blasts);
+        Check(blasts == 2, "the copy and the real car behind it: once each");
+    }
+    bool stillHeld = false;
+    for (int i = 0; i < 2; ++i) {
+        Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+        for (uint32_t e : n.ob.holdFire) stillHeld |= e == 22;
+    }
+    Check(!stillHeld && n.b.GetStats().reports == 0, "an exploded copy is not held, nothing reported back");
+}
+
 void TestBookTraffic() {
     // the host's own book keeps his traffic cars by entity (h...), the guest's by net (t...): the sync translates
     Book host, guest;
@@ -414,6 +490,7 @@ int main() {
     TestBookRepair();
     TestBookHandOver();
     TestBookExplosion();
+    TestExplodeOnce();
     TestBookTraffic();
     TestStale();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
