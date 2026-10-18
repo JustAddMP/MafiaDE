@@ -2,3 +2,5 @@ out/
 *.log
 *.dmp
 Thumbs.db
+__pycache__/
+*.pyc
