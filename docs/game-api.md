@@ -710,6 +710,29 @@ begin with a drive or a walk the tests cannot follow).
   reload when the new car compared equal to the old entity; UNVERIFIED that it does). All of it UNVERIFIED in game:
   the ray checks, that SpawnCar takes the spot, that the snap onto his car looks right.
 
+**Replicas: one authority per NPC (unreleased, `npc-authority`; NOT checked in game).** A guest's NPC paired with a
+host NPC no longer runs its own fight and walk: it is a replica driven from the host's states (docs/protocol.md "NPCs",
+src/game/npc_replica.h), like a player puppet. What the glue (npc_sync.lua) calls on it, and what is not known yet:
+
+| call | when | expected / UNVERIFIED |
+|---|---|---|
+| `h:InterruptBattle()` | on pairing, then every 2 s while driven | the NPC leaves its fight (cover, shooting, its own targets). UNVERIFIED that it stays out of it: the mission's flow may order it into battle again (hence the repeat), and whether a later `MoveVec` is honoured while a battle runs is unknown |
+| `h:InterruptCivilWander()`, `h:InterruptPatrol()`, `h:InterruptAvoidingCar()` | on pairing | its idle wandering, patrol route and car dodging stop (the copies have used the first and last since 0.12.0; on paired mission NPCs UNVERIFIED) |
+| `h:SetReactionOnSound(false)` | on pairing (`true` again when unpaired) | it does not turn to gunfire on its own (as the copies and the copy spawner's driver) |
+| `h:ResumeBattle()` | when the pairing ends (out of range 5 s, host NPC in a car, gone) | its own AI back. UNVERIFIED that it resumes a fight it was in |
+| `h:MoveVec(point, "WALK" / "RUN" / "SPRINT")`, `h:SetMovementSpeedMult(m)`, `SetPos`, `SetDir` | every tick from the C++ side's command | as the player puppets (section 4: MoveVec on AI humans works for puppets and copies; SetMovementSpeedMult is UNVERIFIED, on mission NPCs as well) |
+| not used | | `SwitchBrain` (crashed the game, above), `ScriptControl`, `PreventAIScriptThisPrioAndLower` (could also block the MoveVec AI command), `SetAggressivity` (no way to read the old value back), `Deactivate` (the NPC would stop moving and taking damage, above) |
+
+If none of it holds and the NPC keeps walking off (three snaps within 20 s), it is given up: hidden where the host's
+NPC is (`ShowModel(false)`, `SetPhysState(2)`, `SetDemigod(true)`), still paired (it dies with the host's NPC; never
+despawned: the mission may need it), and a spawned copy shows the host's NPC instead. Its bullets that hit the guest
+anyway, like a copy's, are given back (player_sync.lua `M.OnLocalDamage`); the guest's damage from host NPCs comes from
+the host. Which humans are not npc_sync's at all (ambient pedestrians, the `ambient-peds` package): `GetAIType() == 0`,
+`GetOwner()` nil (on foot) and a `GetName()` that is not `behavior_object_prime-NN-<mission spawner>` (`mc_npc_class`,
+src/game/npc_replica.h `IsAmbientHuman`); mission civilians (AI type 0, spawner-named) stay npc_sync's. The logs say
+`npc: freeze <call> on our <id>: ok / failed`, `npc: our <id> does not follow ... hidden, a copy shows it`, and the
+trace `NGS frozen= refused= snaps=`.
+
 **Mission car back (0.15; built from the code paths above, NOT checked in game).** The swap keeps the real car
 (`c.orig` in player_sync.lua): this game's mission scripts reference that entity, not the copy. Since 0.15 every
 real car is kept this way, not only an adopted mission car: the host's own mission car, swapped on the host's game
