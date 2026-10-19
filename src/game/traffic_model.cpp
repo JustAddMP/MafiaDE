@@ -257,7 +257,90 @@ bool ReadDespawns(net::ByteReader& r, std::vector<uint16_t>& out) {
     return !r.Failed();
 }
 
-// ---- host -------------------------------------------------------------------------------------------------------
+std::vector<uint8_t> PackBump(const BumpInfo& b) {
+    net::ByteWriter w;
+    w.U16(b.net);
+    w.F32(b.error);
+    w.F32(b.copySpeed);
+    w.F32(b.targetSpeed);
+    return w.Take();
+}
+
+bool ReadBump(net::ByteReader& r, BumpInfo& out) {
+    out.net = r.U16();
+    out.error = r.F32();
+    out.copySpeed = r.F32();
+    out.targetSpeed = r.F32();
+    return !r.Failed() && out.net != 0 && std::isfinite(out.error) && std::isfinite(out.copySpeed) &&
+           std::isfinite(out.targetSpeed);
+}
+
+std::vector<uint8_t> WithAuthority(uint8_t authority, const std::vector<uint8_t>& body) {
+    std::vector<uint8_t> out;
+    out.reserve(body.size() + 1);
+    out.push_back(authority);
+    out.insert(out.end(), body.begin(), body.end());
+    return out;
+}
+
+// ---- regions ----------------------------------------------------------------------------------------------------
+namespace {
+net::authority::RegionTuning RegionTuningOf(const RegionConfig& cfg) {
+    net::authority::RegionTuning t;
+    t.hostRadius = cfg.joinRadius;
+    t.releaseRadius = cfg.leaveRadius;
+    return t;
+}
+}  // namespace
+
+RegionFollow::RegionFollow(const RegionConfig& cfg) : cfg_(cfg), ra_(RegionTuningOf(cfg)) {}
+
+float RegionFollow::DistTo(net::PlayerId id) const {
+    const net::authority::PlayerSpot* me = nullptr;
+    const net::authority::PlayerSpot* other = nullptr;
+    for (const auto& p : players_) {
+        if (p.id == me_) me = &p;
+        if (p.id == id) other = &p;
+    }
+    if (!me || !other) return -1;
+    return Dist2D(me->pos, other->pos);
+}
+
+bool RegionFollow::Update(net::PlayerId me, net::PlayerId host, std::span<const net::authority::PlayerSpot> players,
+                          double now) {
+    players_.assign(players.begin(), players.end());
+    ra_.SetPlayers(players, host);
+    const bool first = !init_ || me != me_;
+    const net::PlayerId before = first ? net::kNoPlayer : auth_;
+    if (first) {
+        me_ = me;
+        auth_ = me;  // our own until we are found in someone's region
+        init_ = true;
+    }
+    if (me == host) {
+        auth_ = me;  // the host's game always runs its own traffic
+    } else {
+        bool inWorld = false;
+        for (const auto& p : players_)
+            if (p.id == me) inWorld = p.inWorld;
+        if (inWorld) {  // out of the world (loading, a menu): we keep what we had
+            const net::PlayerId r = ra_.RegionOf(me);
+            if (auth_ == me) {
+                // ours: we join another's region only within joinRadius of its owner
+                const float d = r == me ? -1 : DistTo(r);
+                if (d >= 0 && d <= cfg_.joinRadius) auth_ = r;
+            } else {
+                // another's: we follow the region we are in (its owner may change), ours only beyond leaveRadius of
+                // every owner (RegionOf answers us then)
+                auth_ = r;
+            }
+        }
+    }
+    if (auth_ != before) changedAt_ = now;
+    return auth_ != before;
+}
+
+// ---- authority -------------------------------------------------------------------------------------------------------
 namespace {
 net::interest::Config InterestConfig(const HostConfig& cfg) {
     net::interest::Config c;
@@ -275,9 +358,9 @@ net::interest::Config InterestConfig(const HostConfig& cfg) {
 }
 }  // namespace
 
-HostTraffic::HostTraffic(const HostConfig& cfg) : cfg_(cfg), im_(InterestConfig(cfg)) {}
+AuthorityTraffic::AuthorityTraffic(const HostConfig& cfg) : cfg_(cfg), im_(InterestConfig(cfg)) {}
 
-uint16_t HostTraffic::NewNet() {
+uint16_t AuthorityTraffic::NewNet() {
     for (int tries = 0; tries < 65536; ++tries) {
         const uint16_t n = nextNet_++;
         if (nextNet_ == 0) nextNet_ = 1;
@@ -323,19 +406,19 @@ bool CrewGetsOut(uint8_t targetFlags, float targetSpeed, float copySpeed) {
     return copySpeed < kOrphanSlow;  // (no report yet: negative)
 }
 
-size_t HostTraffic::MissingNow() const {
+size_t AuthorityTraffic::MissingNow() const {
     size_t n = 0;
     for (const auto& [net, c] : cars_) n += c.drv.Missing() ? 1 : 0;
     return n;
 }
 
-size_t HostTraffic::DeclaredNow() const {
+size_t AuthorityTraffic::DeclaredNow() const {
     size_t n = 0;
     for (const auto& [net, c] : cars_) n += c.drv.Declared() ? 1 : 0;
     return n;
 }
 
-void HostTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
+void AuthorityTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
     for (auto& [net, c] : cars_) c.seen = false;
     for (const HostCar& in : cars) {
         if (!Finite(in.st.pos) || !SafeToken(in.model, 64)) continue;
@@ -377,7 +460,7 @@ void HostTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
     }
 }
 
-void HostTraffic::SetView(uint32_t peer, const Vec3& pos, double now) {
+void AuthorityTraffic::SetView(uint32_t peer, const Vec3& pos, double now) {
     if (!Finite(pos)) return;
     auto it = peers_.find(peer);
     if (it == peers_.end()) {
@@ -390,34 +473,36 @@ void HostTraffic::SetView(uint32_t peer, const Vec3& pos, double now) {
     im_.SetPeerViewpoint(peer, {pos.x, pos.y, pos.z});
 }
 
-void HostTraffic::RemovePeer(uint32_t peer) {
+void AuthorityTraffic::RemovePeer(uint32_t peer) {
     im_.RemovePeer(peer);
     peers_.erase(peer);
 }
 
-uint32_t HostTraffic::KeyOf(uint16_t net) const {
+uint32_t AuthorityTraffic::KeyOf(uint16_t net) const {
     auto it = cars_.find(net);
     return it == cars_.end() ? 0 : it->second.c.key;
 }
 
-uint16_t HostTraffic::NetOf(uint32_t key) const {
+uint16_t AuthorityTraffic::NetOf(uint32_t key) const {
     auto it = byKey_.find(key);
     return it == byKey_.end() ? 0 : it->second;
 }
 
-const HostPeerStats* HostTraffic::Stats(uint32_t peer) const {
+const HostPeerStats* AuthorityTraffic::Stats(uint32_t peer) const {
     auto it = peers_.find(peer);
     return it == peers_.end() ? nullptr : &it->second.stats;
 }
 
-float HostTraffic::Dist(const Peer& p, uint16_t net) const {
+float AuthorityTraffic::Dist(const Peer& p, uint16_t net) const {
     auto it = cars_.find(net);
     if (it == cars_.end() || !p.hasView) return 1e9f;
     return traffic::Dist(p.view, it->second.c.st.pos);
 }
 
-void HostTraffic::Tick(double now, uint32_t hostMs, std::vector<PeerOut>& out) {
+void AuthorityTraffic::Tick(double now, uint32_t hostMs, std::vector<PeerOut>& out) {
     out.clear();
+    sentStates_.clear();
+    std::set<uint16_t> sentNets;
     for (auto& [key, p] : peers_) {
         if (p.hasView && now - p.viewAt > cfg_.viewTimeout) {
             p.hasView = false;
@@ -521,6 +606,8 @@ void HostTraffic::Tick(double now, uint32_t hostMs, std::vector<PeerOut>& out) {
             ad->second = Sent{q, now};
             states.push_back(st);
         }
+        for (const CarState& st : states) sentNets.insert(st.net);
+        for (uint16_t n : added) sentNets.insert(n);
         po.states = PackStates(hostMs, states, cfg_.maxPerPacket);
         po.sent = static_cast<uint32_t>(states.size());
         p.stats.relevant = static_cast<uint32_t>(p.relevant.size());
@@ -535,24 +622,123 @@ void HostTraffic::Tick(double now, uint32_t hostMs, std::vector<PeerOut>& out) {
         if (!po.spawns.empty() || !po.despawns.empty() || !po.states.empty() || po.skipped)
             out.push_back(std::move(po));
     }
+    for (uint16_t n : sentNets) {
+        auto it = cars_.find(n);
+        if (it != cars_.end()) sentStates_.push_back(it->second.c.st);
+    }
+    // sharing: a car within shareRadius of a player who has not got it (cap, budget, a new car) is unshared since now
+    for (auto& [net, c] : cars_) {
+        bool missing = false;
+        for (const auto& [key, p] : peers_) {
+            if (!p.hasView || p.admitted.count(net)) continue;
+            if (traffic::Dist(p.view, c.c.st.pos) <= cfg_.shareRadius) {
+                missing = true;
+                break;
+            }
+        }
+        if (!missing)
+            c.unsharedSince = -1;
+        else if (c.unsharedSince < 0)
+            c.unsharedSince = now;
+    }
 }
 
-// ---- guest ------------------------------------------------------------------------------------------------------
+size_t AuthorityTraffic::Unshared(const Vec3& me, float near, double now, double grace, size_t* mine) const {
+    size_t n = 0, all = 0;
+    for (const auto& [net, c] : cars_) {
+        if (Dist2D(me, c.c.st.pos) > near) continue;
+        ++all;
+        if (c.unsharedSince >= 0 && now - c.unsharedSince > grace) ++n;
+    }
+    if (mine) *mine = all;
+    return n;
+}
+
+// ---- receiver ---------------------------------------------------------------------------------------------------
 namespace {
-net::playout::PlayoutTuning TrafficPlayout(const GuestConfig& cfg) {
-    net::playout::PlayoutTuning t;
-    t.startDelay = cfg.interpDelay;
+net::replica::StreamTuning TrafficStream(const GuestConfig& cfg) {
+    net::replica::StreamTuning t;
+    t.playout.startDelay = cfg.interpDelay;
+    t.track.capacity = std::max<size_t>(2, cfg.trackSamples);
+    t.track.teleportDist = cfg.teleport;
+    t.track.maxExtrapolate = cfg.maxExtrapolate;
+    t.track.accelTime = 0;  // velocity only (the 0.15 traffic interpolation)
+    t.track.maxLead = cfg.maxLead;
     return t;
 }
+
+// A state's discrete part in one sample's bits: flags, then the driver's controls (steer, power, brake as on the wire).
+uint32_t PackBits(const CarState& s) {
+    return static_cast<uint32_t>(s.flags) | (static_cast<uint32_t>(static_cast<uint8_t>(motion::PackSnorm8(s.steer))) << 8) |
+           (static_cast<uint32_t>(motion::PackUnorm8(s.power)) << 16) |
+           (static_cast<uint32_t>(motion::PackUnorm8(s.brake)) << 24);
+}
+
+void UnpackControls(uint32_t bits, CarState& s) {
+    s.steer = motion::UnpackSnorm8(static_cast<int8_t>(static_cast<uint8_t>(bits >> 8)));
+    s.power = motion::UnpackUnorm8(static_cast<uint8_t>(bits >> 16));
+    s.brake = motion::UnpackUnorm8(static_cast<uint8_t>(bits >> 24));
+}
+
+float Speed(const Vec3& v) { return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
 }  // namespace
 
-GuestTraffic::GuestTraffic(const GuestConfig& cfg) : cfg_(cfg), playout_(TrafficPlayout(cfg)) {}
+// Core's traffic preset, tuned on the recorded path (tests/traffic_test.cpp "recorded path", TRSWEEP): the copy's
+// speed is set along its heading only (SetSpeed takes km/h), so an error across the road is fixed by the blend alone;
+// with ForTraffic's 1 m dead zone and 30 % share the simulated copy was 2.8 m (p95) off its car in the turns. A 0.5 m
+// dead zone, 8 /s and at most 70 % of its speed: 0.9 m at 30 m, 1.2 m at 150 m (the 0.15 nudge, 8 /s with no cap or
+// dead zone: 0.3 m, with a copy that slid by whatever it was off every tick). The snap (8 m, a stuck copy 2 m off for
+// 3 s, a target jump) stays the preset's. UNVERIFIED in game: how the copy's physics follows (the simulation's car
+// goes where SetRot / SetSpeed point it, 3 % short).
+net::correction::Tuning TrafficCorrection() {
+    net::correction::Tuning t = net::correction::Tuning::ForTraffic();
+    t.deadZone = 0.5f;
+    t.gain = 8.0f;
+    t.speedShare = 0.7f;
+    return t;
+}
 
-void GuestTraffic::OnSpawn(const SpawnInfo& s, double now) {
+motion::VehicleTuning TrafficVehicleTuning(const net::correction::Tuning& corr) {
+    motion::VehicleTuning v;
+    v.snapDist = corr.snapDist;  // the corrector snaps (far, stuck, teleport); the controller pins
+    return v;
+}
+
+ReceiverTraffic::ReceiverTraffic(const GuestConfig& cfg)
+    : cfg_(cfg), streamTuning_(TrafficStream(cfg)), vehicleTuning_(TrafficVehicleTuning(cfg.correction)) {}
+
+ReceiverTraffic::Auth& ReceiverTraffic::AuthOf(uint8_t authority) {
+    auto it = auths_.find(authority);
+    if (it == auths_.end()) it = auths_.emplace(authority, Auth(streamTuning_)).first;
+    return it->second;
+}
+
+const ReceiverTraffic::Auth* ReceiverTraffic::FindAuth(uint8_t authority) const {
+    auto it = auths_.find(authority);
+    return it == auths_.end() ? nullptr : &it->second;
+}
+
+ReceiverTraffic::Car& ReceiverTraffic::CarOf(uint32_t key) {
+    auto it = cars_.find(key);
+    if (it == cars_.end()) {
+        it = cars_.emplace(key, Car(vehicleTuning_, cfg_.correction)).first;
+        it->second.auth = RefAuthority(key);
+    }
+    return it->second;
+}
+
+void ReceiverTraffic::Erase(uint32_t key) {
+    auto a = auths_.find(RefAuthority(key));
+    if (a != auths_.end()) a->second.stream.Remove(RefNet(key));
+    cars_.erase(key);
+}
+
+void ReceiverTraffic::OnSpawn(uint8_t authority, const SpawnInfo& s, double now) {
     if (s.net == 0) return;
-    Car& c = cars_[s.net];
+    const uint32_t key = RefKey(authority, s.net);
+    Car& c = CarOf(key);
     if (c.haveInfo && c.copy && c.info.model != s.model) {
-        pendingRemove_.push_back(s.net);
+        pendingRemove_.push_back(key);
         c.copy = false;
     }
     if (c.released && c.despawnAt < 0 && c.haveInfo) return;  // still player sync's car: a new spawn comes after
@@ -561,181 +747,205 @@ void GuestTraffic::OnSpawn(const SpawnInfo& s, double now) {
     c.haveInfo = true;
     c.released = false;
     c.despawnAt = -1;
-    c.snaps.clear();
+    AuthOf(authority).stream.Remove(s.net);  // its states from now on
     c.lastRecv = now;
     c.haveLast = false;
     ++stats_.spawns;
 }
 
-void GuestTraffic::OnDespawn(uint16_t net, double now) {
-    auto it = cars_.find(net);
+void ReceiverTraffic::OnDespawn(uint8_t authority, uint16_t net, double now) {
+    const uint32_t key = RefKey(authority, net);
+    auto it = cars_.find(key);
     if (it == cars_.end()) return;
     ++stats_.despawns;
     Car& c = it->second;
-    if (c.released) {
-        cars_.erase(it);
+    if (c.released || !c.copy) {
+        Erase(key);
         return;
     }
-    if (c.copy) {
-        c.despawnAt = now + cfg_.despawnGrace;
-    } else {
-        cars_.erase(it);
-    }
+    c.despawnAt = now + cfg_.despawnGrace;
 }
 
-void GuestTraffic::OnStates(uint32_t hostMs, const std::vector<CarState>& states, double now) {
-    if (!haveClock_) {
-        clockMs_ = hostMs;
-        haveClock_ = true;
+void ReceiverTraffic::OnStates(uint8_t authority, uint32_t ms, const std::vector<CarState>& states, double now) {
+    Auth& a = AuthOf(authority);
+    if (!a.haveClock) {
+        a.clockMs = ms;
+        a.haveClock = true;
     } else {
-        clockMs_ += static_cast<int32_t>(hostMs - lastRawMs_);  // wraps every 49.7 days
+        a.clockMs += static_cast<int32_t>(ms - a.lastRawMs);  // wraps every 49.7 days
     }
-    lastRawMs_ = hostMs;
-    const double t = static_cast<double>(clockMs_) / 1000.0;
-    playout_.Observe(t, now);
-    offset_ = playout_.Offset();
-    haveOffset_ = true;
+    a.lastRawMs = ms;
+    const double t = static_cast<double>(a.clockMs) / 1000.0;
+    a.stream.Observe(t, now);
     for (const CarState& s : states) {
-        auto it = cars_.find(s.net);
+        auto it = cars_.find(RefKey(authority, s.net));
         if (it == cars_.end() || !it->second.haveInfo || it->second.despawnAt >= 0) continue;
-        Car& c = it->second;
-        if (!c.snaps.empty() && t <= c.snaps.back().t) {
+        net::replica::Sample smp;
+        smp.t = t;
+        smp.pos = s.pos;
+        smp.vel = s.vel;
+        for (int k = 0; k < 4; ++k) smp.rot[k] = s.rot[k];
+        smp.hasRot = true;
+        smp.bits = PackBits(s);
+        if (!a.stream.Push(s.net, smp)) {
             ++stats_.dropsOld;
             continue;
         }
-        c.snaps.push_back({t, s});
-        while (c.snaps.size() > 8) c.snaps.pop_front();
-        c.lastRecv = now;
+        it->second.lastRecv = now;
         ++stats_.states;
     }
 }
 
-void GuestTraffic::SetLocal(const Vec3& me, bool haveHost, const Vec3& host) {
+void ReceiverTraffic::SetLocal(const Vec3& me, bool haveMe) {
     me_ = me;
-    haveMe_ = Finite(me);
-    if (!haveHost || !haveMe_ || !Finite(host)) {
-        hostMode_ = false;
-        return;
-    }
-    const float d = Dist2D(me, host);
-    if (hostMode_ && d > cfg_.hostFar) hostMode_ = false;
-    if (!hostMode_ && d < cfg_.hostNear) hostMode_ = true;
+    haveMe_ = haveMe && Finite(me);
 }
 
-void GuestTraffic::SetReport(uint16_t net, const CopyReport& r, double now) {
-    auto it = cars_.find(net);
+void ReceiverTraffic::SetReport(uint32_t key, const CopyReport& r, double now) {
+    auto it = cars_.find(key);
     if (it == cars_.end() || !Finite(r.pos) || !Finite(r.vel)) return;
     it->second.rep = r;
     it->second.repAt = now;
 }
 
-void GuestTraffic::Release(uint16_t net) {
-    auto it = cars_.find(net);
+void ReceiverTraffic::Release(uint32_t key) {
+    auto it = cars_.find(key);
     if (it == cars_.end()) return;
     it->second.released = true;
     it->second.copy = false;
 }
 
-void GuestTraffic::Gone(uint16_t net) {
-    auto it = cars_.find(net);
+void ReceiverTraffic::Gone(uint32_t key) {
+    auto it = cars_.find(key);
     if (it == cars_.end()) return;
     it->second.copy = false;
     it->second.vc.Reset();
+    it->second.fix.Reset();
     it->second.repAt = -1e9;
 }
 
-void GuestTraffic::Clear() {
+void ReceiverTraffic::Clear() {
     cars_.clear();
+    for (auto& [id, a] : auths_) {
+        for (uint32_t k : a.stream.Keys()) a.stream.Remove(k);
+        a.paused = false;
+    }
     pendingRemove_.clear();
-    hostPaused_ = false;
     quietUntil_ = -1e9;
     lastTickAt_ = -1;
     stats_.frozen = false;
 }
 
-void GuestTraffic::SetHostPaused(bool paused, double now) {
-    if (paused == hostPaused_) return;
-    hostPaused_ = paused;
-    stats_.frozen = paused;
+void ReceiverTraffic::RemoveAuthority(uint8_t authority) {
+    for (auto it = cars_.begin(); it != cars_.end();) {
+        if (it->second.auth != authority) {
+            ++it;
+            continue;
+        }
+        if (it->second.copy) pendingRemove_.push_back(it->first);
+        it = cars_.erase(it);
+    }
+    auths_.erase(authority);
+}
+
+void ReceiverTraffic::SetPaused(uint8_t authority, bool paused, double now) {
+    Auth& a = AuthOf(authority);
+    if (paused == a.paused) return;
+    a.paused = paused;
     if (paused) {
         ++stats_.pauses;
-        for (auto& [net, c] : cars_) c.frozen = false;  // each copy takes its pose at its next tick
+        for (auto& [key, c] : cars_)
+            if (c.auth == authority) c.frozen = false;  // each copy takes its pose at its next tick
         return;
     }
     quietUntil_ = std::max(quietUntil_, now + cfg_.quietAfter);
-    for (auto& [net, c] : cars_) {
+    for (auto& [key, c] : cars_) {
+        if (c.auth != authority) continue;
         c.frozen = false;
-        c.lastRecv = std::max(c.lastRecv, now);  // no state came while he was paused: not stale for that
+        c.lastRecv = std::max(c.lastRecv, now);  // no state came while it was paused: not stale for that
         c.lastErr = 1e9f;                        // no knock before the copy was seen on its target again
         c.vc.Reset();                            // it stood on purpose: no "too slow" verdict carried over
+        c.fix.Reset();
     }
 }
 
-bool GuestTraffic::Present(const Car& c, double now, CarState& out) const {
+bool ReceiverTraffic::Paused(uint8_t authority) const {
+    const Auth* a = FindAuth(authority);
+    return a && a->paused;
+}
+
+double ReceiverTraffic::PlayoutDelay(uint8_t authority) const {
+    const Auth* a = FindAuth(authority);
+    return a ? a->stream.Delay() : cfg_.interpDelay;
+}
+
+std::vector<uint8_t> ReceiverTraffic::Authorities() const {
+    std::vector<uint8_t> v;
+    for (const auto& [id, a] : auths_) v.push_back(id);
+    return v;
+}
+
+AuthorityStats ReceiverTraffic::StatsOf(uint8_t authority) const {
+    const Auth* a = FindAuth(authority);
+    return a ? a->stats : AuthorityStats{};
+}
+
+bool ReceiverTraffic::Present(const Car& c, uint32_t key, double now, CarState& out, double* rtMs) const {
     if (!c.haveInfo) return false;
-    if (c.snaps.empty()) {
+    const Auth* a = FindAuth(c.auth);
+    const net::replica::SnapshotTrack* tr = a ? a->stream.Track(RefNet(key)) : nullptr;
+    if (!tr || tr->Empty()) {
         out = c.info.st;
+        out.net = c.info.net;
+        if (rtMs) *rtMs = -1;
         return true;
     }
-    const double rt = playout_.RenderTime(now);
-    const Snap* later = &c.snaps.back();
-    if (rt <= c.snaps.front().t) {
-        out = c.snaps.front().s;
-        later = &c.snaps.front();
-    } else if (rt >= c.snaps.back().t) {
-        out = c.snaps.back().s;
-        const float k = static_cast<float>(std::min(rt - c.snaps.back().t, cfg_.maxExtrapolate));
-        out.pos.x += out.vel.x * k;
-        out.pos.y += out.vel.y * k;
-        out.pos.z += out.vel.z * k;
-    } else {
-        for (size_t i = 0; i + 1 < c.snaps.size(); ++i) {
-            const Snap& a = c.snaps[i];
-            const Snap& b = c.snaps[i + 1];
-            if (rt < a.t || rt >= b.t) continue;
-            later = &b;
-            if (traffic::Dist(a.s.pos, b.s.pos) > cfg_.teleport) {
-                out = rt - a.t < (b.t - a.t) * 0.5 ? a.s : b.s;
+    // core's Hermite interpolation at the authority's render time, moved forward by the playout delay (bounded)
+    const net::replica::Out o = a->stream.Present(RefNet(key), now);
+    out = CarState{};
+    out.pos = o.pos;
+    out.vel = o.vel;
+    for (int k = 0; k < 4; ++k) out.rot[k] = o.rot[k];
+    // the driver's controls of the later state of the pair, the flags of the newest (as in 0.15)
+    uint32_t bits = o.bits;
+    double later = o.toT;
+    if (o.teleport) {  // a jump between the pair: the nearer one is shown, the controls are still the later one's
+        const double rt = a->stream.RenderTime(now);
+        for (size_t i = 0; i < tr->Size(); ++i) {
+            if (tr->Get(i).t > rt) {
+                later = tr->Get(i).t;
                 break;
             }
-            const float u = static_cast<float>((rt - a.t) / std::max(1e-6, b.t - a.t));
-            out = b.s;
-            auto lerp = [u](float x, float y) { return x + (y - x) * u; };
-            out.pos = net::playout::Hermite(a.s.pos, a.s.vel, b.s.pos, b.s.vel, b.t - a.t, u);
-            out.vel = {lerp(a.s.vel.x, b.s.vel.x), lerp(a.s.vel.y, b.s.vel.y), lerp(a.s.vel.z, b.s.vel.z)};
-            motion::Nlerp(a.s.rot, b.s.rot, u, out.rot);
+        }
+    }
+    for (size_t i = tr->Size(); i-- > 0;) {
+        if (tr->Get(i).t == later) {
+            bits = tr->Get(i).bits;
             break;
         }
     }
-    // the time the interpolation stands behind, moved forward along the velocity (bounded): where it is now
-    const float lead = static_cast<float>(std::max(0.0, playout_.Delay()));
-    Vec3 d = {out.vel.x * lead, out.vel.y * lead, out.vel.z * lead};
-    const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-    const float k = len > cfg_.maxLead ? cfg_.maxLead / len : 1.0f;
-    out.pos.x += d.x * k;
-    out.pos.y += d.y * k;
-    out.pos.z += d.z * k;
-    out.flags = c.snaps.back().s.flags;
-    out.steer = later->s.steer;
-    out.power = later->s.power;
-    out.brake = later->s.brake;
+    UnpackControls(bits, out);
+    out.flags = static_cast<uint8_t>(tr->Newest().bits & 0xFFu);
     out.net = c.info.net;
+    if (rtMs) *rtMs = (a->stream.RenderTime(now) + std::max(0.0, a->stream.Delay())) * 1000.0;
     return true;
 }
 
-bool GuestTraffic::Target(uint16_t net, double now, CarState& out) const {
-    auto it = cars_.find(net);
-    return it != cars_.end() && now - it->second.lastRecv <= cfg_.stale && Present(it->second, now, out);
+bool ReceiverTraffic::Target(uint32_t key, double now, CarState& out, double* rtMs) const {
+    auto it = cars_.find(key);
+    return it != cars_.end() && now - it->second.lastRecv <= cfg_.stale && Present(it->second, key, now, out, rtMs);
 }
 
-float GuestTraffic::DistToMe(const Car& c, double) const {
+float ReceiverTraffic::DistToMe(const Car& c, uint32_t key) const {
     if (!haveMe_) return 1e9f;
-    const Vec3& p = c.snaps.empty() ? c.info.st.pos : c.snaps.back().s.pos;
+    const Auth* a = FindAuth(c.auth);
+    const net::replica::SnapshotTrack* tr = a ? a->stream.Track(RefNet(key)) : nullptr;
+    const Vec3& p = (tr && !tr->Empty()) ? tr->Newest().pos : c.info.st.pos;
     return Dist2D(me_, p);
 }
 
-bool GuestTraffic::CopyInfo(uint16_t net, float& err, bool& pinned, int& pins) const {
-    auto it = cars_.find(net);
+bool ReceiverTraffic::CopyInfo(uint32_t key, float& err, bool& pinned, int& pins) const {
+    auto it = cars_.find(key);
     if (it == cars_.end() || !it->second.copy) return false;
     err = it->second.lastErr;
     pinned = it->second.vc.Pinned();
@@ -743,103 +953,114 @@ bool GuestTraffic::CopyInfo(uint16_t net, float& err, bool& pinned, int& pins) c
     return true;
 }
 
-void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps) {
+std::vector<uint32_t> ReceiverTraffic::ReportedAt(double now) const {
+    std::vector<uint32_t> v;
+    for (const auto& [key, c] : cars_)
+        if (c.copy && c.repAt == now) v.push_back(key);
+    return v;
+}
+
+void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps) {
     out.clear();
     bumps.clear();
     if (lastTickAt_ > 0 && now - lastTickAt_ > cfg_.localGap) {
-        // our own game stood (paused, loading): the copies were left behind while the host's cars drove on
+        // our own game stood (paused, loading): the copies were left behind while the authorities' cars drove on
         ++stats_.localGaps;
         quietUntil_ = std::max(quietUntil_, now + cfg_.quietAfter);
-        for (auto& [net, c] : cars_) c.lastErr = 1e9f;
+        for (auto& [key, c] : cars_) c.lastErr = 1e9f;
     }
     lastTickAt_ = now;
-    playout_.Update(now);  // the copies' render clock toward the adaptive delay
-    auto drop = [&out](uint16_t net, bool grace) {
+    for (auto& [id, a] : auths_) a.stream.Update(now);  // each authority's render clock toward its adaptive delay
+    auto drop = [&out](uint32_t key, bool grace) {
         GuestCmd c;
         c.type = GuestCmd::Type::Remove;
-        c.net = net;
+        c.key = key;
         c.grace = grace;
         out.push_back(c);
     };
-    for (uint16_t n : pendingRemove_) drop(n, false);
+    for (uint32_t k : pendingRemove_) drop(k, false);
     pendingRemove_.clear();
     // lifetimes
-    for (auto it = cars_.begin(); it != cars_.end();) {
-        Car& c = it->second;
-        const double age = hostPaused_ ? 0.0 : now - c.lastRecv;  // a paused host sends nothing: not stale for that
+    std::vector<uint32_t> erase;
+    for (auto& [key, c] : cars_) {
+        const double age = Paused(c.auth) ? 0.0 : now - c.lastRecv;  // a paused authority sends nothing: not stale
         if (c.released) {
-            if (age > cfg_.forget) {
-                it = cars_.erase(it);
-            } else {
-                ++it;
-            }
+            if (age > cfg_.forget) erase.push_back(key);
             continue;
         }
         if (c.despawnAt >= 0 && now >= c.despawnAt) {
-            if (c.copy) drop(it->first, true);
-            it = cars_.erase(it);
+            if (c.copy) drop(key, true);
+            erase.push_back(key);
             continue;
         }
         if (age > cfg_.forget) {
-            if (c.copy) drop(it->first, false);
-            it = cars_.erase(it);
+            if (c.copy) drop(key, false);
+            erase.push_back(key);
             continue;
         }
         if (age > cfg_.stale && c.copy) {
-            drop(it->first, false);
+            drop(key, false);
             c.copy = false;
             c.vc.Reset();
+            c.fix.Reset();
         }
-        ++it;
     }
-    // which cars have a copy
+    for (uint32_t k : erase) Erase(k);
+    // which cars have a copy: every authority's car near us (every game shows every other game's traffic near it)
     size_t copies = 0;
-    for (auto& [net, c] : cars_) {
+    for (auto& [key, c] : cars_) {
         if (!c.copy) continue;
-        if (!hostMode_ || !haveMe_ || (c.despawnAt < 0 && DistToMe(c, now) > cfg_.dropRadius)) {
-            drop(net, false);
+        if (!haveMe_ || (c.despawnAt < 0 && DistToMe(c, key) > cfg_.dropRadius)) {
+            drop(key, false);
             c.copy = false;
             c.vc.Reset();
+            c.fix.Reset();
             continue;
         }
         ++copies;
     }
-    if (hostMode_ && haveMe_) {
-        std::vector<std::pair<float, uint16_t>> cand;
-        for (auto& [net, c] : cars_) {
-            if (c.copy || c.released || c.despawnAt >= 0 || !c.haveInfo || now - c.lastRecv > 1.0) continue;
-            const float d = DistToMe(c, now);
-            if (d <= cfg_.addRadius) cand.push_back({d, net});
+    if (haveMe_) {
+        std::vector<std::pair<float, uint32_t>> cand;
+        for (auto& [key, c] : cars_) {
+            if (c.copy || c.released || c.despawnAt >= 0 || !c.haveInfo || now - c.lastRecv > 1.0 || Paused(c.auth))
+                continue;
+            const float d = DistToMe(c, key);
+            if (d <= cfg_.addRadius) cand.push_back({d, key});
         }
         std::sort(cand.begin(), cand.end());
-        for (const auto& [d, net] : cand) {
+        for (const auto& [d, key] : cand) {
             if (copies >= cfg_.maxCopies) {
                 // full: the farthest copy gives way to a car at less than half its distance (one per tick)
-                uint16_t far = 0;
+                uint32_t far = 0;
+                bool haveFar = false;
                 float farD = -1;
-                for (auto& [n2, c2] : cars_) {
+                for (auto& [k2, c2] : cars_) {
                     if (!c2.copy || c2.despawnAt >= 0) continue;
-                    const float d2 = DistToMe(c2, now);
+                    const float d2 = DistToMe(c2, k2);
                     if (d2 > farD) {
                         farD = d2;
-                        far = n2;
+                        far = k2;
+                        haveFar = true;
                     }
                 }
-                if (far == 0 || d >= farD * 0.5f || farD < 120) break;
+                if (!haveFar || d >= farD * 0.5f || farD < 120) break;
                 drop(far, false);
-                cars_[far].copy = false;
-                cars_[far].vc.Reset();
+                Car& f = cars_.at(far);
+                f.copy = false;
+                f.vc.Reset();
+                f.fix.Reset();
                 --copies;
             }
-            Car& c = cars_[net];
+            Car& c = cars_.at(key);
             GuestCmd cmd;
             cmd.type = GuestCmd::Type::Add;
-            cmd.net = net;
+            cmd.key = key;
             cmd.info = &c.info;
-            Present(c, now, cmd.target);
+            Present(c, key, now, cmd.target);
             out.push_back(cmd);
             c.copy = true;
             c.vc.Reset();
+            c.fix.Reset();
             c.repAt = -1e9;
             c.haveLast = false;
             c.accDt = 0;
@@ -850,17 +1071,19 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
     // drive
     float sumErr = 0, maxErr = 0;
     uint32_t nErr = 0;
-    for (auto& [net, c] : cars_) {
+    bool frozenAny = false;
+    for (auto& [key, c] : cars_) {
         if (!c.copy || c.despawnAt >= 0) continue;
         c.accDt += dt;
         ++c.tick;
-        const bool due = DistToMe(c, now) <= cfg_.nearDrive || c.tick % std::max(1, cfg_.farDriveEvery) == 0;
+        const bool due = DistToMe(c, key) <= cfg_.nearDrive || c.tick % std::max(1, cfg_.farDriveEvery) == 0;
         if (!due) continue;
         GuestCmd cmd;
         cmd.type = GuestCmd::Type::Drive;
-        cmd.net = net;
-        if (!Present(c, now, cmd.target)) continue;
-        if (hostPaused_) {
+        cmd.key = key;
+        if (!Present(c, key, now, cmd.target)) continue;
+        if (Paused(c.auth)) {
+            frozenAny = true;
             // held where it stands (its last report, else its target), braked, no speed, every tick it is due
             if (!c.frozen) {
                 c.frozen = true;
@@ -900,12 +1123,33 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
         vi.dt = c.accDt;
         c.accDt = 0;
         cmd.vc = c.vc.Update(vi);
+        // The position correction (core Corrector, the traffic preset): nothing inside the dead zone (the copy's own
+        // physics, with the controller's velocity, carries it), beyond it a blend capped at a share of the car's
+        // speed (hidden in its motion), a snap when far, stuck or the target jumped. Pinned copies stay pinned.
+        if (vi.haveCopy && (cmd.vc.fix == motion::VehicleCommand::Fix::Blend ||
+                            cmd.vc.fix == motion::VehicleCommand::Fix::None)) {
+            const net::correction::Result r = c.fix.Update(vi.copy, vi.target, vi.targetVel, vi.dt);
+            if (r.kind == net::correction::Result::Kind::Snap) {
+                cmd.vc.fix = motion::VehicleCommand::Fix::Snap;
+                cmd.vc.nudge = {};
+                for (int k = 0; k < 4; ++k) cmd.vc.rot[k] = vi.targetRot[k];
+                cmd.vc.vel = vi.targetVel;
+                c.vc.Reset();
+                c.fix.Reset();
+                ++stats_.fixSnaps;
+            } else {
+                const bool none = cmd.vc.fix == motion::VehicleCommand::Fix::None;
+                cmd.vc.nudge = r.kind == net::correction::Result::Kind::Blend ? r.delta : Vec3{};
+                if (r.kind == net::correction::Result::Kind::Blend) ++stats_.blends;
+                cmd.vc.fix = (none && r.kind == net::correction::Result::Kind::None) ? motion::VehicleCommand::Fix::None
+                                                                                      : motion::VehicleCommand::Fix::Blend;
+            }
+        } else if (cmd.vc.fix == motion::VehicleCommand::Fix::Pin || cmd.vc.fix == motion::VehicleCommand::Fix::Snap) {
+            c.fix.Reset();  // put on its target: no stuck time, no previous target carried over
+        }
         {
-            const Vec3& tv = cmd.target.vel;
-            const float ts = std::sqrt(tv.x * tv.x + tv.y * tv.y + tv.z * tv.z);
-            const float cs = vi.haveCopy ? std::sqrt(vi.copyVel.x * vi.copyVel.x + vi.copyVel.y * vi.copyVel.y +
-                                                     vi.copyVel.z * vi.copyVel.z)
-                                         : -1.0f;
+            const float ts = Speed(cmd.target.vel);
+            const float cs = vi.haveCopy ? Speed(vi.copyVel) : -1.0f;
             if (CrewGetsOut(cmd.target.flags, ts, cs)) cmd.target.flags |= kCrewOut;
         }
         if (cmd.vc.justPinned) ++stats_.pins;
@@ -914,9 +1158,9 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
             if (!vi.teleported && cmd.vc.error > cfg_.bumpError && c.lastErr < 1.0f && now - c.bumpAt > cfg_.bumpEvery) {
                 c.bumpAt = now;
                 if (now < quietUntil_) {
-                    ++stats_.quietBumps;  // the host's pause or ours: not a knock (put back all the same)
+                    ++stats_.quietBumps;  // an authority's pause or ours: not a knock (put back all the same)
                 } else {
-                    bumps.push_back({net, cmd.vc.error, cmd.vc.cspeed, cmd.vc.tspeed});
+                    bumps.push_back({key, cmd.vc.error, cmd.vc.cspeed, cmd.vc.tspeed});
                     ++stats_.bumps;
                 }
             }
@@ -927,13 +1171,38 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
         }
         out.push_back(cmd);
     }
+    stats_.frozen = frozenAny;
+    // totals, and per authority: its live cars, our copies of them, the cars within viewRadius and of those the ones
+    // with a copy here that reports (it exists and is driven): "shown"
     stats_.known = static_cast<uint32_t>(cars_.size());
-    stats_.live = 0;
-    stats_.copies = 0;
-    for (const auto& [net, c] : cars_) {
-        if (now - c.lastRecv <= cfg_.stale && !c.released) ++stats_.live;
-        if (c.copy) ++stats_.copies;
+    stats_.live = stats_.copies = 0;
+    for (auto& [id, a] : auths_) {
+        a.stats = AuthorityStats{};
+        a.stats.paused = a.paused;
     }
+    uint32_t due = 0, shown = 0;
+    for (const auto& [key, c] : cars_) {
+        Auth& a = AuthOf(c.auth);
+        const bool live = (now - c.lastRecv <= cfg_.stale || a.paused) && !c.released && c.haveInfo;
+        if (live) {
+            ++stats_.live;
+            ++a.stats.live;
+        }
+        if (c.copy) {
+            ++stats_.copies;
+            ++a.stats.copies;
+        }
+        if (live && c.despawnAt < 0 && haveMe_ && DistToMe(c, key) <= cfg_.viewRadius) {
+            ++due;
+            ++a.stats.due;
+            if (c.copy && now - c.repAt < cfg_.reportFresh) {
+                ++shown;
+                ++a.stats.shown;
+            }
+        }
+    }
+    stats_.due = static_cast<uint32_t>(std::min<size_t>(due, cfg_.maxCopies));
+    stats_.shown = std::min(shown, stats_.due);
     if (nErr) {
         stats_.avgErr = sumErr / static_cast<float>(nErr);
         stats_.maxErr = maxErr;
