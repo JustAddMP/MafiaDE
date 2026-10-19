@@ -78,7 +78,8 @@ src/game/
                          the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
 tests/                   our unit tests of game-free logic (car_swap_test.cpp); build.cmd builds them into out\,
                          tools\make_release.cmd runs them
-docs/                    ARCHITECTURE.md (this), PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
+docs/                    ARCHITECTURE.md (this), sync-architecture.md (authority, replication, correction, targets),
+                         PLAN.md, protocol.md (our app messages), re-notes.md, game-api.md,
                          research-*.md, re-tools/, screenshots/
 tests/                   traffic_test.cpp (built by build.cmd, run by make_release.cmd; no game needed)
 tools/                   devlua.ps1 (run Lua in a running game), make_release.cmd + release-readme.txt

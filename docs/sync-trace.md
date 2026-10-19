@@ -11,8 +11,9 @@ setting.
 - **Size:** about 60-80 KB/s with one other player (~250 MB an hour). It is written twice a second, so a crash loses
   at most the last half second.
 - **Also kept now:** the last five main logs (`mafiacoop.log.1` newest .. `.5`), not just one.
-- **Comparing:** `python tools/sync_compare.py <trace from one PC> <trace from the other> [--csv DIR] [--worst N]`
-  (standard library only). See "What the report says" below.
+- **Comparing:** `python tools/sync_compare.py <trace from one PC> <trace from the other> [--csv DIR] [--worst N]
+  [--check]` (standard library only). See "What the report says" below. `--check` ends the report with every sync
+  target of docs/sync-architecture.md section 4 (PASS / FAIL / no data per direction; exit code 1 when one fails).
 
 To report a test: zip the whole `logs` folder of both PCs (the traces are in `logs\trace`).
 

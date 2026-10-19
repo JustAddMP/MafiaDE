@@ -21,6 +21,8 @@ seen on the other's game:
 - the worst moments with the wall-clock time of both games, to look them up in a video or the logs
 
 --csv DIR writes the lined-up time series (one file per player and kind) for plotting.
+--check prints every sync target of docs/sync-architecture.md section 4 with PASS / FAIL / no data (exit code 1 when
+one fails), per direction where it applies.
 Only the Python standard library is used.
 """
 import argparse
@@ -39,6 +41,60 @@ FIX_LOCO = {0: "none", 1: "nudge", 2: "snap"}
 FIX_VEH = {0: "none", 1: "blend", 2: "pin", 3: "snap"}
 WHY = {0: "-", 1: "too slow", 2: "ran off", 3: "stays off"}
 LOG_RE = re.compile(r"^\d{4}-\d\d-\d\d$")
+
+# ---- sync targets (docs/sync-architecture.md section 4) -------------------------------------------------------------
+# metric -> (comparison, limit, what it is). Sections call record(metric, value, who); --check compares every recorded
+# value with its limit. A package that adds a kind adds its metrics here and record() calls in its section.
+TARGETS = {
+    "foot.p95": ("<=", 0.8, "puppet vs player at the same moment, p95 (m)"),
+    "foot.mean": ("<=", 0.35, "puppet vs player, mean (m)"),
+    "foot.stand.p95": ("<=", 0.3, "puppet vs a standing player, p95 (m)"),
+    "foot.gait": (">=", 90.0, "puppet gait matches the player's (%)"),
+    "foot.snaps_per_min": ("<=", 0.5, "puppet snaps per minute on foot"),
+    "car.p95": ("<=", 1.0, "car copy vs the driver's car, p95 (m)"),
+    "car.pinned": ("<=", 10.0, "car copy pinned (% of samples)"),
+    "car.speed_ratio": ("between", (0.9, 1.1), "copy speed / driver's speed, median"),
+    "traffic.true_p95": ("<=", 1.5, "traffic copy vs the authority's car at the same moment, p95 (m)"),
+    "traffic.shown": (">=", 95.0, "authority's traffic shown while near it (% of the time)"),
+    "traffic.unshared_near": ("<=", 0, "own traffic cars still driving near a receiver (max)"),
+    "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
+    "npc.max": ("<=", 4.0, "NPC replica vs the authority's NPC, max (m)"),
+    "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
+    "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
+    "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
+    "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
+    "bw.host_up": ("<=", 160.0, "host upload, all systems, median (KB/s)"),
+}
+METRICS = []  # (metric, value, who)
+
+
+def record(metric, value, who=""):
+    """A measured value for --check (docs/sync-architecture.md section 4)."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return
+    METRICS.append((metric, float(value), who))
+
+
+def check():
+    section("Sync targets (docs/sync-architecture.md section 4)")
+    failed = 0
+    for metric, (op, limit, what) in TARGETS.items():
+        vals = [(v, who) for m, v, who in METRICS if m == metric]
+        if not vals:
+            print("  %-22s no data       %s" % (metric, what))
+            continue
+        for v, who in vals:
+            if op == "<=":
+                ok, lim = v <= limit, "<= %g" % limit
+            elif op == ">=":
+                ok, lim = v >= limit, ">= %g" % limit
+            else:
+                ok, lim = limit[0] <= v <= limit[1], "%g..%g" % limit
+            failed += 0 if ok else 1
+            print("  %-22s %-4s %9.2f  (%s)  %s%s" % (metric, "PASS" if ok else "FAIL", v, lim, what,
+                                                      ("  [" + who + "]") if who else ""))
+    print("  %d failed" % failed)
+    return failed
 
 
 def num(v, default=None):
@@ -260,8 +316,13 @@ def compare(sender, receiver, args, worst):
             rows.append((t, to_sender(t), cp[0], cp[1], tp[0], tp[1], e, err, g, sm, fix,
                          num(f.get("mult"), 1), num(f.get("want"), 0), num(f.get("meas"), -1), num(f.get("carry"), 0)))
     print("  on foot: %d samples" % len(pup))
+    who = "%s on %s" % (sender.role, receiver.role)
     if errs_true:
         print("    puppet vs the player at the same moment: %s" % stats_line(errs_true))
+        record("foot.p95", pct(errs_true, 95), who)
+        record("foot.mean", statistics.fmean(errs_true), who)
+        if by_gait.get("stand"):
+            record("foot.stand.p95", pct(by_gait["stand"], 95), who)
         for gname in ("stand", "walk", "run", "sprint"):
             if by_gait.get(gname):
                 print("      player %-6s %s" % (gname + ":", stats_line(by_gait[gname])))
@@ -276,6 +337,11 @@ def compare(sender, receiver, args, worst):
             print("      player %s, puppet %s: %.1f %%" % (GAITS.get(a), GAITS.get(b), 100.0 * v / total))
         print("    fixes: %d snaps, %d nudged samples (%.2f m in all), catching up in %.1f %% of samples" % (
             snaps, nudges, nudge_sum, 100.0 * carry_n / total))
+        record("foot.gait", 100.0 * same / total, who)
+        on_foot_s = [t for t, f in pup if f.get("have") == "1"]
+        if len(on_foot_s) > 1:
+            # PUP is written at 60 Hz while on foot: minutes on foot from the sample count (gaps not counted)
+            record("foot.snaps_per_min", snaps / max(len(on_foot_s) / 60.0 / 60.0, 1e-6), who)
     if args.csv and rows:
         write_csv(args.csv, "foot-p%d-on-%s.csv" % (sid, receiver.role), [
             "t_receiver", "t_sender", "copy_x", "copy_y", "true_x", "true_y", "true_err", "ctl_err", "gait",
@@ -319,11 +385,15 @@ def compare(sender, receiver, args, worst):
                          tsp, csp, num(f.get("st"), 0), rb[0] if rb else "", rb[5] if rb and len(rb) >= 6 else ""))
         print("  cars: %d samples, pinned in %.1f %% (pins: %s; %d retries of its physics)" % (
             len(veh), 100.0 * pinned / len(veh), ", ".join("%s %d" % kv for kv in pins.items()) or "none", retries))
+        who = "%s on %s" % (sender.role, receiver.role)
+        record("car.pinned", 100.0 * pinned / len(veh), who)
         if errs:
             print("    car copy vs the driver's car at the same moment: %s" % stats_line(errs))
+            record("car.p95", pct(errs, 95), who)
         if spd:
             print("    copy speed / driver's speed (above 2 m/s): median %.2f, p10 %.2f, p90 %.2f" % (
                 pct(spd, 50), pct(spd, 10), pct(spd, 90)))
+            record("car.speed_ratio", pct(spd, 50), who)
         if steer_d:
             print("    steering wish on the copy vs the driver's (did SetSteer stick): mean diff %.3f, p95 %.3f" % (
                 statistics.fmean(steer_d), pct(steer_d, 95)))
@@ -378,6 +448,12 @@ def npcs(guest):
     if avg:
         print("  distance ours vs the host's (per sample mean): %s" % stats_line(avg))
         print("  worst NPC per sample: %s" % stats_line(mx))
+    nd = [num(f.get("d"), -1) for _, f in guest.records["NP"] if num(f.get("d"), -1) >= 0]
+    if nd:
+        # NP: per paired host NPC, our NPC vs the host's newest state (not yet lined up in time: an upper bound
+        # of the real error by the state's age; npc-authority adds a truth record)
+        record("npc.p95", pct(nd, 95), "host NPCs on the guest")
+        record("npc.max", max(nd), "host NPCs on the guest")
     far = Counter()
     for _, f in guest.records["NP"]:
         if num(f.get("d"), -1) > 3:
@@ -469,6 +545,7 @@ def traffic(host, guest):
         print("  guest: host traffic shown %.0f%% of the time; copies mean %.1f (max %d) of %.1f host cars" % (
             100.0 * len(on) / len(trg), statistics.fmean(num(f.get("copies"), 0) for f in trg),
             max(num(f.get("copies"), 0) for f in trg), statistics.fmean(num(f.get("live"), 0) for f in trg)))
+        record("traffic.shown", 100.0 * len(on) / len(trg), "host traffic on the guest")
         last = trg[-1]
         print("  guest: pins %d, snaps %d, bumps %d, states received %d (dropped as old %d)" % (
             num(last.get("pins"), 0), num(last.get("snaps"), 0), num(last.get("bumps"), 0),
@@ -487,6 +564,7 @@ def traffic(host, guest):
     if trl:
         print("  our own traffic while the host's showed: hidden max %d, still driving near us max %d" % (
             max(num(f.get("hidden"), 0) for f in trl), max(num(f.get("near"), 0) for f in trl)))
+        record("traffic.unshared_near", max(num(f.get("near"), 0) for f in trl), "guest's own cars")
     # drivers and crews (TRO): the host's driver reads that failed and came back, the guest's crews out / in / put back
     if host and host.records["TRO"]:
         tro = [f for _, f in host.records["TRO"]]
@@ -693,6 +771,8 @@ def latency(traces):
                                                      "hand-off p50/p95"))
         for sys_name in sorted(by, key=lambda s: -pct(by[s][0], 50)):
             ap, ag, ha = by[sys_name]
+            if sys_name == "player":
+                record("lat.player.p95", pct(ap, 95), "on %s" % tr.role)
             print("    %-14s %7d %6.1f ms %6.1f ms %6.1f ms   %6.1f / %6.1f ms        %5.1f / %5.1f ms" % (
                 sys_name, len(ap), pct(ap, 50), pct(ap, 95), max(ap), pct(ag, 50), pct(ag, 95), pct(ha, 50),
                 pct(ha, 95)))
@@ -741,6 +821,7 @@ def bandwidth(traces):
     for tr in traces:
         rows = defaultdict(lambda: ([], [], 0, 0))  # system -> (out per report, in per report, thinned, deferred)
         reports = 0
+        totals = []  # all systems out, per report
         for _, text in tr.logs:
             if "net: messages: " not in text:
                 continue
@@ -755,6 +836,7 @@ def bandwidth(traces):
                 de = re.search(r"deferred (\d+)", extra)
                 o, i, t0, d0 = rows[s]
                 rows[s] = (o, i, t0 + (int(th.group(1)) if th else 0), d0 + (int(de.group(1)) if de else 0))
+            totals.append(sum(v[0] for v in per.values()))
             for s, (o, i) in per.items():
                 rows[s][0].append(o)
                 rows[s][1].append(i)
@@ -762,6 +844,8 @@ def bandwidth(traces):
             continue
         any_rec = True
         print("  %s's game (%s), %d reports:" % (tr.name, tr.role, reports))
+        if tr.role == "host" and totals:
+            record("bw.host_up", pct(totals, 50), "%s, %d player(s)" % (tr.name, len(tr.players)))
         print("    %-14s %16s %16s %10s %10s" % ("system", "out median/max", "in median/max", "thinned", "deferred"))
         for s in sorted(rows, key=lambda k: -(max(rows[k][0] or [0]) + max(rows[k][1] or [0]))):
             o, i, th, de = rows[s]
@@ -794,6 +878,8 @@ def main():
     ap.add_argument("traces", nargs=2)
     ap.add_argument("--csv", help="write the lined-up time series to this folder")
     ap.add_argument("--worst", type=int, default=10, help="how many worst moments to list (default 10)")
+    ap.add_argument("--check", action="store_true",
+                    help="compare with the sync targets (docs/sync-architecture.md section 4); exit 1 on a failure")
     args = ap.parse_args()
     a, b = Trace(args.traces[0]), Trace(args.traces[1])
     for x, y in ((a, b), (b, a)):  # a game names the other players; its own name comes from the other trace
@@ -839,6 +925,8 @@ def main():
             print("  %6.2f m  %-7s %s  (receiver %s, sender %s) %s" % (e, kind, label.split(" on ")[0], wr, ws, note))
             if len(shown) >= args.worst:
                 break
+    if args.check:
+        return 1 if check() else 0
     return 0
 
 
