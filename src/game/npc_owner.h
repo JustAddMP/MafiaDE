@@ -181,6 +181,7 @@ public:
     void Expire(double now);
     bool Lookup(uint32_t mid, PlayerId& from, uint32_t& key) const;
     bool Has(PlayerId from, uint32_t key) const { return byKey_.count({from, key}) != 0; }
+    uint32_t MidOf(PlayerId from, uint32_t key) const;  // 0: no mirror of it
 
     // Relay (several guests): guest `to`'s share of the other guests' mirrors this round, keyed by RelayKey: live ones
     // with a state of the last kRelayFresh s and dead ones (so his copy dies too), none with a claim under way (it is

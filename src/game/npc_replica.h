@@ -301,6 +301,7 @@ public:
     void Forget(uint32_t key);  // the replica went (unpaired, copy dropped): its controller state goes too
     uint16_t NetOf(uint32_t key) const;
     const Info* InfoOf(uint32_t key) const;
+    const Info* InfoOfNet(uint16_t net) const;
     size_t Tracks() const { return stream_.Size(); }
     size_t Known() const { return byKey_.size(); }
     const net::replica::Stream& StreamRef() const { return stream_; }

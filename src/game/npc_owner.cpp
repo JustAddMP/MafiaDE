@@ -443,6 +443,11 @@ bool HostMirrors::Lookup(uint32_t mid, PlayerId& from, uint32_t& key) const {
     return true;
 }
 
+uint32_t HostMirrors::MidOf(PlayerId from, uint32_t key) const {
+    auto it = byKey_.find({from, key});
+    return it == byKey_.end() ? 0 : it->second;
+}
+
 std::set<uint32_t> HostMirrors::Duplicates(PlayerId lo, PlayerId hi) const {
     struct Cand {
         float d;

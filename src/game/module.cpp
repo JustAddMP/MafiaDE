@@ -340,6 +340,9 @@ public:
         case 0x0206: return "FailVerdict";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
+        case 0x0212: return "NpcStates2";
+        case 0x0213: return "NpcInfo";
+        case 0x0214: return "NpcLeave";
         case 0x0220: return "TrafficSpawn";
         case 0x0221: return "TrafficDespawn";
         case 0x0222: return "TrafficStates";
@@ -369,6 +372,9 @@ public:
         case 0x0421: return "GuestNpcEnd";
         case 0x0422: return "HostNpcHit";
         case 0x0423: return "NpcClaim";
+        case 0x0424: return "GuestNpcStates2";
+        case 0x0425: return "GuestNpcInfo";
+        case 0x0426: return "GuestNpcLeave";
         default: return nullptr;
         }
     }

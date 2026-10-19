@@ -779,4 +779,9 @@ const Info* ReplicaSet::InfoOf(uint32_t key) const {
     return i == infos_.end() ? nullptr : &i->second;
 }
 
+const Info* ReplicaSet::InfoOfNet(uint16_t net) const {
+    auto i = infos_.find(net);
+    return i == infos_.end() ? nullptr : &i->second;
+}
+
 }  // namespace mc::game::npcrep

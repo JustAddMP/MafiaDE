@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "game/latency.h"
 #include "game/npc_replica.h"
 #include "net/wire.h"
 
@@ -884,7 +885,18 @@ void TestReceiver() {
 
 }  // namespace
 
+// our message ids in the latency trace: states are the "npc" stream, infos / leaves "npc-event"
+void TestIds() {
+    using mc::game::latency::SystemOf;
+    namespace lat = mc::game::latency;
+    Check(SystemOf(0x0212) == lat::kNpc && SystemOf(0x0424) == lat::kNpc, "latency: NpcStates2 / GuestNpcStates2 = npc");
+    Check(SystemOf(0x0213) == lat::kNpcEvent && SystemOf(0x0214) == lat::kNpcEvent &&
+              SystemOf(0x0425) == lat::kNpcEvent && SystemOf(0x0426) == lat::kNpcEvent,
+          "latency: NpcInfo / NpcLeave (both ways) = npc-event");
+}
+
 int main() {
+    TestIds();
     TestCodec();
     TestRules();
     TestInterest();

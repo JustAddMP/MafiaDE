@@ -3309,9 +3309,10 @@ end
 function M.OnLocalDamage(m)
   local enemy = tostring(m:GetEnemyGUID())
   local eid = tonumber(enemy:match("(%d+)%s*$"))
-  if eid and M.Npc and M.Npc.copyIds and M.Npc.copyIds[eid] then
-    -- a spawned copy of a host NPC hit us (npc_sync.lua): its shots are only pictures (they aim past us, but its gun
-    -- still found us sometimes): undone on the next tick; the host's NPC's real hits come as Hits from the host
+  if eid and M.Npc and M.Npc.IsPicture and M.Npc.IsPicture(eid) then
+    -- a replica of another game's NPC hit us (npc_sync.lua: a spawned copy, or a paired NPC driven from its authority):
+    -- its shots are only pictures (a copy aims past us, but its gun still found us sometimes): undone on the next
+    -- tick; the authority NPC's real hits come as Hits from its game
     M.copyHits = (M.copyHits or 0) + 1
     M.undoTo = math.max(M.undoTo or 0, M.lastHealth or 0)
     if M.copyHits <= 10 or M.copyHits % 50 == 0 then
