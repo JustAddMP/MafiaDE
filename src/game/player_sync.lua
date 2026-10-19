@@ -2566,7 +2566,7 @@ local function handsOf(so, f)
   local out = {}
   for i, bone in ipairs(PROBE_BONES) do
     local good, b = pcall(so.GetBonePos, so, bone)
-    if not good or type(b) ~= "userdata" and type(b) ~= "table" then return nil end
+    if not good or b == nil or b == false then return nil end  -- a vector (userdata or an HKS struct)
     local gx, bx = pcall(function() return b.x end)
     if not gx or type(bx) ~= "number" then return nil end
     local dx, dy, dz = b.x - q.x, b.y - q.y, b.z - q.z
