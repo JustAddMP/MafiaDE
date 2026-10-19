@@ -382,6 +382,21 @@ void TestRest() {
     in.targetVel = {4, 0, 0};
     const LocomotionCommand run = mv.Update(in);
     Check(run.gait == Gait::Run && !mv.Resting(), "he runs: his gait, no rest blend");
+    // a correction the caller applied instead (traversal Catchup: a blend after a move) is not taken for walking
+    FootDriver ap;
+    LocomotionInput st;
+    st.gaitHint = 0;
+    st.haveCopy = true;
+    st.target = {0, 0, 0};
+    st.dt = static_cast<float>(kDt);
+    LocomotionCommand applied = ap.Update(st);
+    applied.fix = LocomotionCommand::Fix::Nudge;
+    applied.nudge = {0.2f, 0, 0};
+    ap.Applied(applied);
+    st.copy = {0.2f, 0, 0};
+    ap.Update(st);
+    Check(ap.CopySpeed() < 0.01f, "a correction applied by the caller is not walking (copy speed)",
+          Fmt("%.2f m/s", ap.CopySpeed()));
 }
 
 // ---- PlayerTrack ------------------------------------------------------------------------------------------------

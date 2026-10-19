@@ -103,6 +103,9 @@ public:
     //  - a changed speed multiplier re-issues the walk at once (a brake or a speed-up reaches the AI 0.1 s later,
     //    not at the next 0.35 s re-aim).
     motion::LocomotionCommand Update(const motion::LocomotionInput& in);
+    // The command as it was really applied, when the caller changed it after Update (game/traversal.h Catchup turns
+    // a snap after a move into a blend, adds a height part): the copy's own walking speed is measured without it.
+    void Applied(const motion::LocomotionCommand& c);
     void Reset() {
         loco_.Reset();
         haveLast_ = false;

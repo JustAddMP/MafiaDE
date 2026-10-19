@@ -208,7 +208,6 @@ struct Shared {
     std::string luaStatus;
     std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
     std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
-    parked::Book parkedBook;             // every shared car parked in this session (the host sends it to newcomers)
     std::vector<std::string> outEnv;     // Lua -> network ("WE ..." lines, host only)
     std::vector<std::string> outHits;    // Lua -> network ("HT ..." lines: we hit someone's puppet)
     bool isHost = false;
@@ -223,6 +222,7 @@ struct Shared {
     };
     std::map<net::PlayerId, Tag> tags;
     std::map<net::PlayerId, CopyReport> pupReports, carReports;
+    parked::Book parkedBook;  // every shared car parked in this session (the host sends it to newcomers: ParkedCars)
     // world state (Lua "WS" events, twice a second, also without a session)
     bool inWorld = false;
     std::string saveId;
@@ -776,6 +776,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     const bool wasSnap = lc.fix == motion::LocomotionCommand::Fix::Snap;
     const traversal::Catchup::Info tc =
         rem.catchup.Apply(busy == 2, fresh && busy != 1, copyPos, li.target, dt, lc);
+    rem.foot.Applied(lc);  // what Catchup made of it is what moves the puppet
     if (tc.started)
         MC_LOG_INFO("sync: player %u's puppet plays a traversal move (#%d): followed along his path", id,
                     rem.catchup.Moves());
@@ -880,7 +881,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                           "id=%u rT=%.0f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f have=%d age=%.3f cp=%.3f,%.3f,%.3f "
                           "ch=%.3f,%.3f err=%.3f g=%u mult=%.3f want=%.3f meas=%.3f carry=%.3f base=%.2f,%.2f,%.2f "
                           "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u busy=%d nz=%.4f tm=%d "
-                          "rec=%d pose=%u hint=%d rest=%d brk=%d stp=%d own=%.3f lead=%.1f",
+                          "rec=%d pose=%u hint=%d rest=%d brk=%d stp=%d cspd=%.3f lead=%.1f",
                           id, rT, li.target.x, li.target.y, li.target.z, li.targetVel.x, li.targetVel.y,
                           li.haveCopy ? 1 : 0, age, li.copy.x, li.copy.y, li.copy.z, li.copyHeading[0],
                           li.copyHeading[1], lc.error, static_cast<unsigned>(lc.gait), lc.speedMult, lc.want,
@@ -957,12 +958,21 @@ bool ParseParked(const std::string& line, parked::Car& c) {
     return parked::Valid(c);
 }
 
-void WriteParked(net::ByteWriter& w, const parked::Car& c) {
+// Our CarParked from the glue's "CP" line (render thread, not under the lock): written to `w` and booked.
+bool WriteParked(net::ByteWriter& w, const std::string& line) {
+    parked::Car c;
+    if (!ParseParked(line, c)) return false;
     w.U8(c.owner);
     w.U32(c.guid);
     w.Str(c.model);
     for (float f : c.t) w.F32(f);
     w.U8(c.flags);
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    sh.parkedBook.Parked(c);
+    core::trace::Line("PKB", "ev=parked key=%u:%u by=%u wrecked=%u n=%zu", c.owner, c.guid, sh.localId,
+                      static_cast<unsigned>(c.flags & kParkedWrecked), sh.parkedBook.Size());
+    return true;
 }
 
 // A parked car from another game (CarParked, or one entry of the host's ParkedCars) becomes a "K" line for the glue
@@ -989,34 +999,6 @@ void OnCarParked(net::PlayerId from, net::ByteReader& r) {
                 (c.flags & kParkedWrecked) ? ", destroyed" : "");
     core::trace::Line("PKB", "ev=parked key=%u:%u by=%u wrecked=%u n=%zu", c.owner, c.guid, from,
                       static_cast<unsigned>(c.flags & kParkedWrecked), sh.parkedBook.Size());
-}
-
-// ---- ParkedCars (0x0104, reliable, host -> a player who joined or came back): the cars parked before he was here --
-// game/parked_cars.h. A destroyed car is not spawned for him (an intact copy of a wreck would stand there; its wreck
-// stays the host's picture, UNVERIFIED whether a later CarDamage would show it). Accepted before our sync is active
-// (it can come in the poll that completes our join); the "K" lines wait for the glue.
-void OnParkedCars(net::PlayerId from, net::ByteReader& r) {
-    std::vector<parked::Car> cars;
-    if (!parked::Read(r, cars)) {
-        MC_LOG_WARN("sync: a malformed ParkedCars message from player %u, ignored", from);
-        return;
-    }
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    if (from != net::kHostPlayer || from == sh.localId) return;
-    int applied = 0, wrecked = 0;
-    for (const parked::Car& c : cars) {
-        if (c.flags & kParkedWrecked) {
-            ++wrecked;
-            continue;
-        }
-        sh.parkedBook.Parked(c);
-        QueueParked(sh, c);
-        ++applied;
-    }
-    MC_LOG_INFO("sync: the host's parked cars: %zu in this message, %d placed here, %d destroyed ones left out",
-                cars.size(), applied, wrecked);
-    core::trace::Line("PKR", "from=%u n=%zu applied=%d wrecked=%d", from, cars.size(), applied, wrecked);
 }
 
 // ---- WorldEnv (0x0200, reliable, host -> guests): time of day, time flow speed, weather set -------------------------
@@ -1098,6 +1080,34 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
                static_cast<unsigned long>(npc));
     MC_LOG_INFO("sync: hit by %s %u: %.1f (type %u, zone %u)", src == 1 ? "an NPC on the game of player" : "player",
                 from, amount, dtype, zone);
+}
+
+// ---- ParkedCars (0x0104, reliable, host -> a player who joined or came back): the cars parked before he was here --
+// game/parked_cars.h. A destroyed car is not spawned for him (an intact copy of a wreck would stand there; its wreck
+// stays the host's picture, UNVERIFIED whether a later CarDamage would show it). Accepted before our sync is active
+// (it can come in the poll that completes our join); the "K" lines wait for the glue.
+void OnParkedCars(net::PlayerId from, net::ByteReader& r) {
+    std::vector<parked::Car> cars;
+    if (!parked::Read(r, cars)) {
+        MC_LOG_WARN("sync: a malformed ParkedCars message from player %u, ignored", from);
+        return;
+    }
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (from != net::kHostPlayer || from == sh.localId) return;
+    int applied = 0, wrecked = 0;
+    for (const parked::Car& c : cars) {
+        if (c.flags & kParkedWrecked) {
+            ++wrecked;
+            continue;
+        }
+        sh.parkedBook.Parked(c);
+        QueueParked(sh, c);
+        ++applied;
+    }
+    MC_LOG_INFO("sync: the host's parked cars: %zu in this message, %d placed here, %d destroyed ones left out",
+                cars.size(), applied, wrecked);
+    core::trace::Line("PKR", "from=%u n=%zu applied=%d wrecked=%d", from, cars.size(), applied, wrecked);
 }
 
 // ---- PlayerModel (0x0102, reliable, every peer -> everyone): the character a player picked, and how he looks -------
@@ -1904,11 +1914,11 @@ void PlayerSync::Attach(net::Session& session) {
     _session = &session;
     session.On(kMsgPlayerState, &OnState);
     session.On(kMsgCarParked, &OnCarParked);
-    session.On(parked::kMsgParkedCars, &OnParkedCars);
     session.On(kMsgWorldEnv, &OnWorldEnv);
     session.On(kMsgHit, &OnHit);
     session.On(kMsgPlayerModel, &OnPlayerModel);
     session.On(peer_pause::kMsgPeerPaused, &OnPeerPaused);
+    session.On(parked::kMsgParkedCars, &OnParkedCars);
     peer_pause::ClearRemotes();
     _pause.Reset();
     Shared& sh = S();
@@ -1925,11 +1935,11 @@ void PlayerSync::Detach() {
     if (_session) {
         _session->Off(kMsgPlayerState);
         _session->Off(kMsgCarParked);
-        _session->Off(parked::kMsgParkedCars);
         _session->Off(kMsgWorldEnv);
         _session->Off(kMsgHit);
         _session->Off(kMsgPlayerModel);
         _session->Off(peer_pause::kMsgPeerPaused);
+        _session->Off(parked::kMsgParkedCars);
     }
     peer_pause::ClearRemotes();
     _pause.Reset();
@@ -1946,7 +1956,6 @@ void PlayerSync::Detach() {
     sh.names.clear();
     sh.inCmds.clear();
     sh.outParked.clear();
-    sh.parkedBook.Clear();
     sh.outEnv.clear();
     sh.outHits.clear();
     sh.models.clear();
@@ -1956,6 +1965,7 @@ void PlayerSync::Detach() {
     sh.tags.clear();
     sh.pupReports.clear();
     sh.carReports.clear();
+    sh.parkedBook.Clear();
     if (core::trace::IsOpen()) {
         core::trace::Line("END", "why=session-detached");
         core::trace::Close();
@@ -1987,11 +1997,11 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     bool send = false;
     double sampleAt = 0;
     std::vector<std::string> parked, env, hits;
-    std::vector<std::pair<net::PlayerId, std::vector<parked::Car>>> parkedTo;  // host: ParkedCars to send
     bool sendModel = false;
     std::string modelLook, modelWhy;
     int modelSteps = 0;
     bool pauseInWorld = false;
+    std::vector<std::pair<net::PlayerId, std::vector<parked::Car>>> parkedTo;  // host: ParkedCars to send
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -2103,28 +2113,11 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         }
     }
     for (const std::string& line : parked) {
-        parked::Car c;
-        if (!active || !ParseParked(line, c)) continue;
         net::ByteWriter pw(96);
-        WriteParked(pw, c);
-        _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
-        MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
-        std::lock_guard lock(sh.mu);
-        sh.parkedBook.Parked(c);
-        core::trace::Line("PKB", "ev=parked key=%u:%u by=%u wrecked=%u n=%zu", c.owner, c.guid, sh.localId,
-                          static_cast<unsigned>(c.flags & kParkedWrecked), sh.parkedBook.Size());
-    }
-    // The host: a player who joined (or came back: a new joinSeq) gets the cars parked before he was here.
-    for (const auto& [to, cars] : parkedTo) {
-        const auto parts = parked::Split(cars);
-        for (const auto& part : parts) {
-            net::ByteWriter pw(64 + part.size() * 64);
-            parked::Write(pw, part);
-            _session->SendTo(to, parked::kMsgParkedCars, pw.Span(), net::Reliability::Reliable);
+        if (active && WriteParked(pw, line)) {
+            _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
+            MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
         }
-        MC_LOG_INFO("sync: sent player %u the %zu parked car(s) of this session (%zu ParkedCars message(s))", to,
-                    cars.size(), parts.size());
-        core::trace::Line("PKS", "to=%u n=%zu msgs=%zu", to, cars.size(), parts.size());
     }
     for (const std::string& line : env) {
         net::ByteWriter ew(128);
@@ -2141,6 +2134,18 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             _session->SendTo(victim, kMsgHit, hw.Span(), net::Reliability::Reliable);
             MC_LOG_INFO("sync: sent Hit to player %u (%s)", victim, line.c_str() + 3);
         }
+    }
+    // The host: a player who joined (or came back: a new joinSeq) gets the cars parked before he was here.
+    for (const auto& [to, cars] : parkedTo) {
+        const auto parts = parked::Split(cars);
+        for (const auto& part : parts) {
+            net::ByteWriter pw(64 + part.size() * 64);
+            parked::Write(pw, part);
+            _session->SendTo(to, parked::kMsgParkedCars, pw.Span(), net::Reliability::Reliable);
+        }
+        MC_LOG_INFO("sync: sent player %u the %zu parked car(s) of this session (%zu ParkedCars message(s))", to,
+                    cars.size(), parts.size());
+        core::trace::Line("PKS", "to=%u n=%zu msgs=%zu", to, cars.size(), parts.size());
     }
     // Our own pause (game/peer_pause.h): the game's script tick stopped (the pause menu, the CO-OP panel from it, a
     // loading screen) or runs through TickPaused only. Everyone is told, on the change and every 2 s while it lasts.

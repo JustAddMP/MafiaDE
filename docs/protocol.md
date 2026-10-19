@@ -72,7 +72,9 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags (0.15: bit 0 the car is destroyed; read as 0 when missing, older builds ignore it) |
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103 | PeerPaused | every peer -> everyone (`Broadcast`) | R | u8 flags (bit0 paused), u8 reason (0 resumed, 1 no script tick, 2 the game's paused tick only), u32 ms paused so far (on the resume: how long it lasted). Unreleased; see "A paused game" below |
-| 0x0104-0x01FF | reserved (phase 3 events) | | | |
+| 0x0104 | ParkedCars | host -> a player who joined or came back (`SendTo`) | R | u8 version (1), u8 count (<= 24), count x { u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags } (unreleased; see "Parked cars for late joiners") |
+| 0x0105-0x0107 | reserved (player sync events, sync architecture package `players`) | | | |
+| 0x0108-0x01FF | reserved (phase 3 events) | | | |
 
 PlayerState body (56 bytes on foot + weapon name, ~139 bytes in a car):
 
@@ -171,6 +173,16 @@ and a puppet whose player is sent as on foot faster than 12 m/s (a vehicle the s
 position until he is below 9 m/s (docs/game-api.md 25). Older senders (0.15.0) send a bike ride as an on-foot sprint:
 a receiver with this change hides that puppet instead of letting it sprint and "jump".
 
+**Unreleased (sync architecture, package `players`): PlayerState unchanged on the wire.** The receiver now drives
+the puppet's gait from `mode` (the sender's own gait, see "Driving the puppet and the car copy"), and interpolates
+through core's shared replication layer (`net/replica.h`; `src/game/player_motion.h` `PlayerTrack`: one adaptive
+playout clock per sender, a track for his body and one for the car he drives - cleared when he is in another car or
+on foot, so two cars are never blended). Same curve and limits as below (Hermite through the states with their
+velocities, 250 ms extrapolation, then held, discrete fields from the nearer state, controls blended); two changes:
+the "now" lead is the playout delay **plus the one-way trip** (rtt / 2 of the session, at most 150 ms: the playout
+clock's offset contains the smallest one-way delay, so without it the copies trailed by ~14 ms, 0.35 m at 25 m/s),
+and it may move a position up to **4 m** (was 1.5 m: a car at 30 m/s is 1.5 m ahead after 50 ms).
+
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
 running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
 before 0.9.0: 20 Hz and 100 ms): `renderTime = now - offset - 0.05`, where `offset = localReceiveTime - senderTime` is tracked as a running minimum
@@ -195,32 +207,58 @@ animation played at its own pace), see "Driving the puppet and the car copy" bel
 3.5), guest -> host 4.4 KB/s, no loss, no resends, no relay drops; the checkpoint save (HostSave, ~36 KB) goes out only
 when the file changed.
 
-### Driving the puppet and the car copy (0.13.0; not yet checked in game)
+### Driving the puppet and the car copy (unreleased rewrite; NOT checked in game)
 
-The receiver turns the interpolated state into commands with core's controllers (`external/core/src/net/
-remote_motion.h`, unit-tested in core's `net_motion`), one pair per remote player, in `player_sync.cpp`; the Lua glue
-carries them out and reports back where the puppet / car copy is after each tick ("PS" / "VS" lines).
+The receiver turns his presented state (the interpolated state led to "now", above) into commands, one set per remote
+player, in `player_sync.cpp` through `src/game/player_motion.h` (game-side policy over core's
+`net/remote_motion.h` controllers and `net/correction.h` rules; unit-tested in tests/player_motion_test.cpp against
+recorded 0.15.0 paths); the Lua glue carries them out and reports back where the puppet / car copy is after each tick
+("PS" / "VS" lines).
 
-- **On foot** (`LocomotionController`): a gait from his speed (stand / walk / run / sprint, with hysteresis; his sprint
-  flag allows sprint from 3.5 m/s), a speed multiplier for that gait (`SetMovementSpeedMult`, given right before each
-  `MoveVec` so a walk is never interrupted by it), and a walk point ahead along the wanted velocity (his velocity plus
-  1.2/s of the error, at most 2.5 m/s of correction), re-aimed every 0.35 s, on a gait change or a turn of more than
-  12 degrees. The walk/run/sprint speed at multiplier 1 is measured on the puppet itself (0.25 s windows while gait
-  and multiplier are steady, nudges not counted), so the multiplier makes the game's own animation run at his speed.
-  Position fixes stay small: only the error beyond 0.9 m is nudged (2/s); a snap beyond 3.5 m (or 3 m height, 6 m while
-  he is in the air), when he stands and the puppet is more than 0.5 m off for 2 s, or when it walks but does not get
-  anywhere for 1.5 s while more than 0.9 m off. Standing, it turns to his heading at up to 400 degrees/s; when he
-  stops it walks the last bit to his spot. While he gets in or out of a car (seat 9) his puppet stays on foot and
-  walks with him to the door; next to a standing car it gets in with the game's animation (`GetOnVehicle(..., true)`,
-  4 s, then seated at once as before).
-- **His car** (`VehicleController`): his controls are applied to the copy every tick (`SetSteer` with the response
-  curve inverted, `SetPower`, `SetBrake`, `SetHandbrake`), so its wheels steer, brake lights and engine react and its
-  own physics drives it; the transform is corrected toward his (8/s for position and rotation) only as far as needed,
-  and nothing is set while it is on target. If its physics does not keep up (the copy slower than 35 % of his speed for
-  1 s above 3 m/s, more than 8 m/s faster, or more than 1.5 m off for 1.5 s) the copy is pinned to his transform every
-  tick from then on (the pre-0.13.0 way, logged "pinned to his transform every tick"). Snap on a teleport (> 20 m
-  between snapshots) or > 4 m off. No throttle while the copy is faster than him (+1.5 m/s) or he reverses. When he
-  gets out the controls are released (power, brake, handbrake, steering 0).
+- **On foot** (`FootDriver` over core's `LocomotionController`):
+  - **Gait = his.** The gait is the `mode` his game reports (`gaitHint`: idle / walk / run / sprint), not one chosen
+    from the wanted speed (0.15.0: gait matched 63-76 % of the time, "player run, puppet sprint" 8-15 %). Only the
+    speed multiplier (`SetMovementSpeedMult`, 0.6-1.8, given right before each `MoveVec`) absorbs the error; when even
+    1.8 is too slow (the game's AI sprint is ~3.3 m/s at 1, a player's 6.5-7.5) the shortfall is carried as a small
+    nudge along his direction. The AI's speeds at multiplier 1 are first guessed as the 0.15.0 traces measured them
+    (walk 1.3, run 2.2, sprint 3.3 m/s) and calibrated on the puppet itself at run time.
+  - **Commands land in time.** The controller plans for the AI's command lag (0.15 s: the error and his velocity it
+    will have then, his stop point when he brakes); a changed speed multiplier re-issues the walk at once (at most
+    every 0.1 s) instead of at the next 0.35 s re-aim.
+  - **Hidden corrections.** Errors beyond 0.3 m are slid away (2 / s) at most 35 % of the faster of him and the
+    puppet (a puppet still running after he stopped is pulled back within its own motion); when he brakes or turns
+    away and the puppet runs on level with him or ahead, its body is held back to his speed (at most 70 % of its own,
+    its legs keep running: a moment of foot sliding instead of an overshoot it would walk back). Snap beyond 3.5 m
+    (3 m height, 6 m in the air), when he stands and it is 0.5 m off for 2 s, or when blocked 1.5 s.
+  - **Standing.** His game says idle: within 0.6 m the puppet stands at once (no walk for the last bit: a shuffle) -
+    its stop is a walk to where it comes to rest by itself along its own line of motion, never back to a point it
+    passed - and the rest blend slides it onto his spot (from 0.1 m off, 4 / s, at most 0.15 m/s, or 35 % of its own
+    speed while it still brakes). Farther off it walks there. It turns to his heading at up to 400 degrees/s.
+  - Simulated (tests/player_motion_test.cpp: 73 s of the host's real running, sprinting and stopping from the 0.15.0
+    traces, sent at 60 Hz over 14 ms + jitter, against an AI walker 150-250 ms late, speeds off +-20 %, turning at
+    most 360 degrees/s): p95 0.65-0.75 m, mean 0.25-0.31 m, standing p95 0.25-0.27 m, gait 99.8-99.9 %, no snaps.
+    How closely the game's AI walk matches that walker is UNVERIFIED.
+  - Unchanged: while he gets in or out of a car (seat 9) his puppet walks with him to the door; next to a standing car
+    it gets in with the game's animation; actions, traversal moves, ladders, swimming and bikes pause the controller
+    (busy flags) as before.
+- **His car** (`CarDriver` over core's `VehicleController`): his controls are applied to the copy every tick
+  (`SetSteer` with the response curve inverted, `SetPower`, `SetBrake`, `SetHandbrake`), so its own physics drives it.
+  - **Position: the car preset.** Nothing is set while the copy is within 0.5 m and turned less than 3 degrees (most
+    ticks: no `SetPos`, no `SetRot`); beyond, a blend of 5 / s of the excess at most 50 % of his speed (core's
+    `ForCar` preset with a faster blend: a copy whose steering acts ~0.15 s late drifts wide in turns); while his car
+    slides (its velocity more than 15 degrees off its heading above 2 m/s: a skid, a spin, a crash) at most his whole
+    speed. Snap beyond 4 m, when stuck (he stands, 1 m off for 2 s) or on a teleport (> 20 m between snapshots).
+  - **Speed.** After every move the copy gets his speed back (`SetSpeed`, km/h, Round 4) - his speed plus the error
+    along the copy's own heading (1.5 / s, at most 4 m/s; a sideways error given as speed along the heading made a
+    turning copy run wide). Not moved but its own speed is off his by more than 1 m/s or 12 %: given his speed alone
+    (`T` field 69, at most every 0.25 s; UNVERIFIED that `SetSpeed` alone keeps the car's physics sane).
+  - **Pins only as a last resort** (core 0.12 policy): pinned to his transform every tick when its physics does not
+    keep up (slower than 35 % of him for 1 s above 3 m/s, more than 8 m/s faster, or more than 1.5 m off for 1.5 s),
+    its physics retried after 1.5 s, doubling to 8 s, the doubling reset after 10 s kept up (was 5-40 s). VEH `pf` /
+    `ri` say how long and until when.
+  - Simulated (tests/player_motion_test.cpp: 30 s of the host's driving, 0-29 m/s, with a crash, against a copy whose
+    physics reaches 85 % or 115 % of his speed 150-300 ms late): p95 0.88-0.98 m, pinned 0-0.1 %, copy / driver speed
+    1.01-1.02. UNVERIFIED in game.
 - **His car's signals** (`signals` byte; `RV.Signals` in player_sync.lua, NOT checked in game): applied to the copy
   when they change, each change logged on both sides ("player N's car signals: ..." from the C++ side when it arrives,
   "remote car ...: signals A -> B" when it is applied, "our car's signals: ..." on the driver's game). Lights and
@@ -306,11 +344,30 @@ once he got out) until he gets out, then it is despawned when unseen (0.15 multi
 it stayed with despawn immunity for the rest of the game). The same for a host traffic car's copy that a player took
 (traffic_sync.lua hands its obtain id over with it, so player sync despawns it like its own copies: at the session
 end, on a lost connection, when it is trimmed) and for an adopted ambient traffic car of this game (its despawn
-immunity goes off again). A player who joins late
-does not see cars parked before he joined until somebody drives them.
+immunity goes off again). A player who joins late, or comes back after a lost connection, gets the cars parked
+before (ParkedCars, below; before this he did not see them until somebody drove them).
+
+#### Parked cars for late joiners (ParkedCars 0x0104; unreleased, NOT checked in game)
+
+`src/game/parked_cars.h`, unit-tested in tests/parked_cars_test.cpp. Every game keeps a book of the CarParked
+messages it sent or received in this session (key, model, final transform, flags); a car that somebody drives again
+(a PlayerState with seat 0 of that key) leaves it. The **host** sends a player the whole book as soon as he appears
+in the session with a new `(id, joinSeq)` - a late joiner, or a guest back after a lost connection - in messages of
+at most 24 cars, reliable, lane 0 (the player-car order), priority Normal. The receiver takes each car as if its
+CarParked had just come (player_sync.lua `M.Parked`: a copy at that transform, or his own car of that key if it
+stands there), except destroyed ones (flags bit 0): an intact copy of a wreck would stand there, so they are left
+out (logged). Accepted before the receiver's sync is active (it can arrive in the poll that completes the join); the
+cars are placed once he is in the world. Trace `PKB` (book changes), `PKS` (sent), `PKR` (received). Older builds
+ignore the message (unknown app id).
+
+
 
 Puppets that cannot be seated (seat taken, the game keeps throwing them out) are hidden at the car and retried every
-4 s.
+4 s. The 0.15.0 two-PC test: the host's car `manta_prototype` threw puppets out 1-3 frames after every non-animated
+`GetOnVehicle` on both games (seat 0 of a standing copy on the guest at 21:06:49, seat 1 of the host's moving car at
+21:07:17-19), the puppet landing 0.8 m off on the car's roof with physics on; no `SetPos` / physics change of ours in
+between (the in-car path of `M.Drive` only seats), the other cars of both sessions kept their puppets. Taken to be the
+game's (that car model), UNVERIFIED; the thrown-out log line now names the model.
 
 Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
 session end (the whole set, including the hidden "factory" car, is removed when the session ends).
@@ -1158,7 +1215,8 @@ Priorities against the per-peer send budget (`net_budget_kbps`, lowered automati
 Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
 NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
 (0x0260-0x0262), MissionFail / FailVerdict. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
-DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, car damage, the rest.
+DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, ParkedCars, car damage, the
+rest.
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
 parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way

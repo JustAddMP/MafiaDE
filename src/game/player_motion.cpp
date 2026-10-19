@@ -93,6 +93,15 @@ FootDriver::FootDriver(const motion::LocomotionTuning& t, const RestTuning& r, c
 
 float FootDriver::CopySpeed() const { return Len2(vel_[0], vel_[1]); }
 
+void FootDriver::Applied(const motion::LocomotionCommand& c) {
+    if (c.fix == motion::LocomotionCommand::Fix::Snap) {
+        haveLast_ = false;
+        lastNudge_ = {};
+    } else {
+        lastNudge_ = c.fix == motion::LocomotionCommand::Fix::Nudge ? c.nudge : Vec3{};
+    }
+}
+
 motion::LocomotionCommand FootDriver::Update(const motion::LocomotionInput& in) {
     using Fix = motion::LocomotionCommand::Fix;
     motion::LocomotionCommand c = loco_.Update(in);

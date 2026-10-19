@@ -849,7 +849,8 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
   if cmd.fix == 2 or cmd.fix == 3 then
     ent:SetPos(V(tx, ty, tz))
     st.setPosT = M.now  -- car_damage.lua: a copy put in place by SetPos does not report its own bumps as damage
-  elseif cmd.fix == 1 then
+  elseif cmd.fix == 1 and math.abs(cmd.nx) + math.abs(cmd.ny) + math.abs(cmd.nz) > 1e-4 then
+    -- (a blend of the rotation alone, game/player_motion.h CarDriver, moves nothing: no SetPos)
     local p = ent:GetPos()
     ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
   end
