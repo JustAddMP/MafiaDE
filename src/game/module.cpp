@@ -10,6 +10,7 @@
 #include "game/latency.h"
 #include "game/explosion_sync.h"
 #include "game/item_sync.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
@@ -23,6 +24,7 @@
 #include "game/traffic_sync.h"
 #include "game/door_sync.h"
 #include "game/police_sync.h"
+#include "game/world_env.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -213,6 +215,7 @@ public:
         // Lua bridge: hooks the script tick (GameMainThread); player sync runs on it. Failure only disables it.
         if (lua::Install(dllDir, logTag)) {
             PlayerSync::Install();
+            WorldEnvSync::Install();  // after PlayerSync: its glue asks player_sync.lua whether we are in the world
             MissionSync::Install();
             NpcSync::Install();
             TrafficSync::Install();
@@ -234,6 +237,8 @@ public:
         _session = &session;
         latency::Attach(&session);  // lanes, send priorities, the LAT trace (game/latency.h)
         PlayerSync::Attach(session);
+        WorldEnvSync::Attach(session);
+        JoinSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
@@ -247,6 +252,8 @@ public:
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
+        WorldEnvSync::Detach();
+        JoinSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
@@ -307,6 +314,7 @@ public:
     }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
+        WorldEnvSync::Tick(dt);
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
@@ -317,6 +325,7 @@ public:
         ThrowSync::Tick(dt);
         CarDamageSync::Tick(dt);
         CarLookSync::Tick(dt);
+        JoinSync::Tick(dt);  // last: after every system's handlers and ticks of this frame
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
             _latencyLogIn = 10;
@@ -338,6 +347,7 @@ public:
         case 0x0203: return "Cutscene";
         case 0x0205: return "MissionFail";
         case 0x0206: return "FailVerdict";
+        case 0x0207: return "JoinReport";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
         case 0x0220: return "TrafficSpawn";
@@ -374,6 +384,7 @@ public:
     }
     void AppendStatus(std::vector<render::OverlayLine>& out) override {
         PlayerSync::GetStatus(out);
+        WorldEnvSync::GetStatus(out);
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);

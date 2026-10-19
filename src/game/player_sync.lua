@@ -34,7 +34,6 @@
 --                                                                                puppet (game/puppet_guard.h)
 --   K vkey model x y z qx qy qz qw wrecked                                       a car was parked (CarParked;
 --                                                                                wrecked 1 = it is destroyed)
---   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
 --   M profile                                                                    our own model (profile; "tommy" = as the
 --                                                                                story dresses him)
@@ -64,7 +63,6 @@
 --             getter's answer, -1 none (M.SwimGetter); bike: 1 our vehicle is a motorbike (M.VehicleOf))
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw wrecked" (we parked a car we drove),
---            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
 --            for the C++ side's controllers: "PS id x y z hx hy busy" (puppet of player id on foot, after this tick's
@@ -91,7 +89,6 @@ M.cars = M.cars or {}
 M.localId = M.localId or "0"
 M.events = {}
 M.shots = M.shots or 0  -- shots the local player fired (mod 256), counted from his ammo
-M.env = M.env or {}
 M.hitq = M.hitq or {}   -- hits on puppets by the local player, filled by the DAMAGE event callbacks
 M.actSeq = M.actSeq or 0   -- visible actions of the local player so far (mod 256; M.LocalAction), sent in every state
 M.actKind = M.actKind or 0 -- the latest one (player_actions.h codes)
@@ -3174,7 +3171,6 @@ function M.RemoveAll()
     end
   end
   M.cars = {}
-  M.env = {}
   M.replays, M.down, M.died = {}, nil, nil
   pcall(M.UnwatchDamage)
   pcall(M.ModelReset)
@@ -5031,51 +5027,6 @@ function M.Sample(aimInput)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
--- Weather and time of day: the host's game is the clock. The host reports its time (hours, 0..24), time flow speed
--- and weather set every few seconds and at once when the weather or flow changes; guests apply them and correct
--- their clock when it drifts (game.gfx, docs/game-api.md 8).
--- ---------------------------------------------------------------------------------------------------------------
-local ENV_PERIOD = 4      -- s between host reports
-local ENV_MAX_DRIFT = 0.05  -- hours (3 game minutes) before a guest's clock is set
-
-function M.EnvHost()
-  local g = game.gfx
-  local t, flow, w = g:GetTime(), g:GetTimeFlowSpeed(), g:GetCurrentWeatherSetName()
-  if not t or not w then return end
-  local e = M.env
-  local changed = w ~= e.w or flow ~= e.flow
-  if changed or not e.at or M.now - e.at >= ENV_PERIOD then
-    if changed then log(string.format("env: weather %s, time %.2f h, flow %.2f", tostring(w), t, flow or 0)) end
-    e.w, e.flow, e.at = w, flow, M.now
-    M.events[#M.events + 1] = string.format("WE %.4f %.4f %s", t, flow or 0, tostring(w))
-  end
-end
-
-local function hourDiff(a, b)
-  local d = (a - b) % 24
-  if d > 12 then d = d - 24 end
-  return d
-end
-
-function M.EnvGuest(t, flow, w)
-  local g = game.gfx
-  local e = M.env
-  if w and w ~= "" and g:GetCurrentWeatherSetName() ~= w then
-    try("SetWeatherSet", g.SetWeatherSet, g, w, 0, 0)
-    log("env: weather set to " .. w .. " (host)")
-  end
-  if flow and g:GetTimeFlowSpeed() ~= flow then try("SetTimeFlowSpeed", g.SetTimeFlowSpeed, g, flow) end
-  local cur = g:GetTime()
-  if t and cur and math.abs(hourDiff(cur, t)) > ENV_MAX_DRIFT then
-    try("SetTime", g.SetTime, g, t, 0)
-    if not e.synced or math.abs(hourDiff(cur, t)) > 0.5 then
-      log(string.format("env: time %.2f h -> %.2f h (host)", cur, t))
-    end
-  end
-  e.synced = true
-end
-
--- ---------------------------------------------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------------------------------------------
@@ -5456,7 +5407,7 @@ function M.Update(dt, cmds)
   elseif not player then
     M.inWorldAt = nil
   end
-  local enter, aimInput, active, host, env = false, false, false, false, nil
+  local enter, aimInput, active, host = false, false, false, false
   local hits = {}
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
@@ -5539,8 +5490,6 @@ function M.Update(dt, cmds)
       hits[#hits + 1] = f
     elseif op == "M" then
       M.myModel = f[2] or ""
-    elseif op == "W" then
-      env = { tonumber(f[2]), tonumber(f[3]), f[4] }
     elseif op == "E" then
       enter = true
     elseif op == "A" then
@@ -5562,15 +5511,6 @@ function M.Update(dt, cmds)
   -- player shows up (he may still be loading; then his puppet appears the moment his first state arrives)
   local need = active
   for _, _ in pairs(M.pup) do need = true break end
-  if player and active then
-    if host then
-      local good, err = pcall(M.EnvHost)
-      if not good then logErr("env", err) end
-    elseif env then
-      local good, err = pcall(M.EnvGuest, env[1], env[2], env[3])
-      if not good then logErr("env", err) end
-    end
-  end
   M.isHost, M.inSession = host, active
   if player then
     if active then

@@ -25,7 +25,7 @@ public:
     // Sends the local state at 20 Hz while the session is active. enterDown: the enter-vehicle key/button is held
     // in our focused window (E / pad Y; a press next to a car another player drives rides along as passenger).
     // aimDown: the aim control is held (right mouse button / pad left trigger); shown on our puppet while the player
-    // has a gun in hand. The host also sends its time of day and weather (WorldEnv) from here.
+    // has a gun in hand.
     static void Tick(float dt, bool enterDown, bool aimDown);
     // Last known health (0..100) of a player (local or remote), -1 if unknown. Any thread.
     static int Health(net::PlayerId id);

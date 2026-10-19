@@ -125,6 +125,9 @@ on the other.
 | `CLB` | both | per tuning install on a copy (C++) | `ref ent damage=<1 car damage was told: whole state asked, rebuild echo window>` (InstallTuningItems rebuilt the car) |
 | `CDB` | both | each ask of the one-explosion book (C++) | `ent first=<1 it blows up now, 0 refused: blown up already>` (docs/game-api.md 24 "One explosion") |
 | `CDE` | both | each car blown up by the one explode routine (Lua D.Explode) | `ent ok=<SetExploded worked> picture=<1 a picture shown> claimed=<1 our own car, asked already> from=<the player whose game said so, - car damage>` |
+| `WEH` | host | 1 Hz while in the world | time of day truth (src/game/world_env.h): `t=<game hours 0..24> flow=<time flow speed> weather=<weather set> sT=<session clock, ms, of this reading>` |
+| `WEG` | guest | 1 Hz while in the world, and on every SetTime / change of what it does | our clock against the host's: `t=<ours, hours> flow=<ours now (a catch-up's while one runs)> weather=<ours> host=<the host's time now as predicted from his newest WorldEnv> err=<host - ours, game minutes> act=<none: in step or within 0.5 min / flow: a catch-up runs (flow speed changed up to 25 %) / set: SetTime this tick> sT=<session clock, ms> hflow=<the host's flow speed> rate=<game hours per second per flow unit used> measured=<1 the rate is measured from the host's samples, 0 still the guess>` |
+| `JN` | guest (host: `report`) | per event | join / reconnect completeness (src/game/join_sync.h): `ev=begin reconnect=<1 back after a lost connection> others=<other players then>`; per first arrival `ev=<player mission worldenv doors npcs traffic police cardamage> key=<player id or car, - one per system> after=<s since begin>`; `ev=complete after=<s: the last required part> missing=<- or the required parts not here 15 s after we were in the world, e.g. doors,player:2> none=<optional systems that sent nothing> late=<1 complete only after the missing report> reconnect`; host: `ev=report from complete after reconnect late missing times=<system:s,...>` (the guest's JoinReport) |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
 | `FAIL` | both | on a failed mission | `ev=freeroamretry reason role skip fresh` (the game's answer to a failure: skipped or not), `ev=gameover reason role fresh`, `ev=report from seq reason point verdict` (host: a guest's MissionFail and the answer), `ev=verdict kind seq reason` (guest), `ev=action kind seq reason` (what FailFlow decided: 0 SendHostFailed, 1 SelfReload, 2 SendReport, 3 Quit, 4 LoadHostPoint, 5 ReloadInWorld, 6 GameFallback), `ev=log <text>` (its state changes) |
 | `ITH` | host | 2 Hz | world items (docs/game-api.md 20): `items=<shared items known> round=<in this round> sent=<in ItemStates> ours=<taken by the host> guests=<taken by guests> refused=<late takes refused> forgot=<despawned, no take> unknown=<takes of items we did not know>` (C++) |
@@ -195,6 +198,16 @@ Per player as seen on the other game:
 - **car damage:** per game what it sent (by kind), received, set on cars and reported; each player car's last
   state on both games side by side (marked when it differs), cars whose damage could not be read, and the
   traffic cars each game had (damaged ones named).
+- **World** (`WEH` on the host, `WEG` on the guest): the guest's time of day against the host's own reading at the
+  same session time (both stamped `sT`; the host's two readings around it interpolated, the short way round 24 h;
+  without a host trace the guest's own `err`): how many readings, what the guest did (none / flow / set) and every
+  SetTime, `|host - guest|` after the first 10 s of each stretch (a gap of over 5 s between guest readings starts a new
+  stretch: a load or a rejoin; its first sync is left out) as mean / median / p95 / max and the worst moment, the
+  guest's own estimate against the truth, how often the weather was the same, the game's rate the guest measured.
+  Target `world.time_err` = the max of those (<= 0.5 game minutes).
+- **Join and reconnect** (`JN`): each join / rejoin of the guest, the first arrival per system, complete after how
+  many seconds or what was still missing, and the host's copy of the report. Target `join.complete_s` (<= 10 s) for
+  every complete that came in time (a "missing" verdict records its time, over 15 s: FAIL).
 - **reconnects:** per game, the `RCN` events (dropped, lost, back with the time without the host, sync paused /
   resumed).
 - **explosions:** none of the X records are read by the tool yet; grep them (`XC` on the thrower, `XR`/`XV`/`XD` on

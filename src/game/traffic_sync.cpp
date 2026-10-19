@@ -3,6 +3,7 @@
 
 #include "core/log.h"
 #include "core/trace.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/peer_pause.h"
 #include "game/traffic_model.h"
@@ -92,6 +93,7 @@ void OnSpawn(net::PlayerId from, net::ByteReader& r) {
     if (from != net::kHostPlayer || (_session && _session->IsHost())) return;
     std::vector<SpawnInfo> list;
     if (!ReadSpawns(r, list)) return;
+    join::Mark(join::System::Traffic);
     Shared& sh = S();
     const double now = Now();
     std::lock_guard lock(sh.mu);

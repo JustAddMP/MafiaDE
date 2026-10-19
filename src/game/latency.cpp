@@ -100,6 +100,8 @@ void Configure(net::Session& s) {
     s.SetPriority(0x0260, 0x0262, Priority::Critical);  // police state / event / chase
     s.SetPriority(0x0205, 0x0206, Priority::Critical);  // mission fail / verdict
     s.SetPriority(0x0202, 0x0202, Priority::Bulk);      // the host's checkpoint save
+    s.SetPriority(0x0200, 0x0200, Priority::Critical);  // WorldEnv (small, every 2 s: a newcomer's clock at once)
+    s.SetPriority(0x0207, 0x0207, Priority::Normal);    // JoinReport (guest -> host, once per join / reconnect)
     s.SetPriority(0x0211, 0x0211, Priority::Critical);  // NPC death
     s.SetPriority(0x0222, 0x0222, Priority::Bulk);      // traffic car states
     s.SetPriority(0x0210, 0x0210, Priority::Normal);    // NPC states (thinned only when far over the budget)
