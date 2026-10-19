@@ -587,26 +587,47 @@ local function speedOf(ent)
   return math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
 end
 
+-- The number SetSpeed takes for a wanted velocity in m/s: km/h along the car's heading, negative backwards
+-- (src/game/car_units.h, read from the exe: SetSpeed multiplies by 1 / 3.6). Before this fix the copies got m/s:
+-- 0.28 of their speed (the 2026-10-19 two-PC test). The Lua fallback is for an older dll with this file as an override.
+function RV.SpeedArg(vx, vy, vz, rev)
+  if mc_car_speed_arg then return mc_car_speed_arg(vx, vy, vz, rev and 1 or 0) end
+  local kmh = math.min(math.sqrt(vx * vx + vy * vy + vz * vz), 120) * 3.6
+  if kmh ~= kmh then kmh = 0 end
+  return rev and -kmh or kmh
+end
+
+-- GetSpeedFloat is km/h (exe: speed x 3.6, src/game/car_units.h): m/s here, unsigned; -1 when it cannot be read.
+function M.SpeedMs(car)
+  local good, sp = pcall(car.GetSpeedFloat, car)
+  sp = good and tonumber(sp)
+  if not sp then return -1 end
+  if mc_car_speed_ms then return mc_car_speed_ms(sp) end
+  return math.abs(sp) / 3.6
+end
+
 -- Gives the copy its wanted velocity after a move: the game's position setter may stop the body (that is what kept
--- the copies from rolling in the 0.13.0 test: 0.2 m/s against 4.4). SetSpeed takes a vector or, failing that, a
--- number (the speed along its heading); which one works is logged once.
-function RV.GiveSpeed(st, ent, vx, vy, vz)
+-- the copies from rolling in the 0.13.0 test: 0.2 m/s against 4.4). SetSpeed takes one number (the exe's binding
+-- reads a number only, so the vector form tried until now always failed, with a traceback per copy): km/h.
+-- rev: the driver reverses (gear < 0, the traffic reverse flag). How it went is logged once per game run, not per copy.
+function RV.GiveSpeed(st, ent, vx, vy, vz, rev)
   if st.speedHow == "none" then return end
-  if st.speedHow ~= "number" then
-    local good, err = pcall(ent.SetSpeed, ent, V(vx, vy, vz))
-    if good then
-      if not st.speedHow then st.speedHow = "vector"; log("remote car " .. tostring(ent) .. ": SetSpeed(vector) accepted") end
-      return
-    end
-    if st.speedHow == "vector" then return end
-    log("remote car " .. tostring(ent) .. ": SetSpeed(vector) failed (" .. tostring(err) .. "), trying a number")
-  end
-  local good, err = pcall(ent.SetSpeed, ent, math.sqrt(vx * vx + vy * vy + vz * vz))
+  local good, err = pcall(ent.SetSpeed, ent, RV.SpeedArg(vx, vy, vz, rev))
   if good then
-    if st.speedHow ~= "number" then st.speedHow = "number"; log("remote car " .. tostring(ent) .. ": SetSpeed(number) accepted") end
+    if st.speedHow ~= "kmh" then
+      st.speedHow = "kmh"
+      if not RV.speedLogged then
+        RV.speedLogged = true
+        log("remote cars: SetSpeed(km/h) accepted (first: " .. tostring(ent) .. "; logged once)")
+      end
+    end
   else
     st.speedHow = "none"
-    log("remote car " .. tostring(ent) .. ": SetSpeed failed both ways (" .. tostring(err) .. "): no speed after a move")
+    RV.speedFails = (RV.speedFails or 0) + 1
+    if RV.speedFails <= 3 or RV.speedFails % 100 == 0 then
+      log("remote car " .. tostring(ent) .. ": SetSpeed(km/h) failed (" .. tostring(err):match("^[^\n]*")
+        .. "): no speed after a move for this copy (#" .. RV.speedFails .. ")")
+    end
   end
 end
 
@@ -649,7 +670,7 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
     q.s = cmd.qw
     ent:SetRot(q)
     local s2 = probe and speedOf(ent)
-    RV.GiveSpeed(st, ent, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0)
+    RV.GiveSpeed(st, ent, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0, cmd.rev or (cmd.gear or 0) < 0)
     if probe then
       st.probes, st.probeT = (st.probes or 0) + 1, M.now
       log(string.format("remote car %s: probe #%d (%s): speed %.2f m/s, after SetPos %.2f, after SetRot %.2f, after "
@@ -1137,8 +1158,7 @@ function M.SwapTick(c, sessionOver, worldGone)
     add(SW.pup, pup)
     add(SW.lin, loc or c.localIn)
     add(SW.other, other)
-    local good, sp = pcall(c.ent.GetSpeedFloat, c.ent)
-    speed = good and math.abs(tonumber(sp) or 0) or 0
+    speed = math.max(M.SpeedMs(c.ent), 0)  -- m/s (car_swap.h kStillSpeed); GetSpeedFloat is km/h
   end
   add(SW.wrecked, c.parkWrecked)
   add(SW.world, worldGone)
@@ -1243,6 +1263,29 @@ function M.CarsUpdate(p)
     -- a ride along into this car is under way and the game slid us to the wheel (M.RideTick moves us over): we are
     -- still getting in (seat 9) for the others and do not take the car from its driver
     if seat == 0 and c.driver and c.driver ~= "local" and M.ride and M.ride.key == key then seat = 9 end
+    -- One wheel, one driver (src/game/seats.h LocalWheel): another player's state names this wheel too. When he
+    -- drove it here first, our seat-0 reading is the game's slide (his puppet left the seat), not a takeover; when we
+    -- both claimed it before seeing each other, the car's holder (the key's owner) keeps it, else the lower id. If
+    -- we give way we claim nothing (seat 9) and M.WheelTick moves us to a passenger seat or out.
+    if seat == 0 then
+      local rid = M.WheelClaimant(key)
+      if rid then
+        local d = M.WheelDecide(key, c.driver, rid)
+        if d == "yield" then
+          M.YieldWheel(c, rid, c.driver == rid and "slide" or "keeper")
+          seat = 9
+        elseif not (M.wheelKeep and M.wheelKeep[key] == rid) then
+          M.wheelKeep = M.wheelKeep or {}
+          M.wheelKeep[key] = rid
+          log(string.format("car %s: player %s claims its wheel too; we keep it (holder %s, the same rule on his game: "
+            .. "he gives way)", key, rid, tostring(key:match("^(%d+):"))))
+          trace("WHL", string.format("key=%s ev=keep other=%s holder=%s drv=%s", key, rid,
+            tostring(key:match("^(%d+):")), tostring(c.driver)))
+        end
+      elseif M.wheelKeep then
+        M.wheelKeep[key] = nil
+      end
+    end
     M.my = { key = key, seat = seat, c = c }
     c.used = M.now
     if seat == 0 and c.driver ~= "local" then
@@ -1262,6 +1305,7 @@ function M.CarsUpdate(p)
     if pp.veh and pp.seat == 0 and pp.vkey and pp.cx then
       local c = M.cars[pp.vkey]
       if c and c.driver == "local" then
+        -- we are the keeper (M.WheelDecide above): his game makes him give way
         if pp.conflict ~= pp.vkey then log("car " .. pp.vkey .. ": player " .. id .. " drives it too; we keep it") end
         pp.conflict = pp.vkey
       elseif c and c.driver and c.driver ~= "local" and c.driver ~= id and M.pup[c.driver]
@@ -1308,8 +1352,8 @@ function M.CarsUpdate(p)
     end
     -- We were the last driver: once the car has stopped, tell everyone where it rests.
     if c.parkPending and c.ent and valid(c.ent) then
-      local sp = c.ent:GetSpeedFloat() or 0
-      if M.now - c.exitT > 1 and (math.abs(sp) < 0.3 or M.now - c.exitT > 8) then
+      local sp = M.SpeedMs(c.ent)  -- m/s (GetSpeedFloat is km/h)
+      if M.now - c.exitT > 1 and ((sp >= 0 and sp < 0.3) or M.now - c.exitT > 8) then
         c.parkPending = nil
         local cp, q = c.ent:GetPos(), c.ent:GetRot()
         local wrecked, dmg, motor = M.Wrecked(c.ent)
@@ -1499,6 +1543,130 @@ function M.SeatTick(p)
     good and 1 or 0))
 end
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- One wheel, one driver (src/game/seats.h "One wheel"). The 2026-10-19 two-PC test had both players drive one car for
+-- 100 s: the driver's puppet left seat 0 on the passenger's game (thrown out, down in the water), that game slid its
+-- player to the wheel, and both games kept the car ("drives it too; we keep it"), its damage bouncing between them.
+-- ---------------------------------------------------------------------------------------------------------------
+
+-- The other player whose state names seat 0 of car `key` (nil: none).
+function M.WheelClaimant(key)
+  for id, pp in pairs(M.pup) do
+    if pp.veh and pp.seat == 0 and pp.vkey == key then return id end
+  end
+  return nil
+end
+
+-- "keep" or "yield" for our seat-0 reading of car `key` while player `rid` claims its wheel too; drv: c.driver.
+function M.WheelDecide(key, drv, rid)
+  local holder = tonumber(key:match("^(%d+):")) or 255
+  local here = (drv == "local") and tonumber(M.localId) or tonumber(drv) or -1
+  local me, other = tonumber(M.localId) or 0, tonumber(rid) or 0
+  if mc_wheel then return mc_wheel(me, holder, here, other) end
+  -- an older dll with this file as an override: the same rule (seats.cpp LocalWheel)
+  if here == other then return "yield" end
+  local keeper = (me == holder and me) or (other == holder and other) or math.min(me, other)
+  return keeper == me and "keep" or "yield"
+end
+
+-- We give car c's wheel to player rid (why: "slide" or "keeper"): he drives it here from now on (his game holds its
+-- damage), we claim no seat until M.WheelTick has moved us to a passenger seat or out.
+function M.YieldWheel(c, rid, why)
+  if c.driver ~= rid then
+    if c.driver == "local" then
+      log("car " .. c.key .. ": we drove it, player " .. rid .. " keeps it (" .. why .. "): we give way")
+    end
+    c.driver, c.parkPending, c.parkApply, c.lastDriver = rid, nil, nil, rid
+  end
+  local y = M.wheelYield
+  if not (y and y.key == c.key and y.to == rid) then
+    M.wheelYield = { key = c.key, to = rid, t = M.now, tries = 0, why = why, c = c }
+    log(string.format("car %s: the game put us at the wheel while player %s drives it (%s): we give way (no seat "
+      .. "claimed until we sit elsewhere)", c.key, rid, why == "slide" and "his puppet left the seat here, the game slid "
+      .. "us over" or "he is the keeper: the car's holder or the lower id"))
+    trace("WHL", string.format("key=%s ev=yield to=%s why=%s holder=%s", c.key, rid, why,
+      tostring(c.key:match("^(%d+):"))))
+  end
+  M.wheelYield.seen = M.now
+end
+
+-- Every tick after M.CarsUpdate: while we give way, slide to a free passenger seat (SlideToSeat, UNVERIFIED for the
+-- player; three tries 0.7 s apart), then try to get out (GetOffVehicle with the controls locked, two tries); after
+-- that we stay where we are but go on claiming nothing while he claims the wheel. Over when we no longer sit at the
+-- wheel, or nobody claims it any more (then we may take it like any free wheel).
+function M.WheelTick(p)
+  local y = M.wheelYield
+  if not y then return end
+  local c = y.c
+  local car = c and c.ent
+  local atWheel = valid(car) and same(p:GetOwner(), car) and same(car:GetSeatOwner(0), p)
+  if not atWheel or M.now - (y.seen or 0) > 0.5 then
+    if y.locked then try("LockControls", p.LockControls, p, false) end
+    local at
+    if valid(car) and same(p:GetOwner(), car) then
+      for s = 0, 7 do
+        local good, o = pcall(car.GetSeatOwner, car, s)
+        if good and same(o, p) then at = s break end
+      end
+    end
+    log(string.format("car %s: gave way to player %s after %.1f s: %s", y.key, y.to, M.now - y.t,
+      at and ("we sit in seat " .. at) or (atWheel and "he no longer claims the wheel" or "we are out")))
+    trace("WHL", string.format("key=%s ev=done to=%s seat=%s took=%.2f", y.key, y.to, tostring(at), M.now - y.t))
+    M.wheelYield = nil
+    return
+  end
+  if M.now - (y.actT or -10) < 0.7 then return end
+  y.actT = M.now
+  y.tries = y.tries + 1
+  if y.tries <= 3 then
+    local count, free, claims = M.SeatView(c)
+    local seat = mc_rideseat and tonumber(mc_rideseat(count, free, claims)) or -1
+    if seat and seat >= 1 then
+      local good, err = pcall(p.SlideToSeat, p, seat + 1)
+      log(string.format("car %s: sliding to seat %d to give the wheel back (%s, try %d)", y.key, seat,
+        good and "sent" or ("failed: " .. tostring(err)), y.tries))
+      trace("WHL", string.format("key=%s ev=slide seat=%d ok=%d try=%d", y.key, seat, good and 1 or 0, y.tries))
+      return
+    end
+    y.tries = 3  -- no free passenger seat here: out instead
+  end
+  if y.tries <= 5 then
+    if not y.locked then
+      y.locked = true
+      try("LockControls", p.LockControls, p, true)  -- a scripted get-out only works with the controls locked
+    end
+    local good, err = pcall(p.GetOffVehicle, p)
+    log(string.format("car %s: no passenger seat to slide to (or the slides did not move us): getting out (%s, try %d)",
+      y.key, good and "sent" or ("failed: " .. tostring(err)), y.tries - 3))
+    trace("WHL", string.format("key=%s ev=out ok=%d try=%d", y.key, good and 1 or 0, y.tries - 3))
+    return
+  end
+  if not y.gaveUp then
+    y.gaveUp = true
+    if y.locked then
+      y.locked = nil
+      try("LockControls", p.LockControls, p, false)
+    end
+    log("car " .. y.key .. ": still at the wheel after the slides and get-outs: we stay, claiming no seat while player "
+      .. y.to .. " drives it (press E to get out)")
+    trace("WHL", string.format("key=%s ev=stuck to=%s", y.key, y.to))
+  end
+end
+
+-- As a passenger of a car another player drives, ask the game not to slide us to the wheel when it comes free here
+-- (PlayerShouldRemainPassenger, player only: exe+0x2B99140 sets a flag of the player's; UNVERIFIED what the game
+-- does with it). Set on change only, cleared when we leave the seat or drive.
+function M.PassengerHold(p)
+  local my = M.my
+  local want = my ~= nil and my.seat ~= nil and my.seat >= 1 and my.seat <= 8 and my.c ~= nil and my.c.driver ~= nil
+    and my.c.driver ~= "local"
+  if want == (M.remainPassenger or false) and (not want or same(M.remainPassengerP, p)) then return end
+  local good, err = pcall(p.PlayerShouldRemainPassenger, p, want)
+  M.remainPassenger, M.remainPassengerP = want, p
+  log(string.format("PlayerShouldRemainPassenger(%s)%s", tostring(want), good and "" or (" failed: " .. tostring(err))))
+  trace("WHL", string.format("key=%s ev=hold on=%d ok=%d", my and my.key or "-", want and 1 or 0, good and 1 or 0))
+end
+
 -- Ride along under way: where the game put us is checked once we are in the car; at the wheel instead of the chosen
 -- seat we slide over (SlideToSeat, 1-based like GetOnVehicle, UNVERIFIED). Meanwhile M.CarsUpdate does not take the
 -- car from its driver; if we still sit at the wheel when the ride ends, it does (as before 0.15).
@@ -1663,11 +1831,11 @@ function M.Seat(pp, c)
       pp.putBacks = (pp.putBacks or 0) + 1
       if seatLogOk(pp) then
         local g, phys = pcall(so.GetPhysState, so)
-        local g2, sp = pcall(car.GetSpeedFloat, car)
+        local sp = M.SpeedMs(car)
         log(string.format("puppet %s is in car %s but not in seat %d (seat %s, %s, phys %s, car %.1f m/s, %.1f s after "
           .. "seating): put back at once (#%d)", pp.id, tostring(pp.vkey), pp.seat, h,
           other and ("sits in seat " .. other) or "leaving", g and tostring(phys) or "?",
-          g2 and (tonumber(sp) or -1) or -1, M.now - (pp.seatedT or pp.seatT or M.now), pp.putBacks))
+          sp, M.now - (pp.seatedT or pp.seatT or M.now), pp.putBacks))
       end
     end
     if M.now - (pp.backT or -10) >= PUTBACK_GAP then
@@ -1692,13 +1860,13 @@ function M.Seat(pp, c)
     pp.ejectsAll = (pp.ejectsAll or 0) + 1
     if seatLogOk(pp) then
       local g1, phys = pcall(so.GetPhysState, so)
-      local g2, sp = pcall(car.GetSpeedFloat, car)
+      local sp = M.SpeedMs(car)
       local cmd = pp.vcmd or {}
       local q, cp = so:GetPos(), car:GetPos()
       log(string.format("puppet %s thrown out of car %s seat %d (#%d, %d this session): %.1f s after seating, car %.1f "
         .. "m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, put-backs "
         .. "%d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects, pp.ejectsAll,
-        M.now - (pp.seatedT or pp.seatT or M.now), g2 and (tonumber(sp) or -1) or -1, tostring(cmd.fix),
+        M.now - (pp.seatedT or pp.seatT or M.now), sp, tostring(cmd.fix),
         cmd.pinned and " pinned" or "", g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
         seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.brain and "yes" or "no",
         pp.putBacks or 0, math.sqrt((q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 + (q.z - cp.z) ^ 2), tostring(c.driver),
@@ -1770,8 +1938,8 @@ function M.Seat(pp, c)
     local animate = false
     if not pp.hidden and not pp.animTried and not fast then
       local q, cp = so:GetPos(), car:GetPos()
-      local good, sp = pcall(car.GetSpeedFloat, car)
-      animate = good and math.abs(tonumber(sp) or 9) < 1 and (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 < 4 * 4
+      local sp = M.SpeedMs(car)
+      animate = sp >= 0 and sp < 0.3 and (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 < 4 * 4
     end
     if pp.hidden then M.Hide(pp, false, true) end
     pp.seatAnim = animate
@@ -2048,14 +2216,14 @@ end
 local function carState(car)
   local g1, eng = pcall(car.IsEngineOn, car)
   local g2, gear = pcall(car.GetGear, car)
-  local g3, spd = pcall(car.GetSpeedFloat, car)
+  local spd = M.SpeedMs(car)  -- m/s (GetSpeedFloat is km/h; the CR / LR spd field was km/h until this fix)
   local g4, fixed = pcall(car.IsCarPosFixed, car)
   local g5, rpm = pcall(car.GetEngineRotations, car)
   local g6, pwi = pcall(car.GetPowerInternal, car)
   -- the car signals it really has (src/game/car_signals.h byte, -1 = not readable)
   local sig = mc_car_signals and mc_car_signals(tonumber(guidNum(car))) or -1
   return string.format("eng=%s gear=%s spd=%.3f fixed=%s rpm=%.0f pwi=%.3f sig=%d",
-    g1 and (eng and "1" or "0") or "-", g2 and tostring(gear) or "-", g3 and (tonumber(spd) or -1) or -1,
+    g1 and (eng and "1" or "0") or "-", g2 and tostring(gear) or "-", spd,
     g4 and (fixed and "1" or "0") or "-", g5 and (tonumber(rpm) or -1) or -1, g6 and (tonumber(pwi) or -1) or -1,
     math.floor(sig))
 end
@@ -2207,6 +2375,12 @@ end
 
 function M.RemoveAll()
   for id, _ in pairs(M.pup) do M.Remove(id) end
+  -- giving a wheel back (M.WheelTick) or holding the passenger seat (M.PassengerHold) ends with the session
+  local okp, player = pcall(function() return game.game:GetActivePlayer() end)
+  if not okp then player = nil end
+  if M.wheelYield and M.wheelYield.locked and valid(player) then pcall(player.LockControls, player, false) end
+  if M.remainPassenger and valid(player) then pcall(player.PlayerShouldRemainPassenger, player, false) end
+  M.wheelYield, M.remainPassenger, M.wheelKeep = nil, nil, nil
   for _, c in pairs(M.cars) do
     if c.orig then  -- our real car hidden behind a copy: it comes back now, or once we are out of the copy
       if c.st ~= "ready" then
@@ -4191,6 +4365,10 @@ function M.Update(dt, cmds)
     if active then
       good, err = pcall(M.SeatTick, player)
       if not good then logErr("seats", err) end
+      good, err = pcall(M.WheelTick, player)
+      if not good then logErr("wheel", err) end
+      good, err = pcall(M.PassengerHold, player)
+      if not good then logErr("passenger hold", err) end
     end
     good, err = pcall(M.LeftCarsTick, player)
     if not good then logErr("left cars", err) end

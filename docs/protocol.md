@@ -71,7 +71,8 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0100 | PlayerState | every peer -> everyone (`Broadcast`; the host relays guest states) | U, 60 Hz (0.9.0; was 20) | see below |
 | 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags (0.15: bit 0 the car is destroyed; read as 0 when missing, older builds ignore it) |
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
-| 0x0103-0x01FF | reserved (phase 3 events) | | | |
+| 0x0103 | PeerPaused | every peer -> everyone (`Broadcast`) | R | u8 flags (bit0 paused), u8 reason (0 resumed, 1 no script tick, 2 the game's paused tick only), u32 ms paused so far (on the resume: how long it lasted). Unreleased; see "A paused game" below |
+| 0x0104-0x01FF | reserved (phase 3 events) | | | |
 
 PlayerState body (56 bytes on foot + weapon name, ~139 bytes in a car):
 
@@ -263,9 +264,22 @@ Message flow:
    when the copy is lost; destroyed on A's game, it is blown up on ours. The rules: docs/game-api.md 15 "Mission
    car back", src/game/car_swap.h.
 
-Conflicts: if two players get into the driver seat of the same parked car at the same moment, each game keeps its
-own player driving (the other's `seat 0` claim for K is ignored and logged) until one of them gets out; then step 3/4
-apply. On a third game (both are remote there) the one who had the wheel there first keeps it until his state leaves
+Conflicts (one wheel, one driver; unreleased, src/game/seats.h `LocalWheel`, unit-tested in tests/seats_test.cpp; the
+2026-10-19 two-PC test had both players drive one car for 100 s, its damage bouncing between the games): when a game
+reads its own player in seat 0 of K while another player's state names seat 0 of K too,
+- and that player already drove K on this game, the reading is the game's **slide** (his puppet left the seat here:
+  thrown out, down in the water, respawning, and the game moved our passenger to the wheel), not a takeover: we give
+  way;
+- otherwise (both took the wheel before seeing each other's state) the car's **holder** keeps it (the key's owner,
+  the player who first drove K: `1:4746250` -> player 1), and when neither is the holder the lower player id. Both
+  games apply the same rule to the same facts, so exactly one keeps it.
+The player who gives way reports seat 9 (claims nothing) from that very tick, so the keeper's game never sees two
+claims; his game then slides him to a free, unclaimed passenger seat (`SlideToSeat`, three tries 0.7 s apart) or, with
+none, gets him out (`GetOffVehicle` with the controls locked, two tries); if neither works he stays, still claiming
+nothing (logged; press E). The car's damage follows the single driver (car_damage.lua: the holder of a car's damage
+is its driver). While a player sits in a passenger seat of a car another player drives, his game sets
+`PlayerShouldRemainPassenger(true)` (UNVERIFIED that it stops the game's slide). Trace `WHL`. Before this, each game
+kept its own player driving ("drives it too; we keep it") until one of them got out. On a third game (both are remote there) the one who had the wheel there first keeps it until his state leaves
 the wheel (0.15 multi-guest; before, the claim flipped between them every tick, with a "drives it" line and a fresh
 copy swap each time; trace `DRV`). Copies are capped at 12 per game (the oldest parked copy nobody sits in is despawned; never one with a real
 car hidden behind it). When the session ends, copies nobody sits in are despawned (a hidden real car is shown at
@@ -308,6 +322,36 @@ Fire, aim, crouch, reload: a receiver turns `aim` (or a new shot, kept for 1 s a
 `DbgTesting_AimAtDir(ax, ay, az)` on the puppet, fires one real shot per new `shots` count (trigger press/release, at
 most a few per tick; a far backlog is skipped), `crouch` into `SetStalkMove`, and a rising `reload` into a reload
 press. Shots are not separate messages: they ride on the player state (60 Hz), so a lost packet only delays them by a frame or two.
+
+### A paused game (PeerPaused 0x0103; unreleased, NOT checked in game)
+
+Code: `src/game/peer_pause.{h,cpp}` (pure: wire, detector, registry; tests/peer_pause_test.cpp and the host pause in
+tests/traffic_test.cpp), sent and received in `src/game/player_sync.cpp`. While a game is paused (its pause menu, the
+CO-OP panel opened from it, a loading screen) its script tick does not run, so it sends no PlayerState and, on the host,
+no traffic or NPC states. In the 2026-10-19 two-PC test the guest's copies then coasted on their own, and when the host
+resumed 6-10 "knocked ... put back, reported to the host" corrections fired within 0.5 s (and the host logged each
+report back).
+
+- **Sender:** the render thread watches the game's script tick (`lua::LastTickAt`, `LastNormalTickAt`: the hooked
+  `C_ScriptMachine::Tick` / `TickPaused` of the game's machine). No tick for 0.3 s while the world is loaded (or only
+  `TickPaused` ticks for 0.3 s) = paused: PeerPaused `paused=1` goes to everyone, again every 2 s while it lasts (a
+  late joiner learns it), and `paused=0` with the duration on the first tick after it. Logged as `our game is paused
+  (...)` / `our game runs again after N s`, trace `PAU`. Outside the world (menus, lobby) nothing is sent.
+- **Receivers** (registry `peer_pause::For(id)`; Lua `mc_peer_quiet(id)` -> 0 none, 1 paused, 2 grace):
+  - his puppet and the car copy he drives are held where they stand here (from their last reports): the puppet stands,
+    the car is pinned to that pose every tick, braked, without speed; no pin is counted. Logged `player N's game is
+    paused: his puppet and his car held ...` / `... runs again ... (held N s)`, trace `PAU ev=freeze/thaw`;
+  - the host paused: every copy of his traffic is held the same way (`GuestTraffic::SetHostPaused`), none goes stale
+    for the missing states and none is spawned; after his resume they are driven again and no knock (TrafficBump) is
+    reported for 1 s (counted as `quiet` in `TRG`); logged `traffic: the host paused his game: N copies ... held`,
+    trace `TRZ`;
+  - the host's NPCs on a guest are not pulled back while he is paused or within 1 s of his resume (npc_sync.lua,
+    `not put back: the host's game is paused or just resumed`).
+- **Our own pause** counts too: after a tick gap of more than 0.5 s (our game stood while the host's cars drove on)
+  the guest reports no knocks for 1 s (`traffic: our own game stood for a while`, `TRZ ev=localgap`), and the resume
+  of our own detector puts every copy of everybody's things in the 1 s grace.
+- Older builds ignore 0x0103 (an unknown app id); the receiver tolerates trailing bytes and rejects a body shorter
+  than 6 bytes.
 
 ## Phase 6: damage between players (app ids 0x0400-0x04FF)
 

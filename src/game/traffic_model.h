@@ -179,6 +179,10 @@ struct GuestConfig {
     float bumpError = 3.0f;         // m: a copy this far off its target that was on it a moment before was knocked
     double bumpEvery = 2.0;         // s between bump reports of one car
     double despawnGrace = 1.0;      // s a copy stays after its despawn (player sync may adopt it: a car jacked)
+    // the host's pause (game/peer_pause.h): no knock checks while he is paused and this long after his resume, and
+    // after a pause of our own (a tick gap of more than localGap s: our copies were left behind meanwhile)
+    double quietAfter = 1.0;
+    double localGap = 0.5;
 };
 
 struct CopyReport {
@@ -206,6 +210,9 @@ struct GuestBump {
 
 struct GuestStats {
     uint32_t known = 0, live = 0, copies = 0, pins = 0, snaps = 0, bumps = 0;
+    uint32_t quietBumps = 0;    // knocks not reported: the host was paused or had just resumed, or we had
+    uint32_t pauses = 0, localGaps = 0;
+    bool frozen = false;        // the host is paused: the copies are held
     float avgErr = 0, maxErr = 0;
     uint64_t states = 0, spawns = 0, despawns = 0, dropsOld = 0;
 };
@@ -222,6 +229,11 @@ public:
     void Release(uint16_t net);  // the copy is someone's car now (player sync took it): never driven or removed by us
     void Gone(uint16_t net);     // the copy is gone on our game (despawned by the game, world change): spawn anew
     void Clear();                // world change / session end: everything forgotten (the game removed the copies)
+    // The host paused his game (true) or resumed it (false), game/peer_pause.h: while paused every copy is held where
+    // it stands (Pin to that pose, no speed, braked), no copy goes stale or is spawned, no knock is reported; after the
+    // resume the copies are driven again and knocks are not reported for quietAfter s.
+    void SetHostPaused(bool paused, double now);
+    bool HostPaused() const { return hostPaused_; }
     // Commands for this tick: Remove first, then Add (nearest first), then Drive for the copies that are due.
     void Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps);
     bool HostMode() const { return hostMode_; }  // near the host: his traffic here, ours off
@@ -254,6 +266,9 @@ private:
         double bumpAt = -1e9;
         bool haveLast = false;
         Vec3 lastTarget;
+        bool frozen = false;  // held at frozenPos / frozenRot (the host is paused)
+        Vec3 frozenPos;
+        float frozenRot[4] = {0, 0, 0, 1};
     };
     bool Present(const Car& c, double now, CarState& out) const;
     float DistToMe(const Car& c, double now) const;
@@ -271,6 +286,9 @@ private:
     bool haveMe_ = false;
     bool hostMode_ = false;
     GuestStats stats_;
+    bool hostPaused_ = false;
+    double quietUntil_ = -1e9;   // no knock reports before this
+    double lastTickAt_ = -1;     // our previous Tick (a gap: our own pause)
 };
 
 }  // namespace mc::game::traffic

@@ -40,6 +40,36 @@ int YieldSeat(uint8_t local, int seat, int seatCount, uint32_t freeMask, const s
 std::vector<Claim> ParseClaims(const std::string& s);
 
 // ---------------------------------------------------------------------------------------------------------------
+// One wheel, one driver (the 2026-10-19 two-PC test: both players drove the same car for 100 s, its damage bounced
+// between the games). When the driver's puppet leaves seat 0 on a game (thrown out, dead in the water, respawning),
+// that game slides its own player from the passenger seat to the wheel, and the local player then "took the wheel";
+// the other game did the same with its own reading, and neither gave way ("drives it too; we keep it").
+// The rules, the same on every game:
+//   - a seat-0 reading here while another player's state still names seat 0 of this car, and he already drove it on
+//     this game, is the game's slide, not a takeover: we give way (Yield);
+//   - both claim the wheel and neither drove it here before the other (they got in at the same moment, or each game
+//     slid its own player over before it saw the other's state): the car's holder keeps it (the key's owner, the
+//     player who first drove it: "1:4746250" -> player 1); when neither is the holder, the lower player id keeps it.
+// The one who gives way reports seat 9 (getting in, claims nothing), slides to a free passenger seat or gets out
+// (player_sync.lua M.WheelTick), and the keeper's game alone holds the car's damage (car_damage.lua follows the
+// driver).
+// ---------------------------------------------------------------------------------------------------------------
+constexpr int kNobody = -1;
+
+// Of two players claiming the wheel of a car whose key owner is `holder`: who keeps it.
+uint8_t WheelKeeper(uint8_t holder, uint8_t a, uint8_t b);
+
+enum class Wheel : uint8_t {
+    Keep,   // we keep (or take) the wheel; the other player gives way on his game
+    Yield,  // we give way: a slide, or the other one is the keeper
+};
+const char* WheelName(Wheel w);
+
+// We (`local`) read seat 0 of a car (key owner `holder`) while `remote`'s state names seat 0 of it too. driverHere:
+// who drives it on this game so far (local, remote, another id, or kNobody).
+Wheel LocalWheel(uint8_t local, uint8_t holder, int driverHere, uint8_t remote);
+
+// ---------------------------------------------------------------------------------------------------------------
 // Where a remote player's car copy stands on this game (player_sync.lua M.CarTick, mc_copyplace / mc_asidespot).
 // A copy is spawned where his car is; before this fix it waited ("another car stands where it is") for as long as any
 // car of this game stood within kBlockDist of that spot, because a copy spawned into a car shoves it away (a shoved

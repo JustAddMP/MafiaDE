@@ -66,6 +66,25 @@ std::atomic<bool> _available{false};
 std::atomic<bool> _disabled{false};
 std::atomic<uint32_t> _mainThread{0};
 std::atomic<uint64_t> _ticks{0};
+// QPC counts of the game machine's last tick, of any kind and through Tick (not TickPaused): peer_pause.h
+std::atomic<int64_t> _lastTickQpc{0};
+std::atomic<int64_t> _lastNormalTickQpc{0};
+
+void NoteTick(bool paused) {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    _lastTickQpc.store(c.QuadPart, std::memory_order_relaxed);
+    if (!paused) _lastNormalTickQpc.store(c.QuadPart, std::memory_order_relaxed);
+}
+
+double QpcSeconds(int64_t q) {
+    static const double freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart);
+    }();
+    return q > 0 ? static_cast<double>(q) / freq : 0.0;
+}
 
 std::mutex _jobsMutex;
 std::deque<Job> _jobs;
@@ -193,13 +212,19 @@ void DrainMainThread() {
 // machine's tick drains our work.
 uint64_t TickDetour(void* self, void* b, void* c, void* d) {
     uint64_t r = _origTick(self, b, c, d);
-    if (_api.scriptMachine && self == *_api.scriptMachine) DrainMainThread();
+    if (_api.scriptMachine && self == *_api.scriptMachine) {
+        NoteTick(false);
+        DrainMainThread();
+    }
     return r;
 }
 
 uint64_t TickPausedDetour(void* self, void* b, void* c, void* d) {
     uint64_t r = _origTickPaused(self, b, c, d);
-    if (_api.scriptMachine && self == *_api.scriptMachine) DrainMainThread();
+    if (_api.scriptMachine && self == *_api.scriptMachine) {
+        NoteTick(true);
+        DrainMainThread();
+    }
     return r;
 }
 
@@ -997,6 +1022,8 @@ int RayCast(const float from[3], const float to[3], float hit[3]) {
 bool Disabled() { return _disabled.load(); }
 uint32_t MainThreadId() { return _mainThread.load(); }
 uint64_t TickCount() { return _ticks.load(); }
+double LastTickAt() { return QpcSeconds(_lastTickQpc.load(std::memory_order_relaxed)); }
+double LastNormalTickAt() { return QpcSeconds(_lastNormalTickQpc.load(std::memory_order_relaxed)); }
 
 void Post(Job job) {
     if (!Available()) return;

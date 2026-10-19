@@ -524,6 +524,7 @@ function T.Drive(c, f)
     brake = n(f[13]) or 0, hb = n(f[14]) or 0, ctl = f[15] == "1", vx = n(f[16]) or 0, vy = n(f[17]) or 0,
     vz = n(f[18]) or 0 }
   local flags = n(f[22]) or 0
+  cmd.rev = math.floor(flags / 16) % 2 == 1  -- the host's car reverses: SetSpeed gets a negative km/h (RV.GiveSpeed)
   local good, err = pcall(M.RV.Drive, c.rv, c.ent, cmd, tx, ty, tz)
   if not good then
     c.errs = (c.errs or 0) + 1

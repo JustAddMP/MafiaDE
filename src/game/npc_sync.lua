@@ -90,6 +90,9 @@ local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 
 local function log(s) if mc_log then mc_log("npc: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
+-- The host paused his game, or one of the two games resumed less than a second ago (mc_peer_quiet, src/game/
+-- peer_pause.h): his NPCs stood while ours did not (or the other way round), so a copy far off is no reason to pull
+local function hostQuiet() return mc_peer_quiet ~= nil and (mc_peer_quiet(0) or 0) ~= 0 end
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function idOf(o)
   local good, g = pcall(o.GetGUID, o)
@@ -747,7 +750,16 @@ function N.Enforce(s, e, p)
     local q = h:GetPos()
     local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2)
     -- enemies in a fight run and take cover differently on each game: only one far off (12 m) is put back
-    if d > (s.ai == 2 and PULL_DIST_FIGHT or PULL_DIST) then
+    if hostQuiet() then
+      if s.offSince then
+        s.offSince = nil
+        N.quietPulls = (N.quietPulls or 0) + 1
+        if N.quietPulls <= 10 or N.quietPulls % 50 == 0 then
+          log(string.format("our %d is %.1f m off %s, not put back: the host's game is paused or just resumed (#%d)",
+            e.id, d, N.Who(s.key), N.quietPulls))
+        end
+      end
+    elseif d > (s.ai == 2 and PULL_DIST_FIGHT or PULL_DIST) then
       s.offSince = s.offSince or M.now
       if M.now - s.offSince > PULL_TIME then
         s.offSince = nil
