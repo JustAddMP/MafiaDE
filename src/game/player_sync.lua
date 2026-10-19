@@ -2225,6 +2225,9 @@ function M.WatchDamage(p)
     { "MELEE_LIGHT_ATTACK", M.OnMeleeEvent, false }, { "MELEE_HEAVY_ATTACK", M.OnMeleeEvent, true } }
   for _, ae in ipairs(M.ACTION_EVENTS or {}) do subs[#subs + 1] = { ae[1], M.OnActionEvent, ae } end
   for _, te in ipairs(M.TRAV_EVENTS or {}) do subs[#subs + 1] = { te[1], M.OnTravEvent, te } end
+  -- a puppet's AI taking / giving back script control (M.ScriptControl: the "script" ways of playing an action)
+  subs[#subs + 1] = { "SCRIPT_CONTROL", M.OnControlEvent, "SCRIPT_CONTROL" }
+  subs[#subs + 1] = { "AI_CONTROL", M.OnControlEvent, "AI_CONTROL" }
   for _, ev in ipairs(subs) do
     local name, fn, arg = ev[1], ev[2], ev[3]
     local msg = enums.HumanMessages[name]
@@ -2392,29 +2395,33 @@ function M.OnActionEvent(m, ev)
   M.LocalAction(ev[2], opp)
 end
 
--- What a puppet plays for each kind: AnimPlay(name, false) on the puppet (Human.Anim.Play's call, an AI command
--- like MoveVec), names from the game's animation sets (sds_retail/basic_anim: hitmelee_anim, basic_anim), so they
--- exist in the game but none of them was checked in game (UNVERIFIED): the first name that the call accepts is
--- used; a name the call rejects, or whose animation ends at once, is dropped after two tries (logged). Light
+-- What a puppet plays for each kind (played the way M.ANIM_METHODS / mc_anim_method picks: PlayAnimation,
+-- DesirePlayAnimation, AnimPlay with or without script control), names from the game's animation sets
+-- (sds_retail/basic_anim: hitmelee_anim, basic_anim), so they exist in the game but none of them was seen playing on
+-- a puppet (UNVERIFIED): the first name that the call accepts is used (after a round of tries in which no way moved
+-- the puppet's hands, the next name comes first); a name the call rejects, or whose animation ends at once, is
+-- dropped for that way after two tries (logged). The enemy_ names at the ends are ones the game's AI fighters and
+-- grenadiers use (anim_project / hitmelee_anim / basic_anim). Light
 -- punches go through the combo (1-2-3) when they come less than ACTION_COMBO s apart. With a gun in hand the 1h
 -- (pistol-whip) variants are tried first. dur: s the puppet is left alone for it at most (the animation may end
 -- earlier). The lists can be changed from the dev console (MafiaCoop.actionAnims[kind]) for tests.
 local ACTION_COMBO = 1.2
 M.actionAnims = M.actionAnims or {
   [1] = { dur = 0.7, combo = {
-    { "hero_nw_alert_melee_attack_light_1_v1", "hero_nw_alert_melee_punch_1", "hero_nw_alert_melee_punch1_v1" },
+    { "hero_nw_alert_melee_attack_light_1_v1", "hero_nw_alert_melee_punch_1", "hero_nw_alert_melee_punch1_v1",
+      "enemy_fight_punch1_v1", "enemy_1h_attack1_v1a" },
     { "hero_nw_alert_melee_attack_light_2_v1", "hero_nw_alert_melee_punch_2", "hero_nw_alert_melee_punch2_v5" },
     { "hero_nw_alert_melee_attack_light_3_v1", "hero_nw_alert_melee_punch_3", "hero_nw_alert_melee_punch_3_v2" } },
     armed = { "hero_1h_alert_melee_punch_1", "hero_1h_alert_melee_punch_2", "hero_1h_alert_melee_punch_3" } },
   [2] = { dur = 1.0, list = { "hero_nw_alert_melee_attack_heavy_v2_01_release_hero",
-    "hero_nw_alert_melee_charge_punch3_v6", "hero_nw_alert_melee_punch3_ko_l_v2" },
+    "hero_nw_alert_melee_charge_punch3_v6", "hero_nw_alert_melee_punch3_ko_l_v2", "enemy_fight_punch1_v5" },
     armed = { "hero_1h_alert_melee_attack_heavy_charge", "hero_1h_alert_melee_punch2" } },
   [3] = { dur = 0.9, list = { "hero_nw_alert_melee_dodge_down_l_hero", "hero_nw_alert_melee_punch_2_v2",
     "hero_nw_alert_melee_punch2_v5" } },
   [4] = { dur = 1.4, list = { "hero_nw_alert_melee_punch3_ko_l_v2", "hero_nw_alert_melee_attack_kick",
     "hero_nw_alert_melee_attack_heavy_v2_01_release_hero" } },
   [5] = { dur = 1.1, list = { "hero_1h_alert_grenade_throw_cf", "trig_1h_idle_to_grenade_throw",
-    "hero_nw_alert_throw_knife_f" } },
+    "hero_nw_alert_throw_knife_f", "enemy_1h_aim_to_gremade_throw", "hero_truck_chase_molotov_throw" } },
   [6] = { dur = 0.6, list = { "hero_nw_alert_melee_hitreact2_v1", "hero_nw_alert_melee_hitreact2_v2",
     "enemy_nw_alert_melee_hitreact1_v1" } },
   -- traversal (basic_anim / anim_project; there is no plain jump-off animation in these sets: the ledge jump and the
@@ -2452,13 +2459,13 @@ M.actionAnims = M.actionAnims or {
 M.badAnims = M.badAnims or {}  -- name -> failed tries (2 = not used again this session)
 local SWING_SHIELD = 3.0  -- m: a puppet swinging this close makes the local player a demigod for the swing
 
-local function actionCandidates(pp, kind)
+local function actionCandidates(pp, kind, round, method)
   local a = M.actionAnims[kind]
   if not a then return {} end
   local out = {}
   local function add(list)
     for _, name in ipairs(list or {}) do
-      if (M.badAnims[name] or 0) < 2 then out[#out + 1] = name end
+      if (M.badAnims[tostring(method) .. ":" .. name] or 0) < 2 then out[#out + 1] = name end
     end
   end
   local armed = (pp.weapon or "") ~= ""
@@ -2472,6 +2479,14 @@ local function actionCandidates(pp, kind)
   else
     if armed then add(a.armed) end
     add(a.list)
+  end
+  -- every way of playing it (M.ANIM_METHODS) was tried with the first name and none moved the puppet's hands: the
+  -- next round starts with the next name (the name may be what does not play)
+  local n = #out
+  if n > 1 and (round or 0) > 0 then
+    local rot, shift = {}, math.floor(round) % n
+    for i = 1, n do rot[i] = out[(i - 1 + shift) % n + 1] end
+    out = rot
   end
   return out
 end
@@ -2488,11 +2503,114 @@ function M.ShieldFromSwing(pp, so, dur)
   M.shieldUntil = math.max(M.shieldUntil or 0, M.now + dur + 0.3)
 end
 
+-- The ways of making a puppet play an animation (src/game/anim_methods.h, docs/game-api.md 17 "Why no punch
+-- showed"). The 0.15.0 test: AnimPlay (an AI command, queued on the human's AI and run when its brain lets script
+-- commands run: the puppet has the FRIEND brain) is accepted, no punch shows, an idle fidget starts ~2 s late, the
+-- throw is over after 0.14 s. None of the others was seen in game (UNVERIFIED). The C++ side keeps, per action
+-- group, which way is tried now and moves on when one shows nothing (mc_anim_method / mc_anim_report, judged from
+-- the puppet's hands: M.ActionProbe). pre / post: what is set before the call and undone when it is over.
+local SCRIPT_DESIRE = "DesireMainScript"  -- the game's Human scriptControlActivate node: ScriptControl(true, this)
+local DESIRE_PLAY = 100                   -- DesirePlayAnimation's desirability (the scale is not known: high)
+local ACTION_PROBE = 2.5  -- s an action is watched (left alone) while its way is not confirmed: shows a late start
+local PROBE_START = 0.12  -- m a hand moves when the animation has started (anim_methods.h kStartMove)
+M.ANIM_METHODS = {
+  direct = { play = function(so, name) return so:PlayAnimation(name, false) end, direct = true },
+  direct_notrans = { play = function(so, name) return so:PlayAnimation(name, false) end, direct = true,
+    pre = function(so) so:QueueFullbodyNoTransition(true) end,
+    post = function(so) so:QueueFullbodyNoTransition(false) end },
+  desire = { play = function(so, name) return so:DesirePlayAnimation(name, DESIRE_PLAY) end },
+  script = { play = function(so, name) return so:AnimPlay(name, false) end, script = true },
+  script_combat = { play = function(so, name) return so:AnimPlay(name, false) end, script = true,
+    pre = function(so) so:SetCombatMode(true) end, post = function(so) so:SetCombatMode(false) end },
+  animplay = { play = function(so, name) return so:AnimPlay(name, false) end },
+}
+
+-- Script control of the puppet's AI (ScriptControl(on, SCRIPT_DESIRE)); the game answers with a SCRIPT_CONTROL /
+-- AI_CONTROL HUMAN message to the human (M.OnControlEvent logs when).
+function M.ScriptControl(pp, so, on)
+  if (pp.scOn or false) == on then return end
+  local good, err = pcall(so.ScriptControl, so, on, SCRIPT_DESIRE)
+  pp.scOn = on
+  pp.scAskT = M.now
+  pp.scAsks = (pp.scAsks or 0) + 1
+  if not good or pp.scAsks <= 6 then
+    log(string.format("puppet %s: ScriptControl(%s, %s) %s", pp.id, tostring(on), SCRIPT_DESIRE,
+      good and "asked" or ("failed: " .. tostring(err))))
+  end
+  trace("SC", string.format("id=%s on=%d ok=%d", pp.id, on and 1 or 0, good and 1 or 0))
+end
+
+-- SCRIPT_CONTROL / AI_CONTROL on a puppet: when (and whether) its AI took or gave back script control.
+function M.OnControlEvent(m, name)
+  local g = tostring(m:GetReceiverGUID())
+  for _, pp in pairs(M.pup) do
+    if pp.guid == g then
+      pp.scSeen = (pp.scSeen or 0) + 1
+      local gs, st = pcall(m.GetState, m)
+      local gn, on = pcall(m.GetObjectName, m)
+      if pp.scSeen <= 20 then
+        log(string.format("puppet %s: %s (state %s, name %s) %.2f s after ScriptControl(%s)", pp.id, name,
+          gs and tostring(st) or "?", gn and tostring(on) or "?", M.now - (pp.scAskT or M.now), tostring(pp.scOn)))
+      end
+      trace("SC", string.format("id=%s msg=%s state=%s after=%.3f", pp.id, name, gs and tostring(st) or "?",
+        M.now - (pp.scAskT or M.now)))
+      return
+    end
+  end
+end
+
+-- The puppet's hands in its own frame (forward, right, up from its position; f = its facing at the start), or nil.
+local PROBE_BONES = { "RightHand", "LeftHand" }
+local function handsOf(so, f)
+  local q = so:GetPos()
+  local out = {}
+  for i, bone in ipairs(PROBE_BONES) do
+    local good, b = pcall(so.GetBonePos, so, bone)
+    if not good or type(b) ~= "userdata" and type(b) ~= "table" then return nil end
+    local gx, bx = pcall(function() return b.x end)
+    if not gx or type(bx) ~= "number" then return nil end
+    local dx, dy, dz = b.x - q.x, b.y - q.y, b.z - q.z
+    out[i] = { dx * f.x + dy * f.y, dx * f.y - dy * f.x, dz }
+  end
+  return out, q
+end
+
+local function probeStart(so)
+  local d = so:GetDir()
+  local l = math.sqrt(d.x * d.x + d.y * d.y)
+  local f = l > 1e-3 and { x = d.x / l, y = d.y / l } or { x = 0, y = 1 }
+  local rest, q = handsOf(so, f)
+  return { f = f, rest = rest, q0 = q or so:GetPos(), max = 0, root = 0, first = -1, n = 0, ok = rest ~= nil }
+end
+
+-- Each tick while it plays: how far a hand got from its rest, how far the puppet moved, when a hand first moved.
+function M.ActionProbe(pp, so)
+  local r = pp.actRun
+  local pr = r and r.probe
+  if not pr or not pr.ok then return end
+  local h, q = handsOf(so, pr.f)
+  if not h then pr.ok = false; return end
+  pr.n = pr.n + 1
+  for i = 1, #h do
+    local a, b = h[i], pr.rest[i]
+    local d = math.sqrt((a[1] - b[1]) ^ 2 + (a[2] - b[2]) ^ 2 + (a[3] - b[3]) ^ 2)
+    if d > pr.max then pr.max = d end
+    if pr.first < 0 and d >= PROBE_START then pr.first = M.now - r.t end
+  end
+  local m = math.sqrt((q.x - pr.q0.x) ^ 2 + (q.y - pr.q0.y) ^ 2)
+  if m > pr.root then pr.root = m end
+end
+
 function M.PlayAction(pp, so, kind)
   if pp.actRun then M.ActionEnd(pp, so, "next action") end
-  local names = actionCandidates(pp, kind)
+  local method, group, round, confirmed = "animplay", "?", 0, 0
+  if mc_anim_method then method, group, round, confirmed = mc_anim_method(kind) end
+  local how = M.ANIM_METHODS[method] or M.ANIM_METHODS.animplay
+  local names = actionCandidates(pp, kind, round, method)
   local spec = M.actionAnims[kind] or {}
   local dur = spec.dur or 0.8
+  -- not confirmed yet: watched longer (a late start shows in the log), the puppet stands for it
+  local watch = confirmed == 1 and dur or math.max(dur, ACTION_PROBE)
   -- face where he faces (his swing goes that way), drop the aim (an aim command would cut the animation)
   pcall(so.SetDir, so, V(pp.hx or 0, pp.hy or 1, 0))
   if pp.cb and pp.cb.aim then try("AimAtStop", so.DbgTesting_AimAtStop, so); pp.cb.aim = false end
@@ -2500,35 +2618,90 @@ function M.PlayAction(pp, so, kind)
   if kind == 16 and pp.carry and pp.carry.real then
     names = {}  -- the puppet carries it with the game's own carry (TakeBody): that plays the pickup itself
   end
+  local probe = #names > 0 and probeStart(so) or nil
+  if #names > 0 then
+    if how.script then M.ScriptControl(pp, so, true) end
+    if how.pre then
+      local good, err = pcall(how.pre, so)
+      if not good then log(string.format("puppet %s: %s: setting up failed: %s", pp.id, method, tostring(err))) end
+    end
+  end
   local used, aso, why
   for _, name in ipairs(names) do
-    local good, r = pcall(so.AnimPlay, so, name, false)
+    local good, r = pcall(how.play, so, name)
     if good then
       used, aso = name, r
       break
     end
-    M.badAnims[name] = (M.badAnims[name] or 0) + 1
+    local bad = method .. ":" .. name
+    M.badAnims[bad] = (M.badAnims[bad] or 0) + 1
     why = tostring(r)
-    log(string.format("puppet %s: AnimPlay(%s) failed: %s (try %d)", pp.id, name, why, M.badAnims[name]))
+    log(string.format("puppet %s: %s(%s) failed: %s (try %d)", pp.id, method, name, why, M.badAnims[bad]))
   end
   pp.actsPlayed = (pp.actsPlayed or 0) + 1
-  trace("AP", string.format("id=%s kind=%d anim=%s ok=%d dur=%.2f", pp.id, kind, used or "-", used and 1 or 0, dur))
+  trace("AP", string.format("id=%s kind=%d anim=%s ok=%d dur=%.2f method=%s group=%s round=%d conf=%d bones=%d",
+    pp.id, kind, used or "-", used and 1 or 0, watch, method, tostring(group), round, confirmed,
+    probe and probe.ok and 1 or 0))
   if not used then
+    if #names > 0 then
+      if how.post then pcall(how.post, so) end
+      if how.script then M.ScriptControl(pp, so, false) end
+    end
     if pp.actsPlayed <= 20 then
-      log(string.format("puppet %s: no animation for a %s (%d names left)", pp.id, ACTION_NAMES[kind] or "?", #names))
+      log(string.format("puppet %s: no animation for a %s (%d names left, %s)", pp.id, ACTION_NAMES[kind] or "?",
+        #names, method))
     end
     -- a move without its animation is still followed along his path (no snap at its end)
     if move then pp.actRun = { kind = kind, name = "-", t = M.now, untilT = M.now + dur, move = true } end
     return
   end
   if pp.actsPlayed <= 40 or pp.actsPlayed % 100 == 0 then
-    log(string.format("puppet %s plays a %s: %s (#%d)", pp.id, ACTION_NAMES[kind] or "?", used, pp.actsPlayed))
+    log(string.format("puppet %s plays a %s: %s with %s (%s, round %d, %s; #%d)", pp.id, ACTION_NAMES[kind] or "?",
+      used, method, tostring(group), round, confirmed == 1 and "confirmed" or
+      string.format("not confirmed: watched %.1f s", watch), pp.actsPlayed))
   end
-  pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + dur, move = move }
+  pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + watch, move = move,
+    method = method, how = how, probe = probe }
   if kind <= 4 then M.ShieldFromSwing(pp, so, dur) end
 end
 
--- The animation is over (or its time is up, or something else needs the puppet): it walks again.
+-- The action group of a kind (melee, throw, move, other: anim_methods.h), "all" without the C++ side.
+function M.ActionGroup(kind)
+  if not mc_anim_method then return "all" end
+  local _, group = mc_anim_method(kind)
+  return group
+end
+
+-- One judged try (M.ActionProbe) goes to the C++ side, which picks the way for the next action of the group.
+local function reportTry(pp, r, why)
+  local pr = r.probe
+  if not pr or r.name == "-" or why == "he is in a car" or not mc_anim_report then return "-", "-", "-" end
+  -- a traversal move is drawn along his path by SetPos (M.Follow): that moves the puppet but swings no arm
+  local root = r.move and 0 or pr.root
+  local verdict, ev, now, round = mc_anim_report(r.kind, pr.ok and 1 or 0, pr.max, root, pr.first)
+  local group = M.ActionGroup(r.kind)
+  pp.probes = (pp.probes or 0) + 1
+  if pp.probes <= 60 or ev ~= "none" then
+    log(string.format("puppet %s: %s with %s: hands moved %.2f m (%s), the puppet %.2f m, %d samples%s: %s",
+      pp.id, ACTION_NAMES[r.kind] or "?", tostring(r.method), pr.max,
+      pr.first >= 0 and string.format("from %.2f s", pr.first) or "never started", pr.root, pr.n,
+      pr.ok and "" or " (bones not readable)", tostring(verdict)))
+  end
+  if ev == "works" then
+    log(string.format("ANIM: %s actions SHOW with '%s' (hands moved %.2f m, started %.2f s after the call)",
+      tostring(group), tostring(r.method), pr.max, pr.first))
+  elseif ev == "switched" or ev == "lost" then
+    log(string.format("ANIM: %s: '%s' %s: next way '%s'", tostring(group), tostring(r.method),
+      ev == "lost" and "stopped working" or "showed nothing (or could not be judged)", tostring(now)))
+  elseif ev == "wrapped" then
+    log(string.format("ANIM: %s: no way moved the puppet's hands: round %d, starting again with '%s' and the next "
+      .. "animation name", tostring(group), tonumber(round) or 0, tostring(now)))
+  end
+  return verdict, ev, now
+end
+
+-- The animation is over (or its time is up, or something else needs the puppet): it walks again. The try is judged
+-- from its hands and reported (reportTry).
 function M.ActionEnd(pp, so, why)
   local r = pp.actRun
   if not r then return end
@@ -2538,24 +2711,39 @@ function M.ActionEnd(pp, so, why)
     local good, d = pcall(r.so.IsDone, r.so)
     done = good and d == true
   end
-  if not done and valid(so) and r.name ~= "-" then pcall(so.AnimStop, so) end
+  local how = r.how or M.ANIM_METHODS.animplay
+  if not done and valid(so) and r.name ~= "-" then
+    if how.direct and r.so then pcall(so.StopAnimation, so, r.so) end
+    pcall(so.AnimStop, so)
+  end
+  if r.name ~= "-" and valid(so) then
+    if how.post then pcall(how.post, so) end
+    if how.script then M.ScriptControl(pp, so, false) end
+  end
   local took = M.now - r.t
-  -- an animation that is over right away did not play: after two of those its name is not used again
+  -- an animation that is over right away did not play: after two of those its name is not used again (this way)
+  local bad = tostring(r.method) .. ":" .. r.name
   if done and took < 0.1 and r.name ~= "-" then
-    M.badAnims[r.name] = (M.badAnims[r.name] or 0) + 1
-    log(string.format("puppet %s: %s ended at once (%.2f s): not played? (try %d)", pp.id, r.name, took,
-      M.badAnims[r.name]))
+    M.badAnims[bad] = (M.badAnims[bad] or 0) + 1
+    log(string.format("puppet %s: %s ended at once (%.2f s, %s): not played? (try %d)", pp.id, r.name, took,
+      tostring(r.method), M.badAnims[bad]))
   elseif (pp.actsPlayed or 0) <= 40 then
     log(string.format("puppet %s: %s over after %.2f s (%s)", pp.id, r.name, took, done and "finished" or why))
   end
-  trace("AE", string.format("id=%s kind=%d anim=%s took=%.3f done=%d why=%s", pp.id, r.kind, r.name, took,
-    done and 1 or 0, done and "finished" or tostring(why):gsub(" ", "_")))
+  local verdict, ev, now = reportTry(pp, r, why)
+  local pr = r.probe
+  trace("AE", string.format("id=%s kind=%d anim=%s took=%.3f done=%d why=%s method=%s hand=%.3f root=%.3f "
+    .. "start=%.3f bones=%d verdict=%s ev=%s next=%s", pp.id, r.kind, r.name, took, done and 1 or 0,
+    done and "finished" or (tostring(why):gsub(" ", "_")), tostring(r.method), pr and pr.max or 0,
+    pr and pr.root or 0, pr and pr.first or -1, pr and pr.ok and 1 or 0, tostring(verdict), tostring(ev),
+    tostring(now)))
 end
 
 -- True while the puppet plays an action: nothing else is asked of it.
 function M.ActionBusy(pp, so)
   local r = pp.actRun
   if not r then return false end
+  M.ActionProbe(pp, so)
   if M.now >= r.untilT then
     M.ActionEnd(pp, so, "time up")
     return false
@@ -2568,6 +2756,25 @@ function M.ActionBusy(pp, so)
     end
   end
   return true
+end
+
+-- Dev console: MafiaCoop.TestAction(kind[, method[, id]]) plays action `kind` (1 light punch, 2 heavy, 5 throw:
+-- player_actions.h) on a puppet now (the first one on foot, or puppet `id`), with `method` (an M.ANIM_METHODS name)
+-- forced for its group when given; it is then watched, judged and logged like a real one.
+function M.TestAction(kind, method, id)
+  kind = tonumber(kind) or 1
+  for _, pp in pairs(M.pup) do
+    if (id == nil or tostring(pp.id) == tostring(id)) and pp.st == "alive" and valid(pp.so) and not pp.veh then
+      if method then
+        local group = M.ActionGroup(kind)
+        if not (mc_anim_set and mc_anim_set(group, method)) then return "unknown method " .. tostring(method) end
+      end
+      M.PlayAction(pp, pp.so, kind)
+      return string.format("puppet %s plays a %s (%s)", pp.id, ACTION_NAMES[kind] or "?",
+        tostring(mc_anim_method and mc_anim_method(kind) or "?"))
+    end
+  end
+  return "no puppet on foot"
 end
 
 function M.PoseBit(pp, b) return (pp.pose or 0) % (b + b) >= b end
