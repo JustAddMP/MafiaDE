@@ -229,10 +229,29 @@ local function ours(id)
   return false
 end
 
--- ped_sync.lua's humans (the `ambient-peds` package; a missing table is empty): never ours to send, pair or drive.
+-- The crews of another game's traffic copies here (traffic_sync.lua, every game shows the others' traffic): that
+-- game's NPCs, never ours to send or own. Ids collected at most twice a second.
+local crewIds, crewT = {}, -10
+local function copyCrew(id)
+  if M.now - crewT >= 0.5 then
+    crewT, crewIds = M.now, {}
+    local tr = M.Traffic
+    for _, c in pairs(tr and tr.copies or {}) do
+      for _, m in ipairs(c.crew or {}) do
+        local mid = valid(m) and idOf(m)
+        if mid then crewIds[mid] = true end
+      end
+    end
+  end
+  return crewIds[id] ~= nil
+end
+
+-- ped_sync.lua's humans (the `ambient-peds` package; a missing table is empty) and other games' traffic crews: never
+-- ours to send, pair or drive.
 local function pedOwned(id)
   local t = M.PedOwned
-  return t ~= nil and id ~= nil and t[id] ~= nil
+  if t ~= nil and id ~= nil and t[id] ~= nil then return true end
+  return id ~= nil and copyCrew(id)
 end
 
 -- Is local human `e` an ambient pedestrian (src/game/npc_replica.h IsAmbientHuman, through mc_npc_class: AI type 0,
