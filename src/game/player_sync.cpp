@@ -5,6 +5,7 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
+#include "game/anim_methods.h"
 #include "game/car_signals.h"
 #include "game/car_swap.h"
 #include "game/characters.h"
@@ -1217,6 +1218,66 @@ int McAsideSpot(lua_State* L) {
     return 3;
 }
 
+// Which way a puppet is made to play an action (game/anim_methods.h; player_sync.lua M.PlayAction), one ladder per
+// action group, kept for the whole run of the game (a reload does not start the tries again).
+anim_methods::Ladder g_animLadders[anim_methods::kGroupCount];
+
+anim_methods::Ladder& AnimLadder(int kind) {
+    return g_animLadders[static_cast<int>(anim_methods::GroupOf(kind))];
+}
+
+// mc_anim_method(kind) -> method name, group name, round, confirmed (1/0): the way to try for this action now.
+int McAnimMethod(lua_State* L) {
+    const int kind = lua::TypeOf(L, 1) == lua::TNumber ? static_cast<int>(lua::ToNumber(L, 1)) : 0;
+    const auto& l = AnimLadder(kind);
+    lua::PushString(L, anim_methods::Name(l.Current()));
+    lua::PushString(L, anim_methods::Name(anim_methods::GroupOf(kind)));
+    lua::PushNumber(L, static_cast<float>(l.round));
+    lua::PushNumber(L, l.Confirmed() ? 1.0f : 0.0f);
+    return 4;
+}
+
+// mc_anim_report(kind, bonesOk, maxHand, rootMove, firstMoveT) -> verdict, event, method name now, round: one try
+// measured by the glue (M.ActionProbe) goes into its group's ladder.
+int McAnimReport(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const int kind = static_cast<int>(num(1));
+    anim_methods::Probe pr;
+    pr.bonesOk = num(2) != 0.0f;
+    pr.maxHand = num(3);
+    pr.rootMove = num(4);
+    pr.firstMoveT = lua::TypeOf(L, 5) == lua::TNumber ? num(5) : -1.0f;
+    auto& l = AnimLadder(kind);
+    const auto v = anim_methods::Judge(pr);
+    const auto e = l.Report(v);
+    lua::PushString(L, anim_methods::Name(v));
+    lua::PushString(L, anim_methods::Name(e));
+    lua::PushString(L, anim_methods::Name(l.Current()));
+    lua::PushNumber(L, static_cast<float>(l.round));
+    return 4;
+}
+
+// mc_anim_set(group, method) -> true when set: the dev console forces a way ("melee", "throw", "move", "other" or
+// "all"; a method name from game/anim_methods.h). It is then tried like any other (not confirmed yet).
+int McAnimSet(lua_State* L) {
+    const char* g = lua::ToString(L, 1);
+    const char* m = lua::ToString(L, 2);
+    const int mi = anim_methods::Parse(m);
+    bool any = false;
+    if (g && mi >= 0) {
+        for (int i = 0; i < anim_methods::kGroupCount; ++i) {
+            const char* gn = anim_methods::Name(static_cast<anim_methods::Group>(i));
+            if (std::strcmp(g, "all") == 0 || std::strcmp(g, gn) == 0) {
+                g_animLadders[i].Set(mi);
+                any = true;
+            }
+        }
+    }
+    if (any) MC_LOG_INFO("sync: puppet action animations for %s: now tried with %s", g, m);
+    lua::PushBool(L, any);
+    return 1;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1242,6 +1303,9 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_yieldseat", &McYieldSeat);
     lua::RegisterGlobal(L, "mc_copyplace", &McCopyPlace);
     lua::RegisterGlobal(L, "mc_asidespot", &McAsideSpot);
+    lua::RegisterGlobal(L, "mc_anim_method", &McAnimMethod);
+    lua::RegisterGlobal(L, "mc_anim_report", &McAnimReport);
+    lua::RegisterGlobal(L, "mc_anim_set", &McAnimSet);
     return true;
 }
 
