@@ -193,7 +193,7 @@ void TestPose() {
     };
     const State act{9, Action::Vault};
     bool ok = true;
-    for (unsigned bits = 0; bits < 8; ++bits) {
+    for (unsigned bits = 0; bits < 64; ++bits) {
         const Pose p{static_cast<uint8_t>(bits), (bits & kCarry) ? 0xDEADBEEFu : 0u};
         State a;
         Pose q;
@@ -224,10 +224,22 @@ void TestPose() {
     }
     {
         std::vector<uint8_t> b = bytes(act, nullptr);
-        b.push_back(0xF8 | kStealth);  // bits from a newer build
+        b.push_back(0xC0 | kStealth);  // bits from a newer build
         State a;
         Pose q;
         Check(read(b, a, q) && q.bits == kStealth, "unknown pose bits are dropped");
+    }
+    {
+        // swim, under water and bike (added without a version change): kept by this build, dropped by a build whose
+        // mask knows only the first three bits
+        const Pose wet{static_cast<uint8_t>(kSwim | kUnderwater | kBike | kStealth), 0};
+        const std::vector<uint8_t> b = bytes(act, &wet);
+        State a;
+        Pose q;
+        Check(read(b, a, q) && q == wet && b.size() == bytes(act, nullptr).size() + 1,
+              "swim, under water and bike bits: one byte, round trip");
+        const uint8_t oldMask = kStealth | kCarry | kLadder;
+        Check((b.back() & oldMask) == kStealth, "an older reader's mask keeps only the sneak bit of them");
     }
     {
         // an older reader (action block only) is not upset by the pose block
