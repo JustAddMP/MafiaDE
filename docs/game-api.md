@@ -698,7 +698,7 @@ NONE, LOOKAROUND_1..3, EVADE_1..3. What the glue uses instead is a plain animati
 |---|---|
 | `h:AnimPlay(name, loop)` | the call of the game's `Human.Anim.Play` node (`common_human.lua`: `inEntity:AnimPlay(animation, loop)`, result kept as `anim_so`, then `Wait`). Binding `C_WrapperHuman::AnimPlay` (exe 0x23B1DA0) dispatches on the argument count: 2 (string, bool) -> 0x23D3000, also 5 and 6 arguments (other overloads, not used). The native call (0x2BA1F00) builds a 0x1B8-byte AI command and queues it on the human's AI (`+0x138`; for a human without one, a dead one or the player in some states it returns a sync object without queuing anything), like `MoveVec`: so a later walk, turn, aim or weapon command can replace it. Returns a sync object (`IsDone()`). UNVERIFIED in game |
 | `h:AnimStop()` | the `Human.Anim.Stop` node's call; used when the time for an action is up and the animation still runs |
-| `h:DesirePlayAnimation(name, desirability)` / `PlayAnimation(...)` | the other script ways (`Human.DesirePlayAnimation` node: inAnimation, inDesirability; `PlayAnimation` takes docking object, bone, loop). Not used; next to try if `AnimPlay` does nothing on a puppet |
+| `h:DesirePlayAnimation(name, desirability)` / `PlayAnimation(...)` | the other script ways; now tried before `AnimPlay`: see "Why no punch showed" below |
 
 Animation names: from the game's own archives, `sds_retail/basic_anim/hitmelee_anim.sds` (melee attacks, hit
 reactions) and `basic_anim.sds` (throws, door kicks, the 1h punches), unpacked with re2/sds.py (Oodle). The scripted
@@ -727,6 +727,75 @@ While a puppet plays one: it is turned to its player's heading first and its aim
 locomotion controller treats it as "no copy" (no re-aims, nudges or snaps, its standing still is not measured as a
 walk speed; the calibration is kept) and walks it again right after. It ends when the sync object reports done or
 the time above is up (then `AnimStop()`).
+
+**Why no punch showed (0.15.0 test; static analysis 2026-10-19, the fix NOT verified in game).** The test: the
+actions arrive and the trace has `AP ok=1`, but every `AE` is `done=0 why=time_up`, no punch pose shows; from the
+console `AnimPlay(punch)` shows nothing within 5 s, `AnimPlay("hero_nw_calm_idle_fidget_cracknuckles")` plays but ~2 s
+after the call every time, and the throw animation is over after 0.14 s. What the exe and the game's scripts say
+(docs/re-notes.md 12):
+
+- **`AnimPlay` goes through the AI, not to the animation.** Its native call builds an AI command (0x1B8 bytes, ctor
+  0x27DC880) and appends it to the command buffer of the human's AI (`+0x138`, 0x722090) - the same queue as `MoveVec`.
+  Commands in that buffer run when the AI's current *desire* lets script commands run. The puppets have the FRIEND
+  brain (`SwitchBrain(1)` 2 s after spawn, section 18) with desires of its own. The game's own script that plays
+  `AnimPlay` on an NPC (`scripts/common/searchactionpoints/example.lua`) first calls
+  `npc:ScriptControl(true, "DesireBattleScriptPoint")`, waits for the `HumanMessages.SCRIPT_CONTROL` (458783) message,
+  and only then `AnimPlay`s; at the end `AnimStop()` and `ScriptControl(false, ...)`. The designers' node
+  `Human.scriptControlActivate` is `ScriptControl(true, "DesireMainScript")`. So the brain's state machine does stand
+  between `AnimPlay` and the animation: most likely cause of both the ~2 s start (the command waits for the brain to
+  get round to it; the glue also kept steering the puppet during the console test, `SetDir`/`SetPos`/`MoveVec` are AI
+  commands or touch it) and of the punch that never started within its 0.7 s (UNVERIFIED).
+- **`PlayAnimation(name, loop)` has a direct path.** Binding 0x23A2560 (2 args -> 0x23D32C0 -> native 0x2BA2590 /
+  0x2BA25E0): when the human's animation component (`+0x1D8 -> +0x78`) knows the animation (0x2B4EAD0 looks the name
+  up in its animation set and checks it is loaded), it is played by that component at once (0x2C87160, through
+  the human's vfunc `+0x2C8`), without the AI's command buffer; otherwise it falls back to an AI command (ctor
+  0x28A42F0, the same buffer). It returns a sync object; `StopAnimation(so)` stops it.
+- **`DesirePlayAnimation(name, d)`** (0x239F700 -> 0x2B96D70) is the same AI command as `AnimPlay` with a
+  desirability float at `+0x1B8`: the AI weighs it against its own desires (the scale is not known; the glue gives 100).
+- **Animation layer / blend.** No layer or blend argument on any of these. The only related switch is
+  `QueueFullbodyNoTransition(bool)` (0x2390310): sets bit 1 of `+0x1D4` of that same animation component, by its name
+  "queue a full-body animation without a transition" (UNVERIFIED what it does; the reader was not found statically).
+- **Is the melee set loaded?** Yes: `/sds/basic_anim/hitmelee_anim.sds` is in the `Persistent` group of the game's
+  streaming table (tables.sds), with basic_anim, takedowns_anim and script_anim. The punch names are in the animation
+  project (`anim_project.sds`, e.g. `hero_nw_alert_melee_attack_light_1_v1.hkx`), like the fidget.
+- **Fight / combat mode, the game's melee entry.** The player's punch is the melee controller driven by input; the
+  only script doors into it are `AttackMelee` (does nothing on a puppet, section 11) and `EnableCloseCombat` +
+  `AttackMelee` (crashed). `SetCombatMode(bool)` (0x23C2630) acts on the human's `+0x2C8` component (0x2C2D920,
+  0x2C3C3C0, 0x2C304D0): taken to switch the alert/combat stance the melee animations belong to (UNVERIFIED).
+  `IsMeleeFighting()` reads the state. The game's AI fighters use `enemy_` animations (`enemy_fight_punch1_v1`,
+  `enemy_1h_attack1_v1a`, `enemy_1h_aim_to_gremade_throw` (sic)), now at the end of the lists.
+- **The throw over after 0.14 s**: `hero_1h_alert_grenade_throw_cf` is a 1h (gun-hand) animation with an
+  `_autoadditive` twin, i.e. one layered over an aim pose; on an unarmed puppet the command seems to end at once.
+  Same remedy: the ways below, and the enemy grenade throw and the molotov throw as further names.
+
+**What the glue does now (unreleased; UNVERIFIED which way works).** Each action is played one of six ways, tried in this
+order (`M.ANIM_METHODS`, src/game/anim_methods.h), one order per action group (melee 1-4 and 6, throw 5, traversal
+moves 7-14, other 15-20):
+
+| # | way | calls | undone after |
+|---|---|---|---|
+| 1 | `direct` | `PlayAnimation(name, false)` | `StopAnimation(so)` + `AnimStop()` if not done |
+| 2 | `direct_notrans` | `QueueFullbodyNoTransition(true)`, `PlayAnimation(name, false)` | the flag back to false |
+| 3 | `desire` | `DesirePlayAnimation(name, 100)` | `AnimStop()` |
+| 4 | `script` | `ScriptControl(true, "DesireMainScript")`, `AnimPlay(name, false)` | `AnimStop()`, `ScriptControl(false, ...)` |
+| 5 | `script_combat` | `SetCombatMode(true)` + 4 | 4, `SetCombatMode(false)` |
+| 6 | `animplay` | `AnimPlay(name, false)` (0.13.0-0.15.0) | `AnimStop()` |
+
+Every try is measured: right before the call and every tick while it plays, `GetBonePos("RightHand")` /
+`("LeftHand")` (bone names from skeletons.sds) are read in the puppet's own frame (forward, right, up from its
+position). The farther hand's largest distance from its rest decides: 0.20 m or more is "moved" (a punch or throw
+moves it 0.4-0.7 m), under 0.08 m "still"; in between, or when the puppet itself moved over 0.35 m (a walk swings
+the arms; not counted for traversal moves, which are drawn by `SetPos`), or the bones cannot be read, "unknown". Two
+"still" tries move on to the next way, three "unknown" ones too (so a test without readable bones still sees each
+way); a "moved" one keeps that way for the group (log `ANIM: melee actions SHOW with 'direct' ...`); a kept way that
+then shows nothing three times in a row is dropped. After the last way it starts again with the first and the next
+animation name of the list first (`round`). While a group's way is not confirmed, an action is watched (and the
+puppet left alone) 2.5 s instead of its own time, so a late start is seen and measured (`start=` in `AE`). Puppets'
+`SCRIPT_CONTROL` / `AI_CONTROL` messages are logged with the time since the request (trace `SC`). From the dev
+console: `MafiaCoop.TestAction(kind[, way[, id]])` plays an action on a puppet now (way forced for its group),
+`mc_anim_set("melee" | "throw" | "move" | "other" | "all", way)` forces a way; `MafiaCoop.actionAnims` as before.
+The ways' order is kept for the whole run of the game (not reset by a load). The thresholds are guesses (UNVERIFIED);
+the `AE` numbers show what a played and an unplayed animation really measure.
 
 **No damage from the picture.** The animation is not an attack order, so it should not hit anyone; to be sure, a
 puppet swinging within 3 m makes the local player a demigod for the swing (+0.3 s; `SetDemigod`, which also stops

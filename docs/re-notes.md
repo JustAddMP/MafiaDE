@@ -946,6 +946,39 @@ dirt and rust.
 
 ---------------------------------------------------------------------------------------------------------------
 
+## 12. Script animations on a human: AnimPlay, PlayAnimation, DesirePlayAnimation, ScriptControl [static, unverified: found 2026-10-19 without running the game]
+
+Why a puppet showed no punch in the 0.15.0 test (docs/game-api.md 17 "Why no punch showed"). All in
+`C_WrapperHuman` (method table 0x5AD2560); `self+0x10` is the C_Human, `+0x130` of it the object the natives take.
+
+- `AnimPlay` 0x23B1DA0 -> (string, bool) 0x23D3000 -> native 0x2BA1F00: returns an empty sync object when
+  `human+0x1C` bit0 is clear, `human+0x1F9` is set or there is no AI (`human+0x138`); for type 9 (the player) also
+  when vfunc +0x3E0 is false. Else allocates 0x1B8 bytes from the pool at 0x63A17D0, ctor 0x27DC880 (name, loop,
+  three floats, byte), links the sync object (0x7244A0), appends it to the AI's command buffer (`[ai]` 0x722090),
+  then 0x735C00 on the AI.
+- `DesirePlayAnimation` 0x239F700 -> 0x2B96D70: 0x1C0 bytes, the same ctor 0x27DC880, its own vtable, desirability
+  float at +0x1B8, the same buffer (0x722090).
+- `PlayAnimation` 0x23A2560: 2 args -> 0x23D32C0, 4 args (name, dock object, bone, loop) -> 0x23D36C0. 0x23D32C0 ->
+  0x2BA2590 -> 0x2BA25E0(name, loop, dock 0, bone 0): same early checks as AnimPlay (the 0x1F9 case looks at bits
+  11/12 of `vf+0x2C8()->+0x1C8->+0x40`); then if `human+0x1D8->+0x78` (the animation component) exists and
+  0x2B4EAD0(component, name) (lookup through `+0x148` (0x8B5CE0) and `+0x150` (0x8F9040): the entry has data at +0x58
+  and +0x10) is true, plays it directly: `vf+0x2C8()` -> 0x2C65120 -> 0x2C87160(name, loop, &so). Else an AI command
+  (0x1B8 bytes, ctor 0x28A42F0) into the same buffer. `StopAnimation(so)` 0x23A6FA0 -> 0x2BA3250;
+  `StopAllAnimations()` 0x23A64F0 -> 0x2BA3180.
+- `QueueFullbodyNoTransition(bool)` 0x2390310: `component(+0x1D8->+0x78)->+0x1D4`: bit 1 = the argument. No reader
+  found by a byte search for `test [reg+0x1D4], 2` (it may be read as a whole dword).
+- `ScriptControl(bool, desireName)` 0x23A3A70 -> 0x2BA2210: same early checks; allocates a 0x28-byte AI message
+  (pool 0x63A17A8, vtable 0x4E83640, +0x18 the bool, +0x20 the name hash, 0x3CCC820) and posts it to the AI with
+  0x750BB0 (not the command buffer), then 0x735C00. The answer is the HUMAN message SCRIPT_CONTROL (458783) /
+  AI_CONTROL (458784). Script use: `searchactionpoints/example.lua` (ScriptControl(true, "DesireBattleScriptPoint"),
+  waits for SCRIPT_CONTROL, AnimPlay from a list, AnimStop, ScriptControl(false, ...)); `human.lua`
+  scriptControlActivate / Deactivate: "DesireMainScript".
+- `SetCombatMode(bool)` 0x23C2630: 0x2C2D920, then on `vf+0x2C8()`: 0x2C3C3C0, 0x2C304D0.
+- `GetBonePos(name)` 0x23B4E00 (string) -> 0x23E80B0, returns a vector (the game's getBonePos node logs "no bone
+  position found" on nil). Bone names (skeletons.sds): `RightHand`, `LeftHand`, `RightForeArm`, `Head`, `Neck`, ...
+- Animation sets: tables.sds lists `/sds/basic_anim/{skeletons, anim_project, basic_anim, hitmelee_anim,
+  pedestrians_anim, takedowns_anim, script_anim, script_prop_grips}.sds` in the `Persistent` group (always loaded).
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
