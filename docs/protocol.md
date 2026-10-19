@@ -453,7 +453,12 @@ scripts may change things in between; the next WorldEnv puts them back.
   (`IsActive()` false) are neither sent nor paired. A pairing is released after 5 s without a state. A paired copy:
   dies when the host's dies (killed; one that still does not die after 3 tries is hidden); its health follows the host's
   NPC down (never up); is put back to the host's position when it is more than 6 m off for 1.5 s (NPCs with a job
-  only: AI type not 0, not in a car). A hit by the guest on a copy hurts it on his game and goes to the host as NpcHit;
+  only: AI type not 0, not in a car). Unreleased (0.15.0 two-PC test: host cops chasing the guest 30-50 m off his
+  copies, p95 60 m): a host NPC in a vehicle (its car flag, or faster than 11 m/s smoothed, held 2 s) is never pulled,
+  never loose-paired with a local NPC on foot (nor one on foot with a local in a car), and a pairing whose host NPC
+  drives while ours walks more than 40 m away is released after 2 s; a cop (AI type 4) on foot that runs (over
+  1.8 m/s) is steered after the host's every 0.4 s with `MoveVec` (RUN/SPRINT) when more than 3 m off (UNVERIFIED that
+  a police AI follows it). A hit by the guest on a copy hurts it on his game and goes to the host as NpcHit;
   the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit reaction and
   damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`. When the guest's
   copy dies within 1.5 s of his hit, he sends a lethal NpcHit (no damage of its own): 0.8 s later the host kills his
@@ -471,7 +476,11 @@ scripts may change things in between; the next WorldEnv puts them back.
   puppets) with that spawn profile, its health, and the NPC's weapon. The host knows the profile from the NPC's name:
   a human a mission spawner made is called `behavior_object_prime-NN-<spawner name>`, and the spawner (entity type
   65, by that name, the nearest when several share it) tells its profile (docs/game-api.md 15); 0 for NPCs from
-  traffic or police generators, which then get no copy. The copy is driven from the states like a player puppet
+  traffic or police generators. Unreleased: an NPC with profile 0 gets a fallback by its AI type (4: the police
+  profile `characters/ai/police_scotch/ai_police_triggerman`, else the civilian
+  `characters/traffic/traffic_base_ambient_combined`, as their FNV-1 64 hashes, `mc_fnv`); before, it got no copy.
+  An NPC moving faster than 11 m/s counts as in a car whatever its car flag says (no copy, a copy is released, no
+  pull). The copy is driven from the states like a player puppet
   (walk/run toward the position plus the velocity of the last two states, pulled along, heading when standing), aims
   and fires when the shot counter goes up (along its heading; past the guest, 1.6 m beside and 2 m above him, when it
   faces him: its bullets are only a picture, the host's NPC already shot at the guest's puppet and that hit comes as
@@ -516,7 +525,9 @@ npc_sync.lua.
   an NPC that died before it was his own is never sent.
 - **Mirrors (host):** every guest NPC gets a mirror id (unique on the host; at most 24 per guest). It is shown like a
   guest's copy of a host NPC (above), the other way round: a human from the copy spawner with the NPC's spawn profile
-  (the guest reads it from the NPC's spawner name like the host does), its weapon and health, driven from the
+  (the guest reads it from the NPC's spawner name like the host does; unreleased: profile 0, e.g. the guest's cops,
+  gets the fallback by AI type as above: the 0.15.0 test showed 0 of 179 samples of 12 such cops), its weapon and
+  health, driven from the
   guest's states (walk/run, heading, its shots as pictures), a civilian on the host's game (no fight of its own), at
   most 10 at a time, within 90 m of the host, released 12 s after its death, 5 s after the last state, in a car, in
   a cutscene, with the session and the world. Mirror copies are never in the host's NpcStates (no NPC goes back to the
@@ -576,7 +587,16 @@ npc_sync.lua.
   `behavior_object_prime-NN-` with an empty suffix, docs/game-api.md 15), not a player car (player_sync's, Phase 3),
   not a puppet factory's, not the one the host sits in; police when the driver's AI type is 4 or the model name says
   so. Parked cars (no driver) and mission cars (drivers named after a mission spawner) stay local to each game as
-  before. A traffic car whose driver died or got out is shared for 20 s more (flag 4), then it counts as parked.
+  before. A traffic car whose driver died or got out stays shared; once it has stood (under 2 m/s) for 20 s without
+  a driver it counts as parked.
+- **Driverless (flag 4, unreleased):** the host's Lua reads seat 0 of each car every second (and every round while
+  it read no driver): flag 4 in its TC line is "no living generator driver read now". That read flickers (0.15.0
+  two-PC test: 179 cars flagged, 118 of them still moving, 84 still at speed 4 s later, mostly 50-100 m from the host's
+  player). The dll (`game/traffic_model.h` DriverWatch) sends flag 4 only when no driver was read for **1 s while the
+  car was slower than 2 m/s** all that time; it clears it when a driver is read again or the car speeds up past
+  4 m/s (someone drives it). UNVERIFIED in game: why the read fails on moving cars (the log names the reason, `seat 0
+  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the host's player: driver
+  culling or level of detail far from him was the suspicion; trace `TRO`).
 - **Host:** the Lua glue (`traffic_sync.lua`) scans the car table once a second and reports the traffic cars within
   380 m of any guest (his puppet, or his car) 20 times a second: transform, velocity, the driver's controls
   (`mc_car_controls`, flag 8), reversing (velocity against the car's heading, flag 16), handbrake (flag 1), siren
@@ -593,8 +613,10 @@ npc_sync.lua.
   spawning (`PreventPoliceSpawning(true)`) go off, and 6 s later his own moving traffic cars farther than 70 m are
   hidden (`Deactivate`, the car and its crew; shown again when he goes back to his own traffic). The nearest **20**
   host cars within 240 m (dropped beyond 290 m; a far copy gives way to a car at less than half its distance) get a
-  copy: `ObtainCarWithCrew(model, {profile})` (a profile from `data_traffic.crew_presets`, else the puppet factory's;
-  `ObtainSpecificCar` when that fails), `SetDespawnImmunity`, `DisableExplosion`, the crew locked
+  copy: `ObtainCarWithCrew(model, {profile})` (unreleased: a civilian or police spawn profile of this game,
+  `characters/traffic/traffic_base_ambient_combined` / `characters/ai/police_scotch/ai_police_triggerman` and
+  fallbacks, docs/game-api.md 19; one that fails twice before it ever worked is dropped; the puppet factory's Tommy
+  last; `ObtainSpecificCar` when that fails), `SetDespawnImmunity`, `DisableExplosion`, the crew locked
   (`LockControls(true)`, no reaction to sounds), the host's colours and plate. Each copy is driven like a remote
   player's car (Phase 3 "Driving the puppet and the car copy"): the states are interpolated 120 ms behind the newest
   (host clock: the smallest local-minus-host offset seen), moved forward by velocity x 120 ms (at most 2 m), then
@@ -602,8 +624,12 @@ npc_sync.lua.
   snapped when more than 4 m off. Copies farther than 90 m are driven every third tick. A copy goes when its car is
   despawned (1 s later, so player sync can take it first), after 5 s without a state, when the guest goes back to
   his own traffic, and with the world; near ones (80 m) with `DespawnEntity` (when unseen), others at once. Siren
-  and beacons follow flag 2; a host car without driver (flag 4) makes the copy's driver get out (npc_sync kills him
-  when the host's driver died: traffic drivers are NPCs too and pair by position).
+  and beacons follow flag 2. The copy's driver gets out only when the host car is driverless (flag 4, confirmed as
+  above) **and** both the host's car and the copy stand (under 2 m/s; the dll adds flag 32 to the copy's drive
+  command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4 goes again its crew gets back in.
+  Twice a second the crew is checked: a member out of his seat (alive, the seat free, our player not within 8 m) is
+  put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in a row). npc_sync kills the copy's
+  driver when the host's driver died: traffic drivers are NPCs too and pair by position.
 - **Taking a traffic car:** when the host takes a car that is a traffic copy on a guest's game, the guest's player
   sync finds that copy where the host's car is (same model, within 3 m) and adopts it; the traffic glue then hands
   it over (its crew gets out, `TH`) and no longer drives or removes it. When a guest takes a copy, his game makes it
