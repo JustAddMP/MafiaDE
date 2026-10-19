@@ -62,6 +62,7 @@ TARGETS = {
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
+    "join.complete_s": ("<=", 10.0, "a guest's world complete after a join / reconnect (s)"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
     "bw.host_up": ("<=", 160.0, "host upload, all systems, median (KB/s)"),
 }
@@ -688,6 +689,128 @@ def reconnects(tr):
         print("  (not back by the end of the trace)")
 
 
+def hour_diff(a, b):
+    """a - b in hours, the short way round the clock: (-12, 12]."""
+    d = (a - b) % 24.0
+    return d - 24.0 if d > 12.0 else d
+
+
+def world(host, guest):
+    """Time of day and weather on the guest against the host's at the same moment (WEH on the host, WEG on the guest,
+    both stamped with the session clock sT; docs/sync-trace.md, docs/protocol.md "WorldEnv")."""
+    weg = guest.records["WEG"] if guest else []
+    weh = host.records["WEH"] if host else []
+    if not weg and not weh:
+        return
+    section("World: time of day on %s's game against the host's" % (guest.name if guest else "the guest"))
+    if not weg:
+        print("  host readings (WEH): %d, no guest records (WEG)" % len(weh))
+        return
+    hs = []
+    for _, f in weh:
+        st, t = num(f.get("sT")), num(f.get("t"))
+        if st is not None and t is not None:
+            hs.append((st, t, f.get("weather")))
+    hs.sort()
+    hst = [h[0] for h in hs]
+
+    def host_at(st):
+        """The host's time (hours) and weather at session ms st, from the two WEH around it (at most 2.5 s apart)."""
+        i = bisect.bisect_left(hst, st)
+        if 0 < i < len(hs) and hs[i][0] - hs[i - 1][0] <= 2500:
+            a, b = hs[i - 1], hs[i]
+            k = (st - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0.0
+            return (a[1] + hour_diff(b[1], a[1]) * k) % 24.0, a[2]
+        if i < len(hs) and abs(hs[i][0] - st) <= 600:
+            return hs[i][1], hs[i][2]
+        if i > 0 and abs(st - hs[i - 1][0]) <= 600:
+            return hs[i - 1][1], hs[i - 1][2]
+        return None, None
+
+    # stretches: a gap of over 5 s between guest readings is a new world or a rejoin; the first 10 s of each are the
+    # first sync and left out of the target
+    errs, own, acts, measured = [], [], Counter(), []
+    wmatch = wtotal = from_truth = 0
+    seg_start = last_t = None
+    for t, f in weg:
+        if last_t is None or t - last_t > 5.0:
+            seg_start = t
+        last_t = t
+        acts[f.get("act", "?")] += 1
+        e_own = num(f.get("err"))
+        gt, st = num(f.get("t")), num(f.get("sT"))
+        ht, hw = host_at(st) if (st is not None and hs) else (None, None)
+        if ht is not None and gt is not None:
+            e = hour_diff(ht, gt) * 60.0
+            from_truth += 1
+            if hw is not None:
+                wtotal += 1
+                wmatch += 1 if hw == f.get("weather") else 0
+        else:
+            e = e_own  # no host trace (or no stamp): the guest's own estimate
+        if e is None:
+            continue
+        if e_own is not None and ht is not None:
+            own.append(abs(e_own - e))
+        if t - seg_start >= 10.0:
+            errs.append(abs(e))
+            measured.append((e, t, f))
+    print("  guest readings (WEG): %d, host readings (WEH): %d; compared with the host's own reading at the same "
+          "session time: %d" % (len(weg), len(weh), from_truth))
+    print("  what the guest did: %s" % ", ".join("%s %d" % (k, v) for k, v in sorted(acts.items())))
+    sets = [(t, f) for t, f in weg if f.get("act") == "set"]
+    for t, f in sets[:10]:
+        print("    %s SetTime: ours %s h, host %s h (%s game minutes)" % (guest.wall(t), f.get("t"), f.get("host"),
+                                                                       f.get("err")))
+    if errs:
+        print("  |host - guest| after the first 10 s of each stretch: %s" % stats_line(errs, "game minutes"))
+        worst = max(measured, key=lambda m: abs(m[0]))
+        print("  worst: %.2f game minutes at %s (act=%s)" % (worst[0], guest.wall(worst[1]), worst[2].get("act")))
+        record("world.time_err", max(errs), guest.name)
+    else:
+        print("  no readings after the first 10 s")
+    if own:
+        print("  the guest's own estimate against the truth: %s" % stats_line(own, "game minutes"))
+    if wtotal:
+        print("  weather the same as the host's: %.1f %% of %d readings" % (100.0 * wmatch / wtotal, wtotal))
+    rates = [num(f.get("rate")) for _, f in weg if f.get("measured") == "1"]
+    rates = [r for r in rates if r]
+    if rates:
+        print("  the game's rate as the guest measured it: %.5f game hours per second per flow unit (median)" %
+              pct(rates, 50))
+
+
+def joins(guest, host):
+    """How long a guest waited for his world after a join or a reconnect (JN, docs/sync-trace.md)."""
+    jn = guest.records["JN"] if guest else []
+    reports = [(t, f) for t, f in (host.records["JN"] if host else []) if f.get("ev") == "report"]
+    if not jn and not reports:
+        return
+    section("Join and reconnect: %s's world complete" % (guest.name if guest else "the guest"))
+    for t, f in jn:
+        ev = f.get("ev")
+        if ev == "begin":
+            print("  %s %s (%s other player(s))" % (guest.wall(t), "back after a reconnect" if f.get("reconnect") == "1"
+                                                    else "joined", f.get("others", "?")))
+        elif ev == "complete":
+            missing = f.get("missing", "-")
+            after = num(f.get("after"))
+            what = "complete" if missing == "-" else "STILL MISSING " + missing
+            none = f.get("none", "-")
+            print("  %s %s after %s s%s%s" % (guest.wall(t), what, f.get("after"),
+                                             " (late)" if f.get("late") == "1" else "",
+                                             "; nothing came for " + none if none != "-" else ""))
+            if after is not None and f.get("late") != "1":
+                who = "reconnect" if f.get("reconnect") == "1" else "join"
+                record("join.complete_s", after, "%s %s" % (guest.name, who))
+        else:
+            print("    %-10s %-8s after %s s" % (ev, f.get("key", "-"), f.get("after")))
+    for t, f in reports:
+        print("  host %s: player %s reported complete=%s after %s s, missing %s (%s)" % (
+            host.wall(t), f.get("from"), f.get("complete"), f.get("after"), f.get("missing"),
+            (f.get("times") or "").replace(",", ", ").replace(":", " ")))
+
+
 def doors(tr, other):
     """Door changes on this game and what the other game made of them (DR / DL / DA, docs/sync-trace.md)."""
     dr, dl, da = tr.records["DR"], tr.records["DL"], tr.records["DA"]
@@ -909,6 +1032,8 @@ def main():
     for x, y in ((a, b), (b, a)):
         doors(x, y)
     host = a if a.role == "host" else b if b.role == "host" else None
+    world(host, guest)
+    joins(guest, host)
     traffic(host, guest)
     car_damage(a, b)
     car_looks(a, b)
