@@ -7,7 +7,9 @@ namespace mc::game::mapmark {
 
 Plan Decide(const Input& in) {
     Plan p;
-    p.want = in.puppet ? Target::Puppet : (in.hasPos ? Target::Pos : Target::None);
+    // a puppet whose brain switch is still to come carries no icon (the switch would remove it): his position does
+    const bool puppet = in.puppet && !in.brainPending;
+    p.want = puppet ? Target::Puppet : (in.hasPos ? Target::Pos : Target::None);
     if (p.want == Target::Puppet && in.humanFailed && in.icon != Icon::Human) {
         // no human icon for this puppet: a position icon may still follow it (or show where he is)
         if (in.icon == Icon::None) p.want = in.hasPos ? Target::Pos : Target::None;
@@ -36,6 +38,21 @@ Plan Decide(const Input& in) {
     const float dx = in.x - in.lastX, dy = in.y - in.lastY, dz = in.z - in.lastZ;
     if (dx * dx + dy * dy + dz * dz > kMoveEps * kMoveEps) p.act = Action::MovePos;
     return p;
+}
+
+Probe CheckProbe(uint32_t id, double found, int lossesBefore) {
+    if (found < 0) return Probe::Unknown;
+    if (found == static_cast<double>(id)) return Probe::Ok;
+    return lossesBefore + 1 >= kMaxLosses ? Probe::GiveUp : Probe::Lost;
+}
+
+const char* ProbeName(Probe p) {
+    switch (p) {
+        case Probe::Ok: return "ok";
+        case Probe::Lost: return "lost";
+        case Probe::GiveUp: return "give_up";
+        default: return "unknown";
+    }
 }
 
 const char* IconName(Icon i) {
