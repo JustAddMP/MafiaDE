@@ -43,7 +43,7 @@ State& S() {
     return s;
 }
 
-bool IsStream(System s) { return s == kPlayer || s == kNpc || s == kTraffic || s == kItem; }
+bool IsStream(System s) { return s == kPlayer || s == kNpc || s == kTraffic || s == kItem || s == kPed; }
 
 constexpr size_t kMaxPending = 512;  // a system whose tick does not run (paused) keeps only the newest
 constexpr size_t kMaxWindow = 4096;
@@ -57,7 +57,7 @@ constexpr double kTickGapS = 1.0;
 const char* Name(System s) {
     static const char* const kNames[kCount] = {"player", "world",  "npc",     "npc-event", "traffic",
                                                "traffic-event", "door", "explosion", "car-damage", "police",
-                                               "item",   "item-event", "hit"};
+                                               "item",   "item-event", "hit", "ped", "ped-event"};
     return s < kCount ? kNames[s] : "?";
 }
 
@@ -75,6 +75,8 @@ System SystemOf(uint16_t id) {
     if (id >= 0x0260 && id <= 0x026F) return kPolice;
     if (id == 0x0270) return kItem;
     if (id >= 0x0271 && id <= 0x027F) return kItemEvent;
+    if (id == 0x0280) return kPed;
+    if (id >= 0x0281 && id <= 0x0287) return kPedEvent;
     return kCount;
 }
 
@@ -87,6 +89,7 @@ void Configure(net::Session& s) {
     s.SetLane(0x0230, 0x023F, 2);  // doors
     s.SetLane(0x0260, 0x026F, 3);  // police
     s.SetLane(0x0270, 0x027F, 4);  // items
+    s.SetLane(0x0280, 0x0287, 5);  // pedestrians
     // Priorities: what a player does and sees first; bulk that can wait or be thinned when the link is full.
     s.SetPriority(0x0100, 0x0102, Priority::Critical);  // PlayerState, CarParked, PlayerModel
     s.SetPriority(0x0400, 0x040F, Priority::Critical);  // Hit
@@ -104,6 +107,8 @@ void Configure(net::Session& s) {
     s.SetPriority(0x0222, 0x0222, Priority::Bulk);      // traffic car states
     s.SetPriority(0x0210, 0x0210, Priority::Normal);    // NPC states (thinned only when far over the budget)
     s.SetPriority(0x0420, 0x0420, Priority::Normal);    // a guest's own NPC states
+    s.SetPriority(0x0280, 0x0280, Priority::Bulk);      // pedestrian states (thinned first)
+    s.SetPriority(0x0283, 0x0284, Priority::Critical);  // pedestrian death / kill
     // Car damage (0x0250-0x0252) and everything else: Normal.
 }
 

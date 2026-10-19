@@ -1665,3 +1665,30 @@ GetSpawnedSceneObject is the bike; that SetPos / SetRot move a bike; that GetOnV
 GetOutCarFast takes it off; the saddle offsets; that IN_DEEP_WATER is sent to the player and when; the surface and
 depth thresholds; that SetPhysState(1) keeps the water's physics off a puppet; that a demigod NPC does not drown; that
 any swim or moto animation shows on a puppet; CAR_IS_UNDERWATER.
+
+## 26. Pedestrians on two games (unreleased) - static only, NOT verified in game
+
+Used by src/game/ped_sync.* (messages in docs/protocol.md "Pedestrians"). Before this every game kept its own
+ambient pedestrians: in the 0.15.0 two-PC test 47-48 of the host's humans were near the guest and 0.6-1.1 were paired
+(npc_sync pairs by spot, which only mission NPCs share), so ~2 % of the street was the same on both screens.
+
+| call | notes |
+|---|---|
+| ambient pedestrian (the contract with npc_sync) | a human (`mc_entity_ids(8)`) that is not ours (players, puppets, the puppet factory's driver, npc_sync's copies and their spawner's driver, traffic copy crews, `MafiaCoop.PedOwned`), `IsActive()`, `GetAIType()` 0, `GetOwner()` nil (not in a vehicle) and whose `GetName()` is not `behavior_object_prime-NN-<suffix>` with a non-empty suffix (section 15: mission spawners' humans carry the spawner's name; generator humans have an empty suffix; area spawners' pedestrians were not found as scene objects). `MafiaCoop.IsAmbientHuman(h)` (ped_sync.lua) |
+| `h:GetCivilArchetype()` | exists (re-notes appendix); sent hashed to 32 bits as the pedestrian's "look" for the log. UNVERIFIED what it returns for pedestrians and whether it tells looks apart; nothing on our side can pick a model by it |
+| `h:GetCurrentReactionPriority()` | read as "panic" when > 0. UNVERIFIED (by its name; a calm pedestrian may read > 0 too). Only traced and sent, a replica does nothing with it |
+| `h:IsCoverCrouch()` / `h:PanicCrouch(s)` | the authority's pedestrian crouching (UNVERIFIED that a civilian's panic crouch reads as cover crouch) makes a standing replica `PanicCrouch(1.5)` at most every 1.2 s (section 10: PanicCrouch is the hands-over-the-head crouch) |
+| `h:InterruptCivilWander()` / `ResumeCivilWander()`, `InterruptAvoidingCar()` / `ResumeAvoidingCar()`, `SetReactionOnSound(b)`, `DespawnImmunity(b)` | an adopted pedestrian's own AI off while it is a replica, back on when released. UNVERIFIED which of these the civilian brain honours; the replica gets a `MoveVec` every few tenths of a second anyway (section 4), which is what moved the puppets |
+| `h:ShowModel(false)` + `h:Deactivate()`; back: `Activate()`, `ShowModel(true)`, `SetPhysState(<as read with GetPhysState before>)` | a surplus pedestrian hidden while nobody looks (traffic hides its own cars with `Deactivate`, section 19). UNVERIFIED that the game does not despawn or reuse a deactivated pedestrian meanwhile (the glue reports it gone, `PGL`, when its wrapper is no longer valid) |
+| `game.cameramanager:GetPlayerCamera():GetPos()` / `GetDir()` | the camera for "in view": the dll's cone test (60 degrees around the camera direction, up to 150 m; 4 m around the camera always). No occlusion test (a pedestrian behind a wall in front of the camera counts as seen, which only makes it wait longer) |
+| `game.traffic:SetMaxHumanElements(n)` | **static (2026-10-19):** thunk 0x2677360 reads one number (self adaptor 0x3811340, number 0x785B30, converted to an int) and calls 0x2DA3C60(traffic manager, n): it stores n at `[manager + 0x100]` when it differs and calls a notifier (`[[manager + 0x50]] + 0x18`) and a global update. A global pedestrian budget with **no getter**, so the value to go back to is not known. **Not used**: turning it down on a receiver would empty its whole world and the pool of humans it adopts from, and it could not be restored exactly |
+| `game.traffic:BlockSpawnersInSphere(pos, r, b)` | **static (2026-10-19):** thunk 0x2670BE0 reads a vector, a number and a bool and calls 0x2D86A60(manager, {pos, r}, b) -> 0x2D86710, which walks the spawner list (`[manager + 0x168]`) and applies the flag to the spawners inside the sphere **at that moment**: a one-shot flag on spawners, not a lasting zone. The glue calls it with `true` around us (60 m) every 20 m we move while another game's pedestrians show here, and with `false` on every spot afterwards. UNVERIFIED that `true` blocks, that pedestrian (area) spawners are among them, and what happens to spawners streamed in later |
+| copies | spawned by a runtime spawner of our own (section 3, the puppet factory recipe: a crewed `shubert_e_six` 40 m below the player, `C_RuntimeSpawnerComponent` on its driver), profile `characters/traffic/traffic_base_ambient_combined` (its FNV-1 64 hash, as npc_sync's civilian fallback; section 19). Every copy looks like that. UNVERIFIED that it loads through a runtime spawner; a profile that does not load in 12 s stops the copies for 30 s |
+
+**UNVERIFIED (all of it):** whether an adopted pedestrian's own AI stays off between `MoveVec` orders (or walks off
+toward its old wander goal), whether `SetMovementSpeedMult` works on pedestrians, how many ambient humans each game
+has near a player (the coverage target, 80 %, assumes about as many as the authority's; a short pool is covered by at
+most 10 copies), whether hidden pedestrians come back intact, and the BlockSpawnersInSphere semantics above.
+What to look for in the log: `peds: our human N is the replica of pedestrian ...`, `spawned a copy for pedestrian
+...`, `copy profile ... loaded` / `did not load`, `our pedestrian spawners blocked around us: ok`; trace `PDC`
+(coverage), `PDR` (error), `PDL` (the glue's counts).

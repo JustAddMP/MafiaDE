@@ -52,6 +52,9 @@ holder).
 Car look (a copy shows its car's colours, plate, tint, interior, painting and body variant): CarLook (0x0253),
 additive (a peer without it ignores it and keeps its copies as the game spawns them). See "Car look".
 
+Pedestrians (unreleased): PedStates (0x0280), PedSpawn (0x0281), PedGone (0x0282), PedDeath (0x0283), PedKill
+(0x0284), additive (a peer without them keeps its own pedestrians, as before). See "Pedestrians".
+
 App id allocation (core reserves 0x0000-0x00FF):
 
 | Range | Owner |
@@ -1064,6 +1067,70 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   a car puts another game's blast on it itself ("Car damage", blasts on other games), so a remote player's grenade
   does wreck your car, on every game, once; a copy never blows up by itself.
 
+### Pedestrians (unreleased; not yet checked in game)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0280 | PedStates | authority -> one player (`SendTo`; guest -> guest through the host's relay) | U, 10 Hz near, 3 Hz at 50 m | u32 authMs (the authority's clock at the sample), f32 origin x y z, u8 n (at most 50: 817 bytes), then n x 16 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i8 hx hy (heading x127), i16 vx vy (1/100 m/s), u8 flags (1 dead, 2 panic, 4 crouch, 8 running), u8 gait (0 idle, 1 walk, 2 run, 3 sprint) |
+| 0x0281 | PedSpawn | authority -> one player | R | u8 n (at most 24), then n x 22 bytes: u16 net, u8 class (0: unknown, nothing readable yet), u32 look (the authority's `GetCivilArchetype` hashed to 32 bits, 0 unknown; logged, not applied), f32 x y z, i8 hx hy, u8 flags |
+| 0x0282 | PedGone | authority -> one player | R | u8 n, then n x u16 net |
+| 0x0283 | PedDeath | authority -> one player | R | u16 net, f32 x y z (where it died) |
+| 0x0284 | PedKill | receiver -> the authority | R | u16 net: the receiver's replica of it died by his hand |
+
+0x0285-0x0287 are reserved. All of it is additive: a build without it ignores these ids and keeps its own
+pedestrians (every game had its own before). Identity: `NetRef {authority, Pedestrian, net}` (core
+`net/authority.h`); a receiver keys a pedestrian by (sender, net), so two authorities' net ids never mix.
+
+- **What is an ambient pedestrian** (the contract with npc_sync): a human of this game that is not a player, puppet
+  or any copy (MafiaCoop's own), not in a vehicle, `GetAIType()` 0, and not named after a mission spawner
+  (`behavior_object_prime-NN-<suffix>` with a non-empty suffix, docs/game-api.md 15). `MafiaCoop.IsAmbientHuman(h)`
+  says so; `MafiaCoop.PedOwned` (entity id -> true) lists every local human ped_sync controls (adopted and spawned
+  replicas, hidden humans, its spawner's driver). npc_sync never pairs, sends or steers either.
+- **Authority by region** (core `RegionAuthority`, the traffic rules): the host's game within 250 m of the host,
+  elsewhere the nearest player's game in the world (ties: the lower id); a pedestrian keeps its owner until it is
+  400 m from him and another player is 50 m nearer (`Keep`), so when players converge the pedestrians already there
+  stay with their game until they leave or despawn (no hand-over of a living pedestrian's AI). Every game decides this
+  from the positions it has (its own and the puppets'); at a border two games can briefly both send.
+- **Authority side** (`game/ped_model.h` PedAuthority): ped_sync.lua scans the human table every 0.25 s and reports
+  the ambient humans within 75 m of any player 20 times a second (position, heading, dead / panic / crouch read; the
+  velocity and the gait come from the measured positions, smoothed, gait with hysteresis 0.5 / 2.4 / 4.8 m/s up,
+  0.3 / 2.0 / 4.3 down). The dll gives each pedestrian it owns a net id (u16, not reused while a player has it) and
+  keeps core's InterestManager per other player (Kind::Npc: enter 50 m / leave 60 m from him or his car; every 0.1 s
+  up to 15 m, every 0.33 s at 50 m; 16 KB/s budget; the nearest 40 at most): PedSpawn when one comes into his range,
+  PedGone when it leaves (or is no longer ours / gone), PedDeath once when it dies, its state when due and changed
+  (an unchanged one again after 1 s). States carry the sample time on the authority's own clock.
+- **Receiver side** (PedReceiver): one `replica::Stream` per authority (its playout clock, Hermite interpolation,
+  the "now" lead). Within 50 m of us, the authority's living pedestrians get a replica: **adopted first**, one of our
+  own ambient humans of that region (one-to-one, nearest first, kept; within 3 m always, up to 45 m only when neither
+  it nor the target is in view: the camera cone of 60 degrees, 4 m around the camera always counts as in view), its
+  wandering interrupted (`InterruptCivilWander`, `InterruptAvoidingCar`, `SetReactionOnSound(false)`,
+  `DespawnImmunity(true)`; UNVERIFIED which of these the civilian AI honours); **spawned second**, a pedestrian
+  unmatched for 0.8 s (2.5 s when its spot is in view) within 45 m gets a copy from our own spawner (the puppet
+  factory recipe, profile `characters/traffic/traffic_base_ambient_combined`: every copy looks like that, the
+  authority's look is not readable), at most 10 copies and 2 requests at once. Our surplus ambient humans in our 50 m
+  zone (of another's region) are **hidden** while nobody looks (`ShowModel(false)`, `Deactivate`), only while that
+  authority's pedestrians arrive; they are shown again (out of view) where the region is ours again for 2 s, or when
+  150 m away, and all at the session's end. While another's pedestrians show near us our pedestrian spawners around
+  us are blocked (`BlockSpawnersInSphere(pos, 60, true)` every 20 m we move, released after; UNVERIFIED, see
+  docs/game-api.md 26). Every replica is walked like a puppet: core's LocomotionController with the sender's gait as
+  the hint and the correction rules of `Corrector::ForNpc` (0.5 m dead zone, a nudge capped at 35 % of its speed or
+  0.15 m/s standing, a snap beyond 5 m or 3 m up, stuck 0.8 m for 3 s), applied with `MoveVec`,
+  `SetMovementSpeedMult`, `SetPos` / `SetDir`.
+- **Deaths and panic** follow the authority: a PedDeath (or the dead flag) kills the replica (`DoDamage`); the crouch
+  flag makes a standing replica `PanicCrouch` (UNVERIFIED read and picture); running is in the gait. A replica that
+  dies here by our hand sends PedKill to its authority, whose pedestrian then dies (and that death reaches everyone).
+- **Gone / stale:** a pedestrian's replica goes on PedGone or after 3 s without a state: an adopted human gets its own
+  AI back (`ResumeCivilWander`, `ResumeAvoidingCar`, `SetReactionOnSound(true)`), a spawned copy is released when
+  nobody looks (at the latest 3 s later). A player who leaves or loses his connection: his pedestrians' replicas go.
+- **Bandwidth** (per receiving player): 16 bytes per pedestrian per state + 17 bytes per packet. 32 pedestrians near
+  him at 10 Hz: 32 x 10 x 16 = 5.1 KB/s + ~0.2 KB/s headers = **~5.5 KB/s** (worst case, everyone within 15 m and
+  moving; farther ones 3-10 Hz, standing ones once a second), plus PedSpawn 22 bytes per pedestrian when it comes
+  into range. Lane 5, PedStates Bulk (thinned first), PedDeath / PedKill Critical. With 4 players the host uploads at
+  most ~3 x 6 = 18 KB/s for its pedestrians (docs/sync-architecture.md section 7).
+- **Measured:** trace `PDT` (authority truth), `PDR` (replica at 10 Hz, keyed by the authority's sample time), `PDC`
+  (coverage, 1 Hz) and `PDS` / `PDP` / `PDE` / `PDL` (docs/sync-trace.md); `tools/sync_compare.py` "Pedestrians"
+  computes `ped.p95` and `ped.coverage`.
+
 ## Reconnect (no messages of its own)
 
 Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,
@@ -1150,6 +1217,7 @@ session-clock stamp. Ours (`src/game/latency.cpp`, `Configure`):
 | 2 | doors 0x0230-0x023F | |
 | 3 | police 0x0260-0x026F | |
 | 4 | items 0x0270-0x027F | |
+| 5 | pedestrians 0x0280-0x0287 | many small states; their spawn / gone / death need no order with the rest |
 
 A lane message still comes after the lane-0 messages sent before it; lane 0 does not wait for the lanes, so e.g. an
 NPC death sent after a mission change can arrive before it (UNVERIFIED that no handler minds; none checks for it).
@@ -1175,6 +1243,7 @@ network delay N. "Before" is 0.15 main (core 0.11).
 | Items | scan 2 Hz -> 4 Hz | 0..500 ms + 16.7 + N | 0..250 ms + N | ItemStates ~1-3 KB/s near items (E), Bulk |
 | Police | read 5 Hz -> 10 Hz | 0..200 ms + 16.7 + N | 0..100 ms + N | < 0.3 KB/s (E) |
 | Car damage | rounds 4 Hz -> ~6.7 Hz | 0..250 ms + 16.7 + N | 0..150 ms + N | only changes: < 1 KB/s typical, a few KB in a crash (E) |
+| Pedestrian states (unreleased) | 20 Hz authority rounds, 10 Hz near / 3 Hz at 50 m per pedestrian | - | flushed + N + adaptive playout per authority (ped_test: ~125 ms quiet, ~160 ms under 60 ms jitter at 10 Hz) | 16 B per pedestrian per state: ~5.5 KB/s for 32 near one player (worst case, E); Bulk |
 | Explosions, throws | event (detector) | 16.7 + N | N | < 0.2 KB/s (E) |
 | Mission state / fail | on change | 16.7 + N (HostSave held back everything after it) | N; HostSave on its own lane | HostSave up to 256 KB once per checkpoint, Bulk |
 

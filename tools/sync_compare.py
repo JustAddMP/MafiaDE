@@ -14,6 +14,7 @@ seen on the other's game:
 - seats: puppets thrown out of cars (from the copied log lines)
 - NPCs: how far the guest's NPCs were from the host's
 - swapped cars: real cars hidden behind a copy and how they came back (SWR / SWP records)
+- pedestrians: each game's pedestrians as replicas on the other (PDT / PDR / PDC): true error, coverage
 - bandwidth per system (from the copied "net: messages:" log lines of core's NetMonitor): typical (median) and
   worst (max) KB/s out and in, plus what the send budget thinned or deferred
 - latency per system (LAT records): how long a message took from the sender's send to this game applying it,
@@ -590,6 +591,73 @@ def traffic(host, guest):
         print("  note: %s" % s.split("traffic: ", 1)[-1][:160])
 
 
+def peds(auth, recv):
+    """Pedestrians (docs/sync-trace.md PDT / PDR / PDC / PDS): `auth`'s pedestrians as replicas on `recv`'s game.
+    The true error lines up each replica record (PDR rT = the authority clock time its target stands for) with the
+    authority's truth records (PDT sT, the same clock) of that pedestrian."""
+    pdr = [f for _, f in recv.records["PDR"] if int(num(f.get("from"), -1)) == auth.local]
+    pdc = [f for _, f in recv.records["PDC"]]
+    if not pdr and not pdc and not auth.records["PDS"]:
+        return
+    section("Pedestrians (%s's on %s's game)" % (auth.name, recv.name))
+    truth = defaultdict(list)
+    for _, f in auth.records["PDT"]:
+        p, st = vec(f.get("p")), num(f.get("sT"))
+        if p is not None and st is not None:
+            truth[f.get("net")].append((st / 1000.0, p))
+    series = {net: Series(pts, gap=1.0) for net, pts in truth.items()}
+    errs, by_how, missing = [], defaultdict(list), 0
+    worst = Counter()
+    for f in pdr:
+        ser = series.get(f.get("net"))
+        cp, rt = vec(f.get("cp")), num(f.get("rT"))
+        if ser is None or cp is None or rt is None:
+            missing += 1
+            continue
+        tp = ser.at(rt / 1000.0)
+        if tp is None:
+            missing += 1
+            continue
+        e = dist2(cp, tp)
+        errs.append(e)
+        by_how[f.get("how", "?")].append(e)
+        if e > 3:
+            worst[f.get("net")] += 1
+    if errs:
+        print("  replica vs the authority's pedestrian at the same moment: %s" % stats_line(errs))
+        for how, v in sorted(by_how.items()):
+            print("    %-8s %s" % (how, stats_line(v)))
+        record("ped.p95", pct(errs, 95), "%s's on %s" % (auth.name, recv.name))
+        if worst:
+            print("  pedestrians most often more than 3 m off: %s" % ", ".join(
+                "net %s (%d)" % kv for kv in worst.most_common(5)))
+    if pdr:
+        print("  replica records %d, %d without a truth record at that moment (PDT is 1 in 2 states)" % (
+            len(pdr), missing))
+    if pdc:
+        near = sum(num(f.get("near"), 0) for f in pdc)
+        rep_n = sum(num(f.get("rep"), 0) for f in pdc)
+        if near > 0:
+            cov = 100.0 * rep_n / near
+            print("  coverage: %.1f%% of the authorities' pedestrians within 40 m had a replica (%d samples); "
+                  "hidden max %d, adopted mean %.1f, spawned mean %.1f, spawn failures %d" % (
+                      cov, len(pdc), max(num(f.get("hidden"), 0) for f in pdc),
+                      statistics.fmean(num(f.get("adopted"), 0) for f in pdc),
+                      statistics.fmean(num(f.get("spawned"), 0) for f in pdc), num(pdc[-1].get("fails"), 0)))
+            record("ped.coverage", cov, "on %s" % recv.name)
+    pds = auth.records["PDS"]
+    if len(pds) >= 2:
+        (t0, a), (t1, b) = pds[0], pds[-1]
+        secs = max(t1 - t0, 1e-6)
+        print("  %s as the authority: %.0f ambient humans near players (mean), %.0f his to send, %.2f KB/s sent, "
+              "%d states, %d spawns, %d gone, %d deaths, %d kill requests" % (
+                  auth.name, statistics.fmean(num(f.get("peds"), 0) for _, f in pds),
+                  statistics.fmean(num(f.get("owned"), 0) for _, f in pds),
+                  (num(b.get("bytes"), 0) - num(a.get("bytes"), 0)) / 1024 / secs, num(b.get("states"), 0),
+                  num(b.get("spawns"), 0), num(b.get("gones"), 0), num(b.get("deaths"), 0),
+                  num(b.get("killreq"), 0)))
+
+
 def car_damage(a, b):
     """Car damage sync (docs/sync-trace.md CDS / CDT / CDR / CDA / CDX / CDQ): what each game sent, received and set,
     and per player car the last state on both games side by side (traffic cars are named by entity on the host and by
@@ -812,6 +880,10 @@ def msg_system(name):
         return "item-event"
     if n == "Hit":
         return "hit"
+    if n == "PedStates":
+        return "ped"
+    if n.startswith("Ped"):
+        return "ped-event"
     return n
 
 
@@ -910,6 +982,8 @@ def main():
         doors(x, y)
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
+    for x, y in ((a, b), (b, a)):
+        peds(x, y)
     car_damage(a, b)
     car_looks(a, b)
     bandwidth((a, b))

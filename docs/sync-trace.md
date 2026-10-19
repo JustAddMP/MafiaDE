@@ -100,6 +100,13 @@ on the other.
 | `TRZ` | guest | per change | the host's pause and ours for his traffic copies (unreleased): `ev=<freeze thaw localgap> copies quiet=<knocks not reported so far>` |
 | `TRC` | guest | 2 Hz per traffic copy | `net tgt tv cp cv err pin pins f=<state flags: 1 handbrake 2 siren 4 no driver (unreleased: confirmed, 1 s without a driver read while slow) 8 controls 16 reversing>` (`err` 1e9 before the first report) |
 | `TRL` | guest | 2 Hz | `own=<our ambient spawning on> hidden=<our traffic cars hidden> near=<ours still driving near us>` |
+| `PDT` | the pedestrians' authority | 1 in 2 states sent per pedestrian (5 Hz near) | pedestrian truth (unreleased): `net=<its net id> id=<entity id here> sT=<our clock at the sample, ms: the authMs of its PedStates> p=<where it really was then>` |
+| `PDR` | receiver | 10 Hz per replica | `from=<authority> net rT=<the authority's clock time the target stands for, ms: render time + lead> cp=<our replica> tp=<its target then> err=<cp vs tp, ground> how=<adopted / spawned> g=<gait sent>`; sync_compare lines `rT` up with the authority's `PDT sT` for the true error |
+| `PDC` | receiver | 1 Hz | `near=<the authorities' living pedestrians within 40 m of us> rep=<of them with a replica here> hidden=<our own hidden> adopted spawned loading known=<authority pedestrians we have> snaps fails` (`ped.coverage` = rep / near) |
+| `PDS` | both | 1 Hz | our pedestrians as an authority: `peds=<our ambient humans near players> owned=<of them ours to send> bytes states spawns gones deaths killreq` (totals) |
+| `PDP` | both | 1 Hz per other player | `id relevant admitted states skipped bytes deferred` (our pedestrians for him) |
+| `PDE` | both | per event | `ev=adopt / spawn / release / hide / show / kill / diedhere / death / killreq key=<authority << 16 + net> local=<entity id here> how p from net` |
+| `PDL` | both | 1 Hz | ped_sync.lua: `amb=<ambient humans here> near=<reported near players> adopted spawned queued hidden fac=<copy spawner state> blocks=<spots our spawners were blocked around>` |
 | `POL` | both | on change, 1 Hz while wanted | Lua, our police state: `f=<PoliceState flags> w hunt lvl seen decay fine arrest off zone=<centre> p=<our position> held=<our zone's decay held (guest)> follow=<our red zone follows us> forced=<level held>` |
 | `POE` | both | per police event | `from=me ev=<name> arg` (ours, as sent) or `from=<id> ev arg` (another player's, received) |
 | `POR` | both | per changed state received | `from seq f lvl zone` (another player's PoliceState) |
@@ -189,6 +196,10 @@ Per player as seen on the other game:
 - **traffic:** host cars near the guest, bytes per second, unchanged states skipped, budget deferrals; on the guest
   how often the host's traffic showed, copies, the copy-vs-target error and the copies most often off, pins, bumps,
   and how many of the guest's own traffic cars were hidden or still drove near him.
+- **pedestrians** (unreleased): per direction (an authority's pedestrians on the other game) the true error of the
+  replicas (`PDR` against the authority's `PDT` at the same authority time; `ped.p95`), adopted against spawned,
+  the coverage (`PDC`: replicas / the authority's pedestrians within 40 m; `ped.coverage`), hidden and
+  spawned counts, and what each authority sent (`PDS`).
 - **doors:** per game, the door events by kind and verdict, how changes were attributed, the door messages, the
   applies with a failed call, how many of the changes it sent arrived on the other game, and the first 30 sends /
   receipts / snapshots.
