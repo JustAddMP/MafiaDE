@@ -106,6 +106,11 @@ Tick an item (`- [x]`) in the same commit that lands it.
    before it is seated, its seat is checked every tick (`GetSeatOwner`) and it is put back at once; a ride along waits
    for the driver's puppet at the wheel (`SlideToSeat` if the game seats us there); `enemies_target_guests = 0` no
    longer sends hits. Built, needs the in-game test (README-dev.md "Test checklist: 0.15.0 features").
+   Unreleased (merge 2026-10-19, fixed in code, in-game check pending): seats after a guest's reload (the 0.15.0
+   test, Taxi cp_020: the guest hidden in the host's taxi for minutes): a remote car's copy waits 2 s, then stands
+   beside his car with his puppet seated in it (seats.h `PlaceCopy` / `AsideSpot`) and moves onto his car once the
+   cars have parted; a parked copy of his earlier car is dropped, car records are looked up again after a load
+   (trace SCP / DRK).
 - [ ] **Car controls sync** (0.13.0, same): the driver's steering, throttle, brake and handbrake applied to the car
    copies (wheels steer, brake lights), copies carried by their own physics with a blended correction (pinned as
    before when the physics does not follow). Gate: wheels show the driver's steering, no wobble, error as before.
@@ -130,6 +135,10 @@ Tick an item (`- [x]`) in the same commit that lands it.
    snap during a swing. Still missing: door kicks, grenade explosions, medkit, carrying bodies, lockpick, vault /
    ladder, jump, stalk, paired takedowns. Built, needs the in-game test.
    In-game 2026-10-18: BROKEN (visuals). Light / heavy punches go out and arrive (`our light goes out`, `puppet 0 plays a light punch: hero_nw_alert_melee_attack_light_1_v1`, trace AL/ACS/ACT/AP) and the real hit lands (36 damage), but no punch shows on the puppet (burst captures side-on); every AE ends `done=0 why=time_up`. From the console AnimPlay of a punch shows nothing within 5 s, while AnimPlay of `hero_nw_calm_idle_fidget_cracknuckles` plays, ~2 s after the call every time. The throw animation ends after 0.14 s the same way. Needs another way to play the melee set (not loaded outside a fight?) and the 2 s AnimPlay latency explained.
+   Unreleased (merge 2026-10-19, fixed in code, in-game check pending): each action group tries the game's ways
+   in turn (PlayAnimation direct, no-transition, DesirePlayAnimation, script control, script control + combat
+   mode, AnimPlay), judged by the puppet's hand bones, the first that moves them kept (game/anim_methods.h,
+   game-api.md 17, re-notes 12; log `ANIM: ... SHOW with ...`, console `MafiaCoop.TestAction`).
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
@@ -223,6 +232,10 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    longer sits through it while the host is already past it (Bon Appetit: 3 minutes of ambush film): only the host's
    cutscene holds a reload. A crash in the game-sectors walk during a failed mission's load with a friend-brain puppet
    (Omerta, host) is guarded (re-notes 8).
+   Unreleased (merge 2026-10-19, fixed in code, in-game check pending): `garage.pf` and the other progress
+   profiles (my2k_game_stats.pf, profile_data_storage_persistantdata.pf, unknown *.pf) written in a co-op session
+   (0.15.0 test: a co-op chapter changed the garage) go to the session's scratch copy with the slots and stay held
+   until the game restarts; settings stay the player's own (save_paths.h, unit test save_paths_test).
 - [x] **Failed missions in one load** (0.15.0, built 2026-10-18, static, docs/re-notes.md 7, game-api.md 14,
    protocol.md "Story"): the save system's FreeRoamRetry (exe+0x21E8B20, the Free Ride stop) is skipped in co-op
    chapters, so every fail kind takes one load: a chapter host goes straight to his newest checkpoint, a STORY host
@@ -374,8 +387,16 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    - Car damage (protocol.md "Car damage", game-api.md 24): dents, parts, tyres, fire and explosions on every game.
      2026-10-18: crash damage and a blown-up car reached the copy; the copy's wreck damage came back to the host as
      a report and was read as a repair (to fix).
+     Unreleased (merge 2026-10-19, fixed in code, in-game check pending): a copy never reports its wreck or the
+     game's reaction to our writes, the holder never reads a wreck's change as a repair (CDX echo=). The other
+     known issue, a player's car with another variant, colour and plate on the other screen: CarLook (0x0253)
+     gives copies of player and traffic cars the car's tuning items (body variant), colours, plate, tint,
+     interior and painting (game-api.md 24 "Car look", re-notes 13; unit test car_look_test).
    - Police (protocol.md "Police"): wanted states shared, the host's police chase a wanted guest's puppet near the
      host. The offence fix (968d300) is checked in game; the guest's level still runs down during a chase.
+     Unreleased (merge 2026-10-19, fixed in code, in-game check pending): the guest's zone decay is held
+     (PreventZonesDecay) while the host's police are on him and released when the chase ends; a zone that decays
+     during the chase is started again (trace POD / POZ).
    - Several guests (protocol.md "Several guests"): 3-4 players, other guests' NPCs relayed, seat rules, driver
      claims. Only unit tests (core four-player lobby and reconnect tests); no in-game test with three games.
    - Latency (protocol.md "Latency budget", core 0.11.0): lanes and priorities per system, adaptive playout delay,
@@ -446,6 +467,10 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   MK / MKE. Gate: the other player stays on the minimap and map while he drives, after a respawn and a cutscene,
   with his name, no crash on reloads. Built, needs the in-game test.
   In-game 2026-10-18: the logs show one icon per player through spawn, car, reconnect (`made at his position (no puppet yet)` -> `made on his puppet` -> `at his position (in a car)` -> back on his puppet), never two; but no orange marker for the host could be found on the guest's minimap with him 12 / 40 m away. Not confirmed on screen.
+  Unreleased (merge 2026-10-19, fixed in code, in-game check pending): the puppet's friend brain switch (~2 s
+  after its spawn) removed the icon on it; the icon now waits at his position until the switch is done, icons on
+  puppets are checked once a second (`GetIdByScriptWrapper`) and made again when the game dropped them
+  (map_markers.h brainPending / probe, game-api.md 13).
 - [x] Settings page (name, show tags, debug overlay). Done 2026-10-15: CO-OP SETTINGS (core v0.5.0 panel; main menu
   CO-OP > SETTINGS, the lobby, pause menu CO-OP > SETTINGS): NAME (text box; used from the next session), DEBUG
   OVERLAY, SHOW NAME TAGS, MAP MARKERS, FRIENDLY FIRE, all saved in MafiaCoop.ini with `Config::Set`. Checked in game:

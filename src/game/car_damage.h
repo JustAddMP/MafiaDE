@@ -38,7 +38,7 @@ namespace mc::game::car_damage {
 constexpr uint16_t kMsgDamage = 0x0250;   // CarDamage: authority -> everyone (Broadcast; traffic: host -> guests)
 constexpr uint16_t kMsgReport = 0x0251;   // CarDamageReport: a copy's game -> the authority (SendTo / SendToHost)
 constexpr uint16_t kMsgRequest = 0x0252;  // CarDamageRequest: a copy's game -> the authority: send me the whole state
-// 0x0253 is reserved for car damage (not used)
+// 0x0253 is CarLook (game/car_look.h kMsgLook)
 
 constexpr uint8_t kGone = 255;       // part damage: the part is gone (broken off, destroyed)
 constexpr uint8_t kMaxDamage = 254;  // part damage: no energy left, the part still there

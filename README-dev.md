@@ -336,6 +336,28 @@ traffic, map markers, latency and reconnects per game). Trace records: docs/sync
 first and compare it afterwards: in the 2026-10-18 test `profiles\temporaryprofile\garage.pf` was written by both
 games during the co-op chapter.
 
+Unreleased fixes (merged 2026-10-19, code only, none checked in game yet):
+- [ ] Garage (save_paths.h): back up the save folder, play a CHAPTER session: `profiles\temporaryprofile\garage.pf`
+  byte-identical afterwards; log `kept out of the player's profile` and `held until the game restarts`. (Single player
+  garage changes after a co-op session in the same process are lost until the game restarts.)
+- [ ] Police decay: the guest makes himself wanted (ZoneCreate HUNT) with the host's cops near his puppet: `POD
+  hold=1`, his zone stays more than 60 s; drive away: `POD hold=0` within 4 s; the host's `POL w=0` throughout. Watch
+  for a mission that holds the decay itself being released by ours.
+- [ ] Map markers: the guest's log `waits at his position until ... brain switch` and `checked on his puppet: the game
+  has it`; `MK 0:M/human/puppet/ok`; the marker on both minimaps on foot, in a car and after a reconnect. If
+  GetIdByScriptWrapper gives 0 for a working icon it falls back to an icon at his position.
+- [ ] Seats after a reload: Taxi cp_020, the guest rejoins: `SCP ev=place dec=wait` then `dec=aside`, the puppet on
+  seat 0, not `veh-hidden`; the host drives off: `dec=release`; a guest reload: `SCP ev=world` / `ev=oldcopy`, `DRK
+  ev=newkey`.
+- [ ] Melee animations: the host taps Q about 15 times and throws (G); the guest's log `ANIM: melee actions SHOW with
+  '<way>'`; the AE start= latency; from the console `MafiaCoop.TestAction(1, "direct")` and the other ways,
+  `TestAction(15, ...)` checks the hand measurement. Regression: walking and seats after punches played through script
+  control.
+- [ ] Car look: the host's log `look: car 0:<id>: its look from our game`; the guest's `its look set on our copy` and
+  `shows its look`; the same body, colours and plate on screen; no `parts differ ... layout`.
+- [ ] Car damage echoes: blow up the host's car: the guest's log `an echo of our own writes, not reported`, trace `CDX
+  echo=wreck`; the host's car stays a wreck.
+
 Next in-game checks (fixes from the 2026-10-18 test, not yet checked):
 - [ ] Pad guard: close the lobby with pad X (START), then press Enter on the loading screen / the next menu: the
   game takes it (core 0.11.0 `PadHold`; before, the keyboard stayed blocked until a panel was opened again).

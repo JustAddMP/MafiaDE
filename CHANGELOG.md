@@ -3,6 +3,38 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## Unreleased
+
+Fixes for the known issues of the 2026-10-18 test, built from reading the game's code and the test's logs, with
+automated tests where the logic runs without the game. None of it is verified in game yet; the checks are in
+README-dev.md "Test checklist: 0.15.0 features", "Unreleased fixes".
+
+Fixed (unverified in game):
+- Co-op sessions no longer change the player's garage: garage.pf, the 2K play stats and the persistent script data are
+  kept in the session's scratch copy like the save slots, and stay out of the real profile until the game restarts
+  (the game keeps the garage in memory). Settings (controls, audio, video, language, map filter) are still the
+  player's own.
+- Police: a guest's own wanted level no longer runs out after ~20 s while the host's police chase him. His zone's
+  decay is held while host cops are on him (a red zone follows him while one sees him or is close) and released when
+  the chase ends, so he still has to lose them. A zone that decays or decayed during the chase is started again (not
+  after a fine, an arrest or his death).
+- Map markers: the host's marker was missing on a guest's minimap. The puppet's friend brain switch, about 2 s after
+  it spawned, removed the icon on it. Now the icon waits at the player's position until the switch is done, and icons
+  on puppets are checked once a second and made again if the game dropped them.
+- Seats: after a reload, when both players sit in their own mission car at the same spot (Taxi cp_020), the other
+  player's puppet is no longer hidden for minutes. His car's copy waits 2 s, then stands beside his car with him
+  seated in it, and moves onto his car once the cars have parted. A parked copy of his car from before a reload or
+  rejoin no longer blocks the new one, and car records are looked up again after every load.
+- Remote players' punches, throws and other actions (if one of the ways works): the puppet's animation is now played
+  through the game's direct animation call first (PlayAnimation), then the other ways the game offers (no-transition
+  flag, DesirePlayAnimation, script control of the puppet's AI, with combat mode, plain AnimPlay). Each try is checked
+  by watching the puppet's hands, and the first way that moves them is kept (log `ANIM: ... SHOW with ...`).
+- A copy of another player's car now looks like his car: the same body variant (its tuning items), both colours, the
+  plate, window tint, interior and painting (new CarLook message 0x0253; traffic copies too). Car damage can then sync
+  the copy's parts as well.
+- Car damage after an explosion is no longer undone: a copy never reports its wreck or the game's reaction to damage
+  we set on it, and the holder never reads a wreck's change as a repair.
+
 ## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 
 A big step for the shared world: fights, doors, items, explosions and car details you can see on the other screen,
