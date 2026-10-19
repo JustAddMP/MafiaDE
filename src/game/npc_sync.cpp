@@ -3,6 +3,7 @@
 
 #include "core/log.h"
 #include "core/trace.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/npc_owner.h"
 #include "net/wire.h"
@@ -92,6 +93,7 @@ void OnStates(net::PlayerId from, net::ByteReader& r) {
         lines += "N " + npcown::FormatState(s) + "\n";
     }
     ++_statesRecv;
+    join::Mark(join::System::Npcs);
     Append(lines);
 }
 

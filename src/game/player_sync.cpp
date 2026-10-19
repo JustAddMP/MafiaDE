@@ -10,6 +10,7 @@
 #include "game/car_swap.h"
 #include "game/car_units.h"
 #include "game/characters.h"
+#include "game/join_sync.h"
 #include "game/player_actions.h"
 #include "game/puppet_guard.h"
 #include "game/traversal.h"
@@ -49,7 +50,6 @@ namespace {
 constexpr uint16_t kMsgPlayerState = 0x0100;
 constexpr uint16_t kMsgCarParked = 0x0101;
 constexpr uint16_t kMsgPlayerModel = 0x0102;  // every peer -> everyone: the character he picked and how he looks
-constexpr uint16_t kMsgWorldEnv = 0x0200;  // host -> guests: time of day, time flow, weather set
 constexpr uint16_t kMsgHit = 0x0400;       // attacker -> victim: the attacker hit the victim's puppet
 // 4 (0.13.0): flags bit5 in the air, bit6 in cover; the driver's controls in the vehicle block. Two parts came
 // later without a version change: the car signals byte at the end of the vehicle block (lights, indicators, horn,
@@ -199,11 +199,9 @@ struct Shared {
     std::string luaStatus;
     std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
     std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
-    std::vector<std::string> outEnv;     // Lua -> network ("WE ..." lines, host only)
     std::vector<std::string> outHits;    // Lua -> network ("HT ..." lines: we hit someone's puppet)
     bool isHost = false;
     bool aimDown = false;
-    std::string lastWeather;  // last WorldEnv weather (for the log)
     bool enterPressed = false;
     double enterAt = 0;
     // name tags: the head of each remote player's puppet on screen (Lua "NT" events, every script tick)
@@ -233,7 +231,6 @@ bool _enterWasDown = false;
 double _sendAccum = 0;
 double _sentSampleAt = -1;  // localAt of the sample sent last
 uint32_t _sent = 0;
-uint32_t _envSent = 0;
 bool _haveActSeq = false;  // the action counter of the last state sent (player_actions.h), for the log
 uint8_t _lastActSeq = 0;
 uint32_t _actsSent = 0;
@@ -507,6 +504,7 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || from == sh.localId) return;
+    join::Mark(join::System::Player, from);
     Remote& rem = sh.remotes[from];
     const double now = Now();
     rem.clockMs = rem.haveClock ? rem.clockMs + static_cast<int32_t>(timeMs - rem.lastRawMs) : timeMs;
@@ -976,37 +974,6 @@ void OnCarParked(net::PlayerId from, net::ByteReader& r) {
                v[0], v[1], v[2], v[3], v[4], v[5], v[6], flags);
     MC_LOG_INFO("sync: player %u parked car %u:%u (%s)%s", from, owner, guid, model.c_str(),
                 (flags & kParkedWrecked) ? ", destroyed" : "");
-}
-
-// ---- WorldEnv (0x0200, reliable, host -> guests): time of day, time flow speed, weather set -------------------------
-// Lua event line (host): "WE time flow weather"
-bool WriteEnv(net::ByteWriter& w, const std::string& line) {
-    std::istringstream in(line);
-    std::string tag, weather;
-    float t = 0, flow = 0;
-    in >> tag >> t >> flow >> weather;
-    if (!in || tag != "WE" || !std::isfinite(t) || !std::isfinite(flow)) return false;
-    w.F32(t);
-    w.F32(flow);
-    w.Str(weather);
-    return true;
-}
-
-void OnWorldEnv(net::PlayerId from, net::ByteReader& r) {
-    const float t = r.F32();
-    const float flow = r.F32();
-    const std::string weather = r.Str(96);
-    if (!r.Ok() || from != net::kHostPlayer || !std::isfinite(t) || !(std::fabs(flow) <= 1e4f) || t < 0 ||
-        t > 24.5f || weather.empty() || !Token(weather))
-        return;
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    if (!sh.active || sh.isHost) return;
-    AppendLine(sh.inCmds, kMaxInCmds, "W %.4f %.4f %s\n", t, flow, weather.c_str());
-    if (weather != sh.lastWeather) {
-        MC_LOG_INFO("sync: host weather %s, time %.2f h, flow %.2f", weather.c_str(), t, flow);
-        sh.lastWeather = weather;
-    }
 }
 
 // ---- Hit (0x0400, reliable, attacker -> victim): the attacker's player hit the victim's puppet -----------------------
@@ -1806,8 +1773,6 @@ void MainTick(lua_State* L, float dt) {
                         sh.tags[static_cast<net::PlayerId>(id)] = {x, y, d, now};
                 } else if (line.rfind("CP ", 0) == 0)
                     sh.outParked.push_back(line);
-                else if (line.rfind("WE ", 0) == 0 && sh.isHost)
-                    sh.outEnv.push_back(line);
                 else if (line.rfind("HT ", 0) == 0)
                     sh.outHits.push_back(line);
                 else if (line.rfind("ML ", 0) == 0) {  // our story Tommy's profile changed
@@ -1863,7 +1828,6 @@ void PlayerSync::Attach(net::Session& session) {
     _session = &session;
     session.On(kMsgPlayerState, &OnState);
     session.On(kMsgCarParked, &OnCarParked);
-    session.On(kMsgWorldEnv, &OnWorldEnv);
     session.On(kMsgHit, &OnHit);
     session.On(kMsgPlayerModel, &OnPlayerModel);
     session.On(peer_pause::kMsgPeerPaused, &OnPeerPaused);
@@ -1883,7 +1847,6 @@ void PlayerSync::Detach() {
     if (_session) {
         _session->Off(kMsgPlayerState);
         _session->Off(kMsgCarParked);
-        _session->Off(kMsgWorldEnv);
         _session->Off(kMsgHit);
         _session->Off(kMsgPlayerModel);
         _session->Off(peer_pause::kMsgPeerPaused);
@@ -1903,12 +1866,10 @@ void PlayerSync::Detach() {
     sh.names.clear();
     sh.inCmds.clear();
     sh.outParked.clear();
-    sh.outEnv.clear();
     sh.outHits.clear();
     sh.models.clear();
     sh.live.clear();
     sh.gates.clear();
-    sh.lastWeather.clear();
     sh.tags.clear();
     sh.pupReports.clear();
     sh.carReports.clear();
@@ -1942,7 +1903,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     PlayerState local;
     bool send = false;
     double sampleAt = 0;
-    std::vector<std::string> parked, env, hits;
+    std::vector<std::string> parked, hits;
     bool sendModel = false;
     std::string modelLook, modelWhy;
     int modelSteps = 0;
@@ -1956,7 +1917,6 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             sh.enterAt = Now();
         }
         parked.swap(sh.outParked);
-        env.swap(sh.outEnv);
         hits.swap(sh.outHits);
         sh.aimDown = aimDown && active;
         if (active != sh.active) {
@@ -2057,14 +2017,6 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         if (active && WriteParked(pw, line)) {
             _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
             MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
-        }
-    }
-    for (const std::string& line : env) {
-        net::ByteWriter ew(128);
-        if (active && WriteEnv(ew, line)) {
-            _session->Broadcast(kMsgWorldEnv, ew.Span(), net::Reliability::Reliable);
-            if (++_envSent <= 3 || _envSent % 100 == 0)
-                MC_LOG_INFO("sync: sent WorldEnv #%u (%s)", _envSent, line.c_str() + 3);
         }
     }
     for (const std::string& line : hits) {

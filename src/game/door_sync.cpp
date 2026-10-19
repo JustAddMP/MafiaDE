@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/trace.h"
 #include "game/door_model.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "net/wire.h"
 
@@ -192,6 +193,7 @@ void OnSnapshot(net::PlayerId from, net::ByteReader& r) {
         MC_LOG_WARN("doors: bad DoorSnapshot dropped");
         return;
     }
+    join::Mark(join::System::Doors);
     Shared& sh = S();
     size_t applied;
     {
