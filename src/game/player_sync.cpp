@@ -597,13 +597,16 @@ PlayerState Present(const Remote& rem, double now) {
     }
     if ((s.flags & kInVehicle) && !s.model.empty()) {
         const replica::Out c = rem.track.Car(now);
-        if (c.valid) {
+        const PlayerState* ca = c.valid ? SnapAt(rem, c.fromT) : nullptr;
+        const PlayerState* cb = c.valid ? SnapAt(rem, c.toT) : nullptr;
+        const PlayerState* cn = c.u < 0.5f ? ca : cb;
+        // the car track is that of the car in this state (right after he changed cars the render time can still stand
+        // in the old one while the track already holds the new one: then the old car's own fields stay)
+        if (c.valid && cn && cn->keyOwner == s.keyOwner && cn->vehId == s.vehId) {
             s.cpos[0] = c.pos.x, s.cpos[1] = c.pos.y, s.cpos[2] = c.pos.z;
             s.cvel[0] = c.vel.x, s.cvel[1] = c.vel.y, s.cvel[2] = c.vel.z;
             if (c.hasRot)
                 for (int k = 0; k < 4; ++k) s.quat[k] = c.rot[k];
-            const PlayerState* ca = SnapAt(rem, c.fromT);
-            const PlayerState* cb = SnapAt(rem, c.toT);
             if (ca && cb && ca != cb && ca->ctlValid && cb->ctlValid) {
                 s.steer = Lerp(ca->steer, cb->steer, c.u);
                 s.power = Lerp(ca->power, cb->power, c.u);
