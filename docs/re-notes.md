@@ -654,6 +654,24 @@ Used by src/game/save_guard.cpp.
   story point, and the wrong-world load of the real story rewrote it). Since 0.9.1 save_guard redirects
   `aslot/bslot/cslot.pf` with the saves; checked byte-identical after a two-player Taxi session with a failed mission
   on each side.
+- **Profile files** (`Data\<steamid>\profiles\temporaryprofile\*.pf`, XML `C_SaveDataUnwrapped`, one save block
+  per file; block ids in the exe: GameSettings, GameInputModule, Profile_Language, Profile_VideoSettings,
+  Profile_AudioSettings, My2K_Game_Stats, map_filter, garage (C_GarageManager, `C_SaveBlockGarageManager`,
+  `S_SaveGarage`), Profile_Data_Storage_PersistantData; next to them `Saves\videoconfig.cfg` and
+  `Saves\launcconfig.cfg` (format strings `%s%s\%s\Saves\videoconfig.cfg`)). File APIs the exe imports: CreateFileA/W,
+  CreateFile2, DeleteFileA/W, CopyFileExA, CreateDirectoryA/W, WriteFile, SetEndOfFile, fopen, _wfopen; every save
+  and profile write logged so far came through CreateFileA (the W variants and fopen are not hooked: UNVERIFIED that
+  nothing writes a profile through them). Contents seen (2026-10-19): `garage.pf` 150 KB of `C_SaveBlockCar` (the
+  player's garage cars with colours), `my2k_game_stats.pf` `m_LockpickedCars`, `..._persistantdata.pf` a
+  `C_SaveBlockScriptDataStorage` (hashed script variables kept across saves; what they are is UNVERIFIED), the rest
+  settings. The 0.15.0 test (2026-10-18, CHAPTER 2 + 13) found `garage.pf` rewritten (different bytes) by host and
+  guest during the co-op chapter (`savesys: written: garage.pf`); `my2k_game_stats.pf` and the persistent data were
+  byte-identical afterwards. Since then save_guard (table in save_paths.h, tests/save_paths_test.cpp) redirects the
+  three progress files with the slots while blocking, and keeps a progress file it redirected held for the rest of
+  the process (`coop-saves\<pid>-held`): the profile is read at start, and whether a save load re-reads garage.pf is
+  UNVERIFIED, so the game's copy may still hold the co-op garage. Settings are left alone. Achievements are Steam
+  stats (no file). UNVERIFIED in game: that the garage stays byte-identical with the redirect, and whether the game
+  reads garage.pf back during the session (then it gets the scratch copy).
 - **Death or a failed mission in a replay-style load** [confirmed in game 2026-10-16]: leaving the mission area
   (Taxi cp_010, Omerta cp_020: "You abandoned the objective") makes the game load `freeroam_before_quest_activated`
   (slot 2, storage `aslot`) at once, with no fail screen: the free roam state from before the quest, i.e. the

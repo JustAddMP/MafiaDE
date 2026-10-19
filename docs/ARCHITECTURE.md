@@ -67,7 +67,9 @@ src/game/
                          summary) from core's message stamps; tests/latency_test.cpp (protocol.md "Latency budget")
   save_guard.{h,cpp}     save system: logs loads, the chapter loader's one-entry storage fix (reload crash), a
                          following guest's (and a CHAPTER host's) save files redirected to %TEMP% (their slots
-                         stay untouched)
+                         and progress profiles - garage, stats - stay untouched; settings are theirs)
+  save_paths.{h,cpp}     which save / profile file a co-op session may change (redirect, held, left alone);
+                         tests/save_paths_test.cpp
   menu.{h,cpp}           phase 5: CO-OP entries in the game's Scaleform main/pause menus, using core's swf_patch;
                          the main menu's per-frame poll (live refresh, the lobby's Free Ride start)
 tests/                   our unit tests of game-free logic (car_swap_test.cpp); build.cmd builds them into out\,
