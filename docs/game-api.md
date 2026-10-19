@@ -332,7 +332,7 @@ co-op damage uses (src/game/player_sync.lua "Damage between players"; message fl
 | `C_DamageMessage` getters | `GetEnemyGUID` (the attacker: the player for his bullets, the player for rams with the car he drives, the shooting NPC for `CreateShots` from an NPC), `GetDamageType` (0 SHOT, 9 SCRIPT, 11 COLLISION, 12 FALL), `GetDamageAmount` (10 for a pistol or Tommy gun bullet on an NPC; 0.02-0.8 per frame of car contact), `GetHitZone`, `GetWeaponID`, `GetCanHeadShot` |
 | `ON_BULLET_HIT` | sent to the **shooter**; `GetHitObject()` is the human or object hit (a bench: `lh_bench_a_v1_bv01_13`) |
 | player GUID | the local player is `C_EntityGuid: 24585` in every instance (the same entity id in each game) |
-| player melee (key **Q**: tap = light punch, hold about 1 s = charged punch; Counter = Left Alt; the default keys also include Stalk = X, Cover = Left Ctrl, Interact = E) | **Only outside safehouse zones** (below). The swing sends `MELEE_LIGHT_ATTACK` (458809) or `MELEE_HEAVY_ATTACK` (458810) to the attacker himself, `GetOpponentGUID()` = the human the game aimed it at (0 = none). If that is an NPC, about 0.2 s later the NPC gets DAMAGE type 3 (MELEE) with the attacker as enemy: 10 for a light, 36 for a charged punch (17 and 61 health off a puppet), plus MELEE_HIT_REACT (458814) and MELEE_END (458816). Six punches in a row on the same puppet all landed (no guard). **The game only targets humans with AI type 0** (`h:GetAIType()`): spawn profiles `characters/scotch/game/main/game_main_*` give 0; `characters/scotch/ai/ai_ally_*`, `visuals/hero/*`, `characters/game/hero/*` give 1, and a swing at those always has opponent 0 and hurts nobody, even standing right in front of it. `SetCivilArchetype`/`SetBattleArchetype` (decimal hash strings accepted) change the archetypes but not the AI type. The co-op glue (`M.MeleeTick`) therefore sends a Hit for a swing with opponent 0 when a puppet stands within 1.9 m in front of the player at the impact (0.25 s), and gives that puppet a `DoDamage(1)` flinch |
+| player melee (key **Q**: tap = light punch, hold about 1 s = charged punch; Counter = Left Alt; the default keys also include Stalk = X, Cover = Left Ctrl, Interact = E) | **Only outside safehouse zones** (below). The swing sends `MELEE_LIGHT_ATTACK` (458809) or `MELEE_HEAVY_ATTACK` (458810) to the attacker himself, `GetOpponentGUID()` = the human the game aimed it at (0 = none). If that is an NPC, about 0.2 s later the NPC gets DAMAGE type 3 (MELEE) with the attacker as enemy: 10 for a light, 36 for a charged punch (17 and 61 health off a puppet), plus MELEE_HIT_REACT (458814) and MELEE_END (458816). Six punches in a row on the same puppet all landed (no guard). **The game only targets humans with AI type 0** (`h:GetAIType()`): spawn profiles `characters/scotch/game/main/game_main_*` give 0; `characters/scotch/ai/ai_ally_*`, `visuals/hero/*`, `characters/game/hero/*` give 1, and a swing at those always has opponent 0 and hurts nobody, even standing right in front of it. `SetCivilArchetype`/`SetBattleArchetype` (decimal hash strings accepted) change the archetypes but not the AI type. The co-op glue (`M.MeleeTick`) therefore sends a Hit for a swing with opponent 0 when a puppet stands within 1.9 m in front of the player at the impact (0.25 s), and gives that puppet a `DoDamage(1)` flinch. Friend-brain puppets (AI type 1) get no DAMAGE from our bullets either; unreleased lock-on and shot hit test: section 17 "Shooting and punching a puppet" |
 | `h:DoDamage(n)` | one number. SCRIPT damage (type 9, attacker GUID 0, amount 0 in the message), self as sender. On the player: a short flinch and the red damage vignette; the game scales it (`p.health` 100 -> 93.5 for `DoDamage(10)`: 0.65 on this difficulty). A big value kills (YOU DIED) |
 | `game.shotmgr:CreateShots(shooter, from, to, weaponName, scatter, timeout, particle, sound)` | real bullets owned by `shooter`. `timeout` 0 = one shot, 1 = two or three (the weapon's rate over 1 s). Player as shooter: the target NPC gets SHOT damage with `GetEnemyGUID` = player, the zone where it hit and its own hit reaction. **NPC (puppet) as shooter at the player works**: the player gets a SHOT DAMAGE with `GetEnemyGUID` = that NPC and his real hit reaction (health 100 -> 74 for 10 damage: NPC bullets are scaled about 2.6x on the player). **Unreliable**: in some game instances every `CreateShots` call (any shooter, any target) did nothing for the whole run, in others it worked every time; not explained (not window focus, not the model swap, not old sync objects). The glue replays bullets with it and falls back to `DoDamage` when the replay did not land within 0.3 s |
 | `h.health` | health of the player and of NPCs; **writable on NPCs** (`so.health = 5000` sticks; `healthmax` stays 105), not on the player. A puppet knocked down by a car came back with `healthmax` 100 and health 100 |
@@ -877,6 +877,57 @@ Not carried yet (seen while looking, not cheap with this mechanism): takedowns w
 Thrown grenades and molotovs: their flight (a marker and trail drawn by our overlay) and their explosion and fire,
 section 23. Medkits, bodies, vaults, ladders, jumps and the sneak walk: "Traversal" below. Door kicks, the lock
 pull and doors opened by hand: section 21.
+
+**Shooting and punching a puppet (unreleased; static analysis 2026-10-19, NOT verified in game).** The 0.15.0
+two-PC test: the host fired about 20 shots at the guest's puppet and no Hit went out (no `we hit puppet` from a
+bullet), and every punch logged opponent `C_EntityGuid: 0` (damage only through the 1.9 m swing fallback, no
+lock-on). Both have the same cause: every puppet gets the FRIEND brain (`SwitchBrain(1)`, section 18, `M.Ally`), which
+makes it AI type 1, the player's own side. What the exe says about sides:
+
+| address | what | notes |
+|---|---|---|
+| 0x2BA2470 | `GetAIType` native | `[[ai] + 0x298]`: the AI type (the binding 0x23B34A0 reads it through the human's AI at `+0x130`) |
+| 0x25E0700 | "is friend" (a, b) | `a +0x1FD` set (MimicFriend) -> true; else both AI types are mapped to a faction (type 0 -> 3, 1 -> 0, 2 -> 1, 4 -> 2, 17 -> 3, others none) and a float table (0x2496130, presumably `config/game/faction_definitions`) is read at [faction a][faction b]: true when > 0. 12 callers |
+| 0x24AFB90 | "is enemy" (a, b) | the same lookup: true when < 0; `+0x1FD` set -> false. 34 callers, one of them the hit-marker code (`enable_hit_marker`, 0x2C0A9B0) |
+| 0x23B3340 | `MimicFriend(bool)` binding | writes byte `+0x1FD` of the human's AI (0x2B98730): the human then reads as a friend to everyone (the opposite of what we need) |
+
+So a friend-brain puppet is in the player's faction (both AI type 1): the game's melee targeting (only AI type 0
+humans, section 11) and its damage of player bullets skip it. Which caller is the bullet filter and which the melee
+target picker was not found statically (UNVERIFIED that they use 0x25E0700). Options that were weighed:
+
+- **A non-ally brain or AI type on foot** (friend brain only for car seats): no. Brain switches are what crashed the
+  game before the game-sectors guard (section 15), the seat fix needs the friend brain before every seat, and the
+  host's enemies only target the puppet because of it (`enemies_target_guests`). Switching back and forth would bring
+  those problems back. Not done.
+- **MimicFriend / a per-entity "can be targeted" flag**: there is no such flag in the human bindings
+  (re2/human_methods.txt: `SetVisibleByPlayerAim` / `IsVisibleByPlayerAim` exist, by name about the aim assist, not
+  looked into; UNVERIFIED); MimicFriend makes a human more friendly, not less.
+- **A hostile relationship to the local player only**: possible natively (a hook on 0x25E0700 answering "not a
+  friend" for the pair (our player, a puppet) only; enemies keep their relation to the puppet). Not done: a hook on a
+  hot AI function with 12 callers, all unverified, and the friend brain's own decisions use the same function.
+  Kept as the next step if the fallbacks below are not good enough.
+- **Our own hit test** (done): the mod decides what we hit, the game's own word first.
+
+What the glue does (src/game/pvp_hit.h, unit-tested by tests/pvp_hit_test.cpp; player_sync.lua M.ShotFired /
+M.ShotTick / M.MeleeLock / M.MeleeTick):
+
+| step | what | notes |
+|---|---|---|
+| a shot | `countShots` (an ammo drop of the weapon in hand) | the camera's position and direction (`GetPlayerCamera():GetPos()/GetDir()`, the crosshair ray) are tested at once against each puppet's body: a vertical capsule of 0.35 m radius from the feet to 0.15 m above the head bone (`GetBonePos("Head")`, else 1.62 m), up to 150 m (`mc_pvp_ray`); the nearest one hit; the zone from the height (head, body, lower body, leg). A wall: `mc_raycast` from the camera to 0.6 m before the puppet (a hit next to our own player does not count, as for the name tags) |
+| 0.3 s later | the verdict (`mc_pvp_verdict`) | 1. the game's own DAMAGE of our bullet on a puppet within -0.2..+0.3 s of the shot: the Hit was already sent (M.OnPuppetDamage), nothing more (a puppet whose brain switch is still to come, AI type 0, gets them); 2. an `ON_BULLET_HIT` to us naming a puppet: a Hit; 3. our ray hit, not blocked, the puppet alive, shown and on foot: a Hit. Each piece of evidence counts for one shot only |
+| self-check | `rep` | once the game reports our bullet on a **friend-brain** puppet (1 or 2), the ray alone no longer hits (`ray_unconfirmed`): the game's bullets (with their spread) decide from then on. Logged once |
+| the Hit | `M.SendHit(pp, amount, 0 = SHOT, zone, weapon id)` | the amount: what our bullets of that weapon did to any human this session (learned from our DAMAGE events), else 10 (pistol, revolver, SMG; measured), 30 shotgun, 25 rifle, 12 MG (guessed). The victim's game replays it as a real bullet from our puppet (section 11), so his game's own damage and hit reaction apply. The puppet here gets `DoDamage(1)` for a flinch |
+| an orphan `ON_BULLET_HIT` | 0.6 s with no counted shot | a Hit by itself (`bullet_alone`), unless the game's DAMAGE came with it |
+| a punch | `M.MeleeLock` at the swing message | only when the game aimed it at no puppet; the nearest puppet within 2.6 m and 70 degrees of our facing (else of the camera's direction) is locked: our player is turned to it (`p:SetDir`, UNVERIFIED that the player's melee keeps it); at the impact (0.25 s) it is hit within 2.3 m and 60 degrees, else the plain swing test (1.9 m, 45 degrees) |
+| friendly fire | `friendly_fire` (CO-OP SETTINGS, each player's own ini) | off: no shot or punch of ours becomes a Hit (verdict `off`), and Hits from others are not applied (as before) |
+
+Unchanged on purpose: the puppet's brain, its AI type and its seats; the map marker's wait for the brain switch
+(brainPending) and the script control gate (nothing here touches the puppet's AI: `SetDir` is on our own player).
+Logs: `our bullet on puppet N: the game's DAMAGE / ON_BULLET_HIT`, `our shot (...) at puppet N: <verdict>`,
+`our light punch: locked on to puppet N (...): turned to it (SetDir ok)`, `lock-on on puppet N at the impact: X degrees
+off our facing ...: the turn took / did NOT take`; trace `PV` / `PVM` (docs/sync-trace.md).
+UNVERIFIED: whether `ON_BULLET_HIT` comes for a friend, whether the camera ray matches where the bullets go (spread,
+hip fire, the muzzle offset), whether `SetDir` turns the player during a swing, the non-pistol damage values.
 
 ### Traversal: jumps, vaults, ledges, drops, ladders, cover slides, sneaking, bodies, medkits - static only, NOT verified in game
 

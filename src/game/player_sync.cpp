@@ -15,6 +15,7 @@
 #include "game/lua.h"
 #include "game/map_markers.h"
 #include "game/model_change.h"
+#include "game/pvp_hit.h"
 #include "game/peer_pause.h"
 #include "game/seats.h"
 #include "mc/core_version.h"
@@ -1446,6 +1447,89 @@ int McPeerQuiet(lua_State* L) {
     return 1;
 }
 
+// ---- player-versus-player hits on puppets (game/pvp_hit.h; player_sync.lua M.ShotTick / M.MeleeTick) ----
+// Bodies are passed as flat numbers after the fixed arguments; GameMainThread only.
+std::vector<pvphit::Body> PvpBodies(lua_State* L, int first, int per) {
+    std::vector<pvphit::Body> out;
+    const int top = lua::GetTop(L);
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    for (int i = first; i + per - 1 <= top && out.size() < 16; i += per) {
+        pvphit::Body b;
+        b.feet = {num(i), num(i + 1), num(i + 2)};
+        b.headZ = per >= 4 ? num(i + 3) : 0.0f;
+        out.push_back(b);
+    }
+    return out;
+}
+
+// mc_pvp_ray(ox, oy, oz, dx, dy, dz, [fx, fy, fz, headZ]...) -> index (1-based) or nil, t, zone, miss: the nearest
+// puppet body our shot's aim ray hits.
+int McPvpRay(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const pvphit::Vec3 o{num(1), num(2), num(3)}, d{num(4), num(5), num(6)};
+    const std::vector<pvphit::Body> bodies = PvpBodies(L, 7, 4);
+    pvphit::RayHit h;
+    const int i = pvphit::PickShot(o, d, bodies, &h);
+    if (i < 0) {
+        lua::PushNil(L);
+        return 1;
+    }
+    lua::PushNumber(L, static_cast<float>(i + 1));
+    lua::PushNumber(L, h.t);
+    lua::PushNumber(L, static_cast<float>(h.zone));
+    lua::PushNumber(L, h.miss);
+    return 4;
+}
+
+// mc_pvp_melee(mode, mx, my, mz, fx, fy, [x, y, z]...) -> index (1-based) or nil: the puppet our swing goes to. mode
+// "swing" (1.9 m, 45 degrees), "lock" (lock-on: 2.6 m, 70 degrees), "locked" (the locked one at the impact: 2.3 m,
+// 60 degrees).
+int McPvpMelee(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const char* mode = lua::TypeOf(L, 1) == lua::TString ? lua::ToString(L, 1) : "swing";
+    float reach = pvphit::kSwingReach, cosMin = pvphit::kSwingCos;
+    if (mode && std::strcmp(mode, "lock") == 0) reach = pvphit::kLockReach, cosMin = pvphit::kLockCos;
+    if (mode && std::strcmp(mode, "locked") == 0) reach = pvphit::kLockHitReach, cosMin = pvphit::kLockHitCos;
+    const std::vector<pvphit::Body> bodies = PvpBodies(L, 7, 3);
+    const int i = pvphit::PickMelee({num(2), num(3), num(4)}, num(5), num(6), bodies, reach, cosMin);
+    if (i < 0)
+        lua::PushNil(L);
+    else
+        lua::PushNumber(L, static_cast<float>(i + 1));
+    return 1;
+}
+
+// mc_pvp_verdict(friendlyFire, gameDamage, bulletEvent, rayHit, blocked, hittable, gameReports) -> name, sendsHit
+// (flags 1/0): what one of our shots did.
+int McPvpVerdict(lua_State* L) {
+    auto flag = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber && lua::ToNumber(L, i) != 0.0f; };
+    pvphit::ShotInput in;
+    in.friendlyFire = flag(1);
+    in.gameDamage = flag(2);
+    in.bulletEvent = flag(3);
+    in.rayHit = flag(4);
+    in.blocked = flag(5);
+    in.hittable = flag(6);
+    in.gameReports = flag(7);
+    const pvphit::Verdict v = pvphit::Resolve(in);
+    lua::PushString(L, pvphit::VerdictName(v));
+    lua::PushBool(L, pvphit::SendsHit(v));
+    return 2;
+}
+
+// mc_pvp_damage(weaponName) -> the DAMAGE amount one bullet of it does to an NPC (default table)
+int McPvpDamage(lua_State* L) {
+    lua::PushNumber(L, pvphit::BulletDamage(lua::TypeOf(L, 1) == lua::TString ? lua::ToString(L, 1) : nullptr));
+    return 1;
+}
+
+// mc_pvp_evidence(shotT, evidenceT) -> bool: may the game's message at evidenceT belong to the shot seen at shotT
+int McPvpEvidence(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : -1000.0f; };
+    lua::PushBool(L, pvphit::EvidenceMatches(num(1), num(2)));
+    return 1;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1479,6 +1563,11 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_car_speed_arg", &McCarSpeedArg);
     lua::RegisterGlobal(L, "mc_car_speed_ms", &McCarSpeedMs);
     lua::RegisterGlobal(L, "mc_peer_quiet", &McPeerQuiet);
+    lua::RegisterGlobal(L, "mc_pvp_ray", &McPvpRay);
+    lua::RegisterGlobal(L, "mc_pvp_melee", &McPvpMelee);
+    lua::RegisterGlobal(L, "mc_pvp_verdict", &McPvpVerdict);
+    lua::RegisterGlobal(L, "mc_pvp_damage", &McPvpDamage);
+    lua::RegisterGlobal(L, "mc_pvp_evidence", &McPvpEvidence);
     return true;
 }
 
