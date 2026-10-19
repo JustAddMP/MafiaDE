@@ -595,6 +595,28 @@ void GuestTraffic::Gone(uint16_t net) {
 void GuestTraffic::Clear() {
     cars_.clear();
     pendingRemove_.clear();
+    hostPaused_ = false;
+    quietUntil_ = -1e9;
+    lastTickAt_ = -1;
+    stats_.frozen = false;
+}
+
+void GuestTraffic::SetHostPaused(bool paused, double now) {
+    if (paused == hostPaused_) return;
+    hostPaused_ = paused;
+    stats_.frozen = paused;
+    if (paused) {
+        ++stats_.pauses;
+        for (auto& [net, c] : cars_) c.frozen = false;  // each copy takes its pose at its next tick
+        return;
+    }
+    quietUntil_ = std::max(quietUntil_, now + cfg_.quietAfter);
+    for (auto& [net, c] : cars_) {
+        c.frozen = false;
+        c.lastRecv = std::max(c.lastRecv, now);  // no state came while he was paused: not stale for that
+        c.lastErr = 1e9f;                        // no knock before the copy was seen on its target again
+        c.vc.Reset();                            // it stood on purpose: no "too slow" verdict carried over
+    }
 }
 
 bool GuestTraffic::Present(const Car& c, double now, CarState& out) const {
@@ -672,6 +694,13 @@ bool GuestTraffic::CopyInfo(uint16_t net, float& err, bool& pinned, int& pins) c
 void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::vector<GuestBump>& bumps) {
     out.clear();
     bumps.clear();
+    if (lastTickAt_ > 0 && now - lastTickAt_ > cfg_.localGap) {
+        // our own game stood (paused, loading): the copies were left behind while the host's cars drove on
+        ++stats_.localGaps;
+        quietUntil_ = std::max(quietUntil_, now + cfg_.quietAfter);
+        for (auto& [net, c] : cars_) c.lastErr = 1e9f;
+    }
+    lastTickAt_ = now;
     playout_.Update(now);  // the copies' render clock toward the adaptive delay
     auto drop = [&out](uint16_t net, bool grace) {
         GuestCmd c;
@@ -685,7 +714,7 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
     // lifetimes
     for (auto it = cars_.begin(); it != cars_.end();) {
         Car& c = it->second;
-        const double age = now - c.lastRecv;
+        const double age = hostPaused_ ? 0.0 : now - c.lastRecv;  // a paused host sends nothing: not stale for that
         if (c.released) {
             if (age > cfg_.forget) {
                 it = cars_.erase(it);
@@ -779,6 +808,28 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
         cmd.type = GuestCmd::Type::Drive;
         cmd.net = net;
         if (!Present(c, now, cmd.target)) continue;
+        if (hostPaused_) {
+            // held where it stands (its last report, else its target), braked, no speed, every tick it is due
+            if (!c.frozen) {
+                c.frozen = true;
+                const bool fresh = now - c.repAt < cfg_.reportFresh;
+                c.frozenPos = fresh ? c.rep.pos : cmd.target.pos;
+                for (int k = 0; k < 4; ++k) c.frozenRot[k] = fresh ? c.rep.rot[k] : cmd.target.rot[k];
+            }
+            cmd.target.pos = c.frozenPos;
+            for (int k = 0; k < 4; ++k) cmd.target.rot[k] = c.frozenRot[k];
+            cmd.target.vel = {};
+            cmd.target.power = 0;
+            cmd.target.brake = 1;
+            cmd.target.flags = static_cast<uint8_t>((cmd.target.flags & ~kReverse) | kControls | kHandbrake);
+            cmd.vc = motion::VehicleCommand{};
+            cmd.vc.fix = motion::VehicleCommand::Fix::Pin;
+            for (int k = 0; k < 4; ++k) cmd.vc.rot[k] = c.frozenRot[k];
+            c.accDt = 0;
+            c.haveLast = false;
+            out.push_back(cmd);
+            continue;
+        }
         motion::VehicleInput vi;
         vi.target = cmd.target.pos;
         vi.targetVel = cmd.target.vel;
@@ -802,8 +853,12 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
         if (vi.haveCopy) {
             if (!vi.teleported && cmd.vc.error > cfg_.bumpError && c.lastErr < 1.0f && now - c.bumpAt > cfg_.bumpEvery) {
                 c.bumpAt = now;
-                bumps.push_back({net, cmd.vc.error, cmd.vc.cspeed, cmd.vc.tspeed});
-                ++stats_.bumps;
+                if (now < quietUntil_) {
+                    ++stats_.quietBumps;  // the host's pause or ours: not a knock (put back all the same)
+                } else {
+                    bumps.push_back({net, cmd.vc.error, cmd.vc.cspeed, cmd.vc.tspeed});
+                    ++stats_.bumps;
+                }
             }
             c.lastErr = cmd.vc.error;
             sumErr += cmd.vc.error;

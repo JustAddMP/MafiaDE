@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/trace.h"
 #include "game/lua.h"
+#include "game/peer_pause.h"
 #include "game/traffic_model.h"
 #include "net/wire.h"
 
@@ -233,11 +234,11 @@ void GuestTrace(Shared& sh, double now) {
     const GuestStats& st = sh.guest.Stats();
     core::trace::Line("TRG",
                       "mode=%d known=%u live=%u copies=%u avg=%.2f max=%.2f pins=%u snaps=%u bumps=%u states=%llu "
-                      "spawns=%llu despawns=%llu old=%llu",
+                      "spawns=%llu despawns=%llu old=%llu frozen=%d quiet=%u",
                       sh.guest.HostMode() ? 1 : 0, st.known, st.live, st.copies, st.avgErr, st.maxErr, st.pins,
                       st.snaps, st.bumps, static_cast<unsigned long long>(st.states),
                       static_cast<unsigned long long>(st.spawns), static_cast<unsigned long long>(st.despawns),
-                      static_cast<unsigned long long>(st.dropsOld));
+                      static_cast<unsigned long long>(st.dropsOld), st.frozen ? 1 : 0, st.quietBumps);
     for (const auto& [net, rep] : sh.reports) {
         float err = 0;
         bool pinned = false;
@@ -269,7 +270,24 @@ void MainTick(lua_State* L, float dt) {
         if (active && !host) {
             std::vector<GuestCmd> list;
             std::vector<GuestBump> bumps;
+            // the host's pause (PeerPaused, game/peer_pause.h): his traffic copies are held, no knocks reported
+            const bool hostPaused = peer_pause::Remote(0, now) == peer_pause::Quiet::Paused;
+            if (hostPaused != sh.guest.HostPaused()) {
+                const uint32_t quiet0 = sh.guest.Stats().quietBumps;
+                sh.guest.SetHostPaused(hostPaused, now);
+                MC_LOG_INFO("traffic: the host %s: %u copies of his cars %s (knocks not reported so far: %u)",
+                            hostPaused ? "paused his game" : "resumed his game", sh.guest.Stats().copies,
+                            hostPaused ? "held where they stand" : "driven again, no knock reports for 1 s", quiet0);
+                core::trace::Line("TRZ", "ev=%s copies=%u quiet=%u", hostPaused ? "freeze" : "thaw",
+                                  sh.guest.Stats().copies, quiet0);
+            }
+            const uint32_t gaps0 = sh.guest.Stats().localGaps;
             sh.guest.Tick(now, dt, list, bumps);
+            if (sh.guest.Stats().localGaps != gaps0) {
+                MC_LOG_INFO("traffic: our own game stood for a while (paused or loading): no knock reports for 1 s");
+                core::trace::Line("TRZ", "ev=localgap copies=%u quiet=%u", sh.guest.Stats().copies,
+                                  sh.guest.Stats().quietBumps);
+            }
             cmds += sh.guest.HostMode() ? "M 1\n" : "M 0\n";
             AppendCommands(cmds, list);
             for (const auto& c : list)

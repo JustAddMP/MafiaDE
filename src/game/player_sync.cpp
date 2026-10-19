@@ -8,11 +8,13 @@
 #include "game/anim_methods.h"
 #include "game/car_signals.h"
 #include "game/car_swap.h"
+#include "game/car_units.h"
 #include "game/characters.h"
 #include "game/player_actions.h"
 #include "game/traversal.h"
 #include "game/lua.h"
 #include "game/map_markers.h"
+#include "game/peer_pause.h"
 #include "game/seats.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
@@ -145,6 +147,13 @@ struct Remote {
     uint8_t signals = 0;   // car signals of the car he drives, as last logged
     traversal::Catchup catchup;  // his puppet during and right after a traversal move (game/traversal.h)
     actions::Pose pose;          // his pose as last logged
+    // his game is paused (PeerPaused, game/peer_pause.h): his puppet and car copy are held where they stood
+    bool frozen = false;
+    double frozenAt = 0;
+    float frozenPos[3] = {};
+    float frozenHead[2] = {0, 1};
+    float frozenCpos[3] = {};
+    float frozenQuat[4] = {0, 0, 0, 1};
 };
 
 // Where the Lua glue last saw a puppet (on foot, visible: "PS") or the car copy a remote player drives ("VS").
@@ -219,6 +228,8 @@ uint32_t _envSent = 0;
 bool _haveActSeq = false;  // the action counter of the last state sent (player_actions.h), for the log
 uint8_t _lastActSeq = 0;
 uint32_t _actsSent = 0;
+peer_pause::LocalDetector _pause;  // our own game's pause (render thread)
+uint32_t _pauseMsgs = 0;
 
 // main-thread only
 bool _moduleLoaded = false;
@@ -642,6 +653,54 @@ void OnReport(Shared& sh, const std::string& line, double now) {
 
 constexpr double kReportFresh = 0.3;  // s: an older report means the copy is not being driven (hidden, gone)
 
+// His game is paused (PeerPaused, game/peer_pause.h): his puppet and the car copy he drives are held where they stand
+// here (taken from the copies' last reports, else from his last state), standing, the car braked. Under the lock.
+void Freeze(Shared& sh, net::PlayerId id, Remote& rem, PlayerState& s, double now) {
+    const bool inCar = (s.flags & kInVehicle) && !s.model.empty() && s.seat <= 3;
+    if (!rem.frozen) {
+        rem.frozen = true;
+        rem.frozenAt = now;
+        auto pr = sh.pupReports.find(id);
+        const bool pupFresh = pr != sh.pupReports.end() && now - pr->second.at < kReportFresh;
+        for (int k = 0; k < 3; ++k) rem.frozenPos[k] = pupFresh ? pr->second.pos[k] : s.pos[k];
+        for (int k = 0; k < 2; ++k) rem.frozenHead[k] = pupFresh ? pr->second.dir[k] : s.head[k];
+        char key[32] = "-";
+        if (inCar) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
+        auto cr = sh.carReports.find(id);
+        const bool carFresh = inCar && s.seat == 0 && cr != sh.carReports.end() && cr->second.key == key &&
+                              now - cr->second.at < kReportFresh;
+        for (int k = 0; k < 3; ++k) rem.frozenCpos[k] = carFresh ? cr->second.pos[k] : s.cpos[k];
+        for (int k = 0; k < 4; ++k) rem.frozenQuat[k] = carFresh ? cr->second.rot[k] : s.quat[k];
+        MC_LOG_INFO("sync: player %u's game is paused: his puppet%s held where %s here until he resumes", id,
+                    inCar && s.seat == 0 ? " and his car" : "", inCar && s.seat == 0 ? "they stand" : "it stands");
+        core::trace::Line("PAU", "id=%u ev=freeze car=%s pup=%d", id, inCar && s.seat == 0 ? key : "-",
+                          pupFresh ? 1 : 0);
+    }
+    for (int k = 0; k < 3; ++k) {
+        s.pos[k] = rem.frozenPos[k];
+        s.vel[k] = 0;
+        s.cpos[k] = rem.frozenCpos[k];
+        s.cvel[k] = 0;
+    }
+    s.head[0] = rem.frozenHead[0];
+    s.head[1] = rem.frozenHead[1];
+    for (int k = 0; k < 4; ++k) s.quat[k] = rem.frozenQuat[k];
+    s.mode = 0;
+    s.flags &= static_cast<uint8_t>(~(kSprint | kInAir));
+    s.power = 0;
+    s.brake = 1;
+    s.handbrake = 1;
+    s.ctlValid = true;
+}
+
+void Unfreeze(net::PlayerId id, Remote& rem, double now) {
+    rem.frozen = false;
+    rem.veh.Reset();  // its copy stood still on purpose: no "too slow" carried over
+    MC_LOG_INFO("sync: player %u's game runs again: his puppet and car follow him again (held %.1f s)", id,
+                now - rem.frozenAt);
+    core::trace::Line("PAU", "id=%u ev=thaw held=%.2f", id, now - rem.frozenAt);
+}
+
 // The commands for one remote player's puppet and car this tick (under the lock).
 void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState& s, float dt, double now,
                    motion::LocomotionCommand& lc, motion::VehicleCommand& vc) {
@@ -725,7 +784,15 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     for (int k = 0; k < 3; ++k) rem.lastCpos[k] = s.cpos[k];
     rem.haveCpos = inCar && s.seat == 0;
     vi.dt = dt;
-    vc = rem.veh.Update(vi);
+    if (rem.frozen && inCar && s.seat == 0) {
+        // his game is paused: the copy is held where it stood (Pin to the frozen pose, no speed, no controller: no
+        // pins counted, no "physics does not follow" verdict from a car that is meant to stand)
+        vc = motion::VehicleCommand{};
+        vc.fix = motion::VehicleCommand::Fix::Pin;
+        for (int k = 0; k < 4; ++k) vc.rot[k] = rem.frozenQuat[k];
+    } else {
+        vc = rem.veh.Update(vi);
+    }
     static const char* const kWhy[] = {"-", "too slow", "ran off", "stays off"};
     if (vc.justPinned)
         MC_LOG_INFO("sync: player %u's car %s: its physics does not follow here (%s: copy %.1f m/s, target %.1f m/s, "
@@ -777,6 +844,23 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         core::trace::Line("PAS", "id=%u key=%s rT=%.0f seat=%u cp=%.3f,%.3f,%.3f", id, key, rT, s.seat, s.cpos[0],
                           s.cpos[1], s.cpos[2]);
     }
+}
+
+// PeerPaused (0x0103) from another game: its pause or resume (game/peer_pause.h). Render thread.
+void OnPeerPaused(net::PlayerId from, net::ByteReader& r) {
+    peer_pause::Msg m;
+    if (!peer_pause::Read(r, m)) return;
+    const double now = Now();
+    if (!peer_pause::SetRemote(static_cast<uint8_t>(from), m.paused, now)) return;  // a repeat
+    if (m.paused)
+        MC_LOG_INFO("sync: player %u paused his game (%s, %.1f s so far): his puppet, his car and the copies of what "
+                    "his game runs are held here, no knock checks or pull-backs until %.1f s after he resumes",
+                    from, peer_pause::ReasonName(m.reason), m.pausedMs / 1000.0, peer_pause::kGrace);
+    else
+        MC_LOG_INFO("sync: player %u resumed his game after %.1f s: his copies move again (no knock checks for %.1f s)",
+                    from, m.pausedMs / 1000.0, peer_pause::kGrace);
+    core::trace::Line("PAU", "id=%u ev=%s reason=%u ms=%u", from, m.paused ? "paused" : "resumed",
+                      static_cast<unsigned>(m.reason), m.pausedMs);
 }
 
 // "o:g" -> car key; false for "-" or garbage.
@@ -1301,6 +1385,38 @@ int McAnimSc(lua_State* L) {
     return 1;
 }
 
+// mc_wheel(local, holder, driverHere, remote) -> "keep" / "yield": we read seat 0 of a car whose wheel `remote`'s
+// state claims too (game/seats.h LocalWheel; holder = the key's owner, driverHere = who drives it here, -1 nobody).
+int McWheel(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : -1.0f; };
+    auto id = [&num](int i) { return static_cast<uint8_t>(std::clamp(num(i), 0.0f, 255.0f)); };
+    const float here = num(3);
+    lua::PushString(L, seats::WheelName(seats::LocalWheel(id(1), id(2), here < 0 ? seats::kNobody
+                                                                                  : static_cast<int>(here), id(4))));
+    return 1;
+}
+
+// mc_car_speed_arg(vx, vy, vz, reverse) -> the number for SetSpeed (km/h, negative backwards; game/car_units.h);
+// mc_car_speed_ms(kmh) -> GetSpeedFloat's km/h as m/s.
+int McCarSpeedArg(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    lua::PushNumber(L, carunits::SetSpeedArg(num(1), num(2), num(3), num(4) != 0.0f));
+    return 1;
+}
+
+int McCarSpeedMs(lua_State* L) {
+    lua::PushNumber(L, carunits::SpeedFloatToMs(lua::TypeOf(L, 1) == lua::TNumber ? lua::ToNumber(L, 1) : 0.0f));
+    return 1;
+}
+
+// mc_peer_quiet(id) -> 0 none, 1 his game is paused, 2 it resumed less than a second ago (or ours did): no knock
+// checks or pull-backs of copies of his things (game/peer_pause.h).
+int McPeerQuiet(lua_State* L) {
+    const float id = lua::TypeOf(L, 1) == lua::TNumber ? lua::ToNumber(L, 1) : 0.0f;
+    lua::PushNumber(L, static_cast<float>(peer_pause::For(static_cast<uint8_t>(std::clamp(id, 0.0f, 255.0f)), Now())));
+    return 1;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1330,6 +1446,10 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_anim_report", &McAnimReport);
     lua::RegisterGlobal(L, "mc_anim_set", &McAnimSet);
     lua::RegisterGlobal(L, "mc_anim_sc", &McAnimSc);
+    lua::RegisterGlobal(L, "mc_wheel", &McWheel);
+    lua::RegisterGlobal(L, "mc_car_speed_arg", &McCarSpeedArg);
+    lua::RegisterGlobal(L, "mc_car_speed_ms", &McCarSpeedMs);
+    lua::RegisterGlobal(L, "mc_peer_quiet", &McPeerQuiet);
     return true;
 }
 
@@ -1383,7 +1503,11 @@ void MainTick(lua_State* L, float dt) {
             for (auto& [id, rem] : sh.remotes) {
                 if (rem.snaps.empty()) continue;
                 rem.playout.Update(now);  // the render clock toward its adaptive delay (net/playout.h)
-                const PlayerState s = Present(rem, now);
+                PlayerState s = Present(rem, now);
+                if (peer_pause::Remote(static_cast<uint8_t>(id), now) == peer_pause::Quiet::Paused)
+                    Freeze(sh, id, rem, s, now);
+                else if (rem.frozen)
+                    Unfreeze(id, rem, now);
                 motion::LocomotionCommand lc;
                 motion::VehicleCommand vc;
                 DriveCommands(sh, id, rem, s, dt, now, lc, vc);
@@ -1528,6 +1652,9 @@ void PlayerSync::Attach(net::Session& session) {
     session.On(kMsgWorldEnv, &OnWorldEnv);
     session.On(kMsgHit, &OnHit);
     session.On(kMsgPlayerModel, &OnPlayerModel);
+    session.On(peer_pause::kMsgPeerPaused, &OnPeerPaused);
+    peer_pause::ClearRemotes();
+    _pause.Reset();
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
@@ -1544,7 +1671,10 @@ void PlayerSync::Detach() {
         _session->Off(kMsgWorldEnv);
         _session->Off(kMsgHit);
         _session->Off(kMsgPlayerModel);
+        _session->Off(peer_pause::kMsgPeerPaused);
     }
+    peer_pause::ClearRemotes();
+    _pause.Reset();
     _session = nullptr;
     _seenPlayers.clear();
     Shared& sh = S();
@@ -1583,6 +1713,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.pupReports.erase(id);
     sh.carReports.erase(id);
     sh.removed.push_back(id);
+    peer_pause::RemoveRemote(static_cast<uint8_t>(id));
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
     core::trace::Line("PLX", "id=%u", id);
 }
@@ -1597,6 +1728,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     std::vector<std::string> parked, env, hits;
     bool sendModel = false;
     std::string modelLook;
+    bool pauseInWorld = false;
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -1663,6 +1795,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                 }
             }
         }
+        pauseInWorld = sh.inWorld;
         // trace: clock and link per remote player, once a second
         static double clockAt = 0;
         if (active && core::trace::IsOpen() && Now() - clockAt >= 1.0) {
@@ -1712,6 +1845,34 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
             _session->SendTo(victim, kMsgHit, hw.Span(), net::Reliability::Reliable);
             MC_LOG_INFO("sync: sent Hit to player %u (%s)", victim, line.c_str() + 3);
         }
+    }
+    // Our own pause (game/peer_pause.h): the game's script tick stopped (the pause menu, the CO-OP panel from it, a
+    // loading screen) or runs through TickPaused only. Everyone is told, on the change and every 2 s while it lasts.
+    if (active) {
+        const double pnow = Now();
+        const double last = lua::LastTickAt(), normal = lua::LastNormalTickAt();
+        const bool wasPaused = _pause.Paused();
+        peer_pause::Msg pm;
+        if (_pause.Update(pnow, last, normal + 0.05 < last, normal, pauseInWorld, pm)) {
+            net::ByteWriter pw(8);
+            peer_pause::Write(pw, pm);
+            _session->Broadcast(peer_pause::kMsgPeerPaused, pw.Span(), net::Reliability::Reliable);
+            ++_pauseMsgs;
+            if (!pm.paused) peer_pause::SetLocalResumed(pnow);
+            if (pm.paused != wasPaused) {
+                if (pm.paused)
+                    MC_LOG_INFO("sync: our game is paused (%s): told everyone (PeerPaused); they hold our puppet, our "
+                                "car and the copies of what our game runs", peer_pause::ReasonName(pm.reason));
+                else
+                    MC_LOG_INFO("sync: our game runs again after %.1f s: told everyone (no knock checks for %.1f s, "
+                                "here too)", pm.pausedMs / 1000.0, peer_pause::kGrace);
+            }
+            core::trace::Line("PAU", "id=%u ev=%s reason=%u ms=%u", _session->LocalId(),
+                              pm.paused ? (pm.paused != wasPaused ? "local-paused" : "local-repeat") : "local-resumed",
+                              static_cast<unsigned>(pm.reason), pm.pausedMs);
+        }
+    } else if (_pause.Paused()) {
+        _pause.Reset();
     }
     if (sendModel && active) {
         const std::string model = LocalModelSetting();

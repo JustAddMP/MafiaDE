@@ -52,6 +52,22 @@ std::vector<Claim> ParseClaims(const std::string& s) {
     return out;
 }
 
+uint8_t WheelKeeper(uint8_t holder, uint8_t a, uint8_t b) {
+    if (a == holder) return a;
+    if (b == holder) return b;
+    return a < b ? a : b;
+}
+
+const char* WheelName(Wheel w) { return w == Wheel::Keep ? "keep" : "yield"; }
+
+Wheel LocalWheel(uint8_t local, uint8_t holder, int driverHere, uint8_t remote) {
+    if (local == remote) return Wheel::Keep;  // not two players
+    // he drove it here and still says he does: the game slid us over, we did not take it
+    if (driverHere == remote) return Wheel::Yield;
+    // we drove it here first, nobody did, or a third player did: the same rule on both games
+    return WheelKeeper(holder, local, remote) == local ? Wheel::Keep : Wheel::Yield;
+}
+
 const char* PlaceName(Place p) {
     switch (p) {
         case Place::Wait: return "wait";

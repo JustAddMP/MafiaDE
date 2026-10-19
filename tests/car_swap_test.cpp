@@ -3,10 +3,12 @@
 // the CarParked, the local player in the copy, NPCs in it, the CarParked lost or before the exit, a destroyed car, a
 // copy that failed to spawn, a load while swapped, the real car gone, the session ending. Prints PASS/FAIL per
 // check; exits non-zero on any failure.
+#include <cmath>
 #include <cstdio>
 #include <string>
 
 #include "game/car_swap.h"
+#include "game/car_units.h"
 
 using namespace mc::game::carswap;
 
@@ -329,9 +331,37 @@ void TestTwoRemotePassengers() {
     Check(s.Run(3) == Action::Restore, "2 remote passengers: all out: restore");
 }
 
+// The game's car speed units (src/game/car_units.h): SetSpeed(number) takes km/h (the exe multiplies by 1 / 3.6),
+// GetSpeedFloat returns km/h. The 2026-10-19 two-PC test: copies got m/s and ran at 0.28 of their driver's speed.
+void TestSpeedUnits() {
+    namespace cu = mc::game::carunits;
+    auto near = [](float a, float b) { return std::fabs(a - b) < 1e-3f; };
+    // the probes of that test: wanted 9.10 m/s, got 2.53 after SetSpeed(9.10); 1.92 -> 0.53
+    Check(near(cu::SetSpeedArg(9.10f, 0, 0, false), 32.76f), "speed: 9.10 m/s -> SetSpeed(32.76) km/h");
+    const float game = cu::SetSpeedArg(9.10f, 0, 0, false) / 3.6f;  // what the exe makes of it (x 0.27777779)
+    Check(near(game, 9.10f), "speed: the game turns it back into 9.10 m/s");
+    const float before = 9.10f / 3.6f;  // the old call: SetSpeed(9.10)
+    Check(std::fabs(before - 2.53f) < 0.01f && std::fabs(before / 9.10f - 0.28f) < 0.005f,
+          "speed: the old call gave 2.53 m/s (0.28 x), as measured");
+    Check(near(cu::SetSpeedArg(3, 4, 0, false), 18.0f), "speed: the length of the velocity (5 m/s -> 18 km/h)");
+    Check(near(cu::SetSpeedArg(0, 0, 2, false), 7.2f), "speed: the vertical part counts too");
+    Check(near(cu::SetSpeedArg(5, 0, 0, true), -18.0f), "speed: reversing -> negative km/h");
+    Check(cu::SetSpeedArg(0, 0, 0, false) == 0.0f, "speed: standing -> 0");
+    Check(near(cu::SetSpeedArg(500, 0, 0, false), cu::kMaxMs * 3.6f), "speed: clamped at 120 m/s");
+    const float nan = std::nanf("");
+    Check(cu::SetSpeedArg(nan, 1, 0, false) == 0.0f, "speed: NaN -> 0");
+    Check(near(cu::SpeedFloatToMs(36.0f), 10.0f) && near(cu::SpeedFloatToMs(-36.0f), 10.0f),
+          "speed: GetSpeedFloat 36 km/h -> 10 m/s (unsigned)");
+    Check(cu::SpeedFloatToMs(nan) == 0.0f, "speed: GetSpeedFloat garbage -> 0");
+    // car_swap's still check is in m/s: a copy rolling at 1.5 km/h (0.42 m/s) is still, at 3 km/h (0.83 m/s) not
+    Check(cu::SpeedFloatToMs(1.5f) < kStillSpeed && cu::SpeedFloatToMs(3.0f) > kStillSpeed,
+          "speed: kStillSpeed compared in m/s, not km/h");
+}
+
 }  // namespace
 
 int main() {
+    TestSpeedUnits();
     TestHostParks();
     TestParkedBeforeExit();
     TestStaleParked();

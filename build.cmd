@@ -70,7 +70,7 @@ link %MC_LDFLAGS% /SUBSYSTEM:CONSOLE /OUT:"%OUT%\proxy_test.exe" /PDB:"%OUT%\pro
 if errorlevel 1 ( echo [build] ERROR: linking proxy_test.exe failed & goto :fail )
 
 rem the game-free parts of src\game the tests link (only what a test uses is pulled in)
-lib /NOLOGO /OUT:"%OBJ%\game_logic.lib" "%OBJ%\game\car_swap.obj" "%OBJ%\game\npc_owner.obj" "%OBJ%\game\traffic_model.obj" "%OBJ%\game\fail_flow.obj" "%OBJ%\game\map_markers.obj" "%OBJ%\game\world_items.obj" "%OBJ%\game\traversal.obj" "%OBJ%\game\door_model.obj" "%OBJ%\game\police_model.obj" "%OBJ%\game\explosion_model.obj" "%OBJ%\game\car_damage.obj" "%OBJ%\game\car_look.obj" "%OBJ%\game\seats.obj" "%OBJ%\game\latency.obj" "%OBJ%\game\throw_model.obj" "%OBJ%\game\save_paths.obj"
+lib /NOLOGO /OUT:"%OBJ%\game_logic.lib" "%OBJ%\game\car_swap.obj" "%OBJ%\game\npc_owner.obj" "%OBJ%\game\traffic_model.obj" "%OBJ%\game\fail_flow.obj" "%OBJ%\game\map_markers.obj" "%OBJ%\game\world_items.obj" "%OBJ%\game\traversal.obj" "%OBJ%\game\door_model.obj" "%OBJ%\game\police_model.obj" "%OBJ%\game\explosion_model.obj" "%OBJ%\game\car_damage.obj" "%OBJ%\game\car_look.obj" "%OBJ%\game\seats.obj" "%OBJ%\game\latency.obj" "%OBJ%\game\throw_model.obj" "%OBJ%\game\save_paths.obj" "%OBJ%\game\peer_pause.obj"
 if errorlevel 1 ( echo [build] ERROR: game_logic.lib failed & goto :fail )
 rem ---- our unit tests: every tests\*.cpp is one console exe (game-layer logic that needs no game) ----------------
 for %%f in ("%ROOT%\tests\*.cpp") do (

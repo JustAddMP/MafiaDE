@@ -38,6 +38,10 @@ bool Available();          // hooks installed and functions resolved
 bool Disabled();           // gave up after a fault
 uint32_t MainThreadId();   // 0 until the first script tick
 uint64_t TickCount();      // script ticks seen
+// QueryPerformanceCounter seconds of the game script machine's last tick (any kind) and of its last Tick (not
+// TickPaused); 0 = none yet. Any thread (game/peer_pause.h: a game whose tick stopped is paused).
+double LastTickAt();
+double LastNormalTickAt();
 
 // ---- render thread (or any thread) ----------------------------------------------------------------------------
 using Job = std::function<void(lua_State* L)>;

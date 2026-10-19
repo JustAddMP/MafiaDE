@@ -655,6 +655,127 @@ void TestHostThreeGuests() {
     Check(within, "3 guests: every guest within his own state budget");
 }
 
+float Dist3(const Vec3& a, const Vec3& b) {
+    return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+}
+
+// The host pauses his game (game/peer_pause.h; the 2026-10-19 two-PC test: 6-10 "knocked ... put back, reported to the
+// host" within 0.5 s after each of his pauses). A car at 10 m/s; 2 s of states, an 8 s pause without states, then
+// states again from where it stopped. The copy follows its target (reports on target) except where it is pushed.
+void TestHostPause() {
+    GuestTraffic g;
+    std::vector<GuestCmd> cmds;
+    std::vector<GuestBump> bumps;
+    g.OnSpawn(Spawn(1, 0, 0), 10.0);
+    g.SetLocal({0, 0, 0}, true, {0, 0, 0});
+    CopyReport rep;
+    auto onTarget = [&](double now, float push) {
+        CarState t;
+        if (!g.Target(1, now, t)) return;
+        rep.pos = {t.pos.x + push, t.pos.y, t.pos.z};
+        for (int k = 0; k < 4; ++k) rep.rot[k] = t.rot[k];
+        g.SetReport(1, rep, now);
+    };
+    size_t bumpsSeen = 0;
+    double t = 10.0;
+    for (; t < 12.0; t += 0.05) {
+        g.OnStates(static_cast<uint32_t>((t - 10.0) * 1000), {State(1, 10 * static_cast<float>(t - 10.0), 0, 10, 0)},
+                   t);
+        onTarget(t, 0);
+        g.Tick(t, 0.05f, cmds, bumps);
+        bumpsSeen += bumps.size();
+    }
+    Check(bumpsSeen == 0, "pause: driven on target before the pause");
+    const float stopX = 10 * static_cast<float>(t - 0.05 - 10.0);
+
+    // paused: no states for 8 s
+    g.SetHostPaused(true, t);
+    bool allPinned = true, stillHeld = true, anyDrive = false;
+    size_t removes = 0;
+    Vec3 held{};
+    bool haveHeld = false;
+    for (; t < 20.0; t += 0.05) {
+        g.Tick(t, 0.05f, cmds, bumps);
+        bumpsSeen += bumps.size();
+        removes += Count(cmds, GuestCmd::Type::Remove);
+        for (const auto& c : cmds) {
+            if (c.type != GuestCmd::Type::Drive) continue;
+            anyDrive = true;
+            if (c.vc.fix != net::motion::VehicleCommand::Fix::Pin || c.target.vel.x != 0 || c.target.power != 0 ||
+                c.target.brake != 1 || !(c.target.flags & kHandbrake))
+                allPinned = false;
+            if (!haveHeld) {
+                held = c.target.pos;
+                haveHeld = true;
+            } else if (Dist3(held, c.target.pos) > 1e-4f) {
+                stillHeld = false;
+            }
+            // the copy obeys, except for one push of 5 m in the middle of the pause
+            rep.pos = c.target.pos;
+            if (t > 15 && t < 15.06) rep.pos.x += 5;
+            g.SetReport(1, rep, t);
+        }
+    }
+    Check(anyDrive && allPinned, "pause: the copy is pinned, braked, without speed");
+    Check(stillHeld && haveHeld && std::fabs(held.x - stopX) < 3.5f, "pause: held where it stood",
+          Fmt("held %.2f, host stopped at %.2f", held.x, stopX));
+    Check(removes == 0, "pause: 8 s without states, the copy is not stale");
+    Check(bumpsSeen == 0, "pause: a push while paused is no knock report");
+    Check(g.HostPaused() && g.Stats().frozen, "pause: stats say frozen");
+
+    // resumed: the host's car goes on from where it stood (his clock ran on: host time + 8 s)
+    g.SetHostPaused(false, t);
+    const double resumeAt = t;
+    const double hostT0 = 2.0 + (t - 12.0);
+    const uint32_t quietBefore = g.Stats().quietBumps;
+    bool knockedQuiet = false, reportedEarly = false;
+    for (; t < resumeAt + 3.0; t += 0.05) {
+        const double since = t - resumeAt;
+        g.OnStates(static_cast<uint32_t>((hostT0 + since) * 1000),
+                   {State(1, stopX + 10 * static_cast<float>(since), 0, 10, 0)}, t);
+        // on target, but knocked 5 m in the first second (what the resume looked like in the test), and 2.8 s on
+        // (2 s after the first: one report per car every 2 s)
+        const bool knock = (since > 0.6 && since < 0.66) || (since > 2.8 && since < 2.86);
+        onTarget(t, knock ? 5.0f : 0.0f);
+        g.Tick(t, 0.05f, cmds, bumps);
+        if (since < 1.0) {
+            if (g.Stats().quietBumps > quietBefore) knockedQuiet = true;
+            if (!bumps.empty()) reportedEarly = true;
+        } else {
+            bumpsSeen += bumps.size();
+        }
+    }
+    Check(!reportedEarly, "resume: no knock reported in the first second");
+    Check(knockedQuiet, "resume: the knock in the first second is counted as quiet");
+    Check(bumpsSeen == 1, "resume: a knock after the grace is reported again", Fmt("%.0f", bumpsSeen));
+    Check(!g.HostPaused() && !g.Stats().frozen, "resume: not frozen");
+
+    // our own pause (a 1 s gap between our ticks): the copies were left behind, no knock reports for 1 s
+    GuestTraffic l;
+    l.OnSpawn(Spawn(1, 0, 0), 10.0);
+    l.SetLocal({0, 0, 0}, true, {0, 0, 0});
+    CopyReport lr;
+    auto lOn = [&](double now, float push) {
+        CarState tt;
+        if (!l.Target(1, now, tt)) return;
+        lr.pos = {tt.pos.x + push, tt.pos.y, tt.pos.z};
+        for (int k = 0; k < 4; ++k) lr.rot[k] = tt.rot[k];
+        l.SetReport(1, lr, now);
+    };
+    size_t lb = 0;
+    for (double u = 10.0; u < 14.0; u += 0.05) {
+        l.OnStates(static_cast<uint32_t>((u - 10.0) * 1000), {State(1, 10 * static_cast<float>(u - 10.0), 0, 10, 0)},
+                   u);
+        if (u > 12.0 && u < 13.0) continue;  // our game stood: no tick, no report
+        lOn(u, (u > 13.2 && u < 13.26) ? 5.0f : 0.0f);
+        l.Tick(u, 0.05f, cmds, bumps);
+        lb += bumps.size();
+    }
+    Check(l.Stats().localGaps == 1, "local pause: the tick gap is seen");
+    Check(lb == 0 && l.Stats().quietBumps >= 1, "local pause: the knock right after it is not reported",
+          Fmt("bumps %.0f quiet %.0f", lb, l.Stats().quietBumps));
+}
+
 }  // namespace
 
 int main() {
@@ -667,6 +788,7 @@ int main() {
     TestAdaptiveDelay();
     TestEndToEnd();
     TestHostThreeGuests();
+    TestHostPause();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

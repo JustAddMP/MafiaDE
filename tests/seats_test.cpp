@@ -231,9 +231,119 @@ void TestTwinAfterReload() {
           std::to_string(releasedAt));
 }
 
+// ---- one wheel, one driver (WheelKeeper / LocalWheel) ----
+void TestWheelRules() {
+    Check(WheelKeeper(1, 0, 1) == 1 && WheelKeeper(1, 1, 0) == 1, "wheel: the holder keeps it");
+    Check(WheelKeeper(3, 2, 1) == 1 && WheelKeeper(3, 1, 2) == 1, "wheel: neither holds it -> the lower id");
+    // 20:55:59: car 1:4746250 (holder 1); player 1 drove it on the host's game, the host's game slid the host over
+    Check(LocalWheel(0, 1, 1, 1) == Wheel::Yield, "wheel: test 20:55:59, the host was slid over -> he gives way");
+    // the same on a car the host holds: a slide is still no takeover
+    Check(LocalWheel(0, 0, 1, 1) == Wheel::Yield, "wheel: slid over in our own car -> we give way all the same");
+    // both took it before seeing each other (each game's driver so far: its own player, or nobody)
+    for (int holder = 0; holder < 4; ++holder) {
+        for (uint8_t a = 0; a < 4; ++a) {
+            for (uint8_t b = 0; b < 4; ++b) {
+                if (a == b) continue;
+                for (int ha : {static_cast<int>(a), kNobody}) {
+                    for (int hb : {static_cast<int>(b), kNobody}) {
+                        const Wheel wa = LocalWheel(a, static_cast<uint8_t>(holder), ha, b);
+                        const Wheel wb = LocalWheel(b, static_cast<uint8_t>(holder), hb, a);
+                        if ((wa == Wheel::Keep) == (wb == Wheel::Keep)) {
+                            Check(false, "wheel: a race ends with exactly one keeper",
+                                  "holder " + std::to_string(holder) + " players " + std::to_string(a) + "," +
+                                      std::to_string(b));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Check(true, "wheel: every race ends with exactly one keeper (holders 0-3, players 0-3)");
+    Check(LocalWheel(2, 0, 1, 2) == Wheel::Keep, "wheel: not two players -> keep");
+}
+
+// Two games, one car, ticks with one tick of network delay. Each game reads where its own player sits; a player who
+// reads seat 0 decides with LocalWheel when the other's last state claims the wheel too and then claims 0 or 9 (gives
+// way); a player who gave way is out of seat 0 `slideTicks` later (M.WheelTick's SlideToSeat). Returns the ticks in
+// which both games claimed the wheel, and who holds it at the end.
+struct WheelRun {
+    int bothClaimed = 0;
+    int driver = kNobody;  // the one who claims the wheel at the end (kNobody: none or both)
+    int yields[2] = {0, 0};
+};
+
+WheelRun RunWheel(uint8_t holder, int startDriver, int slidAt, int raceAt, int slideTicks = 3) {
+    WheelRun r;
+    int here[2] = {startDriver, startDriver};  // who drives the car on each game so far
+    int seatOf[2] = {startDriver == 0 ? 0 : 1, startDriver == 1 ? 0 : 1};
+    int sent[2] = {seatOf[0], seatOf[1]};  // the seat each game's last state claims
+    int movedAt[2] = {-1, -1};
+    for (int t = 0; t < 40; ++t) {
+        // the scenario: the game slides the passenger to the wheel (his driver's puppet left the seat there), or
+        // both players take the wheel in the same tick (a race)
+        for (int g = 0; g < 2; ++g) {
+            if (t == slidAt && g != startDriver) seatOf[g] = 0;
+            if (t == raceAt) seatOf[g] = 0;
+            if (movedAt[g] >= 0 && t >= movedAt[g]) {
+                seatOf[g] = 1;
+                movedAt[g] = -1;
+            }
+        }
+        int now[2];
+        for (int g = 0; g < 2; ++g) {
+            const int o = 1 - g;
+            const bool otherClaims = sent[o] == 0;
+            if (seatOf[g] != 0) {
+                now[g] = seatOf[g];
+                if (otherClaims) here[g] = o;
+                continue;
+            }
+            if (otherClaims &&
+                LocalWheel(static_cast<uint8_t>(g), holder, here[g], static_cast<uint8_t>(o)) == Wheel::Yield) {
+                now[g] = 9;
+                here[g] = o;
+                if (movedAt[g] < 0) {
+                    movedAt[g] = t + slideTicks;
+                    ++r.yields[g];
+                }
+            } else {
+                now[g] = 0;
+                here[g] = g;
+            }
+        }
+        if (now[0] == 0 && now[1] == 0) ++r.bothClaimed;
+        sent[0] = now[0];
+        sent[1] = now[1];
+    }
+    if ((sent[0] == 0) != (sent[1] == 0)) r.driver = sent[0] == 0 ? 0 : 1;
+    return r;
+}
+
+void TestWheelGames() {
+    // 20:55:59 / 21:02:20: player 1 drives his car 1:..., the host's game slides the host to the wheel
+    WheelRun a = RunWheel(1, 1, 5, -1);
+    Check(a.bothClaimed == 0 && a.driver == 1 && a.yields[0] == 1, "wheel games: slide -> the driver keeps it at once",
+          "both " + std::to_string(a.bothClaimed) + " driver " + std::to_string(a.driver));
+    // the same in a car the host holds
+    WheelRun b = RunWheel(0, 1, 5, -1);
+    Check(b.bothClaimed == 0 && b.driver == 1, "wheel games: slide in the passenger's own car -> the driver keeps it");
+    // a race (both take a free wheel in the same tick): one tick of two claims, then the holder's
+    WheelRun c = RunWheel(1, kNobody, -1, 5);
+    Check(c.bothClaimed == 1 && c.driver == 1 && c.yields[0] == 1 && c.yields[1] == 0,
+          "wheel games: race -> the holder keeps it after one tick",
+          "both " + std::to_string(c.bothClaimed) + " driver " + std::to_string(c.driver));
+    WheelRun d = RunWheel(3, kNobody, -1, 5);
+    Check(d.bothClaimed == 1 && d.driver == 0, "wheel games: race in a third player's car -> the lower id");
+    // before the fix both kept it ("drives it too; we keep it") for 100 s: here never more than one tick
+    Check(a.bothClaimed + b.bothClaimed + c.bothClaimed + d.bothClaimed <= 2, "wheel games: no lasting double driver");
+}
+
 }  // namespace
 
 int main() {
+    TestWheelRules();
+    TestWheelGames();
     TestRideSeat();
     TestYield();
     TestParse();
