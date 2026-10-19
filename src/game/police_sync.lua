@@ -14,9 +14,13 @@
 --     offence announced from a puppet that a cop witnesses becomes OUR player's zone (in-game test 2026-10-18: the
 --     host was wanted at the puppet's spot 12 s after AnnouncePoliceOffence). The "A" commands are only logged.
 --   - guest: while the host's police chase us, our game holds our wanted level at least at the chase's level
---     (ForceMinEscalationLevel) and starts a zone of its own here when the host's police see us and our game has none
---     (ZoneCreate on our own player); released when the chase is over. Far from the host nothing is touched: our own
---     police spawn and work as always (traffic_sync.lua switches our police spawning off only near the host).
+--     (ForceMinEscalationLevel), keeps our zone from decaying (PreventZonesDecay(true, follow): the game's decay timer
+--     is not counted down; follow: a red zone's centre follows us, as when our own police see us) and starts a zone of
+--     its own here when the host's police see us and our game has none, when our zone decays while they are on us, or
+--     when it decayed away while they were still on us (ZoneCreate on our own player); released when the chase is
+--     over (the decay goes on from where it stood: we still have to lose them). Never on the host: his zone is his.
+--     Far from the host nothing is touched: our own police spawn and work as always (traffic_sync.lua switches our
+--     police spawning off only near the host).
 -- traffic_sync.lua asks P.ChaseNear(x, y, z) for the sirens of police copies when a police car's siren cannot be read.
 --
 -- Input (cmds, one line per command):
@@ -24,7 +28,9 @@
 --   T id level hunt                host: our police take on guest `id`'s puppet (this tick's full list)
 --   A id level hunt                host: announce an offence from guest `id`'s puppet (once)
 --   F level                        guest: ForceMinEscalationLevel(level) (0 releases)
---   Z level hunt                   guest: ZoneCreate(our position, hunt and HUNT or SEARCH, level)
+--   Z level hunt why               guest: ZoneCreate(our position, hunt and HUNT or SEARCH, level); why 0 seen, 1 our
+--                                  zone decays, 2 it decayed (police_model.h ZoneWhy)
+--   D hold follow refresh          guest: PreventZonesDecay(hold, follow) (0 0 releases; refresh 1: set again, quiet)
 -- Output (events, one per line):
 --   PS flags level x y z           our state (5 times a second; flags: police_model.h Flags)
 --   PE NAME arg                    a police event of ours (police_model.h EventName)
@@ -81,6 +87,8 @@ local function bit(v, b) return math.floor(v / b) % 2 == 1 end
 P.evq = P.evq or {}          -- event lines queued by the callbacks, sent with the next update
 P.targets = P.targets or {}  -- host: guest id (string) -> { level, hunt, seen = { copId = t }, told = { copId = t }, ... }
 P.forced = P.forced or 0     -- guest: the level we hold (ForceMinEscalationLevel), 0 none
+P.held = P.held or false     -- guest: our zone's decay is held (PreventZonesDecay(true, ...))
+P.follow = P.follow or false -- guest: ... and a red zone follows us
 P.st = P.st or { flags = 0, level = 0, x = 0, y = 0, z = 0 }
 
 local function queue(name, arg)
@@ -388,20 +396,42 @@ function P.Force(level, why)
   if good then P.forced = level end
 end
 
-function P.Zone(p, level, hunt)
+-- The decay of our zone (docs/re-notes.md 10, PreventZonesDecay): hold = the game does not count our zone's decay
+-- timer down (and does not mark it decaying); follow = a red zone's centre is put where we are (the game does this
+-- itself while our own police see us). Module-wide, so it is released (false, false) when the chase is over and when
+-- the session ends. UNVERIFIED in game; a mission that holds the decay itself is released too.
+function P.Hold(hold, follow, refresh, why)
+  local good, err = pcall(game.police.PreventZonesDecay, game.police, hold and true or false, follow and true or false)
+  local changed = hold ~= P.held or follow ~= P.follow
+  if good then P.held, P.follow = hold, follow end
+  if changed or not good then
+    P.nHoldLogs = (P.nHoldLogs or 0) + 1
+    if not good or P.nHoldLogs <= 60 then
+      log(string.format("PreventZonesDecay(%s, %s) %s (%s)", tostring(hold), tostring(follow),
+        good and "ok" or ("FAILED " .. tostring(err)), why))
+    end
+  end
+  if refresh and not good then try("PreventZonesDecay", error, err) end
+end
+
+local ZONE_WHY = { [0] = "the host's police see us", [1] = "our zone decays while the host's police are on us",
+  [2] = "our zone decayed while the host's police are still on us" }
+
+function P.Zone(p, level, hunt, why)
   local q = p:GetPos()
   local zt = hunt and (enums.PoliceZoneType and enums.PoliceZoneType.HUNT or 1)
     or (enums.PoliceZoneType and enums.PoliceZoneType.SEARCH or 0)
   local good, err = pcall(game.police.ZoneCreate, game.police, q, zt, level)
-  log(string.format("ZoneCreate(here %.1f %.1f %.1f, %s, %d) %s: the host's police see us", q.x, q.y, q.z,
-    hunt and "HUNT" or "SEARCH", level, good and "ok" or ("FAILED " .. tostring(err))))
+  P.nZones = (P.nZones or 0) + 1
+  log(string.format("ZoneCreate(here %.1f %.1f %.1f, %s, %d) %s: %s", q.x, q.y, q.z,
+    hunt and "HUNT" or "SEARCH", level, good and "ok" or ("FAILED " .. tostring(err)), ZONE_WHY[why or 0] or "?"))
 end
 
 -- ---- update ----------------------------------------------------------------------------------------------------------
 function P.Update(dt, cmds)
   local ev = {}
   local isActive, host = false, false
-  local tl, ann, force, zones = {}, {}, nil, {}
+  local tl, ann, force, zones, hold = {}, {}, nil, {}, nil
   for line in string.gmatch(cmds or "", "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -415,19 +445,28 @@ function P.Update(dt, cmds)
     elseif c == "F" then
       force = tonumber(f[2]) or 0
     elseif c == "Z" then
-      zones[#zones + 1] = { tonumber(f[2]) or 1, f[3] == "1" }
+      zones[#zones + 1] = { tonumber(f[2]) or 1, f[3] == "1", tonumber(f[4]) or 0 }
+    elseif c == "D" then
+      hold = { f[2] == "1", f[3] == "1", f[4] == "1" }
     end
   end
   P.active, P.isHost = isActive, host
   local p = M.Player and M.Player() or nil
   if not isActive then
     if P.forced ~= 0 then P.Force(0, "the session ended") end
+    if P.held or P.follow then P.Hold(false, false, false, "the session ended") end
     for id, t in pairs(P.targets) do P.Release(id, t, "the session ended") end
     P.targets = {}
     P.evq = {}
     return ""
   end
   if force ~= nil then P.Force(force, force > 0 and "the host's police chase us" or "the host's police stopped") end
+  if hold ~= nil and not host then
+    P.Hold(hold[1], hold[2], hold[3], hold[1] and (hold[2] and "the host's police are on us and see us / are close"
+      or "the host's police are on us") or "the host's police are not on us any more")
+  elseif host and (P.held or P.follow) then
+    P.Hold(false, false, false, "we are the host now: our zone is our own")
+  end
   if not p then
     P.evq = {}
     if next(P.targets) then
@@ -447,10 +486,11 @@ function P.Update(dt, cmds)
       P.me = { x = q.x, y = q.y, z = q.z }
       if mc_trace and (s.flags ~= (P.trF or -1) or s.level ~= P.trL or (bit(s.flags, F_WANTED) and M.now - (P.trT or -10) >= 1)) then
         P.trF, P.trL, P.trT = s.flags, s.level, M.now
-        mc_trace("POL", string.format("f=%d w=%d hunt=%d lvl=%d seen=%d decay=%d fine=%d arrest=%d off=%d zone=%.1f,%.1f,%.1f p=%.1f,%.1f,%.1f",
+        mc_trace("POL", string.format("f=%d w=%d hunt=%d lvl=%d seen=%d decay=%d fine=%d arrest=%d off=%d zone=%.1f,%.1f,%.1f p=%.1f,%.1f,%.1f held=%d follow=%d forced=%d",
           s.flags, bit(s.flags, F_WANTED) and 1 or 0, bit(s.flags, F_HUNT) and 1 or 0, s.level,
           bit(s.flags, F_SEEN) and 1 or 0, bit(s.flags, F_DECAY) and 1 or 0, bit(s.flags, F_FINE) and 1 or 0,
-          bit(s.flags, F_ARREST) and 1 or 0, bit(s.flags, F_OFF) and 1 or 0, s.x, s.y, s.z, q.x, q.y, q.z))
+          bit(s.flags, F_ARREST) and 1 or 0, bit(s.flags, F_OFF) and 1 or 0, s.x, s.y, s.z, q.x, q.y, q.z,
+          P.held and 1 or 0, P.follow and 1 or 0, P.forced or 0))
       end
     elseif not good2 then
       log("read error: " .. tostring(s))
@@ -466,14 +506,16 @@ function P.Update(dt, cmds)
       for id, t in pairs(P.targets) do P.Release(id, t, "we are a guest now") end
       P.targets = {}
     end
-    for _, z in ipairs(zones) do pcall(P.Zone, p, z[1], z[2]) end
+    for _, z in ipairs(zones) do pcall(P.Zone, p, z[1], z[2], z[3]) end
   end
   if M.now - (P.stT or -10) >= 1 then
     P.stT = M.now
     local n = 0
     for _, _ in pairs(P.targets) do n = n + 1 end
-    ev[#ev + 1] = string.format("ST lua: %d events, %d announced, %d targets%s", P.nEvents or 0, P.nAnnounce or 0, n,
-      P.forced ~= 0 and (", level held " .. P.forced) or "")
+    ev[#ev + 1] = string.format("ST lua: %d events, %d announced, %d targets%s%s%s", P.nEvents or 0, P.nAnnounce or 0,
+      n, P.forced ~= 0 and (", level held " .. P.forced) or "",
+      P.held and (P.follow and ", decay held (zone follows us)" or ", decay held") or "",
+      (P.nZones or 0) > 0 and (", " .. P.nZones .. " zones started") or "")
   end
   return table.concat(ev, "\n")
 end

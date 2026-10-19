@@ -794,9 +794,14 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
   are near it (none for 3 s: an inactive PoliceChase, reliable). When he is no target any more the cops set on him
   `Forget` (not while the host himself is wanted).
 - **Guest:** while a PoliceChase says active (and for 4 s after it ended or went silent for 3 s), his game holds his
-  wanted level at least at the chase's level (`ForceMinEscalationLevel`; 0 releases it, also when the session ends);
-  when the host's police see him and his game has no zone, it starts one at his position (`ZoneCreate`, at most every
-  5 s). Far from the host no chase comes: his own police work as always (traffic sync turns his police spawning off
+  wanted level at least at the chase's level (`ForceMinEscalationLevel`; 0 releases it, also when the session ends)
+  and holds his zone's decay (`PreventZonesDecay(true, follow)`, follow: his red zone follows him while a host cop
+  saw his puppet or is within 40 m; released with `(false, false)`): his wanted state follows the host's chase and
+  no longer runs out after ~20 s while the host's cops are on him (0.15 test). When the host's police see him and his
+  game has no zone, it starts one at his position; when his zone decays or decayed away while host cops are near his
+  puppet, it starts a fresh one (not after a fine, an arrest or his death, not with offences off) (`ZoneCreate`, at
+  most every 5 s). No wire change: all of this follows the existing PoliceChase (host-authoritative). The host's own
+  zone is never touched. Far from the host no chase comes: his own police work as always (traffic sync turns his police spawning off
   only near the host).
 - **Police copies** (traffic): the host reads the real siren / beacon of its police cars (`mc_car_signals`) for the
   copies' flag 2 (TrafficStates); the speed guess is only the fallback, now also "near a hunted player".

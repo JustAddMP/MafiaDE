@@ -1,7 +1,8 @@
 // police_test: unit tests for the police sync model (src/game/police_model.h): the wire format of PoliceState,
 // PoliceEvent and PoliceChase, the Lua state line, when our own state is sent, the host's targets (a wanted guest near
 // the host, hysteresis, release hold, offences announced, chase messages) and the guest's answer to a chase (wanted
-// level held, own zone started, released). Prints PASS/FAIL per check; exits non-zero on any failure.
+// level held, own zone started, released) and the guest's zone decay held while the host's police are on him (released
+// when the chase ends; a zone started again when it decays or decayed while they are still on him). Prints PASS/FAIL per check; exits non-zero on any failure.
 #include "game/police_model.h"
 
 #include <cmath>
@@ -48,6 +49,40 @@ const HostCmd* FindCmd(const std::vector<HostCmd>& v, HostCmd::Type t, uint8_t i
     for (const auto& c : v)
         if (c.type == t && c.id == id) return &c;
     return nullptr;
+}
+
+int CountG(const std::vector<GuestCmd>& v, GuestCmd::Type t) {
+    int n = 0;
+    for (const auto& c : v)
+        if (c.type == t) ++n;
+    return n;
+}
+
+const GuestCmd* FindG(const std::vector<GuestCmd>& v, GuestCmd::Type t) {
+    for (const auto& c : v)
+        if (c.type == t) return &c;
+    return nullptr;
+}
+
+// no ForceMin and no Zone (Hold refreshes may be there)
+bool NoLevelOrZone(const std::vector<GuestCmd>& v) {
+    return CountG(v, GuestCmd::Type::ForceMin) == 0 && CountG(v, GuestCmd::Type::Zone) == 0;
+}
+
+WantedState Decaying(WantedState s) {
+    s.flags |= kDecaying;
+    return s;
+}
+
+Chase OnUs(uint8_t level, bool hunt, uint8_t cops, uint8_t seers, float nearest) {
+    Chase c;
+    c.active = true;
+    c.hunt = hunt;
+    c.level = level;
+    c.cops = cops;
+    c.seers = seers;
+    c.nearest = nearest;
+    return c;
 }
 
 void TestWire() {
@@ -383,7 +418,7 @@ void TestGuest() {
     double t = 50;
     g.SetLocal(Clean());
     g.Tick(t, out);
-    Check(out.empty() && g.Forced() == 0, "guest: nothing without a chase");
+    Check(out.empty() && g.Forced() == 0 && !g.Held(), "guest: nothing without a chase");
     Chase c;
     c.active = true;
     c.hunt = true;
@@ -392,42 +427,55 @@ void TestGuest() {
     c.seers = 0;
     g.OnChase(c, t);
     g.Tick(t, out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::ForceMin && out[0].level == 2 && g.Forced() == 2,
-          "guest: chase -> level held");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        Check(f && f->level == 2 && g.Forced() == 2 && CountG(out, GuestCmd::Type::Zone) == 0,
+              "guest: chase -> level held");
+    }
     out.clear();
     g.Tick(t + 0.1, out);
     Check(out.empty(), "guest: held once");
     // they see us and our game has no zone: one zone, then not again before kZoneRetry
     c.seers = 1;
     g.OnChase(c, t + 0.5);
+    out.clear();
     g.Tick(t + 0.5, out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::Zone && out[0].hunt && out[0].level == 2,
-          "guest: seen, no zone -> zone");
+    {
+        const GuestCmd* z = FindG(out, GuestCmd::Type::Zone);
+        Check(CountG(out, GuestCmd::Type::Zone) == 1 && z->hunt && z->level == 2 && z->why == ZoneWhy::Seen &&
+                  CountG(out, GuestCmd::Type::ForceMin) == 0,
+              "guest: seen, no zone -> zone");
+    }
     out.clear();
     g.OnChase(c, t + 1);
     g.Tick(t + 1, out);
-    Check(out.empty(), "guest: zone not again soon");
+    Check(CountG(out, GuestCmd::Type::Zone) == 0, "guest: zone not again soon");
     g.SetLocal(Wanted(2, true));
     g.OnChase(c, t + 1 + kZoneRetry);
     out.clear();
     g.Tick(t + 1 + kZoneRetry, out);
-    Check(out.empty(), "guest: our game has a zone: none started");
+    Check(NoLevelOrZone(out), "guest: our game has a zone: none started");
     // level up
     c.level = 4;
     g.OnChase(c, t + 7);
     out.clear();
     g.Tick(t + 7, out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::ForceMin && out[0].level == 4, "guest: level up");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        Check(f && f->level == 4 && CountG(out, GuestCmd::Type::ForceMin) == 1, "guest: level up");
+    }
     // the chase ends: held kForceHold, then released
     Chase off;
     g.OnChase(off, t + 8);
     out.clear();
     g.Tick(t + 8, out);
-    Check(out.empty() && g.Forced() == 4, "guest: ended, still held");
+    Check(NoLevelOrZone(out) && g.Forced() == 4, "guest: ended, still held");
     out.clear();
     g.Tick(t + 7 + kForceHold + 0.1, out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::ForceMin && out[0].level == 0 && g.Forced() == 0,
-          "guest: released after the hold");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        Check(f && f->level == 0 && g.Forced() == 0, "guest: released after the hold");
+    }
     // the host goes silent mid-chase: stale -> released after the hold
     g.SetLocal(Clean());
     c.level = 1;
@@ -435,22 +483,29 @@ void TestGuest() {
     g.OnChase(c, t + 20);
     out.clear();
     g.Tick(t + 20, out);
-    Check(g.Forced() == 1, "guest: chased again");
+    Check(g.Forced() == 1 && CountG(out, GuestCmd::Type::Zone) == 0, "guest: chased again (clean, not seen: no zone)");
     out.clear();
     g.Tick(t + 20 + kChaseStale + 0.1, out);
-    Check(out.empty() && !g.Chased(t + 20 + kChaseStale + 0.1), "guest: stale chase, level still held");
+    Check(NoLevelOrZone(out) && !g.Chased(t + 20 + kChaseStale + 0.1), "guest: stale chase, level still held");
     out.clear();
     g.Tick(t + 20 + kChaseStale + kForceHold + 0.2, out);
-    Check(out.size() == 1 && out[0].level == 0, "guest: stale chase released");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        Check(f && f->level == 0, "guest: stale chase released");
+    }
     // session end while held
     g.OnChase(c, t + 40);
     out.clear();
     g.Tick(t + 40, out);
     out.clear();
     g.Reset(out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::ForceMin && out[0].level == 0 && g.Forced() == 0 &&
-              !g.Chased(t + 40),
-          "guest: reset releases");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(f && f->level == 0 && h && !h->hold && !h->follow && g.Forced() == 0 && !g.Held() &&
+                  !g.Chased(t + 40),
+              "guest: reset releases (level and decay)");
+    }
     out.clear();
     g.Reset(out);
     Check(out.empty(), "guest: reset with nothing held is quiet");
@@ -465,8 +520,239 @@ void TestGuest() {
     g.OnChase(z, t + 60);
     out.clear();
     g.Tick(t + 60, out);
-    Check(out.size() == 1 && out[0].type == GuestCmd::Type::ForceMin && out[0].level == 1,
-          "guest: level at least 1, no zone outside a world");
+    {
+        const GuestCmd* f = FindG(out, GuestCmd::Type::ForceMin);
+        Check(f && f->level == 1 && CountG(out, GuestCmd::Type::Zone) == 0,
+              "guest: level at least 1, no zone outside a world");
+    }
+}
+
+// The bug of the 0.15 test: the guest's own zone decayed in ~20 s while the host's police chased his puppet. Now his
+// zone's decay is held while the chase goes on and released when it ends.
+void TestGuestDecayHold() {
+    GuestPolice g;
+    std::vector<GuestCmd> out;
+    double t = 100;
+    g.SetLocal(Wanted(2, false));
+    g.Tick(t, out);
+    Check(out.empty() && !g.Held(), "decay: wanted on our own, no chase: our game decides");
+    // the host's police are near our puppet (2 cops, none saw it, 60 m): held, not following
+    g.OnChase(OnUs(2, false, 2, 0, 60), t + 1);
+    out.clear();
+    g.Tick(t + 1, out);
+    {
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(h && h->hold && !h->follow && !h->refresh && g.Held() && g.Holds() == 1, "decay: chase -> held");
+    }
+    out.clear();
+    g.OnChase(OnUs(2, false, 2, 0, 60), t + 1.5);
+    g.Tick(t + 1.5, out);
+    Check(CountG(out, GuestCmd::Type::Hold) == 0, "decay: held once (no repeat within kHoldRefresh)");
+    // 25 s of chase (the old decay time): the hold stays, set again every kHoldRefresh (quiet), never released
+    int refreshes = 0, releases = 0;
+    for (double s = 2; s <= 26; s += 0.5) {
+        g.OnChase(OnUs(2, false, 2, 0, 60), t + s);
+        out.clear();
+        g.Tick(t + s, out);
+        for (const auto& c : out)
+            if (c.type == GuestCmd::Type::Hold) {
+                if (c.hold && c.refresh) ++refreshes;
+                if (!c.hold) ++releases;
+            }
+    }
+    Check(g.Held() && releases == 0 && refreshes >= 10 && refreshes <= 13,
+          "decay: held for the whole chase, refreshed quietly", std::to_string(refreshes) + " refreshes");
+    // a hunt: a cop sees us -> the red zone follows us; he loses sight but one is close (30 m) -> still follows;
+    // only far ones (70 m) -> held, not following
+    g.SetLocal(Wanted(3, true));
+    g.OnChase(OnUs(3, true, 3, 1, 70), t + 27);
+    out.clear();
+    g.Tick(t + 27, out);
+    {
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(h && h->hold && h->follow && !h->refresh && g.Following(), "decay: hunt, seen -> zone follows us");
+    }
+    g.OnChase(OnUs(3, true, 3, 0, 30), t + 27.5);
+    out.clear();
+    g.Tick(t + 27.5, out);
+    Check(CountG(out, GuestCmd::Type::Hold) == 0 && g.Following(), "decay: hunt, a cop close -> still follows");
+    g.OnChase(OnUs(3, true, 3, 0, 70), t + 28);
+    out.clear();
+    g.Tick(t + 28, out);
+    {
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(h && h->hold && !h->follow && !h->refresh && !g.Following(), "decay: hunt, cops far -> held, no follow");
+    }
+    // a search (blue) zone of ours never follows, even when seen
+    g.SetLocal(Wanted(3, false));
+    g.OnChase(OnUs(3, true, 3, 2, 10), t + 29);
+    out.clear();
+    g.Tick(t + 29, out);
+    Check(!g.Following() && g.Held(), "decay: our zone is blue -> no follow");
+    // the chase ends (no cops near: the host sends inactive): held kForceHold more, then released once
+    g.OnChase(Chase{}, t + 30);
+    out.clear();
+    g.Tick(t + 30, out);
+    {
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(g.Held() && (!h || (h->hold && h->refresh)), "decay: chase ended, held a moment longer");
+    }
+    out.clear();
+    g.Tick(t + 29 + kForceHold + 0.1, out);
+    {
+        const GuestCmd* h = FindG(out, GuestCmd::Type::Hold);
+        Check(h && !h->hold && !h->follow && !h->refresh && !g.Held(), "decay: released when the chase really ended");
+    }
+    out.clear();
+    g.Tick(t + 40, out);
+    Check(out.empty(), "decay: released once, then quiet (our game decays as always)");
+    // the host goes silent mid-chase: released after kChaseStale + kForceHold
+    g.OnChase(OnUs(2, false, 1, 0, 50), t + 50);
+    out.clear();
+    g.Tick(t + 50, out);
+    Check(g.Held(), "decay: chased again -> held");
+    out.clear();
+    g.Tick(t + 50 + kChaseStale + 0.1, out);
+    Check(g.Held(), "decay: stale chase, still held");
+    out.clear();
+    g.Tick(t + 50 + kChaseStale + kForceHold + 0.2, out);
+    Check(!g.Held() && FindG(out, GuestCmd::Type::Hold) && !FindG(out, GuestCmd::Type::Hold)->hold,
+          "decay: stale chase released");
+}
+
+// Our zone decays or decayed away while the host's police are still on us: a fresh one here (once per decay; never
+// after a fine, an arrest or our death, never when offences are off, never without host cops near us).
+void TestGuestRefresh() {
+    std::vector<GuestCmd> out;
+    double t = 200;
+    {
+        GuestPolice g;
+        g.SetLocal(Decaying(Wanted(2, false)));
+        g.OnChase(OnUs(2, false, 2, 0, 50), t);
+        g.Tick(t, out);
+        const GuestCmd* z = FindG(out, GuestCmd::Type::Zone);
+        Check(z && z->why == ZoneWhy::Refresh && z->level == 2 && !z->hunt, "refresh: decaying while chased -> zone");
+        out.clear();
+        g.OnChase(OnUs(2, false, 2, 0, 50), t + kZoneRetry + 1);
+        g.Tick(t + kZoneRetry + 1, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "refresh: once per decay");
+        // the decay ended (fresh zone), then decays again: one more
+        g.SetLocal(Wanted(3, true));
+        g.OnChase(OnUs(2, false, 2, 0, 50), t + 13);
+        out.clear();
+        g.Tick(t + 13, out);
+        g.SetLocal(Decaying(Wanted(3, true)));
+        g.OnChase(OnUs(2, false, 2, 0, 50), t + 14);
+        out.clear();
+        g.Tick(t + 14, out);
+        const GuestCmd* z2 = FindG(out, GuestCmd::Type::Zone);
+        Check(z2 && z2->why == ZoneWhy::Refresh && z2->level == 3 && z2->hunt,
+              "refresh: a new decay -> again (our level and hunt kept)");
+    }
+    {
+        // decaying, but no host cop near our puppet: our game decides (no chase message is active without cops; a
+        // chase with cops 0 does not refresh either)
+        GuestPolice g;
+        g.SetLocal(Decaying(Wanted(2, false)));
+        g.OnChase(OnUs(2, false, 0, 0, 0), t);
+        out.clear();
+        g.Tick(t, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "refresh: no cops near -> none");
+        g.OnChase(Chase{}, t + 1);
+        out.clear();
+        g.Tick(t + 10, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "refresh: no chase -> none");
+    }
+    {
+        // offences off (a mission) or a fine going on: none
+        GuestPolice g;
+        WantedState s = Decaying(Wanted(2, false));
+        s.flags |= kOffencesOff;
+        g.SetLocal(s);
+        g.OnChase(OnUs(2, false, 2, 0, 50), t);
+        out.clear();
+        g.Tick(t, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "refresh: offences off -> none");
+        s = Decaying(Wanted(2, false));
+        s.flags |= kFining;
+        g.SetLocal(s);
+        g.OnChase(OnUs(2, false, 2, 0, 50), t + 6);
+        out.clear();
+        g.Tick(t + 6, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "refresh: being fined -> none");
+    }
+    {
+        // the zone decayed away (clean now) while they are still on us: started again at our level
+        GuestPolice g;
+        g.SetLocal(Wanted(3, true));
+        g.OnChase(OnUs(2, true, 2, 0, 60), t);
+        out.clear();
+        g.Tick(t, out);
+        g.SetLocal(Clean());
+        g.OnChase(OnUs(2, true, 2, 0, 60), t + 1);
+        out.clear();
+        g.Tick(t + 1, out);
+        const GuestCmd* z = FindG(out, GuestCmd::Type::Zone);
+        Check(z && z->why == ZoneWhy::Revive && z->level == 3 && z->hunt, "revive: decayed while chased -> zone again");
+        out.clear();
+        g.OnChase(OnUs(2, true, 2, 0, 60), t + 2);
+        g.Tick(t + 2, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "revive: not again before kZoneRetry");
+    }
+    {
+        // clean because we were fined / arrested / died: never started again
+        const Event ends[] = {Event::FineFinished, Event::Arrested, Event::PlayerDeath, Event::HumanArrested};
+        for (Event e : ends) {
+            GuestPolice g;
+            g.SetLocal(Wanted(2, false));
+            g.OnChase(OnUs(2, false, 2, 0, 60), t);
+            out.clear();
+            g.Tick(t, out);
+            g.OnOwnEvent(e, t + 0.5);
+            g.SetLocal(Clean());
+            g.OnChase(OnUs(2, false, 2, 0, 60), t + 1);
+            out.clear();
+            g.Tick(t + 1, out);
+            Check(CountG(out, GuestCmd::Type::Zone) == 0, (std::string("revive: not after ") + EventName(e)).c_str());
+        }
+        // the last wanted state said "being arrested": not either
+        GuestPolice g;
+        WantedState s = Wanted(2, false);
+        s.flags |= kArresting;
+        g.SetLocal(s);
+        g.OnChase(OnUs(2, false, 2, 0, 60), t);
+        out.clear();
+        g.Tick(t, out);
+        g.SetLocal(Clean());
+        g.OnChase(OnUs(2, false, 2, 0, 60), t + 1);
+        out.clear();
+        g.Tick(t + 1, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "revive: not when the last state was an arrest");
+    }
+    {
+        // clean through this whole chase (never wanted in it), not seen: no zone (we did nothing on our game)
+        GuestPolice g;
+        g.SetLocal(Clean());
+        g.OnChase(OnUs(2, false, 3, 0, 20), t);
+        out.clear();
+        g.Tick(t, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0 && g.Held(), "revive: never wanted in this chase -> none");
+        // a previous chase's wanted state does not count once that chase is over
+        GuestPolice h;
+        h.SetLocal(Wanted(2, false));
+        h.OnChase(OnUs(2, false, 2, 0, 60), t);
+        h.Tick(t, out);
+        h.OnChase(Chase{}, t + 1);
+        h.Tick(t + 1 + kForceHold + 0.1, out);  // the chase is fully over
+        h.SetLocal(Clean());
+        h.OnChase(OnUs(2, false, 2, 0, 60), t + 30);
+        out.clear();
+        h.Tick(t + 30, out);
+        Check(CountG(out, GuestCmd::Type::Zone) == 0, "revive: an old chase's wanted state does not count");
+    }
+    Check(std::string(ZoneWhyName(ZoneWhy::Seen)) == "seen" && std::string(ZoneWhyName(ZoneWhy::Refresh)) == "refresh" &&
+              std::string(ZoneWhyName(ZoneWhy::Revive)) == "revive",
+          "zone why names");
 }
 
 }  // namespace
@@ -480,6 +766,8 @@ int main() {
     TestHostRelease();
     TestHostChase();
     TestGuest();
+    TestGuestDecayHold();
+    TestGuestRefresh();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }
