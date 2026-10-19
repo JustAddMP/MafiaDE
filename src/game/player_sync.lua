@@ -510,6 +510,20 @@ function M.VehVel(ent, mc, st)
   return vx, vy, vz
 end
 
+-- A vehicle's rotation (GetRot, a quaternion); a bike whose entity has none: the yaw of `dir` (a unit vector in the
+-- ground plane, e.g. the rider's heading), logged once. Returns a value with .v.x .v.y .v.z .s.
+function M.RotOf(ent, dir)
+  local good, q = pcall(function() return ent:GetRot() end)
+  if good and q ~= nil then return q end
+  if not M.rotLogged then
+    M.rotLogged = true
+    log("vehicle " .. tostring(ent) .. ": no GetRot (" .. tostring(q) .. "): its rotation is taken from the heading")
+  end
+  local yaw = math.atan2(dir and dir.y or 1, dir and dir.x or 0)  -- the game's frame: forward is +y at yaw 0 (a guess)
+  local h = (yaw - math.pi / 2) / 2
+  return { v = { x = 0, y = 0, z = math.sin(h) }, s = math.cos(h) }
+end
+
 function M.VehSpeed(c)
   local good, sp = pcall(function() return c.ent:GetSpeedFloat() end)
   if good and tonumber(sp) then return tonumber(sp) end
@@ -923,7 +937,7 @@ function RV.Signals(st, ent, want)
 end
 
 function RV.Report(st, ent)
-  local p, q = ent:GetPos(), ent:GetRot()
+  local p, q = ent:GetPos(), M.RotOf(ent)
   local vx, vy, vz = M.VehVel(ent, st.mc, st)  -- GetSpeed; a bike without it: from its positions
   return string.format("%.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f", p.x, p.y, p.z, vx, vy, vz, q.v.x, q.v.y,
     q.v.z, q.s)
@@ -948,6 +962,21 @@ end
 
 -- (a copy held beside his car, c.aside, is put at that spot instead, with his car's rotation)
 local function setTransform(c)
+  if c.bike then  -- a bike: whatever its entity does not take is logged once, not an error every tick
+    local good, err = pcall(function()
+      local a = c.aside
+      c.ent:SetPos(a and V(a.x, a.y, a.z) or V(c.tx, c.ty, c.tz))
+      local q = Math:newQuat()
+      q.v = V(c.qx, c.qy, c.qz)
+      q.s = c.qw
+      c.ent:SetRot(q)
+    end)
+    if not good and not c.transformErr then
+      c.transformErr = true
+      log("bike " .. c.key .. ": its transform cannot be set (" .. tostring(err) .. ")")
+    end
+    return
+  end
   local a = c.aside
   c.ent:SetPos(a and V(a.x, a.y, a.z) or V(c.tx, c.ty, c.tz))
   local q = Math:newQuat()
@@ -1565,7 +1594,7 @@ function M.CarsUpdate(p)
       local sp = M.VehSpeed(c) or 0
       if M.now - c.exitT > 1 and (math.abs(sp) < 0.3 or M.now - c.exitT > 8) then
         c.parkPending = nil
-        local cp, q = c.ent:GetPos(), c.ent:GetRot()
+        local cp, q = c.ent:GetPos(), M.RotOf(c.ent)
         local wrecked, dmg, motor = M.Wrecked(c.ent)
         M.events[#M.events + 1] = string.format("CP %s %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %d", key, c.model,
           cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, wrecked and 1 or 0)
@@ -4346,7 +4375,7 @@ function M.Sample(aimInput)
   if aim == 0 then M.aimLogged = nil end
   if inCar then
     local car = my.c.ent
-    local cp, q = car:GetPos(), car:GetRot()
+    local cp, q = car:GetPos(), M.RotOf(car, d)
     my.c.velSt = my.c.velSt or {}
     local vx, vy, vz = M.VehVel(car, my.c.mc, my.c.velSt)  -- a bike without GetSpeed: from its positions
     return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s %s %s %d %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f %.3f",

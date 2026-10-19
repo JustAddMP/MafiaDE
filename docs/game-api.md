@@ -51,7 +51,7 @@ game's own Lua uses. Lua is Havok Script, Lua 5.1 syntax, **numbers are 32-bit f
 | health | `p.health` (property, 0..100) | `GetHealth` does not exist on the wrapper |
 | weapon in hand | `p:InventoryGetSelected()` | weapon name (`"p_mast_a_v1"`), `"empty"` when unarmed |
 | inventory | `p:GetInventoryWeapons()` | returns several strings (varargs), e.g. `exp_grenade, exp_molotov, rev_alf_a_v1, smg_trench_a_v1` |
-| vehicle | `p:GetOwner()` | the car (`<SceneObject: smith_v12>`) or nil on foot |
+| vehicle | `p:GetOwner()` | the car (`<SceneObject: smith_v12>`) or nil on foot. A motorbike is no car: section 25 (`M.VehicleOf`, UNVERIFIED) |
 | seat | `car:GetSeatOwner(i) == p` (i = 0 driver .. 3) | `car:GetActualPlayerSeatIndex()` gives the same 1-based |
 | physics state | `p:GetPhysState()` | 0 DYNAMIC, 1 KINEMATIC, 2 DISABLED (2 while seated) |
 | camera | `game.cameramanager:GetPlayerCamera()` -> `:GetPos()`, `:GetDir()` | used by the tests to place things in view |
@@ -113,7 +113,8 @@ which the remote side sees as walking/running.
 three for god mode), `npc:DespawnImmunity(true)` (returns a sync object). All calls succeed; the puppets are
 civilian-archetype humans and in the tests nobody reacted to them (police and the mission NPC ignored them, they did
 not flee or attack). A demigod human gets no DAMAGE events, so puppets are NOT demigods: they take damage like any NPC
-and their health is topped up instead (section 11). Not tested: wanted levels, puppets holding a gun in front of police
+and their health is topped up instead (section 11) - except while a hazard is near (a car seat, water, a fall, fire,
+an explosion picture): then they are demigods for that time (section 25, the shield; UNVERIFIED). Not tested: wanted levels, puppets holding a gun in front of police
 for a long time.
 
 ## 6. Weapons — verified
@@ -889,7 +890,7 @@ the getters below) decides:
 | `IsCarryingBody()`, `GetCarriedBody()` | getters (player.lua TakeBody / IsCarryingBody nodes) | pose bit "carrying" + the body's key (npc_sync numbering) |
 
 There is no jump message or getter in the bindings (none in `human_methods.txt`, none in the enum); the flags' "in
-air" bit stays as it was. `USE_CORNER` (458866), `PLAYER_COVER_LEAN_*` and `IN_DEEP_WATER` were seen and are not used.
+air" bit stays as it was. `USE_CORNER` (458866) and `PLAYER_COVER_LEAN_*` were seen and are not used; `IN_DEEP_WATER` (458852) is (section 25, water).
 The thresholds are guesses for a 60 Hz sample with the C++ side's smoothed speed: the trace (`TL`, `TE`, docs/sync-trace.md)
 shows what was detected with which height and speed, to tune them.
 
@@ -1494,3 +1495,95 @@ found`); that the open / closed body (and the other visible variant parts) are t
 on a spawned car changes its body (and its deform part list: car damage's layout then matches); that `SetColor(c1,
 c2)` with `GetColor`'s numbers gives the same paint; `SetSPZText`'s bool; whether a traffic copy's colours / tuning
 are already what TrafficSpawn set (the copy is checked against the look either way).
+
+## 25. Water and motorbikes (unreleased) - static only, NOT verified in game
+
+From the 2026-10-19 two-PC test (0.15.0): players on motorbikes were invisible to each other (no bike was seen as a
+vehicle: the ride went out as an on-foot sprint at up to 32 m/s, getting on and off as jumps with vz 9-31 m/s), and
+in the water each game killed the other player's puppet ("died here, respawning it": drowned in a sinking copy, the
+copy of a car set exploded) although the players lived. Code: player_sync.lua "Motorbikes", "Water", "The puppet's
+shield", src/game/water.h, src/game/puppet_guard.h, the pose bits in docs/protocol.md "PlayerState".
+
+**What a motorbike is (static, from the game's own scripts and the exe's strings; UNVERIFIED in game).** Not a
+`C_WrapperCar`. Its scene object carries a `C_RuntimeMotorcycleComponent`, and every vehicle node of the game does
+`local m = e:GetComponent("C_RuntimeMotorcycleComponent")` and calls the car-like methods on the component instead of
+the entity: GetVehicleModelName (garage.lua, freeride.lua), CreateController / CreateControllerByName("car_player"),
+FindSeatForHuman, DestroyController (player.lua), SetNavMode*, AddNavModePathWaypoint, SetSpeed, SetSpeedLimiter*,
+SetRubberBanding*, LockPlayerEntryPoints / UnlockPlayerEntryPoints / LockPlayerEntryPointForSeatID, EnableRadio,
+TurnRadioOn, SetMotorMalfunction, SetWheelsProtected, SetResistance, StabilizeJump, SetCollisionPriority,
+SetForceStopMode, RegisterProblemCallback (common_vehicle.lua, common_vehicle_events.lua), GetActualFuel /
+GetFuelTankCapacity (game.lua). player.lua finds the player's bike with `player:GetOwnerSceneObject()` and the
+component, and only otherwise checks `GetType() == enums.EntityType.CAR`. Bikes are spawned with the same traffic
+calls as cars (ObtainSpecificCar / ObtainCarWithCrew, SpawnCar; traffic.lua then takes GetSpawnedSceneObject and the
+component). Models: `motorcycle_1935`, `moto_blackcats` (data_traffic.lua, freeride.lua "Bike Race"). The exe has a
+`ue::game::C_Motorcycle` with movement modes invalid / frozen / parked / riding / wheelie / stoppie / flying / fallen /
+lifting and get-on / get-off / throw-from actions (`C_MotorcycleActionGetOn` ...), and the animation sets have
+`hero_moto_*` (idle, hold, speed loops, enter / exit, fall), but there is no script getter for the mode: the lean and a
+wheelie are in the bike's rotation, which goes out like a car's. The entity type enum has no motorbike (HUMAN 8,
+PLAYER 9, CAR 10, BOAT 27); the native car readers (`mc_car_controls`, `mc_car_signals`) only read entities of type
+10, so a bike is never read as a car.
+
+**How the mod uses it (UNVERIFIED):**
+
+| what | how |
+|---|---|
+| our bike | `M.VehicleOf(p)`: GetOwner's value when it has the component (else a car when it has GetVehicleModelName, as before), else GetOwnerSceneObject's value with the component. Model: the component's GetVehicleModelName, else the entity's, else `motorcycle_1935`. Seat: a GetSeatOwner on the component or the entity if one answers, else 0 (the rider) unless a remote player's puppet already rides it here (then 1). Velocity: GetSpeed if there is one, else from its positions. Rotation: GetRot, else the rider's heading |
+| sent | as a vehicle (key, model, seat, transform) with pose bit 32 (docs/protocol.md); no controls, signals 0. Our vertical "snaps" (above 8 m/s up, below -12 m/s at the start of a fall) and the first second on foot after a vehicle or the water are no jumps or drops any more (game/traversal.h; log `our height snapped`, trace `TS`) |
+| the bike copy | spawned with ObtainSpecificCar(model) / SpawnCar like a car; its entity is GetSpawnedEntity or GetSpawnedSceneObject, the component from either. Despawn immunity through the component (or the entity). Put on the rider's transform every tick (no controls, speed, engine, signals: none known for a bike; a riderless bike left to its own physics would tip over). Locked for the local player while somebody rides it (Lock / UnlockPlayerEntryPoints on the component). Never swapped, no ride along, no car damage or car look (car_damage.lua / car_look.lua skip it) |
+| the rider's puppet | on at once: `GetOnVehicle(bike, seat + 1, false, "WALK")` with the entity, then the scene object; it is on when GetOwner or GetOwnerSceneObject is the bike. After 4 tries that did not seat it: perched on the saddle (its transform every tick, 0.55 m up, physics off, `hero_moto_idle` / `hold_idle` / `speed_loop` tried with AnimPlay; MafiaCoop.bikeAnims), the seat tried again every 10 s. Off at once: `GetOutCarFast()` (the animated GetOffVehicle when that fails) |
+| probe log | once per bike: `bike <id> (<how>): <entity>, GetType ..., GUID type byte ...; entity has: ...; component ...: ...` (trace `BK`): which car methods each really has. **Read this from the first ride's log** to replace the guesses above |
+
+**The safety net: too fast on foot (game/puppet_guard.h FastFoot).** A remote player sent as on foot faster than
+12 m/s (ground speed, for 0.25 s; a sprint is 7-8) rides something his game did not read as a vehicle (an older
+build's bike, any vehicle we do not know). His puppet is hidden at his position (T field 68; `PH why=fast`) until he is
+below 9 m/s for 0.75 s, in a vehicle or in the water. Log: `player N moves 23.4 m/s on foot (#1): his puppet is hidden
+at his position (a vehicle his game does not report?)` / `player N is slow again ...`, trace `FF`.
+
+**Water (game/water.h; UNVERIFIED).** The bindings have no swim getter for a human or the player (the C_WrapperHuman /
+C_WrapperPlayer lists; the player only has EnableClimbShoreFromSwimming / ClimbShoreFromSwimmingEnabled). The game
+sends the human message `IN_DEEP_WATER` (HumanMessages 458852; the game's OnEventInDeepWater node listens for it).
+Whether it repeats while he swims is not known; there is no "out of the water" message. The glue collects it like the
+traversal messages (travev bit 32) and probes a few getter names on the player once per world (`IsSwimming`,
+`IsInWater`, `IsInDeepWater`, `IsUnderwater`, `IsUnderWater`, `IsDiving`; logged `swim getters on the player: ...`).
+The C++ side's tracker: a getter that answers rules; otherwise the message starts a swim with the surface at his
+height then; 1.2 m below it he is under water (back at the surface above 0.8 m below it); 0.9 m above it for 0.4 s (a
+shore, a pier, a ladder), in a vehicle, after a 25 m height jump, or when a repeating message stops (twice its 3 s
+gap) he is out. Sent as pose bits 8 / 16 (log `we are swim now (was dry: IN_DEEP_WATER; z ..., surface ...)`, trace
+`WT`). The message's getters are logged once (`IN_DEEP_WATER for us; the message has: ...`).
+
+**The swimmer's puppet (UNVERIFIED).** An AI human in deep water drowns (the sets have `male_nw_swim_drown_idle`) and
+cannot path through water, so the puppet is not walked: it is put at his position every tick (the controller is told
+busy 1), made kinematic (`SetPhysState(1)`), shielded (below), and plays a stroke by his speed:
+`hero_nw_alert_swim_idle`, `..._swim_move_slow_new`, `..._swim_move_medium_new`, `..._swim_move_fast`
+(MafiaCoop.swimAnims; AnimPlay, or the move group's way once one is confirmed). If the game drowns it anyway, its
+respawn stays hidden at his position until he is out of the water (`PW`, `PD`). Out of the water it walks again.
+
+**Puppets never die from local causes (game/puppet_guard.h Shield).** A puppet only dies when its player's state says
+so (health 0 from his game: M.PuppetLife's DoDamage). While a hazard is there, and for 1.5 s after, the puppet is a
+demigod (`SetDemigod(true)`, section 5): it sits in a car or on a bike (a crash, the copy exploding or sinking), its
+player swims or is under water, the puppet got IN_DEEP_WATER itself (shielded at once), it falls faster than 6 m/s
+(its player in the air going down, or the puppet itself), it burns, a picture of another game's explosion went off
+within 15 m in the last 2.5 s (shielded at once from explosion_sync.lua's B.Picture, before the blast), or it is
+hidden. His being down switches it off at once, so the network death lands. On foot with no hazard it is not a
+demigod: its DAMAGE events carry the local player's hits on it (a demigod gets none) - which also means a hit on a
+seated or swimming puppet is not sent while it is shielded. Log: `puppet N: shielded, a demigod (seat+water)`,
+`puppet N: shield off`, trace `PG`. If a puppet still dies here: `puppet N: died here, NOT a network death (its player
+has 87 health; death type 12; shield on; in the water): respawned at once` (and `puppet N: DEATH here (damage type,
+killer ...)` from the DEATH event; trace `PD`); after 3 such deaths within 20 s it is held hidden for 10 s
+(`PH why=deaths`).
+
+**A car in the water.** On the driver's game the car sinks and the game may blow it up; that explosion is synced as
+before (it is the authority's). The copies follow the driver's transform as before (pinned when their own physics is
+too slow, which under water it is). New: the glue watches `CarMessages.CAR_IS_UNDERWATER` (car copies get
+`EnableUnderwaterDetection(true)` at spawn, as the game's own vehicle events do; UNVERIFIED that it is needed or that
+the message comes), and a copy under water no longer has its engine switched on once a second (the game stalls it
+there; the 0.15.0 log showed `engine was false, SetEngineOn ok, now false` on the sunk manta). Log `car K is under
+water here (...): its engine is left to the game`, trace `CUW`. The puppets in a sinking or exploding copy are
+shielded (seat).
+
+**UNVERIFIED (all of it):** that GetOwner or GetOwnerSceneObject returns the bike while the player rides it; that the
+component answers GetVehicleModelName; that ObtainSpecificCar spawns a bike and which of GetSpawnedEntity /
+GetSpawnedSceneObject is the bike; that SetPos / SetRot move a bike; that GetOnVehicle seats an NPC on a bike and
+GetOutCarFast takes it off; the saddle offsets; that IN_DEEP_WATER is sent to the player and when; the surface and
+depth thresholds; that SetPhysState(1) keeps the water's physics off a puppet; that a demigod NPC does not drown; that
+any swim or moto animation shows on a puppet; CAR_IS_UNDERWATER.
