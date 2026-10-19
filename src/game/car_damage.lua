@@ -205,7 +205,8 @@ function D.Round(ev)
   D.held = {}
   for key, c in pairs(M.cars or {}) do
     if c.driver then D.last[key] = (c.driver == "local") and me or c.driver end
-    if c.st == "ready" and valid(c.ent) then
+    -- a motorbike (player_sync.lua c.bike, docs/game-api.md 25): not a C_WrapperCar, its damage is not synced
+    if c.st == "ready" and valid(c.ent) and not (c.bike or c.bikeHint) then
       local holder = (c.driver == "local") and me or c.driver or D.last[key] or key:match("^(%d+):")
       local ours = holder == me
       explosionFor(key, c, ours)

@@ -23,11 +23,17 @@ void LocalDetector::Queue(Action a) {
 }
 
 Action LocalDetector::Update(const Sample& s) {
-    if (!s.onFoot) {
+    if (!s.onFoot || s.inWater) {
         Reset();
+        wasAway_ = true;
+        exitT_ = s.t;
         return Action::None;
     }
     const double t = s.t;
+    if (wasAway_) {  // on foot again (off a bike, out of a car or the water): his position settles first
+        wasAway_ = false;
+        exitT_ = t;
+    }
     if (!have_) {  // the first sample: what he does now is not news
         have_ = true;
         prevVz_ = s.vz;
@@ -110,20 +116,33 @@ Action LocalDetector::Update(const Sample& s) {
     }
 
     // jumps and falls, from his vertical speed (not during a fence / ladder move: they move him up and down too)
-    const bool quiet = !ladder_ && pending_ == Pending::None && t - moveT_ >= t_.moveQuiet;
+    // (not right after he got off a vehicle or out of the water either, and a vertical speed no jump or fall starts
+    // with is a snap of his position: counted, and the quiet time starts again)
+    const bool quiet = !ladder_ && pending_ == Pending::None && t - moveT_ >= t_.moveQuiet &&
+                       t - exitT_ >= t_.exitQuiet;
     if (quiet && !air_) {
         if (s.vz > t_.jumpSpeed && prevVz_ <= t_.jumpSpeed) {
-            Queue(Action::Jump);
-            air_ = true;
-            airT_ = t;
-            airMinVz_ = s.vz;
-            sawFall_ = false;
+            if (s.vz > t_.maxJumpSpeed) {
+                ++snaps_;
+                exitT_ = t;
+            } else {
+                Queue(Action::Jump);
+                air_ = true;
+                airT_ = t;
+                airMinVz_ = s.vz;
+                sawFall_ = false;
+            }
         } else if (s.vz < -t_.fallSpeed) {
-            Queue(Action::DropDown);
-            air_ = true;
-            airT_ = t;
-            airMinVz_ = s.vz;
-            sawFall_ = true;
+            if (s.vz < -t_.snapFall) {
+                ++snaps_;
+                exitT_ = t;
+            } else {
+                Queue(Action::DropDown);
+                air_ = true;
+                airT_ = t;
+                airMinVz_ = s.vz;
+                sawFall_ = true;
+            }
         }
     } else if (air_) {
         airMinVz_ = std::min(airMinVz_, s.vz);

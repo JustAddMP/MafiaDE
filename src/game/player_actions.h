@@ -166,7 +166,11 @@ private:
 constexpr uint8_t kStealth = 1;  // IsStealthMove (the crouched sneak walk, IsStalkMove, is flags bit kCrouch)
 constexpr uint8_t kCarry = 2;    // IsCarryingBody
 constexpr uint8_t kLadder = 4;   // on a ladder (from USE_LADDER until he stops climbing, game/traversal.h)
-constexpr uint8_t kPoseBits = kStealth | kCarry | kLadder;
+// Water and bikes (added without a version change: an older reader drops these bits, as it drops any unknown one)
+constexpr uint8_t kSwim = 8;         // in deep water at the surface (game/water.h)
+constexpr uint8_t kUnderwater = 16;  // under water (diving; game/water.h)
+constexpr uint8_t kBike = 32;        // on a motorbike: the vehicle block is a bike (its model, seat and transform)
+constexpr uint8_t kPoseBits = kStealth | kCarry | kLadder | kSwim | kUnderwater | kBike;
 
 struct Pose {
     uint8_t bits = 0;

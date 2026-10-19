@@ -11,12 +11,14 @@
 #include "game/car_units.h"
 #include "game/characters.h"
 #include "game/player_actions.h"
+#include "game/puppet_guard.h"
 #include "game/traversal.h"
+#include "game/water.h"
 #include "game/lua.h"
 #include "game/map_markers.h"
 #include "game/model_change.h"
-#include "game/pvp_hit.h"
 #include "game/peer_pause.h"
+#include "game/pvp_hit.h"
 #include "game/seats.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
@@ -156,6 +158,7 @@ struct Remote {
     float frozenHead[2] = {0, 1};
     float frozenCpos[3] = {};
     float frozenQuat[4] = {0, 0, 0, 1};
+    puppet_guard::FastFoot fast; // "on foot" faster than anyone runs: his puppet hidden (game/puppet_guard.h)
 };
 
 // Where the Lua glue last saw a puppet (on foot, visible: "PS") or the car copy a remote player drives ("VS").
@@ -402,9 +405,26 @@ bool InRange(const float* v, int n, float lim) {
     return true;
 }
 
+// "sneaking carrying ladder swimming under-water bike" (player_actions.h pose bits), "normal" for none
+std::string PoseText(const actions::Pose& p) {
+    std::string s;
+    auto add = [&s](const char* w) {
+        if (!s.empty()) s += ' ';
+        s += w;
+    };
+    if (p.bits & actions::kStealth) add("sneaking");
+    if (p.bits & actions::kCarry) add("carrying");
+    if (p.bits & actions::kLadder) add("ladder");
+    if (p.bits & actions::kSwim) add("swimming");
+    if (p.bits & actions::kUnderwater) add("under-water");
+    if (p.bits & actions::kBike) add("bike");
+    return s.empty() ? "normal" : s;
+}
+
 // ---- sync trace (core/trace.h, docs/sync-trace.md) -------------------------------------------------------------------
 // The state fields of a TX / RX record: "p=x,y,z h=hx,hy v=vx,vy,vz m=mode f=flags hp=health sh=shots w=weapon
-// act=seq:kind pose=bits:body" (pose: player_actions.h kStealth 1, kCarry 2, kLadder 4; body: the carried body)
+// act=seq:kind pose=bits:body" (pose: player_actions.h kStealth 1, kCarry 2, kLadder 4, kSwim 8, kUnderwater 16,
+// kBike 32; body: the carried body)
 // plus, in a car, "car=key mdl=model seat=n cp=x,y,z q=qx,qy,qz,qw cv=x,y,z ctl=valid,steer,power,brake,hb,gear sig=n"
 // (sig: the car signals byte, game/car_signals.h; 0 = unknown).
 std::string TraceFields(const PlayerState& s) {
@@ -611,9 +631,11 @@ PlayerState Present(const Remote& rem, double now) {
 
 // One "T" line per remote player: his state, then what to do with his puppet (lc: the locomotion command) and with
 // the car copy he drives (vc: the vehicle command, applied with his controls, then its wanted velocity, then his car
-// signals). Field order: player_sync.lua M.Update.
+// signals). Field order: player_sync.lua M.Update. fastHide: his state says on foot but he moves faster than anyone
+// runs (game/puppet_guard.h FastFoot): the puppet is hidden at his position (field 68).
 void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s,
-                  const motion::LocomotionCommand& lc, const motion::VehicleCommand& vc, actions::Action act) {
+                  const motion::LocomotionCommand& lc, const motion::VehicleCommand& vc, actions::Action act,
+                  bool fastHide) {
     char key[32] = "-";
     const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
     if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
@@ -622,7 +644,7 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   "%d %d %d %u %.3f %.3f %.3f %u "
                   "%d %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f "
                   "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f %u %u "
-                  "%.4f %u %u\n",
+                  "%.4f %u %u %d\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
@@ -644,7 +666,9 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   veh && s.seat == 0 ? s.signals : 0u,
                   // 65: the height part of the puppet's nudge (traversal: followed along his path / blended after a
                   // move, game/traversal.h); 66, 67: his pose bits and the body he carries (player_actions.h)
-                  lc.nudge.z, static_cast<unsigned>(s.pose.bits), static_cast<unsigned>(s.pose.body));
+                  lc.nudge.z, static_cast<unsigned>(s.pose.bits), static_cast<unsigned>(s.pose.body),
+                  // 68: hide the puppet, he is too fast for one on foot (game/puppet_guard.h FastFoot)
+                  fastHide ? 1 : 0);
 }
 
 // Report lines from the Lua glue: "PS id x y z hx hy [busy]" (puppet on foot, after this tick's commands; busy 1:
@@ -774,11 +798,25 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                           tc.started ? "start" : tc.ended ? "end" : "soft", lc.error, li.target.z - copyPos.z,
                           lc.nudge.x, lc.nudge.y, lc.nudge.z, wasSnap ? 1 : 0);
     if (s.pose != rem.pose) {
-        MC_LOG_INFO("sync: player %u: pose %s%s%s%s(body %u)", id, s.pose.bits ? "" : "normal ",
-                    s.pose.bits & actions::kStealth ? "sneaking " : "",
-                    s.pose.bits & actions::kCarry ? "carrying " : "", s.pose.bits & actions::kLadder ? "ladder " : "",
-                    s.pose.body);
+        MC_LOG_INFO("sync: player %u: pose %s (body %u)", id, PoseText(s.pose).c_str(), s.pose.body);
         rem.pose = s.pose;
+    }
+    // "on foot" faster than anyone runs (a vehicle his game sends as on foot): his puppet is hidden meanwhile
+    {
+        const bool wet = (s.pose.bits & (actions::kSwim | actions::kUnderwater)) != 0;
+        const float ground = std::sqrt(s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]);
+        const puppet_guard::FastFoot::Out ff = rem.fast.Update(now, !(s.flags & kInVehicle) && !wet, ground);
+        if (ff.changed) {
+            if (ff.hide)
+                MC_LOG_INFO("sync: player %u moves %.1f m/s on foot (#%d): his puppet is hidden at his position (a "
+                            "vehicle his game does not report?)",
+                            id, ground, rem.fast.Times());
+            else
+                MC_LOG_INFO("sync: player %u is slow again (%.1f m/s, peak %.1f, %s): his puppet is shown", id, ground,
+                            ff.peak, (s.flags & kInVehicle) ? "in a vehicle" : wet ? "in the water" : "on foot");
+            core::trace::Line("FF", "id=%u hide=%d v=%.2f peak=%.2f veh=%d wet=%d", id, ff.hide ? 1 : 0, ground,
+                              ff.peak, (s.flags & kInVehicle) ? 1 : 0, wet ? 1 : 0);
+        }
     }
     // his car, while he drives it
     char key[32] = "-";
@@ -1053,13 +1091,16 @@ void OnPlayerModel(net::PlayerId from, net::ByteReader& r) {
 
 // ---- local sample ---------------------------------------------------------------------------------------------------
 // "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz aim reload shots ax ay az
-//  cover ctl steer power brake handbrake gear actseq actkind [signals [travev stealth carry body]]"  (signals:
-//  car_signals.h byte, 0 = unknown / on foot; travev: traversal::Event bits the glue saw since the last sample,
-//  stealth / carry: IsStealthMove / IsCarryingBody, body: the carried body's key, npc_sync numbering, 0 = unknown)
+//  cover ctl steer power brake handbrake gear actseq actkind [signals [travev stealth carry body [swim bike]]]"
+//  (signals: car_signals.h byte, 0 = unknown / on foot; travev: traversal::Event bits the glue saw since the last
+//  sample, stealth / carry: IsStealthMove / IsCarryingBody, body: the carried body's key, npc_sync numbering, 0 =
+//  unknown; swim: a swim getter's answer, -1 none (game/water.h); bike: 1 the vehicle is a motorbike)
 struct LocalExtras {
     uint32_t events = 0;
     bool stealth = false, carrying = false;
     uint32_t body = 0;
+    int swimGetter = -1;
+    bool bike = false;
 };
 
 bool ParseSample(const std::string& line, PlayerState& s, LocalExtras& ex) {
@@ -1084,6 +1125,11 @@ bool ParseSample(const std::string& line, PlayerState& s, LocalExtras& ex) {
             ex.stealth = stealth != 0;
             ex.carrying = carry != 0;
             ex.body = body >= 0 && body < 4294967296.0 ? static_cast<uint32_t>(body) : 0;
+            int swim = -1, bike = 0;
+            if (in >> swim >> bike) {
+                ex.swimGetter = std::clamp(swim, -1, 2);
+                ex.bike = bike != 0;
+            }
         }
     }
     s.ctlValid = ctl != 0 && std::isfinite(s.steer) && std::isfinite(s.power) && std::isfinite(s.brake) &&
@@ -1147,9 +1193,31 @@ traversal::LocalDetector _travDetect;
 actions::Merger _actMerge;
 actions::Pose _poseLogged;
 uint32_t _movesDetected = 0;
+water::Tracker _water;   // are we swimming or under water (game/water.h), for the pose block
+int _snapsLogged = 0;    // vertical snaps (mounting a bike, a teleport) the detector did not take for moves
 
 void DetectTraversal(PlayerState& s, const LocalExtras& ex, double now) {
+    // water first: while we swim nothing we do is a jump or a drop
+    water::Sample ws;
+    ws.t = now;
+    ws.z = s.pos[2];
+    ws.onFoot = (s.flags & kInVehicle) == 0;
+    ws.deepWater = (ex.events & traversal::kEvDeepWater) != 0;
+    ws.getter = ex.swimGetter;
+    const water::Change wc = _water.Update(ws);
+    if (ws.deepWater)
+        MC_LOG_INFO("sync: IN_DEEP_WATER for us (z %.2f, #%d this time in the water, state %s)", ws.z,
+                    _water.Messages(), water::Name(_water.Now()));
+    if (wc.changed) {
+        MC_LOG_INFO("sync: we are %s now (was %s: %s; z %.2f, surface %.2f, getter %d)", water::Name(wc.to),
+                    water::Name(wc.from), wc.why, ws.z, _water.Surface(), ex.swimGetter);
+        core::trace::Line("WT", "st=%s was=%s why=%s z=%.3f surf=%.3f get=%d", water::Name(wc.to), water::Name(wc.from),
+                          wc.why, ws.z, _water.Surface(), ex.swimGetter);
+    }
+    const bool wet = _water.InWater();
+    if (wet) s.flags &= static_cast<uint8_t>(~kInAir);  // strokes and dives are no jumps (receiver: li.inAir)
     traversal::Sample ts;
+    ts.inWater = wet;
     ts.t = now;
     ts.z = s.pos[2];
     ts.vz = s.vel[2];
@@ -1163,6 +1231,16 @@ void DetectTraversal(PlayerState& s, const LocalExtras& ex, double now) {
     const actions::Action a = _travDetect.Update(ts);
     s.act = _actMerge.Update(s.act, a);
     s.pose = _travDetect.CurrentPose();
+    if (_water.Now() == water::State::Swim) s.pose.bits |= actions::kSwim;
+    if (_water.Now() == water::State::Under) s.pose.bits |= actions::kUnderwater;
+    if ((s.flags & kInVehicle) && ex.bike) s.pose.bits |= actions::kBike;
+    if (_travDetect.Snaps() != _snapsLogged) {
+        _snapsLogged = _travDetect.Snaps();
+        if (_snapsLogged <= 30 || _snapsLogged % 50 == 0)
+            MC_LOG_INFO("sync: our height snapped (vz %.2f, #%d): no jump or drop sent (getting on or off something?)",
+                        ts.vz, _snapsLogged);
+        core::trace::Line("TS", "z=%.3f vz=%.3f n=%d", ts.z, ts.vz, _snapsLogged);
+    }
     if (a != actions::Action::None) {
         ++_movesDetected;
         if (_movesDetected <= 60 || _movesDetected % 100 == 0)
@@ -1172,9 +1250,7 @@ void DetectTraversal(PlayerState& s, const LocalExtras& ex, double now) {
                           ts.speed, ex.events);
     }
     if (s.pose != _poseLogged) {
-        MC_LOG_INFO("sync: our pose: %s%s%s%s(body %u)", s.pose.bits ? "" : "normal ",
-                    s.pose.bits & actions::kStealth ? "sneaking " : "", s.pose.bits & actions::kCarry ? "carrying " : "",
-                    s.pose.bits & actions::kLadder ? "ladder " : "", s.pose.body);
+        MC_LOG_INFO("sync: our pose: %s (body %u)", PoseText(s.pose).c_str(), s.pose.body);
         core::trace::Line("TP", "bits=%u body=%u", s.pose.bits, s.pose.body);
         _poseLogged = s.pose;
     }
@@ -1530,6 +1606,24 @@ int McPvpEvidence(lua_State* L) {
     return 1;
 }
 
+// mc_pupguard(id, now, hazards) -> on, what: the shield of player id's puppet (game/puppet_guard.h Shield; hazards:
+// its Hazard bits this tick). on: the puppet is to be a demigod now (also for a moment after the hazards went); what:
+// the hazards holding it on ("seat+water", "none" while it only holds on). The glue applies it (M.GuardTick) and logs
+// each change. GameMainThread only.
+std::map<int, puppet_guard::Shield> _shields;
+
+int McPupGuard(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const int id = static_cast<int>(num(1));
+    const double t = lua::TypeOf(L, 2) == lua::TNumber ? lua::ToNumber(L, 2) : 0;
+    const uint32_t hazards = static_cast<uint32_t>(std::max(0.0f, num(3)));
+    if (_shields.size() > 64 && !_shields.count(id)) _shields.clear();
+    const puppet_guard::ShieldOut o = _shields[id].Update(t, hazards);
+    lua::PushBool(L, o.on);
+    lua::PushString(L, puppet_guard::HazardText(o.on ? _shields[id].Last() : hazards).c_str());
+    return 2;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1568,6 +1662,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_pvp_verdict", &McPvpVerdict);
     lua::RegisterGlobal(L, "mc_pvp_damage", &McPvpDamage);
     lua::RegisterGlobal(L, "mc_pvp_evidence", &McPvpEvidence);
+    lua::RegisterGlobal(L, "mc_pupguard", &McPupGuard);
     return true;
 }
 
@@ -1640,7 +1735,7 @@ void MainTick(lua_State* L, float dt) {
                     core::trace::Line("ACT", "id=%u kind=%s seq=%u missed=%d", id, actions::Name(act.play),
                                       s.act.seq, act.missed);
                 }
-                AppendTarget(cmds, ProfileFor(sh, id), id, s, lc, vc, act.play);
+                AppendTarget(cmds, ProfileFor(sh, id), id, s, lc, vc, act.play, rem.fast.Hidden());
             }
         }
     }

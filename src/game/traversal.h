@@ -27,6 +27,7 @@ enum Event : uint32_t {
     kEvPickup = 4,  // PICKUP_BODY
     kEvDrop = 8,    // DROP_BODY
     kEvMedkit = 16, // PLAYER_USED_MEDKIT
+    kEvDeepWater = 32, // IN_DEEP_WATER (not a move: game/water.h tells whether he swims)
 };
 
 struct DetectorTuning {
@@ -46,6 +47,11 @@ struct DetectorTuning {
     float ladderMax = 15.0f;       // s: and at most this long
     float slideSpeed = 2.5f;       // m/s: into cover at least this fast: a slide
     float bodyDedupe = 1.0f;       // s: a body message and the getter edge within this are one pickup / drop
+    // Getting on or off a vehicle (a motorbike's quick mount was sent as a jump with vz 9-31 m/s in the 0.15.0 test)
+    // and out of the water: his position snaps or climbs, which is no jump or drop.
+    float exitQuiet = 1.0f;        // s after he is on foot again (out of a vehicle or the water): no jump / drop
+    float maxJumpSpeed = 8.0f;     // m/s up: faster is a snap (mounting, a teleport), not a jump (one is 3-5)
+    float snapFall = 12.0f;        // m/s down at the start of a fall: a snap (getting off, a teleport), not a drop
 };
 
 struct Sample {
@@ -59,6 +65,7 @@ struct Sample {
     bool stealth = false;  // IsStealthMove
     bool carrying = false; // IsCarryingBody
     uint32_t body = 0;     // the carried body's key (npc_sync numbering), 0 = unknown
+    bool inWater = false;  // he swims or is under water (game/water.h): no jumps or drops, no ladder
 };
 
 class LocalDetector {
@@ -70,6 +77,7 @@ public:
     actions::Pose CurrentPose() const { return pose_; }
     bool OnLadder() const { return ladder_; }
     bool Airborne() const { return air_; }
+    int Snaps() const { return snaps_; }
     void Reset();
 
 private:
@@ -85,6 +93,9 @@ private:
     double pendT_ = 0;
     float pendZ_ = 0;
     double moveT_ = -1e9;  // the latest fence / ladder start
+    double exitT_ = -1e9;  // when he was last in a vehicle or in the water
+    bool wasAway_ = false; // the previous sample was in a vehicle or in the water
+    int snaps_ = 0;        // vertical snaps not taken for a jump or drop
     // airborne (jump or drop)
     bool air_ = false;
     double airT_ = 0;

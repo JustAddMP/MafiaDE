@@ -319,6 +319,9 @@ end
 function B.Picture(x, y, z, weapon, fire, from, seq, kind)
   mc_boom_mark(x, y, z, fire and 1 or 0, tonumber(from) or 255, tonumber(seq) or 0, tonumber(kind) or 0)
   snap(x, y, z)
+  -- the players' puppets near it are shielded before it goes off (player_sync.lua M.PuppetHazard: a puppet dies only
+  -- when its player's state says so, docs/game-api.md 25)
+  if M.PuppetHazard then pcall(M.PuppetHazard, x, y, z) end
   local w = (weapon and weapon ~= "-" and weapon ~= "") and weapon or "exp_grenade"
   -- (positionEntity, positionVector, weapon, damage, stun, fullDamageRange, damageRange, ignoreColl, createFire):
   -- argument order from the game's own CreateScriptExplosion node (game.lua; docs/game-api.md 23)

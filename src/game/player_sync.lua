@@ -10,6 +10,7 @@
 --   T id profile x y z hx hy vx vy vz mode weapon veh vkey seat cx cy cz qx qy qz qw crouch aim reload shots ax ay az health
 --     inair gait mult reissue mx my mz fix nx ny turn fx fy
 --     vfix vnx vny vnz vqx vqy vqz vqw power steer brake handbrake gear ctl pinned vvx vvy vvz act sig nz pose body
+--     fast
 --                                                                                remote player target (profile: spawn
 --                                                                                profile path or decimal hash, or
 --                                                                                "tommy" = story Tommy; M.Profile),
@@ -26,7 +27,11 @@
 --                                                                                player_actions.h); nz: the height
 --                                                                                part of the nudge (traversal);
 --                                                                                pose: 1 sneaking, 2 carrying body
---                                                                                (its key), 4 on a ladder
+--                                                                                (its key), 4 on a ladder, 8
+--                                                                                swimming, 16 under water, 32 on a
+--                                                                                motorbike; fast: 1 = he moves too
+--                                                                                fast for one on foot, hide the
+--                                                                                puppet (game/puppet_guard.h)
 --   K vkey model x y z qx qy qz qw wrecked                                       a car was parked (CarParked;
 --                                                                                wrecked 1 = it is destroyed)
 --   W time flow weather                                                          the host's time of day and weather
@@ -49,13 +54,14 @@
 -- Output: sample, status, events
 --   sample = "P x y z hx hy sprint crouch health weapon veh vkey seat cx cy cz qx qy qz qw cvx cvy cvz
 --             aim reload shots ax ay az cover ctl steer power brake handbrake gear actseq actkind sig
---             travev stealth carry body" or ""
+--             travev stealth carry body swim bike" or ""
 --            (actseq: our actions so far mod 256, actkind: the latest one, as act above; M.LocalAction;
 --             sig: our car's signals byte, src/game/car_signals.h, 0 = unknown or not the driver;
 --             travev: the traversal messages seen for us since the last sample, bits 1 USE_FENCE, 2 USE_LADDER,
 --             4 PICKUP_BODY, 8 DROP_BODY, 16 PLAYER_USED_MEDKIT (the C++ side makes moves of them,
---             src/game/traversal.h); stealth / carry: IsStealthMove / IsCarryingBody; body: the carried body's
---             key as the host numbers NPCs, 0 = unknown)
+--             src/game/traversal.h; 32 IN_DEEP_WATER, src/game/water.h); stealth / carry: IsStealthMove /
+--             IsCarryingBody; body: the carried body's key as the host numbers NPCs, 0 = unknown; swim: a swim
+--             getter's answer, -1 none (M.SwimGetter); bike: 1 our vehicle is a motorbike (M.VehicleOf))
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw wrecked" (we parked a car we drove),
 --            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
@@ -354,8 +360,185 @@ end
 
 function M.KeyOf(ent)
   for k, c in pairs(M.cars) do
-    if c.ent and same(c.ent, ent) then return k, c end
+    if (c.ent and same(c.ent, ent)) or (c.bso and same(c.bso, ent)) then return k, c end
   end
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Motorbikes (docs/game-api.md 25). Found statically in the game's own scripts (NOT checked in game): a motorbike is
+-- not a C_WrapperCar. Its scene object carries a C_RuntimeMotorcycleComponent, and every vehicle node of the game
+-- (common_vehicle.lua, garage.lua, freeride.lua, traffic.lua, player.lua) does `local m =
+-- e:GetComponent("C_RuntimeMotorcycleComponent")` and then calls the car-like methods on that component
+-- (GetVehicleModelName, CreateController, FindSeatForHuman, Lock / UnlockPlayerEntryPoints, SetSpeedLimiter, ...).
+-- player.lua finds the player's bike with player:GetOwnerSceneObject():GetComponent(...), and only then checks
+-- GetType() == CAR. Bikes come from the same traffic calls as cars (ObtainSpecificCar / SpawnCar, then
+-- GetSpawnedSceneObject + the component in traffic.lua). Models: motorcycle_1935, moto_blackcats (data_traffic.lua,
+-- freeride.lua). The exe has C_Motorcycle movement modes (riding, wheelie, stoppie, flying, fallen, lifting) but no
+-- script getter for them: the bike's rotation (sent like a car's) carries its lean and a wheelie.
+-- So a bike is a vehicle record like a car (c.bike, c.mc = its component, c.bso = its scene object): its key, model,
+-- seat and transform go out in the vehicle block (pose bit kBike), its copy is spawned and moved like a car copy, and
+-- whatever a car copy does that a bike does not have (controls, signals, speed, damage, look, swaps, ride along) is
+-- left out. Which methods the bike's entity and component really have is logged once per bike (M.BikeProbe).
+-- ---------------------------------------------------------------------------------------------------------------
+local MOTO = "C_RuntimeMotorcycleComponent"
+local function motoOf(o)
+  if not valid(o) then return nil end
+  local good, mc = pcall(function() return o:GetComponent(MOTO) end)
+  if good and mc ~= nil and mc ~= false then return mc end
+  return nil
+end
+M.MotoOf = motoOf
+
+function M.IsBikeModel(model)
+  return type(model) == "string" and model:find("^moto") ~= nil
+end
+
+local BIKE_PROBE = { "GetType", "GetGUID", "GetPos", "SetPos", "GetRot", "SetRot", "GetDir", "GetSpeed", "GetSpeedFloat",
+  "SetSpeed", "GetSeatOwner", "GetSeatCount", "FindSeatForHuman", "GetPassengers", "GetVehicleModelName",
+  "LockPlayerEntryPoints", "UnlockPlayerEntryPoints", "SetDespawnImmunity", "DisableExplosion", "Deactivate",
+  "Activate", "SetSteer", "SetPower", "SetEngineOn", "GetDamage", "SetHornOn", "EnableUnderwaterDetection" }
+M.bikeProbed = M.bikeProbed or {}
+-- once per bike: which of the car methods its entity and its component answer to (docs/game-api.md 25: to be read
+-- from the log after the first ride)
+function M.BikeProbe(ent, mc, how)
+  local id = valid(ent) and guidNum(ent) or "?"
+  if M.bikeProbed[id] then return end
+  M.bikeProbed[id] = true
+  local function has(o, name)
+    if o == nil then return false end
+    local good, f = pcall(function() return o[name] end)
+    return good and f ~= nil
+  end
+  local e, m = {}, {}
+  for _, name in ipairs(BIKE_PROBE) do
+    if has(ent, name) then e[#e + 1] = name end
+    if has(mc, name) then m[#m + 1] = name end
+  end
+  local gt, ty = pcall(function() return ent:GetType() end)
+  local n = tonumber(id) or 0
+  log(string.format("bike %s (%s): %s, GetType %s, GUID type byte %d; entity has: %s; component %s: %s", id,
+    tostring(how), tostring(ent), gt and tostring(ty) or "?", n % 256, table.concat(e, " "), tostring(mc),
+    table.concat(m, " ")))
+  trace("BK", string.format("id=%s how=%s type=%s tb=%d ent=%s mc=%s", id, tostring(how):gsub(" ", "_"),
+    gt and tostring(ty) or "-", n % 256, table.concat(e, ","), table.concat(m, ",")))
+end
+
+-- The vehicle human h sits in or rides: ent (positions, identity, the network key), mc (a bike's component; nil for a
+-- car), how ("owner" / "owner scene object"). A car is what GetOwner returns when it has GetVehicleModelName (as
+-- before); a bike is GetOwner's or GetOwnerSceneObject's value when it carries the motorcycle component.
+function M.VehicleOf(h)
+  if not valid(h) then return nil end
+  local good, own = pcall(h.GetOwner, h)
+  own = good and own or nil
+  if valid(own) then
+    local memo = M.vehMemo  -- the component lookup once per vehicle (this runs every tick)
+    if not (memo and same(memo.e, own)) then
+      memo = { e = own, mc = motoOf(own) or false }
+      M.vehMemo = memo
+    end
+    if memo.mc then return own, memo.mc, "owner" end
+    if own.GetVehicleModelName then return own, nil, "owner" end
+  end
+  local g2, oso = pcall(function() return h:GetOwnerSceneObject() end)
+  if g2 and valid(oso) then
+    local memo = M.vehMemo2
+    if not (memo and same(memo.e, oso)) then
+      memo = { e = oso, mc = motoOf(oso) or false }
+      M.vehMemo2 = memo
+    end
+    if memo.mc then return oso, memo.mc, "owner scene object" end
+  end
+  return nil
+end
+
+-- the bike's model name: its component's GetVehicleModelName (what garage.lua / freeride.lua call), else the
+-- entity's, else "motorcycle_1935" (the bike of the free ride; UNVERIFIED for the others)
+function M.BikeModel(ent, mc)
+  for _, o in ipairs({ mc, ent }) do
+    if o ~= nil then
+      local good, name = pcall(function() return o:GetVehicleModelName() end)
+      if good and type(name) == "string" and name ~= "" then return name end
+    end
+  end
+  return "motorcycle_1935"
+end
+
+-- Does human h sit on bike record c (GetOwner or GetOwnerSceneObject is the bike)?
+function M.OnBike(h, c)
+  if not valid(h) then return false end
+  local good, own = pcall(h.GetOwner, h)
+  if good and valid(own) and (same(own, c.ent) or same(own, c.bso)) then return true end
+  local g2, oso = pcall(function() return h:GetOwnerSceneObject() end)
+  return g2 and valid(oso) and (same(oso, c.ent) or same(oso, c.bso)) or false
+end
+
+-- A method of a vehicle record that may live on the entity (a car) or on the bike's component: the component first
+-- for a bike. Returns ok, result, where.
+function M.VCall(c, name, ...)
+  local args = { ... }
+  local list = c.mc and { c.mc, c.ent } or { c.ent }
+  local err
+  for _, o in ipairs(list) do
+    if o ~= nil then
+      local good, f = pcall(function() return o[name] end)
+      if good and f then
+        local ok, r = pcall(f, o, unpack(args))
+        if ok then return true, r, (o == c.mc) and "component" or "entity" end
+        err = r
+      end
+    end
+  end
+  return false, err or "no such method", "-"
+end
+
+-- A vehicle's velocity: GetSpeed (cars), else the bike component's, else from its last two positions (kept in st).
+function M.VehVel(ent, mc, st)
+  for _, o in ipairs({ ent, mc }) do
+    if o ~= nil then
+      local good, v = pcall(function() return o:GetSpeed() end)
+      if good and v ~= nil then
+        local g2, x = pcall(function() return v.x end)
+        if g2 and type(x) == "number" then return v.x, v.y, v.z end
+      end
+    end
+  end
+  local p = ent:GetPos()
+  st = st or {}
+  local vx, vy, vz = 0, 0, 0
+  local dt = st.velT and (M.now - st.velT) or 0
+  if dt > 1e-3 and dt < 0.5 then
+    vx, vy, vz = (p.x - st.velX) / dt, (p.y - st.velY) / dt, (p.z - st.velZ) / dt
+  elseif st.vel then
+    vx, vy, vz = st.vel[1], st.vel[2], st.vel[3]
+  end
+  if dt > 1e-3 or not st.velT then
+    st.velT, st.velX, st.velY, st.velZ, st.vel = M.now, p.x, p.y, p.z, { vx, vy, vz }
+  end
+  return vx, vy, vz
+end
+
+-- A vehicle's rotation (GetRot, a quaternion); a bike whose entity has none: the yaw of `dir` (a unit vector in the
+-- ground plane, e.g. the rider's heading), logged once. Returns a value with .v.x .v.y .v.z .s.
+function M.RotOf(ent, dir)
+  local good, q = pcall(function() return ent:GetRot() end)
+  if good and q ~= nil then return q end
+  if not M.rotLogged then
+    M.rotLogged = true
+    log("vehicle " .. tostring(ent) .. ": no GetRot (" .. tostring(q) .. "): its rotation is taken from the heading")
+  end
+  local yaw = math.atan2(dir and dir.y or 1, dir and dir.x or 0)  -- the game's frame: forward is +y at yaw 0 (a guess)
+  local h = (yaw - math.pi / 2) / 2
+  return { v = { x = 0, y = 0, z = math.sin(h) }, s = math.cos(h) }
+end
+
+-- A vehicle's speed in m/s: GetSpeedFloat (km/h: M.SpeedMs, src/game/car_units.h), else from its velocity (a bike
+-- whose entity has no GetSpeedFloat).
+function M.VehSpeed(c)
+  local sp = M.SpeedMs(c.ent)
+  if sp >= 0 then return sp end
+  c.velSt = c.velSt or {}
+  local vx, vy, vz = M.VehVel(c.ent, c.mc, c.velSt)
+  return math.sqrt(vx * vx + vy * vy + vz * vz)
 end
 
 -- A car the local player has driven does not keep an NPC in its driver seat (the puppet is thrown out a few
@@ -698,7 +881,10 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
       if k then st.k = k end
     end
   end
-  RV.Engine(st, ent)
+  -- under water (CAR_IS_UNDERWATER for this copy, st.under: M.OnCarUnderwater) the game stalls the engine: it is not
+  -- switched on again there (before, RV.Engine fought the game once a second: "engine was false, SetEngineOn ok, now
+  -- false" on the sunk manta of the 0.15.0 test)
+  if not st.under then RV.Engine(st, ent) end
   -- gears are not set: SetGear's argument is not known (docs/game-api.md 16); both cars' gears are in the trace
   -- (LR / CR gear) to compare
   st.steerIn = RV.SteerInput(cmd.steer, st.k)
@@ -781,8 +967,9 @@ function RV.Signals(st, ent, want)
 end
 
 function RV.Report(st, ent)
-  local p, v, q = ent:GetPos(), ent:GetSpeed(), ent:GetRot()
-  return string.format("%.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f", p.x, p.y, p.z, v.x, v.y, v.z, q.v.x, q.v.y,
+  local p, q = ent:GetPos(), M.RotOf(ent)
+  local vx, vy, vz = M.VehVel(ent, st.mc, st)  -- GetSpeed; a bike without it: from its positions
+  return string.format("%.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f", p.x, p.y, p.z, vx, vy, vz, q.v.x, q.v.y,
     q.v.z, q.s)
 end
 
@@ -805,6 +992,21 @@ end
 
 -- (a copy held beside his car, c.aside, is put at that spot instead, with his car's rotation)
 local function setTransform(c)
+  if c.bike then  -- a bike: whatever its entity does not take is logged once, not an error every tick
+    local good, err = pcall(function()
+      local a = c.aside
+      c.ent:SetPos(a and V(a.x, a.y, a.z) or V(c.tx, c.ty, c.tz))
+      local q = Math:newQuat()
+      q.v = V(c.qx, c.qy, c.qz)
+      q.s = c.qw
+      c.ent:SetRot(q)
+    end)
+    if not good and not c.transformErr then
+      c.transformErr = true
+      log("bike " .. c.key .. ": its transform cannot be set (" .. tostring(err) .. ")")
+    end
+    return
+  end
   local a = c.aside
   c.ent:SetPos(a and V(a.x, a.y, a.z) or V(c.tx, c.ty, c.tz))
   local q = Math:newQuat()
@@ -818,6 +1020,15 @@ end
 local function setLock(c, closed)
   if c.closed == closed then return end
   c.closed = closed
+  if c.bike then  -- the game's vehicle nodes lock a bike through its component (common_vehicle.lua)
+    local ok, err, where = M.VCall(c, closed and "LockPlayerEntryPoints" or "UnlockPlayerEntryPoints")
+    if not c.lockLogged then
+      c.lockLogged = true
+      log(string.format("bike %s: %s %s (%s)", c.key, closed and "LockPlayerEntryPoints" or "UnlockPlayerEntryPoints",
+        ok and "ok" or ("failed: " .. tostring(err)), tostring(where)))
+    end
+    return
+  end
   if closed then
     try("LockPlayerEntryPoints", c.ent.LockPlayerEntryPoints, c.ent)
   else
@@ -1016,12 +1227,29 @@ function M.CarTick(c)
   elseif c.st == "spawn" then
     if c.sp:IsDone() then
       local car = game.traffic:GetSpawnedEntity(c.qid)
+      -- a bike: traffic.lua takes GetSpawnedSceneObject and its motorcycle component (GetSpawnedEntity may give
+      -- nothing or an entity without the car methods for it; UNVERIFIED which)
+      local g2, so = pcall(function() return game.traffic:GetSpawnedSceneObject(c.qid) end)
+      so = (g2 and valid(so)) and so or nil
+      local mc = motoOf(car) or motoOf(so)
+      if not valid(car) then car = so end
       if not valid(car) then c.st = "failed"; return end
       c.ent, c.st = car, "ready"
-      try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
-      try("DisableExplosion", car.DisableExplosion, car, true)
+      if mc or (c.bikeHint and not car.GetVehicleModelName) then
+        c.bike, c.mc, c.bso = true, mc, so
+        M.BikeProbe(car, mc, "our copy")
+        local a = M.VCall(c, "SetDespawnImmunity", true)
+        log("car " .. c.key .. ": bike copy ready " .. tostring(car) .. (mc and "" or " (no motorcycle component found)")
+          .. ", despawn immunity " .. (a and "set" or "not set"))
+      else
+        try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
+        try("DisableExplosion", car.DisableExplosion, car, true)
+        -- CAR_IS_UNDERWATER for this copy (M.OnCarUnderwater): the game's own vehicle events switch the detection
+        -- on per car (common_vehicle_events.lua EnableUnderwaterDetection); UNVERIFIED that it needs it
+        pcall(function() car:EnableUnderwaterDetection(true) end)
+        log("car " .. c.key .. ": copy ready " .. tostring(car))
+      end
       setTransform(c)
-      log("car " .. c.key .. ": copy ready " .. tostring(car))
     end
   elseif c.st == "ready" then
     if not valid(c.ent) then
@@ -1048,8 +1276,22 @@ function M.CarTick(c)
         -- held beside his car (src/game/seats.h PlaceCopy): not driven onto it while ours stands there; his puppet
         -- sits in it all the same
         if c.rv and c.rv.driven then RV.Idle(c.rv, c.ent) end
+      elseif pp and pp.vcmd and pp.vkey == c.key and (c.bike or c.bikeHint) then
+        -- a bike copy: on its rider's transform every tick (its lean and a wheelie are in that rotation); no
+        -- controls, speed, engine or signals (none known for a bike). Left to its own physics between corrections a
+        -- riderless bike would tip over.
+        c.rv = c.rv or { mc = c.mc }
+        setTransform(c)
+        c.rv.setPosT = M.now
+        if not c.rv.bikeLogged then
+          c.rv.bikeLogged = true
+          log("bike " .. c.key .. ": put on player " .. c.driver .. "'s bike transform every tick")
+        end
+        M.events[#M.events + 1] = "VS " .. c.driver .. " " .. c.key .. " " .. RV.Report(c.rv, c.ent)
       elseif pp and pp.vcmd and pp.vkey == c.key then
         c.rv = c.rv or {}
+        -- under water: CAR_IS_UNDERWATER came for this copy and it is still about that deep (M.OnCarUnderwater)
+        c.rv.under = c.underZ ~= nil and c.tz < c.underZ + 1.5 or nil
         RV.Drive(c.rv, c.ent, pp.vcmd, c.tx, c.ty, c.tz)
         local good, err = pcall(RV.Signals, c.rv, c.ent, pp.vcmd.sig)
         if not good and not c.rv.sigErr then
@@ -1231,31 +1473,67 @@ end
 -- Every tick in the world: swapped cars left over from an ended session (we sat in the copy).
 function M.LeftCarsTick(p)
   if next(M.leftCars) == nil then return end
-  local own = p:GetOwner()
+  local own = M.VehicleOf(p)
   for k, c in pairs(M.leftCars) do
     local inIt = own ~= nil and valid(c.ent) and same(own, c.ent)
     c.localIn = inIt
-    c.driver = (inIt and same(c.ent:GetSeatOwner(0), p)) and "local" or nil
+    local good, d = pcall(function() return c.ent:GetSeatOwner(0) end)
+    c.driver = (inIt and good and same(d, p)) and "local" or nil
     M.SwapTick(c, true, false)
     if not c.orig then M.leftCars[k] = nil end
   end
 end
 
+-- Our seat on a bike: a seat getter of the entity or the component when there is one (UNVERIFIED which), else the
+-- driver's seat - unless another player's puppet sits on this bike's driver seat here (we ride behind him).
+function M.BikeSeat(p, car, mc, key, c)
+  local list = {}
+  if mc ~= nil then list[#list + 1] = mc end
+  list[#list + 1] = car
+  for _, o in ipairs(list) do
+    for s = 0, 1 do
+      local good, h = pcall(function() return o:GetSeatOwner(s) end)
+      if good and valid(h) and same(h, p) then return s, "seat getter" end
+    end
+  end
+  if key and c then
+    for _, pp in pairs(M.pup) do
+      if pp.veh and pp.vkey == key and pp.seat == 0 and pp.so and M.OnBike(pp.so, c) then return 1, "behind his puppet" end
+    end
+  end
+  return 0, "no seat getter: the rider"
+end
+
 -- Who drives what: remote states (seat 0) claim cars; the local player claims the car whose driver seat he is in.
+-- A motorbike is a vehicle like a car (M.VehicleOf; its seat from M.BikeSeat).
 function M.CarsUpdate(p)
   M.my = nil
-  local car = p and p:GetOwner()
-  if car and valid(car) and car.GetVehicleModelName then
-    local seat
-    for s = 0, 3 do if same(car:GetSeatOwner(s), p) then seat = s break end end
-    if not seat then  -- getting in or out: GetActualPlayerSeatIndex is 1-based, 0 = none
-      local good, i = pcall(car.GetActualPlayerSeatIndex, car)
-      seat = (good and tonumber(i) and i >= 1 and i <= 4) and (i - 1) or 9  -- 9: no seat yet, claims nothing
-    end
+  local car, mc, how
+  if p then car, mc, how = M.VehicleOf(p) end
+  if car then
+    local seat, seatHow
     local key, c = M.KeyOf(car)
+    if mc then
+      M.BikeProbe(car, mc, how)
+      seat, seatHow = M.BikeSeat(p, car, mc, key, c)
+    else
+      for s = 0, 3 do if same(car:GetSeatOwner(s), p) then seat = s break end end
+      if not seat then  -- getting in or out: GetActualPlayerSeatIndex is 1-based, 0 = none
+        local good, i = pcall(car.GetActualPlayerSeatIndex, car)
+        seat = (good and tonumber(i) and i >= 1 and i <= 4) and (i - 1) or 9  -- 9: no seat yet, claims nothing
+      end
+    end
     if not key then
       key = M.localId .. ":" .. guidNum(car)
-      c = { key = key, model = car:GetVehicleModelName(), st = "ready", ent = car, used = M.now }
+      c = { key = key, model = mc and M.BikeModel(car, mc) or car:GetVehicleModelName(), st = "ready", ent = car,
+        used = M.now }
+      if mc then
+        c.bike, c.mc = true, mc
+        local g2, oso = pcall(function() return p:GetOwnerSceneObject() end)
+        c.bso = (g2 and valid(oso)) and oso or nil
+        log(string.format("car %s: a motorbike (%s, found through the %s, seat %d: %s)", key, c.model, tostring(how),
+          seat, tostring(seatHow)))
+      end
       M.cars[key] = c
       -- the copy we sat in when the last session ended (or the connection was lost) is a copy again, not ours
       for k, lc in pairs(M.leftCopies) do
@@ -1274,7 +1552,22 @@ function M.CarsUpdate(p)
     -- drove it here first, our seat-0 reading is the game's slide (his puppet left the seat), not a takeover; when we
     -- both claimed it before seeing each other, the car's holder (the key's owner) keeps it, else the lower id. If
     -- we give way we claim nothing (seat 9) and M.WheelTick moves us to a passenger seat or out.
-    if seat == 0 then
+    if seat == 0 and (c.bike or c.bikeHint) then
+      -- a motorbike: no seats to slide to, no ride along (M.BikeSeat). When another player's state names its saddle
+      -- too, the same keeper rule decides, and the one who gives way counts as the rider behind him (seat 1, as
+      -- M.BikeSeat does when his puppet sits on the saddle here): no M.WheelTick, no slide or get-out tried on a bike
+      local rid = M.WheelClaimant(key)
+      if rid and M.WheelDecide(key, c.driver, rid) == "yield" then
+        seat = 1
+        if c.bikeYield ~= rid then
+          c.bikeYield = rid
+          log(string.format("bike %s: player %s rides it too and keeps it: we count as behind him (seat 1)", key, rid))
+          trace("WHL", string.format("key=%s ev=bike to=%s holder=%s", key, rid, tostring(key:match("^(%d+):"))))
+        end
+      else
+        c.bikeYield = nil
+      end
+    elseif seat == 0 then
       local rid = M.WheelClaimant(key)
       if rid then
         local d = M.WheelDecide(key, c.driver, rid)
@@ -1327,11 +1620,18 @@ function M.CarsUpdate(p)
         pp.conflict = pp.vkey
       else
         c = M.EnsureCar(pp.vkey, pp.veh, pp.cx, pp.cy, pp.cz, pp.qx, pp.qy, pp.qz, pp.qw)
+        -- his state says bike (pose bit 32) or the model is one: handled as a bike before its copy shows what it is
+        if not c.bikeHint and (M.PoseBit(pp, 32) or M.IsBikeModel(pp.veh)) then
+          c.bikeHint = true
+          log("car " .. pp.vkey .. ": player " .. id .. " rides a motorbike (" .. tostring(pp.veh) .. ")")
+        end
         pp.conflict = nil
         if c.driver ~= id then
           log("car " .. pp.vkey .. ": player " .. id .. " drives it")
-          -- noNpc: a real car of ours that came back from a swap (it threw his puppet out before): a copy at once
-          if (c.localDriven or c.noNpc) and c.st == "ready" and not c.localIn and not c.swapFailed then
+          -- noNpc: a real car of ours that came back from a swap (it threw his puppet out before): a copy at once.
+          -- Never a bike (no swap: whether a bike throws an NPC rider off is not known; M.SeatBike has a fallback)
+          if (c.localDriven or c.noNpc) and c.st == "ready" and not c.localIn and not c.swapFailed
+            and not (c.bike or c.bikeHint) then
             M.Swap(c, c.localDriven and ("player " .. id .. " drives a car we drove") or ("player " .. id
               .. " drives our car again"))
           end
@@ -1359,10 +1659,10 @@ function M.CarsUpdate(p)
     end
     -- We were the last driver: once the car has stopped, tell everyone where it rests.
     if c.parkPending and c.ent and valid(c.ent) then
-      local sp = M.SpeedMs(c.ent)  -- m/s (GetSpeedFloat is km/h)
-      if M.now - c.exitT > 1 and ((sp >= 0 and sp < 0.3) or M.now - c.exitT > 8) then
+      local sp = M.VehSpeed(c) or 0
+      if M.now - c.exitT > 1 and (math.abs(sp) < 0.3 or M.now - c.exitT > 8) then
         c.parkPending = nil
-        local cp, q = c.ent:GetPos(), c.ent:GetRot()
+        local cp, q = c.ent:GetPos(), M.RotOf(c.ent)
         local wrecked, dmg, motor = M.Wrecked(c.ent)
         M.events[#M.events + 1] = string.format("CP %s %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %d", key, c.model,
           cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, wrecked and 1 or 0)
@@ -1420,10 +1720,10 @@ end
 -- Ride along: E next to a car somebody else drives seats the local player in its first free passenger seat
 -- (the game would otherwise try the driver's door; player entry is locked on those cars).
 function M.RideAlong(p)
-  if M.ride or p:GetOwner() then return end
+  if M.ride or M.VehicleOf(p) then return end
   local pos, best, bestD = p:GetPos(), nil, 25
   for _, c in pairs(M.cars) do
-    if c.st == "ready" and c.driver and c.driver ~= "local" and valid(c.ent) then
+    if c.st == "ready" and c.driver and c.driver ~= "local" and valid(c.ent) and not (c.bike or c.bikeHint) then
       local cp = c.ent:GetPos()
       local d = (cp.x - pos.x) ^ 2 + (cp.y - pos.y) ^ 2
       if d < bestD then best, bestD = c, d end
@@ -1507,7 +1807,7 @@ function M.SeatTick(p)
     return
   end
   local c = my.c
-  if not (c.ent and valid(c.ent)) then return end
+  if not (c.ent and valid(c.ent)) or c.bike then return end  -- (a bike: no seat getter known, M.BikeSeat)
   if M.now - (M.seatYieldT or -10) < 0.5 then return end
   M.seatYieldT = M.now
   local y = M.seatYield
@@ -1741,9 +2041,19 @@ function M.Hide(pp, hide, forSeat)
   pp.moving = false
 end
 
--- Puppet out of whatever car it sits in (animated; the car must not be moving).
-function M.GetOut(pp)
+-- Puppet out of whatever car it sits in (animated; the car must not be moving). fast: off a bike, at once
+-- (GetOutCarFast, C_WrapperHuman; UNVERIFIED on a bike), the animated exit if that call fails.
+function M.GetOut(pp, fast)
   if pp.exitSo then return end
+  if fast then
+    local good, r = pcall(pp.so.GetOutCarFast, pp.so)
+    if good then
+      pp.exitSo, pp.exitT = r or true, M.now
+      log("puppet " .. pp.id .. " gets off the bike (fast)")
+      return
+    end
+    log("puppet " .. pp.id .. ": GetOutCarFast failed (" .. tostring(r) .. "): the normal exit")
+  end
   pp.exitSo, pp.exitT = pp.so:GetOffVehicle(), M.now
   log("puppet " .. pp.id .. " getting out")
 end
@@ -1985,6 +2295,286 @@ function M.SeatDriverNow(pp, c)
   return now == "ours"
 end
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- A puppet on a motorbike (docs/game-api.md 25; all of it UNVERIFIED in game). It gets on at once (GetOnVehicle with
+-- animate = false, as for cars; the bike's entity first, then its scene object) and off at once (GetOutCarFast): a
+-- rider's mount and dismount are quick. It counts as on the bike when GetOwner or GetOwnerSceneObject is the bike.
+-- When BIKE_TRIES tries did not put it on, it is "perched" instead: shown at the bike's saddle (its transform every
+-- tick, physics off so it does not collide with the bike) with a riding animation tried once - a rider sitting on
+-- top, not a seated one, but visible where he is. Every BIKE_RETRY s a perched puppet tries the seat again.
+-- ---------------------------------------------------------------------------------------------------------------
+local BIKE_TRIES = 4
+local BIKE_RETRY = 10
+local BIKE_SADDLE = 0.55                      -- m above the bike's origin (a guess)
+local BIKE_BACK = { [0] = -0.05, [1] = -0.6 }  -- m along the bike: the rider, the pillion behind him (guesses)
+M.bikeAnims = M.bikeAnims or { "hero_moto_idle", "hero_moto_hold_idle", "hero_moto_speed_loop" }
+
+function M.SeatBike(pp, c)
+  local so = pp.so
+  if M.OnBike(so, c) then
+    if pp.perch then M.PerchEnd(pp, "it sits on the bike now", true) end
+    pp.bikeRec = c
+    if not pp.seated then
+      pp.seated, pp.seatedT = true, M.now
+      log(string.format("puppet %s rides bike %s seat %d (%.1f s after the first try, %d tries)", pp.id,
+        tostring(pp.vkey), pp.seat, M.now - (pp.bikeT0 or M.now), pp.seatTries or 0))
+      trace("BKS", string.format("key=%s id=%s seat=%d ev=on tries=%d", tostring(pp.vkey), pp.id, pp.seat,
+        pp.seatTries or 0))
+    end
+    return true
+  end
+  if pp.seated then
+    pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
+    log(string.format("puppet %s is off bike %s (#%d): on again", pp.id, tostring(pp.vkey), pp.ejects))
+    pp.seatTries = 0
+  end
+  if pp.perch then
+    M.PerchTick(pp, c)
+    if M.now - (pp.perch.retryT or pp.perch.t) < BIKE_RETRY then return true end
+    pp.perch.retryT = M.now
+  elseif (pp.seatTries or 0) >= BIKE_TRIES then
+    M.PerchStart(pp, c)
+    return true
+  end
+  -- the friend brain first, as for a car seat (M.Seat)
+  if M.WantsBrain() and not pp.ally then
+    if M.Ally(pp, so) then pp.brainT = M.now; return true end
+    if M.now - (pp.spawnT or M.now) < 2.5 then return true end
+  end
+  if pp.brainT and M.now - pp.brainT < BRAIN_SETTLE then return true end
+  if not pp.perch and (pp.seatTries or 0) > 0 and M.now - (pp.seatT or -10) < 0.5 then return true end
+  pp.bikeT0 = pp.bikeT0 or M.now
+  if pp.hidden and not pp.perch then M.Hide(pp, false, true) end
+  pp.seatT, pp.seatTries = M.now, (pp.seatTries or 0) + 1
+  local tried = {}
+  local targets = { c.ent }
+  if c.bso and not same(c.bso, c.ent) then targets[#targets + 1] = c.bso end
+  for _, target in ipairs(targets) do
+    local good, err = pcall(so.GetOnVehicle, so, target, pp.seat + 1, false, "WALK")
+    tried[#tried + 1] = (target == c.bso and "scene object " or "entity ") .. (good and "ok" or ("failed: " .. tostring(err)))
+    if good then break end
+  end
+  if pp.seatTries <= 6 then
+    log(string.format("puppet %s: onto bike %s seat %d (try %d%s): %s", pp.id, tostring(pp.vkey), pp.seat,
+      pp.seatTries, pp.perch and ", perched meanwhile" or "", table.concat(tried, "; ")))
+  end
+  return true
+end
+
+-- Perched on the bike (no seat): at its saddle every tick, physics off, a riding animation tried once.
+function M.PerchStart(pp, c)
+  local so = pp.so
+  pp.perch = { key = c.key, t = M.now }
+  if pp.hidden then M.Hide(pp, false, true) end
+  local good = pcall(so.SetPhysState, so, 2)
+  local anim = "-"
+  for _, name in ipairs(M.bikeAnims) do
+    local ok = pcall(so.AnimPlay, so, name, false)
+    if ok then anim = name break end
+  end
+  log(string.format("puppet %s: could not be seated on bike %s after %d tries: perched on it (physics off %s, "
+    .. "animation %s)", pp.id, tostring(pp.vkey), pp.seatTries or 0, good and "ok" or "failed", anim))
+  trace("BKS", string.format("key=%s id=%s seat=%d ev=perch anim=%s", tostring(pp.vkey), pp.id, pp.seat, anim))
+  M.PerchTick(pp, c)
+end
+
+function M.PerchTick(pp, c)
+  local so, b = pp.so, c.ent
+  if not valid(b) then return end
+  local p = b:GetPos()
+  local g, d = pcall(function() return b:GetDir() end)
+  local dx, dy = 0, 1
+  if g and d then dx, dy = d.x, d.y end
+  local l = math.sqrt(dx * dx + dy * dy)
+  if l > 1e-3 then dx, dy = dx / l, dy / l else dx, dy = pp.hx or 0, pp.hy or 1 end
+  local back = BIKE_BACK[pp.seat] or BIKE_BACK[1]
+  so:SetPos(V(p.x + dx * back, p.y + dy * back, p.z + BIKE_SADDLE))
+  so:SetDir(V(dx, dy, 0))
+end
+
+-- seated: it sits on the bike now (its physics is the seat's business: made DYNAMIC it would be thrown off)
+function M.PerchEnd(pp, why, seated)
+  local so = pp.so
+  pp.perch = nil
+  if valid(so) then
+    pcall(so.AnimStop, so)
+    if not pp.hidden and not seated then pcall(so.SetPhysState, so, 0) end
+  end
+  log("puppet " .. pp.id .. ": no longer perched on the bike (" .. tostring(why) .. ")")
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Water (docs/game-api.md 25). His state says he swims or is under water (pose bits 8 / 16, from game/water.h on his
+-- game). An AI human in deep water drowns (the animation sets have male_nw_swim_drown_idle) and cannot path through
+-- water, so the puppet is not walked: it is put at his position every tick, made kinematic (SetPhysState(1),
+-- UNVERIFIED that this keeps the water's physics off it), shielded (M.GuardTick: a demigod) and plays a swim stroke by
+-- his speed (names from basic_anim, the way the move group plays its animations; UNVERIFIED that any shows). If the
+-- game drowns it anyway (a local death in the water, M.PuppetLife) its respawn stays hidden at his position until he
+-- is out of the water.
+-- ---------------------------------------------------------------------------------------------------------------
+M.swimAnims = M.swimAnims or {
+  idle = { "hero_nw_alert_swim_idle" },
+  slow = { "hero_nw_alert_swim_move_slow_new", "hero_nw_alert_swim_move_medium_new" },
+  medium = { "hero_nw_alert_swim_move_medium_new", "hero_nw_alert_swim_move_fast" },
+  fast = { "hero_nw_alert_swim_move_fast", "hero_nw_alert_swim_move_medium_new" },
+}
+
+function M.Wet(pp) return M.PoseBit(pp, 8) or M.PoseBit(pp, 16) end
+
+-- True while the puppet is in water mode (M.Drive does nothing else with it then).
+function M.WaterTick(pp, so)
+  local w = pp.water
+  if not M.Wet(pp) then
+    if w then
+      pp.water, pp.waterHide = nil, nil
+      if w.aso or w.name then pcall(so.AnimStop, so) end
+      if pp.hidden then
+        M.Hide(pp, false)
+      else
+        pcall(so.SetPhysState, so, 0)
+      end
+      so:SetPos(V(pp.tx, pp.ty, pp.tz))
+      log(string.format("puppet %s: its player is out of the water (%.1f s in it): it walks again", pp.id, M.now - w.t))
+      trace("PW", string.format("id=%s ev=out dur=%.1f", pp.id, M.now - w.t))
+    end
+    return false
+  end
+  if not w then
+    w = { t = M.now, under = false, anims = 0 }
+    pp.water = w
+    if pp.actRun then M.ActionEnd(pp, so, "he swims") end
+    if pp.carry then M.CarryEnd(pp, so, "he swims") end
+    pp.onLadder = nil
+    log(string.format("puppet %s: its player swims (%.1f %.1f %.1f): put at his position every tick, kinematic, swim "
+      .. "strokes tried", pp.id, pp.tx or 0, pp.ty or 0, pp.tz or 0))
+    trace("PW", string.format("id=%s ev=in p=%.2f,%.2f,%.2f", pp.id, pp.tx or 0, pp.ty or 0, pp.tz or 0))
+  end
+  local under = M.PoseBit(pp, 16)
+  if under ~= w.under then
+    w.under = under
+    log("puppet " .. pp.id .. ": its player " .. (under and "dives" or "is back at the surface"))
+    trace("PW", string.format("id=%s ev=%s z=%.2f", pp.id, under and "under" or "surface", pp.tz or 0))
+  end
+  if pp.waterHide then  -- the game drowned it once already: hidden at his position until he is out
+    if not pp.hidden then M.Hide(pp, true) end
+    so:SetPos(V(pp.tx, pp.ty, pp.tz))
+    return true
+  end
+  if pp.hidden then M.Hide(pp, false, true) end
+  if not w.phys then
+    w.phys = true
+    local good, err = pcall(so.SetPhysState, so, 1)
+    log("puppet " .. pp.id .. ": kinematic for the water " .. (good and "ok" or ("failed: " .. tostring(err))))
+  end
+  so:SetPos(V(pp.tx, pp.ty, pp.tz))
+  if (pp.hx or 0) ~= 0 or (pp.hy or 0) ~= 0 then so:SetDir(V(pp.hx, pp.hy, 0)) end
+  -- a stroke by his speed, again when its sync object is done (at most every 0.5 s) or after 2 s without one
+  local sp = math.sqrt((pp.vx or 0) ^ 2 + (pp.vy or 0) ^ 2)
+  local kind = sp < 0.4 and "idle" or sp < 1.2 and "slow" or sp < 2.2 and "medium" or "fast"
+  local done = false
+  if w.aso and type(w.aso) ~= "boolean" then
+    local g, d = pcall(function() return w.aso:IsDone() end)
+    done = g and d == true
+  end
+  local due = kind ~= w.kind or done or (M.now - (w.animT or -10) > 2)
+  if due and M.now - (w.animT or -10) >= 0.5 then
+    w.kind, w.animT = kind, M.now
+    local method = "animplay"
+    if mc_anim_method then
+      local m, _, _, confirmed = mc_anim_method(7)  -- the move group's way, when one was seen working
+      if confirmed == 1 and M.ANIM_METHODS[m] and not M.ANIM_METHODS[m].script then method = m end
+    end
+    local how = M.ANIM_METHODS[method] or M.ANIM_METHODS.animplay
+    local used
+    for _, name in ipairs(M.swimAnims[kind] or {}) do
+      local good, r = pcall(how.play, so, name)
+      if good then used, w.aso, w.name = name, r, name break end
+    end
+    w.anims = w.anims + 1
+    if w.anims <= 8 or w.anims % 50 == 0 then
+      log(string.format("puppet %s: swim stroke %s (%s, %.1f m/s): %s", pp.id, kind, method, sp,
+        used or "no animation accepted"))
+    end
+  end
+  return true
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- The puppet's shield (game/puppet_guard.h Shield, mc_pupguard; docs/game-api.md 25): a puppet only dies when its
+-- player's state says so. While a hazard is near (a car seat, the water, a fall, fire, a picture of another game's
+-- explosion, hidden) and for a moment after, it is a demigod; otherwise not (its DAMAGE events carry the local
+-- player's hits). Applied every tick; at once from an explosion picture or IN_DEEP_WATER (M.ShieldNow).
+-- ---------------------------------------------------------------------------------------------------------------
+local HZ = { seat = 1, water = 2, inWater = 4, fall = 8, fire = 16, blast = 32, hidden = 64, down = 128 }
+M.HZ = HZ
+local FALL_SPEED = 6       -- m/s down: a fall that can kill
+local BLAST_NEAR = 15      -- m from a picture of another game's explosion
+local BLAST_TIME = 2.5     -- s
+M.blasts = M.blasts or {}
+
+function M.ApplyShield(pp, so, on, what)
+  if on == (pp.demi or false) then return end
+  local good, err = pcall(so.SetDemigod, so, on)
+  pp.demi = on
+  pp.demiN = (pp.demiN or 0) + 1
+  if pp.demiN <= 40 or pp.demiN % 50 == 0 then
+    log(string.format("puppet %s: %s (%s)%s", pp.id, on and "shielded, a demigod" or "shield off", tostring(what),
+      good and "" or (": SetDemigod failed: " .. tostring(err))))
+  end
+  trace("PG", string.format("id=%s on=%d why=%s ok=%d", pp.id, on and 1 or 0, tostring(what), good and 1 or 0))
+end
+
+-- a hazard bit right now (an explosion picture, IN_DEEP_WATER): the shield goes on before the next tick
+function M.ShieldNow(pp, bit)
+  if not (pp.st == "alive" and valid(pp.so)) or (pp.health or 100) <= 0 then return end
+  local on, what = true, "-"
+  if mc_pupguard then on, what = mc_pupguard(tonumber(pp.id) or 0, M.now, bit) end
+  M.ApplyShield(pp, pp.so, on, what)
+end
+
+-- explosion_sync.lua: a picture of another game's explosion goes off at x y z now
+function M.PuppetHazard(x, y, z)
+  M.blasts[#M.blasts + 1] = { x = x, y = y, z = z, t = M.now }
+  for _, pp in pairs(M.pup) do
+    if pp.st == "alive" and valid(pp.so) then
+      local q = pp.so:GetPos()
+      if (q.x - x) ^ 2 + (q.y - y) ^ 2 + (q.z - z) ^ 2 <= BLAST_NEAR * BLAST_NEAR then M.ShieldNow(pp, HZ.blast) end
+    end
+  end
+end
+
+function M.BlastNear(q)
+  local keep, near = {}, false
+  for _, b in ipairs(M.blasts) do
+    if M.now - b.t < BLAST_TIME then
+      keep[#keep + 1] = b
+      if (q.x - b.x) ^ 2 + (q.y - b.y) ^ 2 + (q.z - b.z) ^ 2 <= BLAST_NEAR * BLAST_NEAR then near = true end
+    end
+  end
+  M.blasts = keep
+  return near
+end
+
+function M.GuardTick(pp, so)
+  local h = 0
+  local function add(b, on) if on then h = h + b end end
+  add(HZ.seat, pp.veh and pp.seat <= 3 and (pp.seated or pp.perch ~= nil or valid(so:GetOwner())))
+  add(HZ.water, M.Wet(pp))
+  add(HZ.inWater, pp.inWaterT ~= nil and M.now - pp.inWaterT < 3)
+  local q = so:GetPos()
+  local pvz = 0
+  if pp.gzT and M.now - pp.gzT > 1e-3 and M.now - pp.gzT < 0.5 then pvz = (q.z - pp.gz) / (M.now - pp.gzT) end
+  pp.gz, pp.gzT = q.z, M.now
+  add(HZ.fall, (pp.inAir and (pp.vz or 0) < -FALL_SPEED) or pvz < -FALL_SPEED)
+  add(HZ.fire, M.Burning(pp))
+  add(HZ.blast, M.BlastNear(q))
+  add(HZ.hidden, pp.hidden == true)
+  add(HZ.down, (pp.health or 100) <= 0)
+  local on, what = h ~= 0, tostring(h)
+  if mc_pupguard then on, what = mc_pupguard(tonumber(pp.id) or 0, M.now, h) end
+  M.ApplyShield(pp, so, on, what)
+end
+
 -- Crouch, aim, shots and reload on a puppet (on foot only). The puppet is an AI civilian; these are the human
 -- debug commands the game's own test scripts use (docs/game-api.md 10):
 --   SetStalkMove(bool)                 crouch (aiming stands it up again)
@@ -2081,6 +2671,8 @@ function M.Drive(pp)
   local so = pp.so
   if not valid(so) then M.ScriptForget(pp); pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
+  local gok, gerr = pcall(M.GuardTick, pp, so)  -- the shield: no local death (game/puppet_guard.h)
+  if not gok then logErr("puppet guard", gerr) end
   if not pp.ally and M.WantsBrain() then M.Ally(pp, so) end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     pp.act = nil  -- his punches / throws from a car seat are not shown
@@ -2109,7 +2701,14 @@ function M.Drive(pp)
       pp.seatCar = c.ent
     end
     pp.dist = 0
-    if pp.seat <= 3 and c and c.st == "ready" and valid(c.ent) and M.Seat(pp, c) then return end
+    if pp.water then M.WaterTick(pp, so) end  -- (out of water mode: his pose has no water bit in a vehicle)
+    if pp.seat <= 3 and c and c.st == "ready" and valid(c.ent) then
+      if c.bike or c.bikeHint then
+        if M.SeatBike(pp, c) then return end
+      elseif M.Seat(pp, c) then
+        return
+      end
+    end
     -- No car (yet) or no seat: hide the puppet and park it at the car.
     if valid(so:GetOwner()) then
       M.GetOut(pp)
@@ -2120,13 +2719,51 @@ function M.Drive(pp)
     return
   end
   pp.seatKey = nil
+  if pp.perch then M.PerchEnd(pp, "he is off the bike") end
   -- he walks to / from a car door (seat 9): script control is given back (an action may still play out, without it)
   if pp.veh and pp.seat == 9 then M.ScriptRelease(pp, so, "door walk", "door") end
+  -- off a bike: at once (a rider gets off quickly); the bike it rode is checked itself (GetOwner may not name a bike)
+  local br = pp.bikeRec
+  if br and valid(br.ent) and M.OnBike(so, br) then
+    M.GetOut(pp, true)
+    if M.now - pp.exitT < 1 then return end
+    pp.exitSo = nil  -- still on it after 1 s: tried again next tick
+  elseif br then
+    pp.bikeRec = nil
+  end
   if valid(so:GetOwner()) then  -- the player got out: let the puppet climb out, then follow on foot again
     M.GetOut(pp)
     if M.now - pp.exitT < 3 then return end
   end
   pp.exitSo = nil
+  -- Too fast for one on foot (T field 68: game/puppet_guard.h FastFoot; a vehicle his game sends as on foot), or
+  -- held back after repeated local deaths (M.PuppetLife): hidden at his position, nothing else.
+  local hold = (pp.fast and "fast") or ((pp.hideUntil and M.now < pp.hideUntil) and "deaths") or nil
+  if hold then
+    if pp.holdWhy ~= hold then
+      pp.holdWhy = hold
+      log(string.format("puppet %s: hidden at its player's position (%s)", pp.id, hold == "fast" and string.format(
+        "he moves %.1f m/s, too fast for one on foot", math.sqrt((pp.vx or 0) ^ 2 + (pp.vy or 0) ^ 2))
+        or "it died here again and again"))
+      trace("PH", string.format("id=%s why=%s", pp.id, hold))
+    end
+    if pp.actRun then M.ActionEnd(pp, so, "hidden") end
+    M.Hide(pp, true)
+    so:SetPos(V(pp.tx, pp.ty, pp.tz))
+    pp.act = nil
+    M.ReportPS(pp, so, 1)
+    return
+  elseif pp.holdWhy then
+    log("puppet " .. pp.id .. ": shown again (" .. pp.holdWhy .. " is over)")
+    trace("PH", string.format("id=%s why=none was=%s", pp.id, pp.holdWhy))
+    pp.holdWhy = nil
+  end
+  -- in the water: put at his position, swim strokes (M.WaterTick); the controller leaves it alone (busy 1)
+  if M.WaterTick(pp, so) then
+    pp.act = nil
+    M.ReportPS(pp, so, 1)
+    return
+  end
   if pp.hidden then
     M.Hide(pp, false)
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
@@ -2152,10 +2789,13 @@ function M.Drive(pp)
     M.Combat(pp)
   end
   M.CarryTick(pp, so)
-  -- where it is now, for the C++ side's controller (measured speed, error, next walk point)
+  M.ReportPS(pp, so, (move or ladder) and 2 or (busy and 1 or 0))
+end
+
+-- where the puppet is now, for the C++ side's controller (measured speed, error, next walk point); busy as in M.Drive
+function M.ReportPS(pp, so, busy)
   local q, d = so:GetPos(), so:GetDir()
-  M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f %d", pp.id, q.x, q.y, q.z, d.x, d.y,
-    (move or ladder) and 2 or (busy and 1 or 0))
+  M.events[#M.events + 1] = string.format("PS %s %.3f %.3f %.3f %.4f %.4f %d", pp.id, q.x, q.y, q.z, d.x, d.y, busy)
 end
 
 -- On foot: the puppet walks with the game's own locomotion (MoveVec: AI path following with the walk/run/sprint
@@ -2262,13 +2902,14 @@ function M.TracePuppet(pp)
   local g3, ai = pcall(so.GetAIType, so)
   trace("PR", string.format("id=%s st=%s p=%s d=%.3f,%.3f hid=%d veh=%s seat=%s own=%s seated=%d ejects=%d tries=%d "
     .. "anim=%s phys=%s spr=%s dead=%d hp=%.0f mv=%d mult=%.2f moves=%d snaps=%d sown=%s brain=%d ai=%s back=%d "
-    .. "leaving=%d ejAll=%d",
+    .. "leaving=%d ejAll=%d demi=%d fast=%d wet=%d perch=%d bike=%d",
     pp.id, pp.st, f3(so:GetPos()), so:GetDir().x, so:GetDir().y, pp.hidden and 1 or 0, tostring(pp.vkey),
     tostring(pp.seat), valid(own) and tostring(guidNum(own)) or "-", pp.seated and 1 or 0, pp.ejects or 0,
     pp.seatTries or 0, tostring(pp.seatAnim), g1 and tostring(phys) or "-", g2 and (spr and "1" or "0") or "-",
     so:IsDeath() and 1 or 0, tonumber(so.health) or -1, pp.moving and 1 or 0, pp.mult or 1, pp.moves or 0,
     pp.snaps or 0, sown, pp.brain and 1 or 0, g3 and tostring(ai) or "-", pp.putBacks or 0, pp.leaving and 1 or 0,
-    pp.ejectsAll or 0))
+    pp.ejectsAll or 0, pp.demi and 1 or 0, pp.fast and 1 or 0, pp.water and (pp.water.under and 2 or 1) or 0,
+    pp.perch and 1 or 0, (c and (c.bike or c.bikeHint)) and 1 or 0))
 end
 
 -- LR: our own player (and the car we drive): what the others are sent, read back from the game
@@ -2581,6 +3222,7 @@ function M.OnPuppetDamage(pp, m)
   local dtype, zone = tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0
   if dtype == 8 then pp.burnT = M.now end  -- FIRE: see M.Burning
   local weapon = tonumber(m:GetWeaponID()) or 0
+  pp.lastDmg = { t = M.now, dtype = dtype, amount = amount }  -- for the log of a local death (M.PuppetLife)
   if not M.IsLocalAttacker(enemy) then
     pp.otherHits = (pp.otherHits or 0) + 1
     if pp.otherHits <= 3 then
@@ -2588,8 +3230,10 @@ function M.OnPuppetDamage(pp, m)
     end
     return
   end
-  -- our bullet's DAMAGE on a puppet: the evidence M.ShotTick matches our shots against (no second Hit for them)
-  if dtype == 0 and not M.boomOurs then M.PvpEvidence("game", pp) end
+  -- our bullet's DAMAGE on a puppet: the evidence M.ShotTick matches our shots against (no second Hit for them).
+  -- Not one without damage (a shielded puppet, M.ApplyShield: a demigod may report 0): no Hit is sent for it here,
+  -- so it must not stand in for the ray's Hit
+  if dtype == 0 and amount > 0 and not M.boomOurs then M.PvpEvidence("game", pp) end
   if not M.friendlyFire or amount <= 0 then return end
   -- a car against a human sends a burst of small COLLISION (11) / IN_CAR (10) messages (one per frame of contact):
   -- summed and sent as one Hit after RAM_SUM s (M.RamTick)
@@ -2720,7 +3364,20 @@ function M.DamageDispatch(m, g)
 end
 
 function M.OnDeathEvent(m)
-  if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
+  local g = tostring(m:GetReceiverGUID())
+  if g ~= M.localGuid then
+    -- a puppet died here: what killed it (M.PuppetLife logs it and respawns it unless its player is down)
+    for _, pp in pairs(M.pup) do
+      if pp.guid == g then
+        local g1, dt = pcall(m.GetDamageType, m)
+        local g2, kg = pcall(m.GetKillerGUID, m)
+        pp.deathInfo = { dtype = g1 and tostring(dt) or "?", killer = g2 and tostring(kg) or "?" }
+        log(string.format("puppet %s: DEATH here (damage type %s, killer %s, its player's health %.0f, shield %s)",
+          pp.id, pp.deathInfo.dtype, pp.deathInfo.killer, pp.health or -1, pp.demi and "on" or "off"))
+      end
+    end
+    return
+  end
   M.died, M.diedAt, M.diedRetry = true, M.now, nil
   log(string.format("we died (killer %s, damage type %s)%s", tostring(m:GetKillerGUID()), tostring(m:GetDamageType()),
     M.isHost and "" or ", respawning next to the host after the reload"))
@@ -2763,13 +3420,52 @@ function M.WatchDamage(p)
       log("could not watch " .. name .. " events (" .. tostring(id) .. ")")
     end
   end
+  -- a car under water (CarMessages.CAR_IS_UNDERWATER, common_vehicle_events.lua OnCarIsUnderwater): M.OnCarUnderwater
+  local cuw = enums.CarMessages and enums.CarMessages.CAR_IS_UNDERWATER
+  if cuw then
+    local good, id = pcall(game.game.RegisterBlanketEvent, game.game, {}, function(ctx, m)
+      local ok, err = pcall(M.OnCarUnderwater, m)
+      if not ok then logErr("car under water event", err) end
+    end, enums.EventType.CAR, cuw)
+    if good and tonumber(id) and tonumber(id) >= 0 then
+      ids[#ids + 1] = id
+    else
+      log("could not watch CAR_IS_UNDERWATER events (" .. tostring(id) .. ")")
+    end
+  else
+    log("could not watch CAR_IS_UNDERWATER events (no CarMessages.CAR_IS_UNDERWATER in this build)")
+  end
   M.dmg = { key = key, ids = ids }
   M.swings = {}
   M.pvpShots, M.pvpEv = {}, {}
   log("watching damage, deaths, our punches, bullet hits and actions (" .. #ids .. " subscriptions)")
 end
 
+-- A car went under water here (CAR_IS_UNDERWATER; UNVERIFIED whether it needs EnableUnderwaterDetection, which car
+-- copies get at spawn, and whether it repeats). A copy a remote player drives: its engine is no longer switched on
+-- (the game stalls it under water; RV.Drive st.under), and it is otherwise left to the driver's transform. Our own car:
+-- only logged (the game sinks it, may blow it up; car_damage.lua sends that like any explosion).
+function M.OnCarUnderwater(m)
+  local id = tonumber(tostring(m:GetReceiverGUID()):match("(%d+)%s*$"))
+  if not id then return end
+  for key, c in pairs(M.cars) do
+    if valid(c.ent) and tonumber(guidNum(c.ent)) == id then
+      local q = c.ent:GetPos()
+      local first = c.underZ == nil
+      c.underZ = q.z
+      if first then
+        log(string.format("car %s is under water here (%.1f %.1f %.1f; %s): its engine is left to the game", key, q.x,
+          q.y, q.z, c.driver == "local" and "we drive it" or (c.driver and ("player " .. c.driver .. " drives it"))
+          or "parked"))
+        trace("CUW", string.format("key=%s z=%.2f drv=%s", key, q.z, tostring(c.driver or "-")))
+      end
+      return
+    end
+  end
+end
+
 -- Puppet health and death, every tick before driving it. True while the puppet is (being made) dead.
+local LOCAL_DEATHS, LOCAL_WINDOW, LOCAL_HOLD = 3, 20, 10  -- local deaths within s: then held hidden for s
 function M.PuppetLife(pp)
   local so = pp.so
   local dead = so:IsDeath()
@@ -2779,9 +3475,12 @@ function M.PuppetLife(pp)
   local hp = pp.health or 100
   if hp <= 0 or (pp.deadShown and (hp < 10 or M.now - (pp.deadAt or 0) < 3)) then
     if not dead and not pp.deadShown then
-      -- it goes down (a ragdoll): its action ends and script control is given back first
+      -- it goes down (a ragdoll): its action ends and script control is given back first; a shielded puppet (a
+      -- demigod, M.GuardTick) is shielded no more: this death comes from the network and must land
       if pp.actRun then M.ActionEnd(pp, so, "he is down") end
       M.ScriptRelease(pp, so, "it goes down", "ragdoll")
+      if mc_pupguard then mc_pupguard(tonumber(pp.id) or 0, M.now, HZ.down) end
+      M.ApplyShield(pp, so, false, "its player is down")
       pcall(so.DoDamage, so, PUP_HEALTH * 100)
       log("puppet " .. pp.id .. ": its player is down, the puppet dies")
     end
@@ -2790,7 +3489,36 @@ function M.PuppetLife(pp)
     return true
   end
   if dead then  -- its player is back (respawned, checkpoint), or something killed it here: a fresh puppet
-    log("puppet " .. pp.id .. ": " .. (pp.deadShown and "its player is back, respawning it" or "died here, respawning it"))
+    if pp.deadShown then
+      log("puppet " .. pp.id .. ": its player is back, respawning it")
+    else
+      -- Not a network death: the local game killed it (drowned, a fall, fire, an explosion, the car it sat in). Its
+      -- player lives: respawned at once (the factory has its profile loaded). In the water its respawn stays hidden
+      -- until he is out (M.WaterTick); after LOCAL_DEATHS such deaths within LOCAL_WINDOW s it is held hidden for
+      -- LOCAL_HOLD s (no respawn churn).
+      local wet = M.Wet(pp) or (pp.inWaterT ~= nil and M.now - pp.inWaterT < 5)
+      if wet then pp.waterHide = true end
+      pp.localDeaths = pp.localDeaths or {}
+      local recent = {}
+      for _, t in ipairs(pp.localDeaths) do if M.now - t < LOCAL_WINDOW then recent[#recent + 1] = t end end
+      recent[#recent + 1] = M.now
+      pp.localDeaths = recent
+      if #recent >= LOCAL_DEATHS then pp.hideUntil = M.now + LOCAL_HOLD end
+      M.localDeathCount = (M.localDeathCount or 0) + 1
+      local d, k = pp.lastDmg, pp.deathInfo
+      local cause = k and string.format("death type %s", tostring(k.dtype))
+        or (d and M.now - d.t < 3 and string.format("damage type %d (%.0f) %.1f s before", d.dtype, d.amount, M.now - d.t))
+        or "no damage seen"
+      log(string.format("puppet %s: died here, NOT a network death (its player has %.0f health; %s; shield %s; %s%s): "
+        .. "respawned at once%s%s", pp.id, pp.health or -1, cause, pp.demi and "on" or "off",
+        wet and "in the water" or "on land", pp.veh and (", in car " .. tostring(pp.vkey) .. " seat " .. tostring(pp.seat)) or "",
+        wet and ", hidden until he is out of the water" or "",
+        pp.hideUntil and M.now < pp.hideUntil and string.format(", held hidden %d s (%d local deaths in %d s)", LOCAL_HOLD,
+          #recent, LOCAL_WINDOW) or ""))
+      trace("PD", string.format("id=%s hp=%.0f cause=%s demi=%d wet=%d veh=%s n=%d", pp.id, pp.health or -1,
+        (cause:gsub(" ", "_")), pp.demi and 1 or 0, wet and 1 or 0, tostring(pp.vkey or "-"), #recent))
+    end
+    pp.lastDmg, pp.deathInfo, pp.demi = nil, nil, nil
     local f = M.fac
     -- its map marker goes first: the navigation module updates its markers once a second and read the released
     -- puppet through a stale marker (crash in exe+0x243a915, docs/game-api.md 15)
@@ -2878,13 +3606,40 @@ end
 -- and drops have no message) and counts them into the action block. Which human receives these messages was not
 -- checked (UNVERIFIED): taken to be the player himself like the melee ones; the IsCarryingBody edge covers a pickup
 -- whose message goes elsewhere.
+-- IN_DEEP_WATER (32) is no move: the C++ side's water tracker (src/game/water.h) takes it; the same message for a
+-- puppet shields it at once (an AI human drowns; M.ShieldNow).
 local TRAV_EVENTS = { { "USE_FENCE", 1 }, { "USE_LADDER", 2 }, { "PICKUP_BODY", 4 }, { "DROP_BODY", 8 },
-  { "PLAYER_USED_MEDKIT", 16 } }
+  { "PLAYER_USED_MEDKIT", 16 }, { "IN_DEEP_WATER", 32 } }
 M.TRAV_EVENTS = TRAV_EVENTS
 M.travEv = M.travEv or 0
 
 function M.OnTravEvent(m, ev)
-  if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
+  local g = tostring(m:GetReceiverGUID())
+  if ev[1] == "IN_DEEP_WATER" and g ~= M.localGuid then
+    for _, pp in pairs(M.pup) do
+      if pp.guid == g then
+        if not pp.inWaterT or M.now - pp.inWaterT > 5 then
+          log(string.format("puppet %s: IN_DEEP_WATER here (its player %s): shielded", pp.id,
+            M.Wet(pp) and "swims too" or "does not swim"))
+          trace("PW", string.format("id=%s ev=deepwater wet=%d", pp.id, M.Wet(pp) and 1 or 0))
+        end
+        pp.inWaterT = M.now
+        M.ShieldNow(pp, HZ.inWater)
+      end
+    end
+    return
+  end
+  if g ~= M.localGuid then return end
+  if ev[1] == "IN_DEEP_WATER" and not M.deepMsgLogged then
+    -- which getters the message has (logged once: what it can tell besides "deep water")
+    M.deepMsgLogged = true
+    local names = {}
+    for _, n in ipairs({ "GetState", "GetDepth", "GetWaterLevel", "GetPos", "GetValue", "IsIn", "GetInWater" }) do
+      local good, f = pcall(function() return m[n] end)
+      if good and f ~= nil then names[#names + 1] = n end
+    end
+    log("IN_DEEP_WATER for us; the message has: " .. (#names > 0 and table.concat(names, " ") or "none of the probed getters"))
+  end
   local bit = ev[2]
   if M.travEv % (bit + bit) < bit then M.travEv = M.travEv + bit end
   M.travSeen = (M.travSeen or 0) + 1
@@ -3724,6 +4479,9 @@ function M.ShotFired(p, weapon, n)
       local l = math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
       shot.pp, shot.dist, shot.zone, shot.miss = pp, dist, zone, miss
       shot.hittable = pvpHittable(pp)
+      -- shielded (M.ApplyShield: SetDemigod while it swims, falls, burns, ...): the game sends no DAMAGE for it, so
+      -- "the game reports our bullets" (M.pvpReports) says nothing about this shot: the ray and ON_BULLET_HIT decide
+      shot.shielded = pp.demi == true
       shot.blocked = l > 1e-3 and shotBlocked(c, d.x / l, d.y / l, d.z / l, dist) or false
     end
   elseif not mc_pvp_ray and not M.pvpNoRay then
@@ -3755,7 +4513,7 @@ function M.ShotTick(p)
         local verdict, sends = "miss", false
         if mc_pvp_verdict then
           verdict, sends = mc_pvp_verdict(M.friendlyFire and 1 or 0, ge and 1 or 0, be and 1 or 0, s.pp and 1 or 0,
-            s.blocked and 1 or 0, s.hittable and 1 or 0, M.pvpReports and 1 or 0)
+            s.blocked and 1 or 0, s.hittable and 1 or 0, (M.pvpReports and not s.shielded) and 1 or 0)
         end
         local pp = s.pp
         if be and (verdict == "bullet") then pp = M.pup[be.id] or pp end
@@ -3775,10 +4533,10 @@ function M.ShotTick(p)
               s.miss or -1, (pp and pp.brain) and "yes" or "no", ge and "yes" or "no", be and "yes" or "no", c))
           end
           trace("PV", string.format("id=%s v=%s hit=%d w=%s wid=%d dmg=%.1f dist=%.2f zone=%s miss=%.2f blk=%d "
-            .. "ok=%d ge=%d be=%d brain=%d rep=%s", tostring(pp and pp.id or "-"), verdict, sends and 1 or 0,
+            .. "ok=%d ge=%d be=%d brain=%d rep=%s demi=%d", tostring(pp and pp.id or "-"), verdict, sends and 1 or 0,
             tostring(s.weapon), wid, amount, s.dist or -1, tostring(s.zone or -1), s.miss or -1, s.blocked and 1 or 0,
             s.hittable and 1 or 0, ge and 1 or 0, be and 1 or 0, (pp and pp.brain) and 1 or 0,
-            tostring(M.pvpReports or "-")))
+            tostring(M.pvpReports or "-"), s.shielded and 1 or 0))
         end
       end
     end
@@ -4161,6 +4919,35 @@ local function countShots(p, weapon)
   M.shotWeapon, M.shotAmmo = weapon, ammo
 end
 
+-- A swim getter on the player, if this build has one (none is in the bindings' lists, docs/re-notes.md appendix; a
+-- few names are probed once per world, UNVERIFIED): 2 under water, 1 swimming, 0 not, -1 no getter. The water state
+-- itself is decided on the C++ side (src/game/water.h) from this, IN_DEEP_WATER and his height.
+local SWIM_GETTERS = { { "IsSwimming", 1 }, { "IsInWater", 1 }, { "IsInDeepWater", 1 }, { "IsUnderwater", 2 },
+  { "IsUnderWater", 2 }, { "IsDiving", 2 } }
+function M.SwimGetter(p)
+  local key = tostring(M.inWorldAt)
+  if M.swimKey ~= key then
+    M.swimKey, M.swimFns = key, {}
+    local found = {}
+    for _, g in ipairs(SWIM_GETTERS) do
+      local good, f = pcall(function() return p[g[1]] end)
+      if good and f ~= nil then
+        M.swimFns[#M.swimFns + 1] = { g[1], g[2] }
+        found[#found + 1] = g[1]
+      end
+    end
+    log("swim getters on the player: " .. (#found > 0 and table.concat(found, " ")
+      or "none (IN_DEEP_WATER and the height tell whether we swim)"))
+  end
+  if #M.swimFns == 0 then return -1 end
+  local r = 0
+  for _, g in ipairs(M.swimFns) do
+    local good, v = pcall(function() return p[g[1]](p) end)
+    if good and v == true and g[2] > r then r = g[2] end
+  end
+  return r
+end
+
 function M.Sample(aimInput)
   local p = M.Player()
   if not p then return "" end
@@ -4222,17 +5009,22 @@ function M.Sample(aimInput)
   end
   local travEv = M.travEv or 0
   M.travEv = 0
-  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d %d %d %d %d %d", aim, reload,
-    M.shots, ad.x, ad.y, ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind, sig, travEv, stealth,
-    carry, bodyKey)
+  -- water: a swim getter's answer when this game has one (M.SwimGetter, -1 none); bike: our vehicle is a motorbike
+  local swim = inCar and -1 or M.SwimGetter(p)
+  local bike = (inCar and my.c.bike) and 1 or 0
+  local tail = string.format(" %d %d %d %.3f %.3f %.3f %d %d %.4f %.4f %.4f %.4f %d %d %d %d %d %d %d %d %d %d", aim,
+    reload, M.shots, ad.x, ad.y, ad.z, cover, ctl, steer, power, brake, hb, gear, M.actSeq, M.actKind, sig, travEv,
+    stealth, carry, bodyKey, swim, bike)
   if aim == 1 and not M.aimLogged then log("we aim"); M.aimLogged = true end
   if aim == 0 then M.aimLogged = nil end
   if inCar then
     local car = my.c.ent
-    local cp, q, cv = car:GetPos(), car:GetRot(), car:GetSpeed()
+    local cp, q = car:GetPos(), M.RotOf(car, d)
+    my.c.velSt = my.c.velSt or {}
+    local vx, vy, vz = M.VehVel(car, my.c.mc, my.c.velSt)  -- a bike without GetSpeed: from its positions
     return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s %s %s %d %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f %.3f",
       pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon, my.c.model, my.key, my.seat,
-      cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, cv.x, cv.y, cv.z) .. tail
+      cp.x, cp.y, cp.z, q.v.x, q.v.y, q.v.z, q.s, vx, vy, vz) .. tail
   end
   return string.format("P %.3f %.3f %.3f %.4f %.4f %d %d %d %s - - 0 0 0 0 0 0 0 1 0 0 0",
     pos.x, pos.y, pos.z, d.x, d.y, sprint, crouch, health, weapon) .. tail
@@ -4725,6 +5517,7 @@ function M.Update(dt, cmds)
         sig = n(f[64]) or 0 }
       pp.lc.nz = n(f[65]) or 0
       pp.pose, pp.body = math.floor(n(f[66]) or 0), n(f[67]) or 0
+      pp.fast = f[68] == "1"  -- too fast for one on foot: hidden (game/puppet_guard.h FastFoot)
       local act = n(f[63]) or 0
       if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now

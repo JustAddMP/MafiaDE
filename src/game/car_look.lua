@@ -201,7 +201,8 @@ function K.Round(ev)
   local me = tonumber(M.localId or "0") or 0
   local n, src, cop = 0, 0, 0
   for key, c in pairs(M.cars or {}) do
-    if c.st == "ready" or c.st == "lost" then
+    -- a motorbike (player_sync.lua c.bike, docs/game-api.md 25): not a C_WrapperCar, its look is not synced
+    if (c.st == "ready" or c.st == "lost") and not (c.bike or c.bikeHint) then
       local owner = tonumber(key:match("^(%d+):"))
       if owner == me then
         -- our car (the key is ours: we drove it first): its look goes out from the car itself, also while it is

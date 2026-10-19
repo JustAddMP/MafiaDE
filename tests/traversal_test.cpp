@@ -247,6 +247,87 @@ void TestDetector() {
     }
 }
 
+// Getting on and off a motorbike, snaps of his height and the water (0.15.0 two-PC test: a bike's quick mount and
+// dismount went out as jumps with vz 9-31 m/s).
+void TestSnapsVehiclesWater() {
+    {  // the mount: his height snaps up 0.6 m (smoothed vz ~15 m/s), then he is on the bike (a vehicle) for 2 s, then
+       // off with a snap down; nothing is a move
+        LocalDetector d;
+        const auto h = Run(d, 5, [](double t, Sample& s) {
+            if (t >= 1.0 && t < 1.06) {
+                s.vz = 15;
+                s.z = 0.6f * static_cast<float>((t - 1.0) / 0.06);
+            } else if (t >= 1.06 && t < 3.0) {
+                s.z = 0.6f;
+                s.onFoot = false;
+            } else if (t >= 3.0 && t < 3.05) {
+                s.vz = -14;
+                s.z = 0.6f - 0.6f * static_cast<float>((t - 3.0) / 0.05);
+            }
+            s.speed = t > 1 && t < 3 ? 20.0f : 0.0f;
+        });
+        Check(h.empty() && d.Snaps() >= 1, "getting on and off a bike: no jump, no drop (the mount is a snap)",
+              Names(h) + " snaps " + std::to_string(d.Snaps()));
+    }
+    {  // off the bike: a hop 0.2 s later is still part of getting off (quiet); a jump 1.6 s later counts
+        LocalDetector d;
+        const auto h = Run(d, 5, [](double t, Sample& s) {
+            s.onFoot = t >= 1.0;
+            if (t < 1.0) s.z = 0.6f;
+            float z1 = 0, vz1 = 0, z2 = 0, vz2 = 0;
+            Ballistic(t, 1.2, 3.8f, z1, vz1);
+            Ballistic(t, 2.6, 3.8f, z2, vz2);
+            if (t >= 1.0) {
+                s.z = z1 + z2;
+                s.vz = vz1 + vz2;
+            }
+        });
+        Check(Only(h, {Action::Jump}) && h[0].t >= 2.59 && h[0].t < 2.7,
+              "off a vehicle: quiet for a moment, then jumps count again", Names(h));
+    }
+    {  // a snap up while on foot (a teleport, a mount the vehicle read missed): not a jump
+        LocalDetector d;
+        const auto h = Run(d, 3, [](double t, Sample& s) {
+            if (t >= 1.0 && t < 1.05) s.vz = 18;
+            s.z = t >= 1.05 ? 1.0f : 0.0f;
+        });
+        Check(h.empty() && d.Snaps() == 1, "a vertical speed of 18 m/s up: a snap, no jump",
+              Names(h) + " snaps " + std::to_string(d.Snaps()));
+    }
+    {  // a snap down at the start of a "fall" (getting off something high): not a drop; a real fall still is
+        LocalDetector d;
+        const auto h = Run(d, 6, [](double t, Sample& s) {
+            if (t >= 1.0 && t < 1.05) s.vz = -16;
+            if (t >= 1.0) s.z = -1;
+            if (t > 3 && t < 3.45) {
+                s.vz = -9.81f * static_cast<float>(t - 3);
+                s.z = -1 - 4.9f * static_cast<float>((t - 3) * (t - 3));
+            } else if (t >= 3.45) {
+                s.z = -2;
+            }
+        });
+        Check(Only(h, {Action::DropDown}) && h[0].t > 3 && d.Snaps() == 1,
+              "a snap down: no drop; a real fall later: a drop", Names(h));
+    }
+    {  // swimming: strokes and dives (vz +-3 m/s) are nothing; climbing out (2.5 m/s up) right after neither
+        LocalDetector d;
+        const auto h = Run(d, 6, [](double t, Sample& s) {
+            s.inWater = t > 0.5 && t < 4;
+            if (s.inWater) {
+                s.vz = 3.0f * static_cast<float>(std::sin(t * 4));
+                s.z = -0.75f * static_cast<float>(std::cos(t * 4));
+                s.speed = 1.2f;
+            } else if (t >= 4 && t < 4.4) {
+                s.vz = 2.5f;
+                s.z = static_cast<float>(t - 4) * 2.5f;
+            } else if (t >= 4.4) {
+                s.z = 1;
+            }
+        });
+        Check(h.empty() && d.CurrentPose().bits == 0, "in the water and climbing out: nothing detected", Names(h));
+    }
+}
+
 // ---- receiver -------------------------------------------------------------------------------------------------------
 // A puppet that only moves by the commands' fixes (walking is not simulated: the worst case for catching up).
 struct Pup {
@@ -408,6 +489,7 @@ void TestCatchup() {
 
 int main() {
     TestDetector();
+    TestSnapsVehiclesWater();
     TestCatchup();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

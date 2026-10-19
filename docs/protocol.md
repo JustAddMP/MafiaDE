@@ -124,7 +124,11 @@ u8  act                   the latest one: 0 none, 1 light punch, 2 heavy (charge
                           read as none
 -- pose block (traversal; after the action block; optional, see below):
 u8  pose                  what he keeps doing: bit0 sneaking (IsStealthMove), bit1 carrying a body (IsCarryingBody),
-                          bit2 on a ladder (from USE_LADDER until he stops climbing); other bits are dropped
+                          bit2 on a ladder (from USE_LADDER until he stops climbing); unreleased, without a version
+                          change: bit3 swimming, bit4 under water (game/water.h), bit5 on a motorbike
+                          (the vehicle block above is a bike: its model, seat, key and transform); other bits are
+                          dropped (a build without bits 3-5 drops them: its puppet walks the swimmer along the
+                          bottom and takes the bike for a car model)
 u32 body                  only when pose bit1: the carried body's key as the host numbers its NPCs (npc_sync: the
                           host's own entity id; a guest sends the host key his NPC is paired with), 0 = unknown
 ```
@@ -152,6 +156,20 @@ carrying) follows the action block and is optional the same way: a state that en
 "no pose", an older reader stops before it; a state whose pose says "carrying" but ends before the body is rejected.
 `version` stays 4. A receiver drives the puppet from the pose (sneak walk, the body it carries, held on the ladder
 path) and plays the moves: docs/game-api.md 17.
+
+**Water and motorbikes in the pose block** (unreleased; src/game/water.h, src/game/puppet_guard.h; unit-tested in
+tests/water_test.cpp, tests/puppet_guard_test.cpp, tests/player_actions_test.cpp, tests/traversal_test.cpp; NOT
+checked in game). Three more pose bits, added without a version change exactly like the pose block itself: an older
+reader masks them away. Bit3 swimming / bit4 under water: the sender's water tracker (the IN_DEEP_WATER human message,
+the height where he went in, a swim getter if the game has one) says so; meanwhile no jumps or drops are sent and
+flags bit5 (in the air) is cleared. Bit5: the vehicle he is in is a motorbike (a scene object with a
+`C_RuntimeMotorcycleComponent`, not a car); the vehicle block carries it like a car (model e.g. `motorcycle_1935`, seat
+0 rider / 1 pillion, the key, the transform: the bike's lean and a wheelie are in its rotation, velocity from its
+positions when the bike has no GetSpeed; controls and signals 0 / unknown). The receiver: a swimmer's puppet is put
+at his position every tick with swim strokes, a bike's copy is pinned to the rider's transform with the puppet on it,
+and a puppet whose player is sent as on foot faster than 12 m/s (a vehicle the sender could not read) is hidden at his
+position until he is below 9 m/s (docs/game-api.md 25). Older senders (0.15.0) send a bike ride as an on-foot sprint:
+a receiver with this change hides that puppet instead of letting it sprint and "jump".
 
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
 running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
