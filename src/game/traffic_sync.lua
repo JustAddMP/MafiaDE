@@ -23,10 +23,14 @@
 --   R net grace                                guest: its copy goes (grace 1: the host stopped sending it)
 --   C net fix nx ny nz qx qy qz qw power steer brake hb ctl vx vy vz tx ty tz flags
 --                                              guest: drive that copy (VehicleCommand, the host car's controls)
+--                                              (flags as TrafficStates, plus 32: the copy's crew may get out now, the
+--                                              host's car is driverless and both stand; traffic_model.h CrewGetsOut)
 -- Output (events, one per line):
 --   TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags
 --                                              host: one traffic car (flags: 2 siren (police: read, else a guess),
---                                              4 no driver, 8 controls known, 16 reversing); then
+--                                              4 no living driver read at the wheel this round (the C++ side's
+--                                              DriverWatch sends "driverless" only after 1 s of that while slow),
+--                                              8 controls known, 16 reversing); then
 --   TE                                         host: end of the round
 --   TV id x y z                                host: where guest `id` is (his puppet / his car here)
 --   TP x y z known hx hy hz                    guest: where we are and the host is (known 0: not seen)
@@ -45,7 +49,7 @@ local SEND_INTERVAL = 0.05  -- s between host rounds
 local RANGE = 380           -- m from a guest: host cars reported (the C++ side admits within 260 m)
 local SIREN_SPEED = 14      -- m/s: a police car this fast has its siren on (when its signals cannot be read)
 local SIREN_HOLD = 8        -- s the siren stays on after that
-local ORPHAN_KEEP = 20      -- s a traffic car that lost its driver is still shared
+local ORPHAN_KEEP = 20      -- s a traffic car without a driver read, standing (under 2 m/s), is still shared
 local MAX_OBTAINS = 3       -- copies loading at once (guest)
 local LOAD_TIMEOUT = 8      -- s an obtain or spawn may take
 local RETRY_WAIT = 5        -- s before a failed copy is tried again
@@ -55,9 +59,25 @@ local NEAR_DESPAWN = 80     -- m: a copy this close goes when unseen (DespawnEnt
 local CLEAR_WAIT = 6        -- s after switching our traffic off before our own moving cars are hidden
 local CLEAR_DIST = 70       -- m: our own traffic cars farther than this are hidden (closer ones when they get there)
 local CLEAR_INTERVAL = 1.0
-local CIV_CREW = { "civilian_white_crew", "civilian_crew", "civilians" }
-local POLICE_CREW = { "police_lvl1", "police" }
+-- Crews of the copies: spawn profile names (ObtainCarWithCrew takes the name; the game hashes it, FNV-1 64). The names
+-- come from the game's own Lua (data_traffic.human_models, read from the order of its constants: `civilian` ->
+-- traffic_base_ambient_combined, `civilian_white_man` -> game_attractivemen, `police_lvl1` -> ai_police_lvl1; the
+-- crew presets name those keys) and its tables; each one below has its hash in
+-- sds_retail/combinables/spawnprofiles.sds (checked statically, 2026-10-19; ai_police_lvl1 does NOT, the
+-- police_scotch ones do). The old preset lookup found no profile path in data_traffic.crew_presets (those hold
+-- preset names, not paths), so every crew was the fallback Tommy. UNVERIFIED in game: that these load as crews.
+-- A profile that fails twice before it ever worked is not used again (the next one is tried).
+local CIV_CREW = { "characters/traffic/traffic_base_ambient_combined", "characters/game/game_attractivemen",
+  "characters/traffic/traffic_workers_male" }
+local POLICE_CREW = { "characters/ai/police_scotch/ai_police_triggerman",
+  "characters/ai/police_scotch/ai_police_shotgunner" }
 local FALLBACK_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
+local CREW_BAD_AFTER = 2    -- failures of a crew profile (that never worked) before it is not used again
+local SEAT_CHECK = 0.5      -- s between checks that a copy's crew sits in its seats (guest)
+local RESEAT_WAIT = 1.0     -- s between two put-backs of one crew member
+local RESEAT_MAX = 8        -- put-backs of one crew member in a row (seated again resets it) before we give up
+local RESEAT_NEAR = 8       -- m: no put-back while our player is this close to the copy (he may be taking the car)
+local MISS_LOG = 40         -- "no driver read" lines logged (then every 50th)
 
 local function log(s) if mc_log then mc_log("traffic: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -80,7 +100,7 @@ local function token(s, max)
   return s:sub(1, max)
 end
 
-T.list = T.list or {}      -- host: entity id -> { e, id, model, kind, c1, c2, plate, drv, orphanT, sirenT }
+T.list = T.list or {}      -- host: entity id -> { e, id, model, kind, c1, c2, plate, drv, missT, slowMissT, sirenT }
 T.copies = T.copies or {}  -- guest: net -> { net, kind, model, st, ent, qid, rv, ... }
 T.hidden = T.hidden or {}  -- guest: our own traffic cars hidden while the host's traffic shows: id -> { car, crew }
 T.badModels = T.badModels or {}
@@ -128,15 +148,74 @@ function T.IsTraffic(e)
 end
 
 local function crewOf(car)
-  local out = {}
+  local out, seats = {}, {}
   for s = 0, 3 do
     local good, h = pcall(car.GetSeatOwner, car, s)
-    if good and valid(h) then out[#out + 1] = h end
+    if good and valid(h) then
+      out[#out + 1] = h
+      seats[#seats + 1] = s
+    end
   end
-  return out
+  return out, seats
+end
+
+local function speedOf(e)
+  local good, s = pcall(e.GetSpeed, e)
+  if not (good and s) then return 0 end
+  return math.sqrt(s.x * s.x + s.y * s.y + s.z * s.z)
+end
+
+-- Why no living traffic driver is read at the wheel of car `e` now: nil when one is (and the driver), else a reason.
+local function driverMiss(e)
+  local good, drv = pcall(e.GetSeatOwner, e, 0)
+  if not good then return "seat read failed" end
+  if not valid(drv) then return "seat 0 empty" end
+  if not generatorHuman(drv) then
+    local okn, name = pcall(drv.GetName, drv)
+    return "seat 0 holds " .. token(okn and name or "?", 48) .. " (no generator human)", drv
+  end
+  local okd, dead = pcall(drv.IsDeath, drv)
+  if okd and dead then return "its driver is dead", drv end
+  return nil, drv
 end
 
 -- ---- host -------------------------------------------------------------------------------------------------------------
+-- A car of the list without a driver read now: noted (the C++ side's DriverWatch decides when it is driverless: 1 s
+-- of this while slow). Logged with the reason and how far the host's player is (game-side driver culling or level of
+-- detail far from him was the suspicion after the 0.15.0 test: 118 of 179 cars flagged while moving).
+function T.NoteMiss(c, why, e)
+  if c.missT then return end
+  c.missT, c.missWhy = M.now, why
+  T.misses = (T.misses or 0) + 1
+  local q = e:GetPos()
+  local p = M.Player and M.Player()
+  local me = p and p:GetPos()
+  local dist = me and math.sqrt((q.x - me.x) ^ 2 + (q.y - me.y) ^ 2) or -1
+  local spd = speedOf(e)
+  local okd, drv = pcall(e.GetSeatOwner, e, 0)
+  local act = (okd and valid(drv)) and (active(drv) and "active" or "inactive") or "-"
+  if T.misses <= MISS_LOG or T.misses % 50 == 0 then
+    log(string.format("host traffic car %d: no driver read (%s, %s), %.1f m/s, %.0f m from us; still shared, "
+      .. "driverless only after 1 s of this while slower than 2 m/s (#%d)", c.id, why, act, spd, dist, T.misses))
+  end
+  if mc_trace then
+    mc_trace("TRO", string.format("key=%d ev=miss why=%s drv=%s spd=%.1f dist=%.0f", c.id,
+      token((why:gsub("%s+", "_")), 64), act, spd, dist))
+  end
+end
+
+function T.NoteBack(c, how)
+  if not c.missT then return end
+  local gone = M.now - c.missT
+  T.backs = (T.backs or 0) + 1
+  if T.backs <= MISS_LOG or T.backs % 50 == 0 then
+    log(string.format("host traffic car %d: its driver is read again after %.1f s (%s, #%d)", c.id, gone, how,
+      T.backs))
+  end
+  if mc_trace then mc_trace("TRO", string.format("key=%d ev=back after=%.2f how=%s", c.id, gone, how)) end
+  c.missT, c.missWhy, c.slowMissT = nil, nil, nil
+end
+
 function T.Scan(p)
   local seen = {}
   local mine = p:GetOwner()
@@ -145,9 +224,8 @@ function T.Scan(p)
     local e = mc_entity(id)
     if e and e.GetVehicleModelName and active(e) and not ourCar(e, mine) then
       local c = T.list[id]
-      local good, drv = pcall(e.GetSeatOwner, e, 0)
-      drv = good and valid(drv) and drv or nil
-      local traffic = drv and generatorHuman(drv) and not drv:IsDeath()
+      local miss, drv = driverMiss(e)
+      local traffic = miss == nil
       if traffic or (c and c.e and same(c.e, e)) then
         if not c or not same(c.e, e) then
           local okm, model = pcall(e.GetVehicleModelName, e)
@@ -172,12 +250,18 @@ function T.Scan(p)
         if c then
           seen[id] = true
           if traffic then
-            c.drv, c.orphanT = drv, nil
-          elseif not c.orphanT then
-            c.orphanT = M.now  -- its driver died or got out: shared a while longer, then it is a parked car
-          end
-          if c.orphanT and M.now - c.orphanT > ORPHAN_KEEP then
-            T.list[id], seen[id] = nil, nil
+            c.drv = drv
+            T.NoteBack(c, "scan")
+          else
+            T.NoteMiss(c, miss, e)
+            -- no driver and standing: shared a while longer, then it is a parked car (one still rolling or driven
+            -- by someone we cannot read stays shared)
+            if speedOf(e) <= 2 then c.slowMissT = c.slowMissT or M.now else c.slowMissT = nil end
+            if c.slowMissT and M.now - c.slowMissT > ORPHAN_KEEP then
+              T.list[id], seen[id] = nil, nil
+              log(string.format("host traffic car %d: no driver for %.0f s and standing: a parked car now, not shared",
+                id, M.now - c.missT))
+            end
           end
         end
       end
@@ -249,7 +333,12 @@ function T.HostSend(ev)
               if c.sirenT and M.now - c.sirenT < SIREN_HOLD then flags = flags + 2 end
             end
           end
-          if c.orphanT then flags = flags + 4 end
+          -- a car without a driver at the last read is read again every round (the read flickers: a driver read
+          -- again clears it at once); flag 4 is this round's read, the C++ side confirms it (DriverWatch)
+          if c.missT then
+            local miss, drv = driverMiss(e)
+            if miss then flags = flags + 4 else c.drv = drv T.NoteBack(c, "round") end
+          end
           ev[#ev + 1] = string.format("TC %d %d %s %d %d %s %.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f "
             .. "%.3f %.3f %d", id, c.kind, c.model, c.c1, c.c2, c.plate, q.x, q.y, q.z, s.x, s.y, s.z, r.v.x, r.v.y, r.v.z,
             r.s, st, pw, br, hb, flags)
@@ -325,42 +414,38 @@ function T.ClearLocal(p)
 end
 
 -- ---- guest: copies of the host's cars ---------------------------------------------------------------------------------
--- The crew of a copy: a profile from the game's crew presets (data_traffic.crew_presets; their layout is not known, so
--- the first profile path found in the preset), else the puppet factory's profile.
-local function findProfile(t, depth)
-  if depth > 4 then return nil end
-  if type(t) == "string" then
-    if t:find("/") then return t end
-    return nil
+-- The crew profile of a copy: the first of CIV_CREW / POLICE_CREW (police: then the civilian ones) that has not
+-- failed, else the puppet factory's Tommy.
+T.crewBad = T.crewBad or {}    -- profile -> true: not used again
+T.crewFails = T.crewFails or {}
+T.crewOk = T.crewOk or {}      -- profile -> true: a copy got a crew with it
+function T.CrewProfile(kind)
+  local prof = FALLBACK_PROFILE
+  for _, list in ipairs(kind == 1 and { POLICE_CREW, CIV_CREW } or { CIV_CREW }) do
+    for _, name in ipairs(list) do
+      if not T.crewBad[name] then prof = name break end
+    end
+    if prof ~= FALLBACK_PROFILE then break end
   end
-  if type(t) ~= "table" then return nil end
-  for _, v in pairs(t) do
-    local r = findProfile(v, depth + 1)
-    if r then return r end
+  T.crewUsed = T.crewUsed or {}
+  local k = kind .. ":" .. prof
+  if not T.crewUsed[k] then
+    T.crewUsed[k] = true
+    log("copy crew (" .. (kind == 1 and "police" or "traffic") .. "): " .. prof)
   end
-  return nil
+  return prof
 end
 
-function T.CrewProfile(kind)
-  T.crew = T.crew or {}
-  if T.crew[kind] then return T.crew[kind] end
-  local prof
-  local presets = data_traffic and data_traffic.crew_presets
-  if type(presets) == "table" then
-    for _, name in ipairs(kind == 1 and POLICE_CREW or CIV_CREW) do
-      prof = findProfile(presets[name], 0)
-      if prof then
-        log("copy crew (" .. (kind == 1 and "police" or "traffic") .. "): " .. prof .. " from preset " .. name)
-        break
-      end
-    end
+-- A copy made with crew profile `prof` failed (`why`): a profile that never worked is not used again after
+-- CREW_BAD_AFTER failures. Returns true when the failure is put down to the profile (then not to the car model).
+function T.CrewFailed(prof, why)
+  if not prof or prof == FALLBACK_PROFILE or T.crewOk[prof] then return false end
+  T.crewFails[prof] = (T.crewFails[prof] or 0) + 1
+  if T.crewFails[prof] >= CREW_BAD_AFTER and not T.crewBad[prof] then
+    T.crewBad[prof] = true
+    log("crew profile " .. prof .. " failed " .. T.crewFails[prof] .. " times (last: " .. why .. "): not used again")
   end
-  if not prof then
-    prof = FALLBACK_PROFILE
-    log("copy crew (" .. (kind == 1 and "police" or "traffic") .. "): no crew preset found, " .. prof)
-  end
-  T.crew[kind] = prof
-  return prof
+  return true
 end
 
 local function setTransform(c)
@@ -388,9 +473,12 @@ function T.Fail(c, why)
   if c.qid then pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid) end
   c.qid, c.ent, c.so, c.sp = nil, nil, nil, nil
   c.st, c.retryT = "failed", M.now + RETRY_WAIT
+  -- with a crew profile that never worked yet, the profile is the suspect, not the model
+  local crewBlame = c.prof and T.CrewFailed(c.prof, why)
+  c.prof = nil
   T.fails = T.fails or {}
-  T.fails[c.model] = (T.fails[c.model] or 0) + 1
-  if T.fails[c.model] >= BAD_AFTER and not T.badModels[c.model] then
+  if not crewBlame then T.fails[c.model] = (T.fails[c.model] or 0) + 1 end
+  if (T.fails[c.model] or 0) >= BAD_AFTER and not T.badModels[c.model] then
     T.badModels[c.model] = true
     log("model " .. c.model .. " failed " .. BAD_AFTER .. " times: no copies of it any more")
   end
@@ -404,11 +492,13 @@ function T.CopyTick(c, p)
   end
   if c.st == "new" then
     if obtaining() >= MAX_OBTAINS then return end
-    local so, id = try("ObtainCarWithCrew", game.traffic.ObtainCarWithCrew, game.traffic, c.model,
-      { T.CrewProfile(c.kind) })
+    local prof = T.CrewProfile(c.kind)
+    local so, id = try("ObtainCarWithCrew", game.traffic.ObtainCarWithCrew, game.traffic, c.model, { prof })
+    c.prof = so and prof or nil
     if not so then
+      T.CrewFailed(prof, "ObtainCarWithCrew refused")
       so, id = try("ObtainSpecificCar", game.traffic.ObtainSpecificCar, game.traffic, c.model)
-      if so then log("copy of host car " .. c.net .. ": no crew (" .. c.model .. ")") end
+      if so then log("copy of host car " .. c.net .. ": no crew (" .. c.model .. ", " .. prof .. " refused)") end
     end
     if not so then T.Fail(c, "obtain refused") return end
     c.so, c.qid, c.st, c.t0 = so, id, "obtain", M.now
@@ -427,7 +517,15 @@ function T.CopyTick(c, p)
       try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
       -- an explosion here only would leave the host's car driving on: copies do not explode
       try("DisableExplosion", car.DisableExplosion, car, true)
-      c.crew = crewOf(car)
+      c.crew, c.seats = crewOf(car)
+      if c.prof then
+        if #c.crew > 0 then
+          if not T.crewOk[c.prof] then log("crew profile " .. c.prof .. " works (copy of host car " .. c.net .. ")") end
+          T.crewOk[c.prof] = true
+        else
+          T.CrewFailed(c.prof, "the copy came without a crew")
+        end
+      end
       for _, m in ipairs(c.crew) do
         pcall(m.DespawnImmunity, m, true)
         pcall(m.SetReactionOnSound, m, false)
@@ -440,8 +538,8 @@ function T.CopyTick(c, p)
       c.rv = { probes = 3 }  -- player_sync.lua's speed probes are for player cars
       T.made = (T.made or 0) + 1
       if T.made <= 40 or T.made % 50 == 0 then
-        log(string.format("copy of host car %d ready: %s, %s, crew %d (#%d)", c.net, c.model,
-          c.kind == 1 and "police" or "traffic", #crewOf(car), T.made))
+        log(string.format("copy of host car %d ready: %s, %s, crew %d (%s) (#%d)", c.net, c.model,
+          c.kind == 1 and "police" or "traffic", #c.crew, tostring(c.prof or "none"), T.made))
       end
     elseif M.now - c.t0 > LOAD_TIMEOUT then
       T.Fail(c, "spawn timeout")
@@ -537,14 +635,78 @@ function T.Drive(c, f)
     pcall(c.ent.SetSirenOn, c.ent, siren)
     pcall(c.ent.SetBeaconLightOn, c.ent, siren)
   end
-  local noDriver = math.floor(flags / 4) % 2 == 1
-  if noDriver and not c.noDriver then
-    c.noDriver = true
+  -- 32: the host's car is driverless (confirmed there: no driver read for 1 s while slow) and both cars stand: our
+  -- driver gets out. Never out of a moving copy; the flag gone (a driver read again, or it drives on): back in.
+  local crewOut = math.floor(flags / 32) % 2 == 1
+  if crewOut and not c.crewOut then
+    c.crewOut = true
+    T.outs = (T.outs or 0) + 1
     local okd, d = pcall(c.ent.GetSeatOwner, c.ent, 0)
     if okd and valid(d) and not d:IsDeath() then pcall(d.GetOffVehicle, d) end
-    log("host car " .. c.net .. " lost its driver: ours gets out (npc_sync kills him if the host's died)")
+    if T.outs <= 40 or T.outs % 50 == 0 then
+      log(string.format("host car %d has no driver (for 1 s and standing): ours gets out (npc_sync kills him if the "
+        .. "host's died) (#%d)", c.net, T.outs))
+    end
+    if mc_trace then mc_trace("TRO", string.format("net=%d ev=out", c.net)) end
+  elseif not crewOut and c.crewOut then
+    c.crewOut = false
+    log(string.format("host car %d is driven again: our crew gets back in", c.net))
+    if mc_trace then mc_trace("TRO", string.format("net=%d ev=in", c.net)) end
+  end
+  if not c.crewOut and M.now - (c.seatT or -10) >= SEAT_CHECK then
+    c.seatT = M.now
+    local good, err = pcall(T.KeepSeated, c)
+    if not good then
+      c.errs = (c.errs or 0) + 1
+      if c.errs <= 3 then log("copy " .. c.net .. " seat check error: " .. tostring(err)) end
+    end
   end
   T.ev[#T.ev + 1] = "TR " .. c.net .. " " .. M.RV.Report(c.rv, c.ent)
+end
+
+-- A copy keeps its crew seated: one found out of its seat (its AI left the car: a bump, a sound, a car-jack started
+-- and given up) is put back with a non-animated GetOnVehicle (docs/game-api.md 7, "Seating"), at most once a second
+-- and RESEAT_MAX times in a row. Dead ones stay out (npc_sync killed him: the host's driver died); nobody is put back
+-- while our player is near the copy (he may be getting in: player_sync then takes the car over) or while another
+-- human holds the seat.
+function T.KeepSeated(c)
+  local ent = c.ent
+  if not (c.crew and c.seats and valid(ent)) then return end
+  local p = M.Player and M.Player()
+  if p then
+    local q, me = ent:GetPos(), p:GetPos()
+    if (q.x - me.x) ^ 2 + (q.y - me.y) ^ 2 < RESEAT_NEAR * RESEAT_NEAR then return end
+  end
+  c.reseat = c.reseat or {}
+  for i, m in ipairs(c.crew) do
+    local seat = c.seats[i]
+    local r = c.reseat[i] or { n = 0, t = -10 }
+    c.reseat[i] = r
+    if valid(m) and seat and not m:IsDeath() then
+      local okh, holder = pcall(ent.GetSeatOwner, ent, seat)
+      if okh and same(holder, m) then
+        r.n = 0
+      elseif okh and not valid(holder) and r.n < RESEAT_MAX and M.now - r.t >= RESEAT_WAIT then
+        r.n, r.t = r.n + 1, M.now
+        local okg = pcall(m.GetOnVehicle, m, ent, seat + 1, false, "WALK")
+        T.reseats = (T.reseats or 0) + 1
+        local mq, cq = m:GetPos(), ent:GetPos()
+        if T.reseats <= 40 or T.reseats % 50 == 0 then
+          log(string.format("copy of host car %d: crew member %d was out of seat %d (%.1f m from the car, car %.1f m/s): "
+            .. "put back%s (try %d, #%d)", c.net, i, seat,
+            math.sqrt((mq.x - cq.x) ^ 2 + (mq.y - cq.y) ^ 2 + (mq.z - cq.z) ^ 2), speedOf(ent),
+            okg and "" or " (GetOnVehicle failed)", r.n, T.reseats))
+        end
+        if mc_trace then
+          mc_trace("TRO", string.format("net=%d ev=reseat seat=%d try=%d ok=%d", c.net, seat, r.n, okg and 1 or 0))
+        end
+        if r.n == RESEAT_MAX then
+          log(string.format("copy of host car %d: crew member %d keeps leaving seat %d: no more put-backs", c.net, i,
+            seat))
+        end
+      end
+    end
+  end
 end
 
 function T.DropAll(why, p)
@@ -625,9 +787,13 @@ function T.Update(dt, cmds)
         ev[#ev + 1] = "TE"
       end
     end
-    local n = 0
-    for _, _ in pairs(T.list) do n = n + 1 end
-    T.status = string.format("%d traffic cars, %d near guests", n, T.hostSent or 0)
+    local n, nd = 0, 0
+    for _, c in pairs(T.list) do
+      n = n + 1
+      if c.missT then nd = nd + 1 end
+    end
+    T.status = string.format("%d traffic cars, %d near guests, %d without a driver read (%d misses, %d read again)",
+      n, T.hostSent or 0, nd, T.misses or 0, T.backs or 0)
   else
     -- where we are and where the host is (his puppet, or his car)
     local me = p:GetPos()
@@ -686,8 +852,9 @@ function T.Update(dt, cmds)
     for _, c in pairs(T.copies) do
       if c.st == "ready" then ready = ready + 1 elseif c.st ~= "failed" then loading = loading + 1 end
     end
-    T.status = string.format("%s, copies %d (+%d loading), ours hidden %d, ours near %d",
-      T.localOn == false and "host traffic" or "own traffic", ready, loading, T.hiddenCount or 0, T.localLeft or 0)
+    T.status = string.format("%s, copies %d (+%d loading), ours hidden %d, ours near %d, crews out %d, put back %d",
+      T.localOn == false and "host traffic" or "own traffic", ready, loading, T.hiddenCount or 0, T.localLeft or 0,
+      T.outs or 0, T.reseats or 0)
   end
   if M.now - (T.stT or -10) >= 1 then
     T.stT = M.now

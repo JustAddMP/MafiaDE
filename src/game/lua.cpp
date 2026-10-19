@@ -6,6 +6,7 @@
 #include "core/mem.h"
 #include "dll/ui_input.h"
 #include "game/car_signals.h"
+#include "game/name_hash.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -637,9 +638,7 @@ int McCarSetSignals(lua_State* L) {
 // mc_fnv(text) -> the game's 64-bit name hash of `text` (FNV-1, the hash behind spawn profile names) as a decimal string
 int McFnv(lua_State* L) {
     const char* s = ToString(L, 1);
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (const char* c = s ? s : ""; *c; ++c) h = (h * 0x100000001b3ull) ^ static_cast<uint8_t>(*c);
-    PushString(L, std::to_string(h));
+    PushString(L, std::to_string(NameHash(s ? s : "")));
     return 1;
 }
 
