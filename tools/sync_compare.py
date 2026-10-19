@@ -59,6 +59,7 @@ TARGETS = {
     "traffic.unshared_near": ("<=", 0, "own traffic cars still driving near a receiver (max)"),
     "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
     "npc.max": ("<=", 4.0, "NPC replica vs the authority's NPC, max (m)"),
+    "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
@@ -448,12 +449,8 @@ def npcs(guest):
     if avg:
         print("  distance ours vs the host's (per sample mean): %s" % stats_line(avg))
         print("  worst NPC per sample: %s" % stats_line(mx))
-    nd = [num(f.get("d"), -1) for _, f in guest.records["NP"] if num(f.get("d"), -1) >= 0]
-    if nd:
-        # NP: per paired host NPC, our NPC vs the host's newest state (not yet lined up in time: an upper bound
-        # of the real error by the state's age; npc-authority adds a truth record)
-        record("npc.p95", pct(nd, 95), "host NPCs on the guest")
-        record("npc.max", max(nd), "host NPCs on the guest")
+    # (NP: our NPC vs the target the C++ side computed for it, not lined up with the host's NPC in time; the true
+    # error and the npc.* targets come from NPT / NPR, npc_replicas())
     far = Counter()
     for _, f in guest.records["NP"]:
         if num(f.get("d"), -1) > 3:
@@ -467,10 +464,130 @@ def npcs(guest):
     if foot:
         print("  paired host NPCs on foot: distance %s" % stats_line(foot))
     last = ngs[-1]
-    if "unpairs" in last:
+    if "refused" in last:
+        print("  driven: %d commands, snaps %d, paired NPCs frozen %d, refused (hidden, a copy shown) %d, unpaired (in a "
+              "vehicle, ours on foot) %d, copies with a fallback profile %d" % (
+                  num(last.get("drives"), 0), num(last.get("snaps"), 0), num(last.get("frozen"), 0),
+                  num(last.get("refused"), 0), num(last.get("unpairs"), 0), num(last.get("fallbacks"), 0)))
+    elif "unpairs" in last:
         print("  pulls %d, unpaired (in a vehicle, ours on foot) %d, cops steered %d, copies with a fallback profile %d"
               % (num(last.get("pulls"), 0), num(last.get("unpairs"), 0), num(last.get("steers"), 0),
                  num(last.get("fallbacks"), 0)))
+
+
+def hermite_at(samples, t, gap):
+    """samples: sorted [(t, (x, y, z), (vx, vy))]. Position at t on the Hermite curve through the two samples around it
+    (their velocities), None outside or across a gap."""
+    ts = [x[0] for x in samples]
+    i = bisect.bisect_left(ts, t)
+    if i <= 0 or i >= len(samples):
+        if samples and abs(samples[0 if i <= 0 else -1][0] - t) < 1e-3:
+            return samples[0 if i <= 0 else -1][1]
+        return None
+    t0, p0, v0 = samples[i - 1]
+    t1, p1, v1 = samples[i]
+    h = t1 - t0
+    if h <= 0 or h > gap:
+        return None
+    u = (t - t0) / h
+    h00, h10, h01, h11 = 2 * u ** 3 - 3 * u ** 2 + 1, u ** 3 - 2 * u ** 2 + u, -2 * u ** 3 + 3 * u ** 2, u ** 3 - u ** 2
+    x = h00 * p0[0] + h10 * h * v0[0] + h01 * p1[0] + h11 * h * v1[0]
+    y = h00 * p0[1] + h10 * h * v0[1] + h01 * p1[1] + h11 * h * v1[1]
+    return (x, y, p0[2] + (p1[2] - p0[2]) * u)
+
+
+def npc_replicas(authority, receiver, worst):
+    """One authority per NPC (docs/sync-trace.md NPT / NPR): each replica on the receiver vs the authority's NPC at the
+    same moment. NPT = the authority's NPC as sent (its sample time sT on its steady clock, the clock of TX); NPR = the
+    replica where the receiver's game shows it (10 Hz), lined up through the receiver's clock relation to the authority
+    (as the player section). npc.p95 / npc.max (host NPCs on a guest, on foot)."""
+    aid = authority.local
+    npr = [(t, f) for t, f in receiver.records["NPR"] if int(num(f.get("from"), -1)) == aid]
+    npt = authority.records["NPT"]
+    if not npr and not npt:
+        return
+    what = "host NPCs on %s's game" % receiver.name if authority.role == "host" else \
+        "%s's own NPCs on the host's game" % authority.name
+    section("NPC replicas: %s (one authority per NPC)" % what)
+    if not npr or not npt:
+        print("  %d truth records (NPT) on the authority, %d replica records (NPR) on the receiver: nothing to line up" % (
+            len(npt), len(npr)))
+        return
+    diff, _, _ = clock_relation(receiver, authority, aid)
+    if diff is None:
+        print("  no player states from the authority in the receiver's trace: the clocks cannot be related")
+        return
+    truth = defaultdict(list)
+    for _, f in npt:
+        p, v = vec(f.get("p")), vec(f.get("v"))
+        if p and v:
+            truth[f.get("key")].append((num(f.get("sT"), 0) / 1000.0, p, v))
+    for k in truth:
+        truth[k].sort()
+    errs, foot, copies, paired, ctl, lag = [], [], [], [], [], []
+    fixes = Counter()
+    by_key = Counter()
+    for t, f in npr:
+        cp = vec(f.get("cp"))
+        if not cp:
+            continue
+        ctl.append(num(f.get("err"), 0))
+        fixes[f.get("fix", "0")] += 1
+        ts = t - diff
+        tp = hermite_at(truth.get(f.get("key"), []), ts, 1.2)
+        if tp is None:
+            continue
+        e = dist2(cp, tp)
+        errs.append(e)
+        (copies if f.get("kind") == "2" else paired).append(e)
+        rt = num(f.get("rT"))
+        if rt is not None:
+            lag.append(ts * 1000.0 - rt)
+        if e > 3:
+            by_key[f.get("key")] += 1
+        worst.append((e, "NPC", "%s NPC %s" % (authority.name, f.get("key")), receiver.wall(t), authority.wall(ts),
+                      "kind %s, fix %s" % (f.get("kind"), f.get("why", "-"))))
+        foot.append(e)
+    print("  %d replica records, %d lined up with the authority's NPC (truth records %d of %d NPCs)" % (
+        len(npr), len(errs), len(npt), len(truth)))
+    if errs:
+        print("  replica vs the authority's NPC at the same moment: %s" % stats_line(errs))
+        if paired:
+            print("    paired NPCs (driven):  %s" % stats_line(paired))
+        if copies:
+            print("    spawned copies:        %s" % stats_line(copies))
+        who = "%s on %s" % (what.split(" on ")[0], receiver.role)
+        record("npc.p95", pct(foot, 95), who)
+        record("npc.max", max(foot), who)
+    if ctl:
+        print("  replica vs its target (controller error): %s" % stats_line(ctl))
+    if lag:
+        print("  target time behind the true moment (ms; 0 = the lead reaches now): median %.0f, p95 %.0f" % (
+            pct(lag, 50), pct(lag, 95)))
+    print("  fixes: none %d, nudge %d, snap %d" % (fixes.get("0", 0), fixes.get("1", 0), fixes.get("2", 0)))
+    snaps = Counter(f.get("why") for _, f in receiver.records["NPS"] if int(num(f.get("from"), -1)) == aid)
+    if snaps:
+        print("  snaps by reason: %s" % ", ".join("%s %d" % kv for kv in snaps.most_common()))
+    if by_key:
+        print("  NPCs most often more than 3 m off: %s" % ", ".join("%s (%d)" % kv for kv in by_key.most_common(5)))
+
+
+def npc_bandwidth(host):
+    """NBW (host, every 10 s): NPC states + infos + leaves sent to each guest (KB/s), the NPCs near him."""
+    nbw = host.records["NBW"] if host else []
+    if not nbw:
+        return
+    section("NPC bandwidth per guest (host upload)")
+    by = defaultdict(list)
+    near = defaultdict(list)
+    for _, f in nbw:
+        by[f.get("to")].append(num(f.get("kbs"), 0))
+        near[f.get("to")].append(num(f.get("near"), 0))
+    for g in sorted(by):
+        v = by[g]
+        print("  to guest %s: median %.2f, max %.2f KB/s; NPCs in his interest median %.0f, max %.0f" % (
+            g, pct(v, 50), max(v), pct(near[g], 50), max(near[g])))
+        record("npc.bw", pct(v, 50), "to guest %s" % g)
 
 
 def swapped_cars(tr):
@@ -790,7 +907,7 @@ def msg_system(name):
         return "player"
     if n in ("WorldEnv", "MissionState", "HostSave", "Cutscene", "MissionFail", "FailVerdict"):
         return "world"
-    if n in ("NpcStates", "GuestNpcStates"):
+    if n in ("NpcStates", "GuestNpcStates", "NpcStates2", "GuestNpcStates2"):
         return "npc"
     if n.startswith("Npc") or n in ("GuestNpcEnd", "HostNpcHit"):
         return "npc-event"
@@ -902,6 +1019,9 @@ def main():
     if guest:
         npcs(guest)
         own_npcs(guest, b if guest is a else a)
+        other = b if guest is a else a
+        npc_replicas(other, guest, worst)  # the host's NPCs on the guest
+        npc_replicas(guest, other, worst)  # the guest's own NPCs on the host
     for tr in (a, b):
         swapped_cars(tr)
     for tr in (a, b):
@@ -910,6 +1030,7 @@ def main():
         doors(x, y)
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
+    npc_bandwidth(host)
     car_damage(a, b)
     car_looks(a, b)
     bandwidth((a, b))
