@@ -86,12 +86,19 @@ on the other.
 | `POT` | host | 1 Hz per targeted guest | Lua: `id lvl hunt cops=<our police within 90 m of his puppet> seers=<of them, saw it in 5 s> near=<m> set=<set on it this scan> attacks=<Attack calls so far>` |
 | `POC` | both | per PoliceChase | host `dir=tx id active hunt lvl cops seers near`; guest `dir=rx active hunt lvl cops seers near forced=<level we hold>` |
 | `CDS` | both | 1 Hz per car | car damage (docs/game-api.md 24): `ref=<o:g player car, h<id> our traffic car (host), t<net> a host traffic car's copy (guest)> ent role=<A we hold its damage, C a copy> auth=<the player whose game holds it> quiet=<1 moved by SetPos lately> read=<1 its damage could be read> parts dmg=<damaged parts> gone worst=<0-254> tyres=<burst or off> flags=<1 exploded 2 burning> burn=<s left> gd md=<GetDamage, GetMotorDamage> known=<a full state of the car is known> ep=<epoch> adm atyres aflags=<the holder's state as known here> layout` |
-| `CDT` | both | per CarDamage sent | `ref kind=<first, diff, full, keyframe, repair, answer> ep n=<parts listed> flags parts=<index:damage,...> to=<answer: the player>` |
+| `CDT` | both | per CarDamage sent | `ref kind=<first, diff, full, keyframe, repair, answer> ep n=<parts listed> flags parts=<index:damage,...> to=<answer: the player>`; also `ref kind=drop-after-write ep` (nothing sent: the holder's car read less damage within 1 s of our own writes on it, taken as the game's reaction, no repair) |
 | `CDR` | both | per car damage message received | `from ref kind=<damage, report, request> ep n flags full repaired` |
 | `CDA` | both | per change set on a car | `ref ent why=<sync: a copy raised to the holder's; report: another game's copy's damage on our car; rebind: a new entity for a car; repair> parts=<index:damage,...> wheels=<count> burn explode reason=<repair: epoch, stale, quiet>` |
-| `CDX` | both | per CarDamageReport sent | `ref to ep parts wheels=<1 a tyre / wheel> flags` |
+| `CDX` | both | per CarDamageReport sent | `ref to ep parts wheels=<1 a tyre / wheel> flags` (never the exploded flag); `ref to ep echo=<wreck: the copy or the holder's car is exploded; write: within 1.5 s of our cascading writes on the copy> parts` when the copy's new damage was taken as an echo of our own writes and NOT sent (docs/game-api.md 24 "Echoes") |
 | `CDQ` | both | per CarDamageRequest sent | `ref to` |
 | `CDK` | both | another game's explosion put on a car we hold (C++) | `ref ent d=<m from the blast> fire=<1 a molotov's fire only> seq from parts=<quanta added> tyres burn explode writes=<writes made>` (docs/game-api.md 24) |
+| `CLS` | both | per look of ours | car look (docs/game-api.md 24 "Car look"): `ref ent seq look=<model\|c1\|c2\|plate\|tint\|interior\|dirt\|rust\|painting\|tuning: the line form with \| for spaces>` when our car's look is new or changed; `ref ent to seq answer=1` per answer to a request |
+| `CLR` | both | per CarLook received | `from ref op=<look, request> seq look=<as CLS, - for a request>` |
+| `CLQ` | both | per request sent | `ref ent to=<the player whose game has the car>` (our copy has no look yet; every 3 s) |
+| `CLA` | both | per look set on a copy | `ref ent try=<1..3> what=<colours, plate, window tint, interior, painting, tuning N item(s) ids; spaces as \|>` |
+| `CLW` | both | per look set on a copy (Lua) | `ent what=<color,plate,tint,interior,painting,tuning> ids=<tuning items installed, - none> res=<each setter: name, or name FAILED error>` |
+| `CLM` | both | once per copy entity | `ref ent tries` the copy's read back matches the car's look |
+| `CLF` | both | once per copy entity | `ref ent what` the copy still differs after 3 tries: given up (a new copy entity is tried again) |
 | `CDB` | both | each ask of the one-explosion book (C++) | `ent first=<1 it blows up now, 0 refused: blown up already>` (docs/game-api.md 24 "One explosion") |
 | `CDE` | both | each car blown up by the one explode routine (Lua D.Explode) | `ent ok=<SetExploded worked> picture=<1 a picture shown> claimed=<1 our own car, asked already> from=<the player whose game said so, - car damage>` |
 | `RCN` | both | on reconnect events (docs/protocol.md "Reconnect") | `ev=dropped id` (a player lost his connection, slot held), `ev=lost why` (guest: we lost the host), `ev=sync-paused`, `ev=sync-resumed local`, `ev=back same=<1 same slot> local attempts` |
