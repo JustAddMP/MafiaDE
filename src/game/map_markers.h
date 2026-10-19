@@ -12,6 +12,15 @@
 // is released never has an icon on it (the navigation module read a released puppet through a stale icon: crash in
 // exe+0x243a915, docs/game-api.md 15), and a puppet seen again never needs a second icon (the game gives an entity no
 // second human icon after UnregisterId). A position icon is replaced by the human icon once he has a puppet.
+//
+// The friend brain switch (player_sync.lua M.Ally, SwitchBrain(1), about 2 s after a puppet spawns) removes a human
+// icon that is on the puppet: SwitchBrain -> exe 0x2B81D70 -> 0x2B820D0 -> 0x3060200 looks the human up in the
+// navigation module's entity map and unregisters its human icon (0x30602B0, the same routine as UnregisterId) when
+// the old brain held a navigation id (brain +0x11C). On a guest the host's puppet (a Tommy profile, AI type 1) lost
+// its icon this way within 2 s (0.15.0 test: the id was gone, ChangeIconTargetToPos returned false, nothing on the
+// minimap); the host's copy of a guest (AI type 0) kept it. So the human icon goes on a puppet only once its brain
+// switch is done (Input::brainPending: until then the icon stays at his position), and an icon on a puppet is checked
+// once a second against the game (GetIdByScriptWrapper, CheckProbe): a lost one is made anew, twice at most per puppet.
 #include <cstdint>
 #include <string>
 
@@ -35,6 +44,7 @@ struct Input {
     bool puppet = false;         // his puppet is alive, shown and on foot (it may carry the icon)
     bool puppetChanged = false;  // the icon follows a puppet entity that is not his puppet now
     bool humanFailed = false;    // RegisterHumanEntityDirect gave no icon for this puppet
+    bool brainPending = false;   // his puppet's friend brain switch is still to come (it would remove an icon on it)
     bool hasPos = false;         // we know where he is
     float x = 0, y = 0, z = 0;   // where he is (his car while he drives or rides)
     float lastX = 0, lastY = 0, lastZ = 0;  // where the icon was put last (Target::Pos)
@@ -49,6 +59,19 @@ constexpr float kMoveEps = 1.0f;     // m: a position icon is moved when he is t
 constexpr size_t kMaxNameBytes = 32; // a name on the map is cut to this (at a UTF-8 character boundary)
 
 Plan Decide(const Input& in);
+
+// The once-a-second check of an icon on a puppet: GetIdByScriptWrapper(puppet) gives the navigation id of the icon on
+// that entity (0 = none). found < 0: the check could not be made (no such call, an error).
+enum class Probe : uint8_t {
+    Unknown,  // not checked (found < 0)
+    Ok,       // the game has our icon on the puppet
+    Lost,     // it has none / another one: ours is gone, make it anew (no UnregisterId: the id is not the game's now)
+    GiveUp,   // lost kMaxLosses times on this puppet: it gets no icon of its own, his icon stays at his position
+};
+constexpr int kMaxLosses = 2;      // icons lost on one puppet before it gets no more
+constexpr float kProbePeriod = 1;  // s between checks of an icon on a puppet (and from putting it there to the first)
+Probe CheckProbe(uint32_t id, double found, int lossesBefore);
+const char* ProbeName(Probe p);
 
 const char* IconName(Icon i);
 const char* TargetName(Target t);

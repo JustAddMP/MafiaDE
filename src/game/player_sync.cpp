@@ -1092,9 +1092,10 @@ int McTrace(lua_State* L) {
     return 0;
 }
 
-// mc_mapmark(icon, target, puppet, changed, failed, hasPos, x, y, z, lx, ly, lz) -> want, action: what to do with a
-// remote player's map marker (game/map_markers.h; player_sync.lua M.MarkersTick). icon "none"/"human"/"pos", target
-// "none"/"puppet"/"pos", the flags 1/0; returns the target names and the action name. GameMainThread only.
+// mc_mapmark(icon, target, puppet, changed, failed, hasPos, x, y, z, lx, ly, lz, brainPending) -> want, action: what
+// to do with a remote player's map marker (game/map_markers.h; player_sync.lua M.MarkersTick). icon
+// "none"/"human"/"pos", target "none"/"puppet"/"pos", the flags 1/0 (brainPending may be left out: 0); returns the
+// target names and the action name. GameMainThread only.
 int McMapMark(lua_State* L) {
     auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
     mapmark::Input in;
@@ -1106,10 +1107,23 @@ int McMapMark(lua_State* L) {
     in.hasPos = num(6) != 0;
     in.x = num(7), in.y = num(8), in.z = num(9);
     in.lastX = num(10), in.lastY = num(11), in.lastZ = num(12);
+    in.brainPending = num(13) != 0;
     const mapmark::Plan p = mapmark::Decide(in);
     lua::PushString(L, mapmark::TargetName(p.want));
     lua::PushString(L, mapmark::ActionName(p.act));
     return 2;
+}
+
+// mc_mapmark_probe(id, found, losses) -> "ok"/"lost"/"give_up"/"unknown": the check of an icon on a puppet (found =
+// game.navigation:GetIdByScriptWrapper(puppet), -1 when it could not be called; losses = icons this puppet lost
+// before). GameMainThread only.
+int McMapMarkProbe(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : -1.0f; };
+    const float id = num(1);
+    const mapmark::Probe p = id < 0 ? mapmark::Probe::Unknown
+                                    : mapmark::CheckProbe(static_cast<uint32_t>(id), num(2), static_cast<int>(num(3)));
+    lua::PushString(L, mapmark::ProbeName(p));
+    return 1;
 }
 
 // mc_carswap(key, now, bits, copySpeed, parkedAt) -> action, lockCopy, phase, why: one step of the swapped-car
@@ -1197,6 +1211,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_trace", &McTrace);
     lua::RegisterGlobal(L, "mc_carswap", &McCarSwap);
     lua::RegisterGlobal(L, "mc_mapmark", &McMapMark);
+    lua::RegisterGlobal(L, "mc_mapmark_probe", &McMapMarkProbe);
     lua::RegisterGlobal(L, "mc_rideseat", &McRideSeat);
     lua::RegisterGlobal(L, "mc_yieldseat", &McYieldSeat);
     return true;

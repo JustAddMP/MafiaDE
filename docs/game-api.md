@@ -403,7 +403,8 @@ markers", the decision in src/game/map_markers.h, unit-tested by tests/map_marke
 
 | his state | his icon |
 |---|---|
-| puppet alive, shown, on foot | the human icon on the puppet (`RegisterHumanEntityDirect(puppet, 1, 1)`, verified above), it follows the entity |
+| puppet alive, shown, on foot | the human icon on the puppet (`RegisterHumanEntityDirect(puppet, 1, 1)`, verified above), it follows the entity; checked once a second (`GetIdByScriptWrapper`) |
+| puppet alive, shown, on foot, its friend brain switch still to come (first ~2 s, `M.Ally`) | at his position (the switch would remove an icon on the puppet, see below) |
 | driving or riding (seat 0-3) | the same icon at his car's spot from his latest state (`cx cy cz` of the `T` command), moved with `ChangeIconTargetToPos` when he is more than 1 m from it, at most 5 times a second |
 | puppet hidden (cutscene, no car copy yet), dead and respawning, re-created, model swapped, factory reset, puppet never spawned, far away | the same icon at his position from his latest state (the C++ side sends every remote player's state every tick, near or far) |
 | no puppet yet in this world (just joined, far away, his model still loading) | a position icon (`RegisterIconPos`, type `freeride-generic`, UNVERIFIED look), replaced by the human icon once his puppet exists |
@@ -418,6 +419,45 @@ whose icon was unregistered is remembered (`pp.mkBurnt`) and only gets an icon m
 `SetIconFarVisibility(id, true)`. Log: `sync: player <id>: map marker <nav id> made on his puppet / at his position /
 off his puppet / on his puppet / removed (<why>)`; trace `MK` (counts, 1 Hz) and `MKE` (each change), sync-trace.md.
 
+**The friend brain switch removes the human icon (0.15.0 bug: the host's marker missing on the guest's minimap).**
+In the 0.15.0 one-PC test the guest's logs said `map marker 23 made on his puppet` (and later 434, 484) but no orange
+marker was on the guest's minimap with the host 12 m / 40 m away; the host's markers of the guest were fine. Every
+guest run, and only on the guest, `could not move it off his puppet` followed as soon as the host got into a car:
+`ChangeIconTargetToPos` returned false, which it does **only when the id is not in the module's id map** (0x2F40CE0 ->
+0x2FA3470 -> id lookup 0x2FB2000, false at once when not found). So the icon was gone soon after it was made. The
+cause, statically: `h:SwitchBrain(n)` (C_HumanScriptW, 0x2391B80) -> 0x2BA5820 -> 0x2B81D70 (the brain switch) ->
+0x2B820D0, which, when the old brain holds a navigation id (brain +0x11C not the "none" value), calls 0x3060200: look
+the human up in the module's entity map (+0x170, by the entity's GUID at +0xA8) and unregister the human icon on it
+with 0x30602B0, the routine `UnregisterId` uses (0x2F5A500). It then registers a new icon only for entity type 9
+(0x2B7FE10), not for our puppets (type 8). Our `M.Ally` switches every puppet to the friend brain 2 s after it spawns
+(0.15: on the guests' games too), and in every 0.15.0 log the human icon had been made 0.04-2 s **before** that
+switch. On the guest the host's puppet is a Tommy profile (AI type 1 at spawn: an ally brain, which holds a navigation id:
+inferred from the logs, where that id is set was not found statically); the host's copy of a guest (Paulie, AI type 0, a civilian brain) kept its icon through the same
+switch (its `ChangeIconTargetToPos` worked). The one guest icon made 44 ms **after** the switch (run 3, icon 60) was
+not removed until the puppet went. Before 0.15 guests never switched brains, which is why the 0.5.0 check saw the
+host's marker on the guest's map.
+
+The fix (static, UNVERIFIED in game): a puppet whose switch is still to come on this game (`M.WantsBrain()` and not
+yet `pp.ally`) carries no icon: his icon stays at his position (`Input::brainPending` in map_markers.h; a human icon
+already on it is moved off first) and goes onto the puppet once the switch is done. And an icon on a puppet is
+checked once a second, starting 1 s after it is put there, with `GetIdByScriptWrapper(puppet)`:
+
+| call | arguments (static) | notes |
+|---|---|---|
+| `GetIdByScriptWrapper(entity)` | entity -> number | read only (0x2F5B0D0 -> 0x2FC6AE0 -> entity map lookup 0x2FC4160): the navigation id of the icon on that entity, **0 when it has none**. Our check: it must give our id (`mc_mapmark_probe`, `mapmark::CheckProbe`) |
+
+A lost icon (0 or another id) is dropped (an `UnregisterId` of the old id just in case) and made anew at the next update;
+after `kMaxLosses` (2) on the same puppet he keeps an icon at his position instead. An icon found gone while being
+moved off a puppet (`ChangeIconTargetToPos` false) is now `LOST ... made anew` and does not mark the puppet as
+"burnt". Static reading also says `UnregisterId` (0x30602B0) erases the icon from both maps (id map and the entity
+link, 0x305FBC0 + 0x3080D10), so a later `RegisterHumanEntityDirect` on the same human should make a fresh icon: the
+0.4 "never a second icon after UnregisterId" observation may have had another cause; `pp.mkBurnt` is kept for now
+(UNVERIFIED either way). Logs to look for: `map marker waits at his position until his puppet's friend brain switch
+is done`, `<id> made at his position (..., his puppet's brain switch first)`, `(position icon) removed: he has a puppet
+now`, `<id> made on his puppet (brain switch done)`, `<id> checked on his puppet: the game has it (human icon)`; a
+problem shows as `<id> LOST: the game has no icon on his puppet (...)`. Trace `MK` ids carry the check result
+(`0:434/human/puppet/ok`) and `/brainwait`; `MKE ev=lost/give_up`.
+
 What the exe and the game's own scripts say about `game.navigation` (`C_NavigationScriptW`, method table RVA
 0x5AF9720: 106 methods plus __gc and __eq; re-notes lists the first 88; the argument types are read from the classic binding's checks:
 `isnumber` 0x785B30, `isstring` 0x1254DD0, `isboolean` 0x1AC6B10, entity 0x1ABD980, vehicle 0x1ABD570, vector
@@ -430,7 +470,8 @@ What the exe and the game's own scripts say about `game.navigation` (`C_Navigati
 | `RegisterIconPos(...)` | 5 to 11 arguments: `(x, y, icon, text, showText)`, `(x, y, icon, text, showText, desc)`, `(+ picture)`, `(+ colour number)`, `(x, y, icon, text, showText, desc, picture, colour, s, s)`, `(x, y, z, icon, text, showText, desc, picture, colour, s, s)` -> id | the shorter forms put z = 0, colour 0xFFFFFF, desc "0". The game calls e.g. `RegisterIconPos(x, y, "relay_collectable", "UI_Text_home", .., "UI_Text_homeDescription", "/gui/pop/home.dds")` and `RegisterIconPos(x, y, z, "race_checkpoint", "racing_checkpoint", .., tonumber("FFFFFF", 16), ..)`. `icon` is a name from the navigation config in `ingame_gui.sds` (e.g. `freeride-generic`, `freeride-challenge`, `car_player`, `car_hostile`, `race_checkpoint`, `relay_collectable`, `collectable_*`, `health_station`, `objective_warning`, `informant`); `text`/`desc` are string table ids |
 | `RegisterIconEntityDirect(entity, ...)` | same overload scheme with an entity first | used by the game for informants, pickups (`grow_house_pickup`), health stations |
 | `RegisterVehicleDirect(car, type)` | vehicle, string -> id | `type` from the vehicle list `enemy police_car taxi_car enemy_squeeler enemy_enforcer enemy_boat police_boat player_car player_boat vehicle taxi_target`; the game uses `"enemy"` (node `Game.Hud.CreateVehicleIcon`, default `enemy`). Not used: a car copy is despawned in many places (M.Swap, M.Restore, M.DropCar), and an icon on a released car is the same crash risk as on a puppet |
-| `ChangeIconTargetToPos(id, vector)` | number, C_Vector -> bool | moves an icon (any kind) to a position; unlinks it from its entity (0x305FBC0) first. The game's objective scripts switch icons between entities and positions with this pair |
+| `ChangeIconTargetToPos(id, vector)` | number, C_Vector -> bool | moves an icon (any kind) to a position; unlinks it from its entity (0x305FBC0) first. The game's objective scripts switch icons between entities and positions with this pair. Returns false only when the id is unknown (0x2FA3470 -> 0x2FB2000): the icon no longer exists |
+| `GetIdByScriptWrapper(entity)` | entity -> number | the id of the icon on the entity, 0 when none (read only; see "friend brain switch" above) |
 | `ChangeIconTargetToEntityDirect(id, entity)` | number, entity -> bool | puts an icon on an entity (false when the entity is not usable or the id unknown) |
 | `SetIconTextByNavId(id, text)` | number, string | the game sets e.g. `"%\nDEFENSE"` texts with it; where the full map shows it (hover popup?) is UNVERIFIED |
 | `SetIconFarVisibility(id, bool)` | number, boolean | the flow node `Game:Hud` icon nodes feed it from their `inRadarEdge` input: most likely "stay on the minimap's edge when out of range" (UNVERIFIED) |
@@ -438,7 +479,10 @@ What the exe and the game's own scripts say about `game.navigation` (`C_Navigati
 | `SetIndicatorHideRange(id, m)` | number, number | (not used) |
 | `SetIconFakeGPSPositionOnEntity(id, vector)`, `SetIconOverrideIndicatorPosition(id, vector)`, `SelectIcon(id)` | | (not used) |
 
-UNVERIFIED (needs the in-game test): that a human icon moved with `ChangeIconTargetToPos` is still drawn (on the
+UNVERIFIED (needs the in-game test): that with the brain switch first the host's marker shows on the guest's minimap
+and stays (and survives getting into a car: `at his position (in a car)` instead of `could not move it off`); that
+`GetIdByScriptWrapper` returns our id for a working icon (if it gave 0 for a visible one, every icon would be "lost"
+twice and end as a position icon: look for `checked on his puppet: the game has it`); that a human icon moved with `ChangeIconTargetToPos` is still drawn (on the
 minimap and the full map) and moves when moved again; that `freeride-generic` gives a visible icon; that
 `ChangeIconTargetToEntityDirect` puts a moved icon back on a (new) puppet; where the name shows; what
 `SetIconFarVisibility` does; whether the navigation module keeps or drops icons across a world load (we unregister

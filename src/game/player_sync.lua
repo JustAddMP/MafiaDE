@@ -3208,6 +3208,11 @@ end
 --     re-created, swapped): the same icon at his position (ChangeIconTargetToPos), moved a few times a second from
 --     his latest state (the C++ side sends it every tick, near or far);
 --   - before his first puppet: a position icon (RegisterIconPos), replaced by the human icon once he has one.
+-- The friend brain switch (M.Ally, ~2 s after a puppet spawns) removes a human icon on the puppet (exe 0x2B820D0 ->
+-- 0x3060200, map_markers.h): on a guest the host's puppet lost its icon that way in 0.15.0 and was on nobody's
+-- minimap. So while his puppet's switch is still to come his icon stays at his position (brainPending), and an icon on
+-- a puppet is checked once a second (GetIdByScriptWrapper(puppet) must give its id, mc_mapmark_probe): a lost icon is
+-- made anew, twice at most per puppet, then he keeps an icon at his position.
 -- What to do is decided by mc_mapmark (src/game/map_markers.h, unit-tested). A puppet is never released with the icon
 -- on it: M.Unmark moves the icon off it first (the navigation module updates its icons once a second and read a
 -- released puppet through a stale icon: crash in exe+0x243a915, docs/game-api.md 15). The icon goes (UnregisterId)
@@ -3218,9 +3223,15 @@ end
 local MARK_PERIOD = 0.2                 -- s between marker updates (5 Hz; the navigation module redraws once a second)
 local MARK_POS_ICON = "freeride-generic" -- RegisterIconPos icon type before he has a puppet (UNVERIFIED look)
 local MARK_TRACE_PERIOD = 1.0
+local MARK_PROBE_PERIOD = 1.0           -- s between checks of an icon on a puppet (mapmark::kProbePeriod)
 M.names = M.names or {}                 -- player id -> name ("N" commands), shown on his marker
 
 local function nav() return game.navigation end
+
+-- his puppet's friend brain switch is still to come on this game (M.Ally): it would remove an icon on the puppet
+local function markBrainPending(pp, so)
+  return M.WantsBrain() and not pp.ally and pp.st == "alive" and valid(so)
+end
 
 -- where he is for his marker: his car while he drives or rides, else himself (from his latest state)
 local function markPos(pp)
@@ -3244,10 +3255,12 @@ local function markTrace(pp, mk, ev)
     ev, mk.icon, mk.target, mk.x or 0, mk.y or 0, mk.z or 0))
 end
 
--- the icon follows position x y z now; false when the game refused
+-- the icon follows position x y z now; false when the game refused (false, true: the game has no icon with this id,
+-- ChangeIconTargetToPos returns false only then: exe 0x2FA3470 -> id lookup 0x2FB2000)
 local function markToPos(pp, mk, x, y, z)
   local good, ok = pcall(nav().ChangeIconTargetToPos, nav(), mk.id, V(x, y, z))
-  if not good or ok == false then return false end
+  if not good then return false, false end
+  if ok == false then return false, true end
   mk.target, mk.so, mk.x, mk.y, mk.z = "pos", nil, x, y, z
   return true
 end
@@ -3277,21 +3290,29 @@ function M.Unmark(pp, remove)
   if not mk then return end
   if not remove and mk.target ~= "puppet" then return end
   local x, y, z = markPos(pp)
-  if not remove and x and y and z and markToPos(pp, mk, x, y, z) then
-    markLog(pp, mk.id .. " off his puppet, to his position")
-    markTrace(pp, mk, "detach")
-    return
+  local gone = false  -- the game has no icon with this id any more (it removed it itself)
+  if not remove and x and y and z then
+    local moved
+    moved, gone = markToPos(pp, mk, x, y, z)
+    if moved then
+      markLog(pp, mk.id .. " off his puppet, to his position")
+      markTrace(pp, mk, "detach")
+      return
+    end
   end
   pcall(nav().UnregisterId, nav(), mk.id)
   pp.mk = nil
-  for _, e in ipairs({ mk.so, mk.made }) do  -- the puppets this icon was on get no second human icon
+  -- the puppets this icon was on get no second human icon (UNVERIFIED belief from 0.4, see game-api.md 13); not when
+  -- the game had removed the icon itself (then it was no UnregisterId of ours)
+  for _, e in ipairs(gone and {} or { mk.so, mk.made }) do
     if valid(e) and not markBurnt(pp, e) then
       pp.mkBurnt = pp.mkBurnt or {}
       if #pp.mkBurnt >= 4 then table.remove(pp.mkBurnt, 1) end
       pp.mkBurnt[#pp.mkBurnt + 1] = e
     end
   end
-  markLog(pp, mk.id .. " removed (" .. tostring(remove or "could not move it off his puppet") .. ")")
+  markLog(pp, mk.id .. " removed (" .. tostring(remove or "could not move it off his puppet") ..
+    (gone and ": the game had no icon with this id any more" or "") .. ")")
   markTrace(pp, mk, "remove")
 end
 
@@ -3300,6 +3321,46 @@ function M.MarkersClear(why)
   for _, pp in pairs(M.pup) do
     if pp.mk then M.Unmark(pp, why) end
   end
+end
+
+-- Once a second: is our icon on his puppet still the game's icon there? GetIdByScriptWrapper(puppet) gives the id of
+-- the icon on that entity (0: none; exe 0x2FC6AE0, read only). A lost icon (the game removed it, e.g. a brain switch)
+-- is dropped and made anew at the next update; after mapmark::kMaxLosses on the same puppet it gets no icon of its
+-- own any more (his icon stays at his position). Returns true when pp.mk was dropped.
+local function markProbe(pp, mk, so)
+  if not mc_mapmark_probe or mk.target ~= "puppet" or not valid(so) or not same(mk.so, so) then return false end
+  if M.now - (mk.chkT or mk.onT or M.now) < MARK_PROBE_PERIOD then return false end
+  mk.chkT = M.now
+  local n = nav()
+  local good, found = pcall(n.GetIdByScriptWrapper, n, so)
+  local f = good and tonumber(found) or -1
+  local lost = (pp.mkLost and same(pp.mkLost.so, so)) and pp.mkLost.n or 0
+  local res = mc_mapmark_probe(mk.id, f, lost)
+  local first = mk.chk == nil
+  mk.chk = res
+  if res == "ok" then
+    if first then markLog(pp, string.format("%s checked on his puppet: the game has it (%s icon)", tostring(mk.id), mk.icon)) end
+    return false
+  end
+  if res == "unknown" then
+    if first then markLog(pp, mk.id .. " could not be checked (" .. tostring(found) .. ")") end
+    return false
+  end
+  -- lost / give_up: the game has no icon of ours on the puppet now
+  markLog(pp, string.format("%s LOST: the game has %s on his puppet (%s icon, %.1f s after it was put there, brain "
+    .. "switch %s)%s", tostring(mk.id), f == 0 and "no icon" or ("icon " .. tostring(found)), mk.icon,
+    M.now - (mk.onT or M.now), pp.ally and string.format("done %.1f s ago", M.now - (pp.brainT or M.now)) or "not yet",
+    res == "give_up" and ": this puppet gets no icon of its own any more, his icon stays at his position"
+      or ": made anew"))
+  markTrace(pp, mk, res == "give_up" and "give_up" or "lost")
+  pcall(n.UnregisterId, n, mk.id)  -- normally gone already; if not (another icon on the puppet), ours goes too
+  pp.mk = nil
+  pp.mkLost = { so = so, n = lost + 1 }
+  if res == "give_up" then
+    if mk.icon == "human" then pp.mkFailed = so else pp.mkNoFollow = so end
+  end
+  pp.mkT = nil
+  return true
 end
 
 function M.MarkOne(pp)
@@ -3315,18 +3376,25 @@ function M.MarkOne(pp)
   -- his puppet may carry the icon: alive, shown, on foot (and the icon could be put on it: mkNoFollow)
   local shown = pp.st == "alive" and valid(so) and not pp.hidden and not (pp.veh and (pp.seat or 0) <= 3)
     and not same(pp.mkNoFollow, so)
-  if mk and mk.target == "puppet" and not (valid(mk.so) and shown and same(mk.so, so)) then
+  local pending = markBrainPending(pp, so)  -- his icon waits at his position until the brain switch is done
+  if mk and mk.target == "puppet" and not (valid(mk.so) and shown and not pending and same(mk.so, so)) then
     -- not on his shown puppet any more: off it at once, not at the next update
     pp.mkT = nil
   end
   if pp.mkT and M.now - pp.mkT < MARK_PERIOD then return end
   pp.mkT = M.now
+  if mk and markProbe(pp, mk, so) then mk = nil end
+  if pending and shown and not same(pp.mkWaitLogged, so) then
+    pp.mkWaitLogged = so
+    markLog(pp, "waits at his position until his puppet's friend brain switch is done (it would remove an icon on it)")
+  end
   local x, y, z = markPos(pp)
   local hasPos = x ~= nil and y ~= nil and z ~= nil
   local changed = mk and mk.target == "puppet" and not same(mk.so, so)
   local refused = same(pp.mkFailed, so) or markBurnt(pp, so)  -- no (working) human icon for this puppet
   local _, act = mc_mapmark(mk and mk.icon or "none", mk and mk.target or "none", shown and 1 or 0, changed and 1 or 0,
-    refused and 1 or 0, hasPos and 1 or 0, x or 0, y or 0, z or 0, mk and mk.x or 0, mk and mk.y or 0, mk and mk.z or 0)
+    refused and 1 or 0, hasPos and 1 or 0, x or 0, y or 0, z or 0, mk and mk.x or 0, mk and mk.y or 0, mk and mk.z or 0,
+    pending and 1 or 0)
   if act == "keep" then
     if mk then markName(pp, mk) end
     return
@@ -3342,8 +3410,9 @@ function M.MarkOne(pp)
     local good, id = pcall(n.RegisterHumanEntityDirect, n, so, 1, 1)
     if good and id then
       mk = markNew(pp, id, "human", "puppet", so)
-      mk.made = so
-      markLog(pp, id .. " made on his puppet")
+      mk.made, mk.onT = so, M.now
+      markLog(pp, string.format("%s made on his puppet (brain switch %s)", tostring(id),
+        pp.ally and "done" or "not on this game"))
       markTrace(pp, mk, "create")
     else
       pp.mkFailed = so
@@ -3359,7 +3428,8 @@ function M.MarkOne(pp)
       pp.mkPosFailed = nil
       mk = markNew(pp, id, "pos", "pos", nil, x, y, z)
       markLog(pp, string.format("%s made at his position (%.0f %.0f %.0f, %s)", tostring(id), x, y, z,
-        valid(so) and "no human icon for his puppet" or "no puppet yet"))
+        not valid(so) and "no puppet yet" or (pending and "his puppet's brain switch first")
+          or (shown and "no human icon for his puppet" or "puppet not shown")))
       markTrace(pp, mk, "create")
     else
       if not pp.mkPosFailed then markLog(pp, "position icon not made (" .. tostring(id) .. "), tried again in 5 s") end
@@ -3368,7 +3438,7 @@ function M.MarkOne(pp)
   elseif act == "to_puppet" then
     local good, ok = pcall(n.ChangeIconTargetToEntityDirect, n, mk.id, so)
     if good and ok ~= false then
-      mk.target, mk.so = "puppet", so
+      mk.target, mk.so, mk.onT, mk.chk, mk.chkT = "puppet", so, M.now, nil, nil
       markLog(pp, mk.id .. " on his puppet")
       markTrace(pp, mk, "to_puppet")
     elseif mk.icon == "human" then
@@ -3382,12 +3452,20 @@ function M.MarkOne(pp)
       pp.mkNoFollow = so
     end
   elseif act == "to_pos" or act == "move_pos" then
-    if markToPos(pp, mk, x, y, z) then
+    local moved, gone = markToPos(pp, mk, x, y, z)
+    if moved then
       if act == "to_pos" then
         markLog(pp, string.format("%s at his position (%s)", tostring(mk.id),
-          (pp.veh and (pp.seat or 0) <= 3) and "in a car" or (pp.st ~= "alive" and "no puppet" or "puppet hidden")))
+          (pp.veh and (pp.seat or 0) <= 3) and "in a car" or (pp.st ~= "alive" and "no puppet"
+            or (pending and shown and "brain switch first" or "puppet hidden"))))
         markTrace(pp, mk, "to_pos")
       end
+    elseif mk.target == "puppet" and gone then
+      -- the game removed it itself (no UnregisterId of ours): made anew at the next update, the puppet not burnt
+      markLog(pp, mk.id .. " LOST: the game has no icon with this id any more (found moving it off his puppet): made anew")
+      markTrace(pp, mk, "lost")
+      pp.mk = nil
+      pp.mkT = nil
     elseif mk.target == "puppet" then
       M.Unmark(pp, "could not move it off his puppet")
     elseif M.now - (pp.mkReT or -10) >= 1 then  -- made anew where he is, at most once a second
@@ -3415,7 +3493,9 @@ function M.MarkersTick()
     local ids = {}
     for id, pp in pairs(M.pup) do
       local mk = pp.mk
-      ids[#ids + 1] = id .. ":" .. (mk and (tostring(mk.id) .. "/" .. mk.icon .. "/" .. mk.target) or "-")
+      ids[#ids + 1] = id .. ":" .. (mk and (tostring(mk.id) .. "/" .. mk.icon .. "/" .. mk.target .. "/"
+        .. (mk.target == "puppet" and (mk.chk or "unchecked") or "-")) or "-")
+        .. (markBrainPending(pp, pp.so) and "/brainwait" or "")
     end
     trace("MK", string.format("players=%d puppet=%d pos=%d none=%d ids=%s", nh + np + nn, nh, np, nn,
       #ids > 0 and table.concat(ids, ",") or "-"))

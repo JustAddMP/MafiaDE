@@ -222,9 +222,89 @@ void TestThreeOthers() {
           "3 others: name lines keyed by player id (two players may share a name)");
 }
 
+// ---- the friend brain switch removes a human icon on the puppet (0.15.0: the host's marker missing on the guest) ----
+void TestBrainPending() {
+    Input in = At(10, 20, 3);
+    in.puppet = true;
+    in.brainPending = true;
+    Expect(in, Target::Pos, Action::CreatePos, "brain: switch to come, no icon -> position icon, not on the puppet");
+    in.icon = Icon::Pos;
+    in.target = Target::Pos;
+    in.lastX = 10, in.lastY = 20, in.lastZ = 3;
+    Expect(in, Target::Pos, Action::Keep, "brain: switch to come, position icon -> it stays (no human icon yet)");
+    in.x = 15;
+    Expect(in, Target::Pos, Action::MovePos, "brain: switch to come, he walks -> the position icon follows him");
+    in.brainPending = false;
+    Expect(in, Target::Puppet, Action::ReplaceWithHuman, "brain: switch done -> the human icon on the puppet");
+    Input h = At(10, 20, 3);
+    h.puppet = true;
+    h.icon = Icon::Human;
+    h.target = Target::Puppet;
+    h.brainPending = true;
+    Expect(h, Target::Pos, Action::ToPos, "brain: human icon on a puppet whose switch is to come -> off it first");
+    h.target = Target::Pos;
+    h.brainPending = false;
+    Expect(h, Target::Puppet, Action::ToPuppet, "brain: switch done -> the same icon back on the puppet");
+    Input none;
+    none.puppet = true;
+    none.brainPending = true;
+    Expect(none, Target::None, Action::Keep, "brain: switch to come, no position -> wait (nothing on the puppet)");
+}
+
+void TestProbe() {
+    Check(CheckProbe(434, 434, 0) == Probe::Ok, "probe: the game has our id on the puppet -> ok");
+    Check(CheckProbe(434, -1, 0) == Probe::Unknown, "probe: no check possible -> unknown (nothing done)");
+    Check(CheckProbe(434, 0, 0) == Probe::Lost, "probe: no icon on the puppet -> lost (made anew)");
+    Check(CheckProbe(434, 500, 0) == Probe::Lost, "probe: another icon on the puppet -> lost");
+    Check(CheckProbe(434, 0, kMaxLosses - 1) == Probe::GiveUp, "probe: lost kMaxLosses times -> give up");
+    Check(CheckProbe(434, 434, 5) == Probe::Ok, "probe: ok whatever was lost before");
+    Check(std::string(ProbeName(Probe::Ok)) == "ok" && std::string(ProbeName(Probe::Lost)) == "lost" &&
+              std::string(ProbeName(Probe::GiveUp)) == "give_up" && std::string(ProbeName(Probe::Unknown)) == "unknown",
+          "probe: names for the Lua side");
+}
+
+// The 0.15.0 guest case end to end: the host's puppet spawns, its brain is switched 2 s later. Before the fix the human
+// icon went on it at once and the switch removed it; now it waits at his position, then goes on the puppet once.
+// A game icon that still disappears (probe Lost) is made anew, at most kMaxLosses times, then a position icon.
+void TestBrainSession() {
+    Marker m;
+    Input in = At(-943, -233, 3);
+    Step(m, in);  // no puppet yet
+    Check(m.icon == Icon::Pos, "brain session: position icon before the puppet");
+    in.puppet = true;
+    in.brainPending = true;
+    for (int t = 0; t < 10; ++t) Step(m, in);  // 2 s at 5 Hz: spawned, switch to come
+    Check(m.icon == Icon::Pos && m.target == Target::Pos && m.creates == 1,
+          "brain session: puppet spawned, switch to come -> still the position icon");
+    in.brainPending = false;  // M.Ally switched it
+    Step(m, in);
+    Check(m.icon == Icon::Human && m.target == Target::Puppet && m.creates == 2 && m.removes == 1,
+          "brain session: switch done -> the human icon on the puppet (position icon replaced)");
+    for (int t = 0; t < 50; ++t) Step(m, in);
+    Check(m.creates == 2 && m.target == Target::Puppet, "brain session: on foot afterwards -> kept, nothing made again");
+    // the game removes it anyway: the probe sees it lost, the Lua side drops it (icon None) and it is made anew
+    int losses = 0;
+    for (int round = 0; round < 3; ++round) {
+        const Probe pr = CheckProbe(23, 0, losses);
+        if (pr == Probe::Ok || pr == Probe::Unknown) break;
+        ++losses;
+        m.icon = Icon::None, m.target = Target::None;
+        if (pr == Probe::GiveUp) in.humanFailed = true;  // pp.mkFailed: no own icon for this puppet
+        Step(m, in);
+        if (pr == Probe::GiveUp) break;
+    }
+    Check(losses == kMaxLosses, "brain session: an icon lost again and again -> given up after kMaxLosses",
+          std::to_string(losses));
+    Check(m.icon == Icon::Pos && m.target == Target::Pos,
+          "brain session: given up -> a position icon shows him (never nothing)");
+}
+
 }  // namespace
 
 int main() {
+    TestBrainPending();
+    TestProbe();
+    TestBrainSession();
     TestFirstIcon();
     TestHumanIcon();
     TestPosIcon();
