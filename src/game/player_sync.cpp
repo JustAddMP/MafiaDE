@@ -223,6 +223,7 @@ struct Shared {
     std::map<net::PlayerId, Tag> tags;
     std::map<net::PlayerId, CopyReport> pupReports, carReports;
     parked::Book parkedBook;  // every shared car parked in this session (the host sends it to newcomers: ParkedCars)
+    std::map<parked::Key, parked::Car> parkedIn;  // parked cars from the network, until we are in a world
     // world state (Lua "WS" events, twice a second, also without a session)
     bool inWorld = false;
     std::string saveId;
@@ -975,11 +976,18 @@ bool WriteParked(net::ByteWriter& w, const std::string& line) {
     return true;
 }
 
-// A parked car from another game (CarParked, or one entry of the host's ParkedCars) becomes a "K" line for the glue
-// (player_sync.lua M.Parked). Under the lock.
+// A parked car from another game (CarParked, or one entry of the host's ParkedCars) waits until we are in a world
+// (MainTick hands it to the glue as a "K" line, player_sync.lua M.Parked): a car record the glue made while we were in
+// the menu or on a loading screen (a newcomer gets ParkedCars at his join) was dropped as "the old world's" on the
+// first tick in the world (M.CarsNewWorld). The newest one per car wins. Under the lock.
 void QueueParked(Shared& sh, const parked::Car& c) {
-    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %u\n", c.owner, c.guid,
-               c.model.c_str(), c.t[0], c.t[1], c.t[2], c.t[3], c.t[4], c.t[5], c.t[6], c.flags);
+    sh.parkedIn[{c.owner, c.guid}] = c;
+    if (sh.parkedIn.size() > parked::Book::kMax) sh.parkedIn.erase(sh.parkedIn.begin());
+}
+
+void AppendParked(std::string& out, const parked::Car& c) {
+    AppendLine(out, SIZE_MAX, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %u\n", c.owner, c.guid, c.model.c_str(),
+               c.t[0], c.t[1], c.t[2], c.t[3], c.t[4], c.t[5], c.t[6], c.flags);
 }
 
 void OnCarParked(net::PlayerId from, net::ByteReader& r) {
@@ -1749,6 +1757,10 @@ void MainTick(lua_State* L, float dt) {
             cmds += std::string("G ") + (NameTagsOn() ? "1 " : "0 ") + (MapMarkersOn() ? "1 " : "0 ") +
                     (EnemiesTargetGuests() ? "1 " : "0 ") + (sectors_guard::Active() ? "1\n" : "0\n");
             cmds += sh.inCmds;
+            if (!sh.parkedIn.empty() && sh.inWorld && now - sh.worldAt < 2.0) {  // QueueParked
+                for (const auto& [k, c] : sh.parkedIn) AppendParked(cmds, c);
+                sh.parkedIn.clear();
+            }
             sh.inCmds.clear();
             if (sh.enterPressed && now - sh.enterAt < 0.5) cmds += "E\n";
             sh.enterPressed = false;
@@ -1966,6 +1978,7 @@ void PlayerSync::Detach() {
     sh.pupReports.clear();
     sh.carReports.clear();
     sh.parkedBook.Clear();
+    sh.parkedIn.clear();
     if (core::trace::IsOpen()) {
         core::trace::Line("END", "why=session-detached");
         core::trace::Close();
