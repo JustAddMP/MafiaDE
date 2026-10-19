@@ -790,9 +790,12 @@ function N.Enforce(s, e, p)
   -- pulled back when it walked off (not in cars: they drive their own way)
   -- (only NPCs with a job: enemies, allies, police, scripted ones; plain civilians wander their own way here)
   local inVeh, ourCar = N.InVehicle(s), h:GetOwner()
+  -- (while the host's game is paused or just resumed, hostQuiet: his NPCs stood, their last speed and distance say
+  -- nothing; no unpairing and no steering then, as no pull-backs)
+  local quiet = hostQuiet()
   -- the host's NPC drives (or rides), ours walks far from it: not the same NPC (a loose pair made while both stood,
   -- or before the host's got in): unpaired, the pairing finds one of the right kind (or none)
-  if inVeh and not ourCar and s.ai ~= 0 then
+  if inVeh and not ourCar and s.ai ~= 0 and not quiet then
     local q = h:GetPos()
     local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2)
     if d > LOOSE_DIST then
@@ -820,7 +823,7 @@ function N.Enforce(s, e, p)
     -- puppet here and drifts off, 0.15.0: p50 6 m, p95 13 m while running). UNVERIFIED that MoveVec steers a police
     -- AI (spawned copies, civilians, follow it).
     local spd = s.spd or 0
-    if s.ai == 4 and d > STEER_DIST and spd > 1.8 and M.now - (s.steerT or -10) >= STEER_EVERY then
+    if s.ai == 4 and not quiet and d > STEER_DIST and spd > 1.8 and M.now - (s.steerT or -10) >= STEER_EVERY then
       s.steerT = M.now
       local lead = math.min(0.6, d / math.max(spd, 1))
       local good = pcall(h.MoveVec, h, V(s.x + (s.vx or 0) * lead, s.y + (s.vy or 0) * lead, s.z),
@@ -832,7 +835,7 @@ function N.Enforce(s, e, p)
       end
     end
     -- enemies in a fight run and take cover differently on each game: only one far off (12 m) is put back
-    if hostQuiet() then
+    if quiet then
       if s.offSince then
         s.offSince = nil
         N.quietPulls = (N.quietPulls or 0) + 1

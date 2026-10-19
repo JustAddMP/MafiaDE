@@ -45,6 +45,7 @@ constexpr uint8_t kCrewOut = 32;
 constexpr double kOrphanConfirm = 1.0;  // s without a driver read, slow all that time
 constexpr float kOrphanSlow = 2.0f;     // m/s: slow
 constexpr float kOrphanDriven = 4.0f;   // m/s: a declared driverless car this fast is driven again (someone drives it)
+constexpr double kOrphanGap = 0.5;      // s between two rounds (normally 0.05): the host's game stood, the watch restarts
 
 class DriverWatch {
 public:
@@ -57,6 +58,7 @@ public:
 private:
     double missSince_ = -1;  // first round without a driver read (-1: one was read last round)
     double slowSince_ = -1;  // first round slow while missing (-1: not slow)
+    double lastAt_ = -1;     // the last round (kOrphanGap)
     bool declared_ = false;
 };
 

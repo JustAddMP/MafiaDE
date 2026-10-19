@@ -291,6 +291,11 @@ uint16_t HostTraffic::NewNet() {
 }
 
 bool DriverWatch::Update(double now, bool driverSeen, float speed) {
+    // no rounds for a while (the host's game was paused, game/peer_pause.h, or loading): that time is not time without
+    // a driver; a car not yet declared starts its watch again
+    const bool gap = lastAt_ >= 0 && now - lastAt_ > kOrphanGap;
+    lastAt_ = now;
+    if (gap && !declared_) missSince_ = slowSince_ = -1;
     if (driverSeen || !std::isfinite(speed)) {
         missSince_ = slowSince_ = -1;
         declared_ = false;

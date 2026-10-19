@@ -807,9 +807,26 @@ void TestDriverWatch() {
         Check(!at09 && at10, "driver: standing without a driver: driverless after 1.0 s, not at 0.9 s");
         Check(w.Update(1.05, false, 3.0f), "driver: pushed to 3 m/s (below 'driven again', 4 m/s): still driverless");
         Check(!w.Update(1.1, false, 6.0f), "driver: driverless car speeding up (6 m/s) is driven again");
-        Check(!w.Update(1.5, false, 0.0f), "driver: ... and needs 1 s slow again");
-        Check(w.Update(2.6, false, 0.0f), "driver: ... after which it is driverless again");
-        Check(!w.Update(2.65, true, 0.0f) && !w.Missing(), "driver: a driver read clears it at once");
+        bool early = false;
+        for (int i = 0; i <= 18; ++i) early |= w.Update(1.15 + i * 0.05, false, 0.0f);  // rounds 0.05 s apart
+        Check(!early, "driver: ... and needs 1 s slow again");
+        Check(w.Update(2.2, false, 0.0f), "driver: ... after which it is driverless again");
+        Check(!w.Update(2.25, true, 0.0f) && !w.Missing(), "driver: a driver read clears it at once");
+    }
+    {
+        DriverWatch w;  // the host's game pauses (no rounds for 8 s) while a slow car's driver is not read
+        bool before = false;
+        for (int i = 0; i <= 10; ++i) before |= w.Update(i * 0.05, false, 0.0f);  // 0.5 s missing
+        const bool afterGap = w.Update(8.5, false, 0.0f);
+        bool soon = false;
+        for (int i = 1; i <= 18; ++i) soon |= w.Update(8.5 + i * 0.05, false, 0.0f);
+        bool later = false;
+        for (int i = 19; i <= 22; ++i) later |= w.Update(8.5 + i * 0.05, false, 0.0f);
+        Check(!before && !afterGap && !soon, "driver: the host's pause is not time without a driver (watch restarts)");
+        Check(later, "driver: ... driverless 1 s after the resume");
+        DriverWatch d;  // a car declared before the pause stays declared over it
+        for (int i = 0; i <= 22; ++i) d.Update(i * 0.05, false, 0.0f);
+        Check(d.Declared() && d.Update(9.0, false, 0.0f), "driver: declared before the pause: still after it");
     }
     {
         DriverWatch w;  // the driver dies at 12 m/s; the car rolls to a stop over 4 s
