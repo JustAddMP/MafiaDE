@@ -2294,6 +2294,8 @@ function M.OnPuppetDamage(pp, m)
     end
     return
   end
+  -- our bullet's DAMAGE on a puppet: the evidence M.ShotTick matches our shots against (no second Hit for them)
+  if dtype == 0 and not M.boomOurs then M.PvpEvidence("game", pp) end
   if not M.friendlyFire or amount <= 0 then return end
   -- a car against a human sends a burst of small COLLISION (11) / IN_CAR (10) messages (one per frame of contact):
   -- summed and sent as one Hit after RAM_SUM s (M.RamTick)
@@ -2415,6 +2417,7 @@ end
 
 function M.DamageDispatch(m, g)
   if g == M.localGuid then return M.OnLocalDamage(m) end
+  M.LearnBulletDamage(m)
   -- mission NPCs (npc_sync.lua): our hits on copies of the host's NPCs, replayed guest shots landing on the host's
   if M.Npc and M.Npc.OnDamage and M.Npc.OnDamage(m, tonumber(g:match("(%d+)%s*$"))) then return end
   for _, pp in pairs(M.pup) do
@@ -2448,6 +2451,8 @@ function M.WatchDamage(p)
   -- a puppet's AI taking / giving back script control (M.ScriptControl: the "script" ways of playing an action)
   subs[#subs + 1] = { "SCRIPT_CONTROL", M.OnControlEvent, "SCRIPT_CONTROL" }
   subs[#subs + 1] = { "AI_CONTROL", M.OnControlEvent, "AI_CONTROL" }
+  -- our bullets touching a puppet (sent to the shooter, docs/game-api.md 11): evidence for M.ShotTick
+  subs[#subs + 1] = { "ON_BULLET_HIT", M.OnBulletHitEvent }
   for _, ev in ipairs(subs) do
     local name, fn, arg = ev[1], ev[2], ev[3]
     local msg = enums.HumanMessages[name]
@@ -2466,7 +2471,8 @@ function M.WatchDamage(p)
   end
   M.dmg = { key = key, ids = ids }
   M.swings = {}
-  log("watching damage, deaths, our punches and actions (" .. #ids .. " subscriptions)")
+  M.pvpShots, M.pvpEv = {}, {}
+  log("watching damage, deaths, our punches, bullet hits and actions (" .. #ids .. " subscriptions)")
 end
 
 -- Puppet health and death, every tick before driving it. True while the puppet is (being made) dead.
@@ -2516,6 +2522,11 @@ end
 -- (AI type 1) are never picked by the game's melee targeting, so the swing goes into the air (opponent 0); then the
 -- puppet in reach in front of us at the moment of impact is the one we hit: a Hit with the damage a punch does to an
 -- NPC (10, a charged punch 36) and a small DoDamage on the puppet for its flinch.
+-- Every puppet has the friend brain (M.Ally: AI type 1), so this is every punch once a puppet is 2 s old. Lock-on
+-- (unreleased, M.MeleeLock): at the swing the nearest puppet within 2.6 m and 70 degrees of our facing is our target:
+-- we are turned to it (p:SetDir, UNVERIFIED on the player) and at the impact it is hit within 2.3 m / 60 degrees
+-- (src/game/pvp_hit.h PickMelee, mc_pvp_melee). Why the game cannot do it itself: docs/game-api.md 17 "Shooting and
+-- punching a puppet".
 local SWING_IMPACT = 0.25  -- s from the swing to the impact (the DAMAGE of a landed punch comes 0.19-0.2 s after it)
 local SWING_REACH = 1.9    -- m from us to the puppet
 local SWING_DAMAGE = { light = 10, heavy = 36 }
@@ -2524,8 +2535,11 @@ M.swings = M.swings or {}
 function M.OnMeleeEvent(m, heavy)
   if tostring(m:GetReceiverGUID()) ~= M.localGuid then return end
   local good, opp = pcall(m.GetOpponentGUID, m)
-  M.swings[#M.swings + 1] = { t = M.now, heavy = heavy, opp = good and tostring(opp) or "" }
+  local sw = { t = M.now, heavy = heavy, opp = good and tostring(opp) or "" }
+  M.swings[#M.swings + 1] = sw
   M.LocalAction(heavy and 2 or 1, good and tostring(opp) or "-")
+  local ok, err = pcall(M.MeleeLock, sw)
+  if not ok then log("melee lock-on failed: " .. tostring(err)) end
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
@@ -3154,22 +3168,95 @@ function M.CarryEnd(pp, so, why)
   trace("CB", string.format("id=%s key=%s end=%s", pp.id, tostring(c.key), tostring(why):gsub(" ", "_")))
 end
 
--- The puppet our swing reaches: on foot, within SWING_REACH, in front of us (45 degrees either side), nearest first.
-function M.SwingTarget(p)
-  local a, d = p:GetPos(), p:GetDir()
-  local best, bestD
+-- The puppets a punch or shot of ours may be aimed at: alive, shown, on foot (not hidden, not down). With `all` also
+-- those in a car (a shot at them is "not_hittable": the car takes it).
+local function pvpBodies(all)
+  local list = {}
   for _, pp in pairs(M.pup) do
-    if pp.st == "alive" and valid(pp.so) and not pp.veh and not pp.hidden and (pp.health or 100) > 0 then
+    if pp.st == "alive" and valid(pp.so) and not pp.hidden and (all or (not pp.veh and (pp.health or 100) > 0 and
+        not pp.deadShown)) then
+      list[#list + 1] = pp
+    end
+  end
+  return list
+end
+
+local function pvpHittable(pp)
+  return pp.st == "alive" and valid(pp.so) and not pp.veh and not pp.hidden and (pp.health or 100) > 0 and
+    not pp.deadShown
+end
+
+-- The puppet our swing reaches. mode "swing": within SWING_REACH in front of us (45 degrees either side), nearest
+-- first; "lock": the lock-on pick (2.6 m, 70 degrees); "locked": only `only`, the locked puppet (2.3 m, 60 degrees).
+-- src/game/pvp_hit.h PickMelee (mc_pvp_melee); without it (an older dll) the 0.15.0 swing test.
+function M.SwingTarget(p, mode, only, dir)
+  local a, d = p:GetPos(), dir or p:GetDir()
+  local list = only and { only } or pvpBodies(false)
+  if #list == 0 then return nil end
+  if mc_pvp_melee then
+    local args = {}
+    for _, pp in ipairs(list) do
       local b = pp.so:GetPos()
-      local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
-      local dist = math.sqrt(dx * dx + dy * dy)
-      if dist <= SWING_REACH and math.abs(dz) < 1.2 and dist > 1e-3 and (dx * d.x + dy * d.y) / dist >= 0.7 and
-          (not bestD or dist < bestD) then
-        best, bestD = pp, dist
-      end
+      args[#args + 1], args[#args + 2], args[#args + 3] = b.x, b.y, b.z
+    end
+    local i = mc_pvp_melee(mode or "swing", a.x, a.y, a.z, d.x, d.y, (table.unpack or unpack)(args))
+    return i and list[i] or nil
+  end
+  if mode and mode ~= "swing" then return nil end
+  local best, bestD
+  for _, pp in ipairs(list) do
+    local b = pp.so:GetPos()
+    local dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+    local dist = math.sqrt(dx * dx + dy * dy)
+    if dist <= SWING_REACH and math.abs(dz) < 1.2 and dist > 1e-3 and (dx * d.x + dy * d.y) / dist >= 0.7 and
+        (not bestD or dist < bestD) then
+      best, bestD = pp, dist
     end
   end
   return best
+end
+
+-- degrees between our facing and the direction to puppet pp, and the distance
+local function facingOff(p, pp)
+  local a, d, b = p:GetPos(), p:GetDir(), pp.so:GetPos()
+  local dx, dy = b.x - a.x, b.y - a.y
+  local dist = math.sqrt(dx * dx + dy * dy)
+  local dl = math.sqrt(d.x * d.x + d.y * d.y)
+  if dist < 1e-3 or dl < 1e-3 then return 0, dist end
+  local c = math.max(-1, math.min(1, (dx * d.x + dy * d.y) / (dist * dl)))
+  return math.deg(math.acos(c)), dist
+end
+
+-- Lock-on at our swing (M.OnMeleeEvent): the game aimed it at nobody (or not at a puppet) and a puppet is near in
+-- front of us (or of the camera): we are turned to it and it is this swing's target at the impact (M.MeleeTick).
+function M.MeleeLock(sw)
+  if not M.friendlyFire then return end
+  for _, pp in pairs(M.pup) do
+    if pp.guid and pp.guid == sw.opp then return end  -- the game's own lock-on (a puppet before its brain switch)
+  end
+  local p = M.Player()
+  if not p or valid(p:GetOwner()) then return end
+  local pp = M.SwingTarget(p, "lock")
+  local how = "facing"
+  if not pp then
+    local cam = game.cameramanager:GetPlayerCamera()
+    local cd = cam and cam:GetDir()
+    if cd then pp, how = M.SwingTarget(p, "lock", nil, cd), "camera" end
+  end
+  if not pp then return end
+  local off, dist = facingOff(p, pp)
+  local a, b = p:GetPos(), pp.so:GetPos()
+  local dx, dy = b.x - a.x, b.y - a.y
+  local l = math.sqrt(dx * dx + dy * dy)
+  local turned, err = false, nil
+  if l > 1e-3 then turned, err = pcall(p.SetDir, p, V(dx / l, dy / l, 0)) end
+  sw.lock, sw.lockOff = pp, off
+  M.locks = (M.locks or 0) + 1
+  if M.locks <= 20 or M.locks % 50 == 0 then
+    log(string.format("our %s punch: locked on to puppet %s (%.1f m, %.0f degrees off our %s; the game's opponent "
+      .. "%s): turned to it %s (#%d)", sw.heavy and "heavy" or "light", pp.id, dist, off, how, sw.opp,
+      turned and "(SetDir ok)" or ("FAILED: " .. tostring(err)), M.locks))
+  end
 end
 
 function M.MeleeTick(p)
@@ -3183,17 +3270,253 @@ function M.MeleeTick(p)
       for _, pp in pairs(M.pup) do
         if pp.guid and pp.guid == sw.opp then aimed = true end  -- the game targeted a puppet: its DAMAGE tells
       end
-      local pp = not aimed and M.friendlyFire and not p:GetOwner() and M.SwingTarget(p)
+      local pp, how = nil, "swing"
+      if not aimed and M.friendlyFire and not p:GetOwner() then
+        if sw.lock and pvpHittable(sw.lock) then
+          pp, how = M.SwingTarget(p, "locked", sw.lock), "locked"
+          -- did the turn take? (our facing at the impact against the direction to the puppet)
+          local off, dist = facingOff(p, sw.lock)
+          M.lockTurns = (M.lockTurns or 0) + 1
+          if M.lockTurns <= 10 or M.lockTurns % 50 == 0 then
+            log(string.format("lock-on on puppet %s at the impact: %.0f degrees off our facing (%.0f at the swing), "
+              .. "%.1f m: the turn %s, %s", sw.lock.id, off, sw.lockOff or -1, dist, off < 25 and "took" or
+              "did NOT take", pp and "hit" or "out of reach"))
+          end
+          trace("PVM", string.format("id=%s heavy=%d off0=%.0f off=%.0f dist=%.2f hit=%d", sw.lock.id,
+            sw.heavy and 1 or 0, sw.lockOff or -1, off, dist, pp and 1 or 0))
+        end
+        if not pp then pp, how = M.SwingTarget(p, "swing"), "swing" end
+      end
       if pp then
         local amount = sw.heavy and SWING_DAMAGE.heavy or SWING_DAMAGE.light
-        log(string.format("our %s punch reached puppet %s (not a melee target for the game)", sw.heavy and "heavy" or
-          "light", pp.id))
+        log(string.format("our %s punch reached puppet %s (not a melee target for the game; %s)", sw.heavy and "heavy"
+          or "light", pp.id, how == "locked" and "locked on" or "in front of us"))
         M.SendHit(pp, amount, 3, 1, 0)  -- 3 = enums.DamageType.MELEE, zone 1 = BODY
         pcall(pp.so.DoDamage, pp.so, 1)  -- its flinch
       end
     end
   end
   M.swings = keep
+end
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- Our shots at puppets (unreleased; src/game/pvp_hit.h, docs/game-api.md 17 "Shooting and punching a puppet"). The
+-- friend brain (M.Ally) puts every puppet on our side, and the game sends no DAMAGE for our bullets on a friend
+-- (0.15.0 two-PC test: ~20 shots, no Hit). Each shot we fire (counted from the ammo, countShots) is resolved
+-- PVP_WAIT s later from, in this order: the game's DAMAGE of our bullet on a puppet (already sent by M.OnPuppetDamage),
+-- the game's ON_BULLET_HIT naming a puppet (UNVERIFIED for a friend), our ray test (the camera's aim ray at the
+-- shot against each puppet's body, mc_pvp_ray; walls by mc_raycast). Every shot near a puppet gets a PV trace record
+-- and the first ones a log line, so one test shows which of the three works.
+-- ---------------------------------------------------------------------------------------------------------------
+local PVP_WAIT = 0.3      -- s a shot waits for the game's evidence (pvp_hit.h kShotWait)
+local PVP_ORPHAN = 0.6    -- s an ON_BULLET_HIT on a puppet waits for a counted shot before it is a Hit by itself
+local PVP_EV_KEEP = 2     -- s evidence is kept
+M.pvpShots = M.pvpShots or {}
+M.pvpEv = M.pvpEv or {}
+M.pvpCount = M.pvpCount or {}
+M.bulletDmg = M.bulletDmg or {}
+M.weaponIds = M.weaponIds or {}
+
+local function weaponId(name)
+  if not name or name == "-" then return 0 end
+  local id = M.weaponIds[name]
+  if id == nil then
+    local good, v = pcall(game.game.GetItemIDFromName, game.game, name)
+    id = good and tonumber(v) or 0
+    M.weaponIds[name] = id
+  end
+  return id
+end
+
+-- One bullet's damage on an NPC: learned from our real DAMAGE on NPCs this session (per weapon id), else the table.
+local function bulletDamage(name, wid)
+  local learned = M.bulletDmg[wid or 0]
+  if learned then return learned end
+  return mc_pvp_damage and mc_pvp_damage(name) or 10
+end
+
+-- Any human's DAMAGE from our bullet (DamageDispatch): its amount per weapon (what a Hit of ours carries).
+function M.LearnBulletDamage(m)
+  if tonumber(m:GetDamageType()) ~= 0 or tostring(m:GetEnemyGUID()) ~= M.localGuid then return end
+  local wid, amount = tonumber(m:GetWeaponID()) or 0, tonumber(m:GetDamageAmount()) or 0
+  if wid > 0 and amount > 0 and M.bulletDmg[wid] ~= amount then
+    M.bulletDmg[wid] = amount
+    log(string.format("our bullets of weapon %d do %.1f to a human (learned for hits on puppets)", wid, amount))
+  end
+end
+
+-- The game told us about our bullet on puppet pp: kind "game" (its DAMAGE) or "bullet" (ON_BULLET_HIT).
+function M.PvpEvidence(kind, pp)
+  M.pvpEv[#M.pvpEv + 1] = { kind = kind, id = pp.id, t = M.now, brain = pp.brain and true or false }
+  M.pvpCount[kind] = (M.pvpCount[kind] or 0) + 1
+  if pp.brain and not M.pvpReports then
+    -- the game does report our bullets on a friend-brain puppet: from now on its word decides (the ray alone misses)
+    M.pvpReports = kind
+    log(string.format("the game reports our bullets on a friend-brain puppet (%s, puppet %s): our ray test alone no "
+      .. "longer hits", kind == "game" and "its DAMAGE" or "ON_BULLET_HIT", pp.id))
+  end
+  if M.pvpCount[kind] <= 10 then
+    log(string.format("our bullet on puppet %s: %s (friend brain %s)", pp.id,
+      kind == "game" and "the game's DAMAGE" or "ON_BULLET_HIT", pp.brain and "yes" or "not yet"))
+  end
+end
+
+function M.OnBulletHitEvent(m)
+  local okR, recv = pcall(m.GetReceiverGUID, m)
+  if not okR then
+    if not M.bulletNoRecv then
+      M.bulletNoRecv = true
+      log("ON_BULLET_HIT has no GetReceiverGUID here (" .. tostring(recv) .. "): not used")
+    end
+    return
+  end
+  if tostring(recv) ~= M.localGuid then return end
+  local good, obj = pcall(m.GetHitObject, m)
+  if not good or not obj then return end
+  local g = guidStr(obj)
+  for _, pp in pairs(M.pup) do
+    if pp.so and ((g and pp.guid == g) or same(obj, pp.so)) then return M.PvpEvidence("bullet", pp) end
+  end
+  M.bulletOther = (M.bulletOther or 0) + 1
+  if M.bulletOther <= 3 then log("our bullet hit " .. tostring(obj) .. " (ON_BULLET_HIT works, not a puppet)") end
+end
+
+-- Take (and use up) the first evidence of `kind` that fits a shot seen at time t; prefer puppet `id`.
+local function takeEvidence(kind, t, id)
+  local pick
+  for i, e in ipairs(M.pvpEv) do
+    if e.kind == kind and not e.used then
+      local fits = mc_pvp_evidence and mc_pvp_evidence(t, e.t) or (e.t >= t - 0.2 and e.t <= t + 0.3)
+      if fits and (not pick or (e.id == id and M.pvpEv[pick].id ~= id)) then pick = i end
+    end
+  end
+  if pick then M.pvpEv[pick].used = true; return M.pvpEv[pick] end
+  return nil
+end
+
+-- true when something solid is between the camera and the point `dist` m along the aim (not near the camera, us or
+-- the puppet itself); nil when the ray cast is not available
+local function shotBlocked(c, ux, uy, uz, dist)
+  if not mc_raycast then return nil end
+  local s, e = 0.3, dist - 0.6
+  if e <= s then return false end
+  local hit, x, y, z = mc_raycast(c.x + ux * s, c.y + uy * s, c.z + uz * s, c.x + ux * e, c.y + uy * e, c.z + uz * e)
+  if not (hit and x) then return false end
+  local me = game.game:GetActivePlayer()
+  local mp = me and me:GetPos()
+  local nearMe = mp and (x - mp.x) ^ 2 + (y - mp.y) ^ 2 < 0.8 * 0.8 and z > mp.z - 0.2 and z < mp.z + 2.0
+  return not nearMe
+end
+
+-- countShots: we fired n shots of `weapon` just now. The aim ray is tested now (positions of this moment), the
+-- verdict waits for the game's evidence (M.ShotTick).
+function M.ShotFired(p, weapon, n)
+  if not M.inSession or next(M.pup) == nil then return end
+  local cam = game.cameramanager:GetPlayerCamera()
+  local c, d = cam and cam:GetPos(), cam and cam:GetDir()
+  local shot = { t = M.now, weapon = weapon, n = n }
+  local list = pvpBodies(true)
+  if c and d and mc_pvp_ray and #list > 0 then
+    local args = {}
+    for _, pp in ipairs(list) do
+      local b = pp.so:GetPos()
+      local good, hd = pcall(pp.so.GetBonePos, pp.so, "Head")
+      args[#args + 1], args[#args + 2], args[#args + 3] = b.x, b.y, b.z
+      args[#args + 1] = (good and hd and hd.z > b.z + 0.5 and hd.z < b.z + 2.2) and hd.z or 0
+    end
+    local i, dist, zone, miss = mc_pvp_ray(c.x, c.y, c.z, d.x, d.y, d.z, (table.unpack or unpack)(args))
+    if i then
+      local pp = list[i]
+      local l = math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z)
+      shot.pp, shot.dist, shot.zone, shot.miss = pp, dist, zone, miss
+      shot.hittable = pvpHittable(pp)
+      shot.blocked = l > 1e-3 and shotBlocked(c, d.x / l, d.y / l, d.z / l, dist) or false
+    end
+  elseif not mc_pvp_ray and not M.pvpNoRay then
+    M.pvpNoRay = true
+    log("no mc_pvp_ray in this dll: our shots on puppets count only when the game reports them")
+  end
+  M.pvpShots[#M.pvpShots + 1] = shot
+end
+
+M.pvpVerdicts = M.pvpVerdicts or {}
+local function pvpLog(kind)
+  M.pvpVerdicts[kind] = (M.pvpVerdicts[kind] or 0) + 1
+  local c = M.pvpVerdicts[kind]
+  return c <= 10 or c % 50 == 0, c
+end
+
+-- Resolve our shots whose wait is over; ON_BULLET_HITs on a puppet that no counted shot took become Hits too.
+function M.ShotTick(p)
+  if #M.pvpShots == 0 and #M.pvpEv == 0 then return end
+  local keep = {}
+  for _, s in ipairs(M.pvpShots) do
+    if M.now - s.t < PVP_WAIT then
+      keep[#keep + 1] = s
+    else
+      local id = s.pp and s.pp.id
+      for k = 1, s.n do
+        local ge = takeEvidence("game", s.t, id)
+        local be = takeEvidence("bullet", s.t, id)
+        local verdict, sends = "miss", false
+        if mc_pvp_verdict then
+          verdict, sends = mc_pvp_verdict(M.friendlyFire and 1 or 0, ge and 1 or 0, be and 1 or 0, s.pp and 1 or 0,
+            s.blocked and 1 or 0, s.hittable and 1 or 0, M.pvpReports and 1 or 0)
+        end
+        local pp = s.pp
+        if be and (verdict == "bullet") then pp = M.pup[be.id] or pp end
+        local wid = weaponId(s.weapon)
+        local amount = bulletDamage(s.weapon, wid)
+        local zone = (pp and pp == s.pp and s.zone) or 1
+        if sends and pp and valid(pp.so) then
+          M.SendHit(pp, amount, 0, zone, wid)  -- 0 = enums.DamageType.SHOT: replayed as a real bullet on his game
+          pcall(pp.so.DoDamage, pp.so, 1)        -- its flinch
+        end
+        if s.pp or ge or be then
+          local show, c = pvpLog(verdict)
+          if show then
+            log(string.format("our shot (%s) at puppet %s: %s%s (%.1f m, zone %s, %.2f m off its axis, friend brain %s, "
+              .. "the game's DAMAGE %s, ON_BULLET_HIT %s, #%d)", s.weapon, tostring(pp and pp.id or "-"), verdict,
+              sends and string.format(": Hit of %.1f sent", amount) or "", s.dist or -1, tostring(s.zone or "-"),
+              s.miss or -1, (pp and pp.brain) and "yes" or "no", ge and "yes" or "no", be and "yes" or "no", c))
+          end
+          trace("PV", string.format("id=%s v=%s hit=%d w=%s wid=%d dmg=%.1f dist=%.2f zone=%s miss=%.2f blk=%d "
+            .. "ok=%d ge=%d be=%d brain=%d rep=%s", tostring(pp and pp.id or "-"), verdict, sends and 1 or 0,
+            tostring(s.weapon), wid, amount, s.dist or -1, tostring(s.zone or -1), s.miss or -1, s.blocked and 1 or 0,
+            s.hittable and 1 or 0, ge and 1 or 0, be and 1 or 0, (pp and pp.brain) and 1 or 0,
+            tostring(M.pvpReports or "-")))
+        end
+      end
+    end
+  end
+  M.pvpShots = keep
+  -- evidence: an ON_BULLET_HIT no counted shot took (the ammo count missed it) is a Hit by itself, unless the
+  -- game's DAMAGE for the same puppet came with it; old entries go
+  local ev = {}
+  for _, e in ipairs(M.pvpEv) do
+    local age = M.now - e.t
+    if e.kind == "bullet" and not e.used and age >= PVP_ORPHAN then
+      e.used = true
+      local ge = takeEvidence("game", e.t, e.id)
+      local pp = M.pup[e.id]
+      if not ge and M.friendlyFire and pp and pvpHittable(pp) then
+        local wid = weaponId(M.shotWeapon)
+        local amount = bulletDamage(M.shotWeapon, wid)
+        M.SendHit(pp, amount, 0, 1, wid)
+        pcall(pp.so.DoDamage, pp.so, 1)
+        local show, c = pvpLog("bullet_alone")
+        if show then
+          log(string.format("ON_BULLET_HIT on puppet %s without a counted shot: Hit of %.1f sent (#%d)", e.id, amount,
+            c))
+        end
+        trace("PV", string.format("id=%s v=bullet_alone hit=1 w=%s wid=%d dmg=%.1f dist=-1 zone=1 miss=-1 blk=0 ok=1 "
+          .. "ge=0 be=1 brain=%d rep=%s", e.id, tostring(M.shotWeapon), wid, amount, e.brain and 1 or 0,
+          tostring(M.pvpReports or "-")))
+      end
+    end
+    if age < PVP_EV_KEEP then ev[#ev + 1] = e end
+  end
+  M.pvpEv = ev
 end
 
 -- A puppet fired: when the shot passes near the local player, he ignores damage for a moment. That bullet is only
@@ -3532,6 +3855,8 @@ local function countShots(p, weapon)
     M.shots = (M.shots + n) % 256
     M.fired = (M.fired or 0) + n
     if M.fired <= 20 or M.fired % 50 == 0 then log("we fired (" .. weapon .. ", shot " .. M.fired .. ")") end
+    local good, err = pcall(M.ShotFired, p, weapon, n)  -- our shots at puppets (M.ShotTick)
+    if not good then logErr("shot", err) end
   elseif ammo and weapon == M.shotWeapon and M.shotAmmo and ammo > M.shotAmmo then
     M.reloadUntil = M.now + 1.0  -- the clip was refilled: show a reload even if IsReloading() missed it
     log("we reloaded (" .. weapon .. ")")
@@ -4154,6 +4479,8 @@ function M.Update(dt, cmds)
     if not good then logErr("ram", err) end
     good, err = pcall(M.MeleeTick, player)
     if not good then logErr("melee", err) end
+    good, err = pcall(M.ShotTick, player)
+    if not good then logErr("shots", err) end
     good, err = pcall(M.DownTick, player)
     if not good then logErr("down", err) end
     pcall(M.DemigodTick, player)
