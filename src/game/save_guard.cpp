@@ -4,6 +4,7 @@
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
+#include "game/save_paths.h"
 
 #include <windows.h>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -185,44 +187,76 @@ void* SlotFindDetour(void* self, uint32_t slot, void* id) {
     return _dbgEntry;
 }
 
-// ---- the save files (Documents\My Games\Mafia Definitive Edition\Data\<id>\gamesaves\<profile>\<slot>\saveN.sav) ----
-// The game reads and writes them with CreateFileA from its file layer (paths with mixed / and \). While Block() is
-// on, every access below "gamesaves" goes to a scratch copy of the tree instead: writes always, reads when the scratch
-// file exists (so a Retry reads the checkpoint written in this session), deletes and copies likewise. The real files
-// are never opened for writing. The same for the save slots' profiles (profiles\<profile>\aslot.pf, bslot.pf,
-// cslot.pf): they hold the slot's script data (its current chapter, the weapons it has), which a co-op chapter
-// rewrote with its own (0.9.1; seen: the story slot's mm_110_omerta became mm_20_taxi). gamesettings.pf and the other
-// profile files (settings) are left alone.
-std::string Redirect(const char* path, bool write) {
-    if (!path || !_block.load()) return {};
-    std::string p(path);
-    for (char& c : p)
-        if (c == '/') c = '\\';
-    std::string lower = p;
-    for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    size_t at = lower.find("\\gamesaves\\");
-    if (at == std::string::npos) {
-        const size_t profiles = lower.find("\\profiles\\");
-        const std::string file = lower.substr(lower.find_last_of('\\') + 1);
-        if (profiles == std::string::npos || !(file == "aslot.pf" || file == "bslot.pf" || file == "cslot.pf"))
-            return {};
-        at = profiles;  // ...\coop-saves\<pid>\profiles\...
-    }
-    std::string scratch;
+// ---- the save and profile files (Documents\My Games\Mafia Definitive Edition\Data\<id>\...) ---------------------------
+// The game reads and writes them with CreateFileA from its file layer (paths with mixed / and \). Which file goes
+// where is save_paths.h's table (tested by tests/save_paths_test.cpp). While Block() is on, every access to a
+// redirected file (the saves below "gamesaves", the slot profiles aslot/bslot/cslot.pf, the progress profiles
+// garage.pf / my2k_game_stats.pf / profile_data_storage_persistantdata.pf, unknown *.pf) goes to a scratch copy of
+// the tree instead: writes always, reads when the scratch file exists (so a Retry reads the checkpoint written in this
+// session), deletes and copies likewise. The real files are never opened for writing. The settings
+// (gamesettings.pf, key bindings, language, audio, video, map filter, Saves\videoconfig.cfg) are the player's own and
+// left alone. Up to 0.15.0 only the slots and their profiles were redirected: a co-op chapter rewrote garage.pf on
+// host and guest (the in-game test of 0.15.0).
+// After the session (Block(false)) the game still holds the progress blocks it had in memory (the profile is read at
+// start; UNVERIFIED whether a later save load re-reads them), so a progress file the session wrote stays held for the
+// rest of the process: its writes go to <scratch>-held\profiles\... (cleared when a later start finds the process
+// gone), and the player's real garage changes again only after a restart of the game.
+std::set<std::string> _held;           // progress files (lower-case names) a co-op session of this process wrote
+std::atomic<bool> _anyHeld{false};
+std::atomic<uint32_t> _profileRedirects{0};
+
+struct Routed {
+    std::string target;  // "" = the real file
+    save_paths::Mapped m;
+    bool held = false;   // after the session (the held tree)
+};
+
+Routed Route(const char* path, bool write) {
+    Routed r;
+    if (!path) return r;
+    const bool blocking = _block.load();
+    if (!blocking && !_anyHeld.load()) return r;
+    r.m = save_paths::Classify(path);
+    if (!save_paths::Redirected(r.m.kind)) return r;
+    std::string root;
     {
         std::lock_guard lock(_mu);
-        scratch = _scratch;
+        if (blocking) {
+            root = _scratch;
+        } else if (save_paths::HeldAfterSession(r.m.kind) && _held.count(r.m.file)) {
+            root = _scratch.empty() ? std::string() : _scratch + "-held";
+            r.held = true;
+        }
     }
-    if (scratch.empty()) return {};
-    std::string target = scratch + p.substr(at);  // ...\coop-saves\<pid>\gamesaves\...
-    while (target.find("\\\\") != std::string::npos) target.replace(target.find("\\\\"), 2, "\\");
+    if (root.empty()) return r;
+    const std::string target = save_paths::Join(root, r.m.sub);  // ...\coop-saves\<pid>\gamesaves\... or \profiles\...
+    if (target.empty()) return r;
     if (write) {
-        for (size_t i = scratch.size() + 1; (i = target.find('\\', i)) != std::string::npos; ++i)
+        CreateDirectoryA(root.c_str(), nullptr);
+        for (size_t i = root.size() + 1; (i = target.find('\\', i)) != std::string::npos; ++i)
             CreateDirectoryA(target.substr(0, i).c_str(), nullptr);
+        if (blocking && save_paths::HeldAfterSession(r.m.kind)) {
+            std::lock_guard lock(_mu);
+            _held.insert(r.m.file);
+            _anyHeld = true;
+        }
     } else if (GetFileAttributesA(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        return {};  // nothing written in this session: the real file is read
+        return r;  // nothing written in this session: the real file is read
     }
-    return target;
+    r.target = target;
+    return r;
+}
+
+// One log line per profile file redirect (they are few: loads, quest starts); saves as before (first 50, every 50th).
+void LogRoute(const char* what, const char* name, const Routed& r) {
+    if (r.m.kind == save_paths::Kind::Save) return;
+    const uint32_t n = ++_profileRedirects;
+    if (n > 200 && n % 50 != 0) return;
+    MC_LOG_INFO("savesys: profile %s #%u %s (%s: %s): %s -> %s", what, n,
+                r.held ? "held back after the co-op session (the game may still hold its co-op changes; the real file "
+                         "changes again after a restart)"
+                       : "kept out of the player's profile",
+                save_paths::KindName(r.m.kind), save_paths::Why(r.m), name, r.target.c_str());
 }
 
 // The session's checkpoint (SetSessionSave): <scratch>\session-checkpoint.dat (not *.sav: the host's checkpoint scan
@@ -261,37 +295,46 @@ HANDLE WINAPI CreateFileADetour(LPCSTR name, DWORD access, DWORD share, LPSECURI
             return _origCreateFileA(sub.c_str(), access, share, sa, disp, flags, tmpl);
         }
     }
-    const std::string to = Redirect(name, write);
-    if (to.empty()) {
+    const Routed r = Route(name, write);
+    if (r.target.empty()) {
         // the profile and save files written for real (diagnostics: what the game writes outside our redirect)
         if (write && name && (std::strstr(name, "gamesaves") || std::strstr(name, "profiles")) &&
-            std::strstr(name, "Mafia Definitive Edition"))
-            MC_LOG_INFO("savesys: written: %s", std::strrchr(name, '/') ? std::strrchr(name, '/') + 1 : name);
+            std::strstr(name, "Mafia Definitive Edition")) {
+            const save_paths::Mapped m = r.m.file.empty() ? save_paths::Classify(name) : r.m;
+            MC_LOG_INFO("savesys: written: %s (%s: %s%s)", m.file.c_str(), save_paths::KindName(m.kind),
+                        save_paths::Why(m),
+                        _block.load() && !save_paths::Redirected(m.kind) ? ", left alone in co-op" : "");
+        }
         if (!write && name && _block.load() && std::strstr(name, "gamesaves"))
             MC_LOG_INFO("savesys: read of a real save in a co-op session: %s", name);
         return _origCreateFileA(name, access, share, sa, disp, flags, tmpl);
     }
     if (write) {
         const uint32_t n = ++_redirected;
-        if (n <= 50 || n % 50 == 0) MC_LOG_INFO("savesys: save write #%u kept out of the real slot: %s -> %s", n, name, to.c_str());
+        if (r.m.kind == save_paths::Kind::Save && (n <= 50 || n % 50 == 0))
+            MC_LOG_INFO("savesys: save write #%u kept out of the real slot: %s -> %s", n, name, r.target.c_str());
     }
-    return _origCreateFileA(to.c_str(), access, share, sa, disp, flags, tmpl);
+    LogRoute(write ? "write" : "read", name, r);
+    return _origCreateFileA(r.target.c_str(), access, share, sa, disp, flags, tmpl);
 }
 
 BOOL WINAPI DeleteFileADetour(LPCSTR name) {
-    const std::string to = Redirect(name, true);
-    if (!to.empty()) {
-        _origDeleteFileA(to.c_str());
+    const Routed r = Route(name, true);
+    if (!r.target.empty()) {
+        LogRoute("delete", name, r);
+        _origDeleteFileA(r.target.c_str());
         return TRUE;  // the real file stays
     }
     return _origDeleteFileA(name);
 }
 
 BOOL WINAPI CopyFileExADetour(LPCSTR from, LPCSTR to, LPPROGRESS_ROUTINE cb, LPVOID data, LPBOOL cancel, DWORD flags) {
-    const std::string dst = Redirect(to, true);
-    if (dst.empty()) return _origCopyFileExA(from, to, cb, data, cancel, flags);
-    const std::string src = Redirect(from, false);
-    return _origCopyFileExA(src.empty() ? from : src.c_str(), dst.c_str(), cb, data, cancel, flags);
+    const Routed dst = Route(to, true);
+    if (dst.target.empty()) return _origCopyFileExA(from, to, cb, data, cancel, flags);
+    const Routed src = Route(from, false);
+    LogRoute("copy", to, dst);
+    return _origCopyFileExA(src.target.empty() ? from : src.target.c_str(), dst.target.c_str(), cb, data, cancel,
+                            flags);
 }
 
 void ClearScratch(const std::string& dir) {
@@ -389,9 +432,21 @@ void Block(bool on) {
         ClearScratch(dir);
         RemoveDirectoryA(dir.c_str());
     }
-    MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (co-op session: the real save slots are not "
-                                     "touched)").c_str()
+    MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (co-op session: the real save slots, slot "
+                                     "profiles and progress profiles (garage, stats, persistent data) are not "
+                                     "touched; settings are)").c_str()
                                   : "saves go to the real save slots again");
+    if (!on) {
+        std::string held;
+        {
+            std::lock_guard lock(_mu);
+            for (const std::string& f : _held) held += (held.empty() ? "" : ", ") + f;
+        }
+        if (!held.empty())
+            MC_LOG_INFO("savesys: held until the game restarts (the co-op session wrote them and the game may still "
+                        "hold its changes): %s -> %s-held",
+                        held.c_str(), dir.c_str());
+    }
 }
 
 void SetSessionSave(const std::vector<uint8_t>& bytes, const std::string& id) {

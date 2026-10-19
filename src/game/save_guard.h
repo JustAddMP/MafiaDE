@@ -5,8 +5,11 @@
 //     (the host of a STORY session continues his own story and keeps saving it): while Block(true) is set, every save
 //     file the game writes goes to a scratch tree (%TEMP%\MafiaCoop\coop-saves\<pid>) and is read back from there
 //     (a Retry after a death loads the checkpoint of this session); his real Free Ride and story saves stay as they
-//     were (so do the slots' profiles, aslot.pf / bslot.pf / cslot.pf). The scratch tree is cleared each time
-//     blocking starts;
+//     were (so do the slots' profiles, aslot.pf / bslot.pf / cslot.pf, and after 0.15.0 the progress profiles
+//     garage.pf / my2k_game_stats.pf / profile_data_storage_persistantdata.pf; the settings profiles are the
+//     player's own and left alone: save_paths.h has the table). The scratch tree is cleared each time blocking
+//     starts. A progress profile the session wrote stays held (written to %TEMP%\...\<pid>-held) until the game
+//     restarts: the game may still hold the session's changes in memory;
 //   - while blocking, the game's answer to a failed mission (a load of "freeroam_before_quest_activated", a save of the
 //     player's own story) is kept inside the session (SlotFindDetour, SetSessionSave; docs/re-notes.md 7).
 // Install() once at start; Block() from any thread.

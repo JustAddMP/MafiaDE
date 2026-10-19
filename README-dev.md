@@ -645,7 +645,13 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
 - A guest's game writes no saves into his own slots while he is in a co-op session: every save file goes to
   `%TEMP%\MafiaCoop\coop-saves\<pid>` (read back from there in the session, folders of ended games removed at the next
   start; docs/re-notes.md 7). The log says `savesys: save write #n kept out of the real slot`. The slots' profiles
-  (`profiles\...\aslot.pf`, `bslot.pf`, `cslot.pf`: the slot's script data) are redirected the same way (0.9.1).
+  (`profiles\...\aslot.pf`, `bslot.pf`, `cslot.pf`: the slot's script data) are redirected the same way (0.9.1),
+  and so are the progress profiles `garage.pf`, `my2k_game_stats.pf`, `profile_data_storage_persistantdata.pf`
+  (after 0.15.0: the 2026-10-18 test found garage.pf rewritten by a co-op chapter); once the session wrote one, it
+  stays held (`coop-saves\<pid>-held`) until the game restarts, as the game may keep the session's garage in memory.
+  The settings (`gamesettings.pf`, key bindings, language, audio, video, map filter, `Saves\videoconfig.cfg`) are
+  the player's own and left alone. Table: src/game/save_paths.h; log `savesys: profile write #n kept out of the
+  player's profile (progress: the cars in the player's garage)`.
   The host of a lobby CHAPTER session is redirected the same way from START on (the game would otherwise save that chapter into his Free
   Ride slot); his checkpoint scan reads the scratch tree too, so his new checkpoints still reach the guests. The host
   of a STORY session continues his own story and keeps saving it (that is his campaign, as in single player); in Free
