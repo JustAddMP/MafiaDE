@@ -308,12 +308,22 @@ aliases (a newer version's, a typo) are shown as that default.
   lacks that alias show the character anyway, and for story Tommy it is the profile his game's model manager holds
   (a decimal hash, e.g. the Free Ride outfit; reported by the Lua glue as `ML <hash>`), so everyone sees his real
   clothes. Both strings are `[A-Za-z0-9_/.-]`, at most 96 bytes, else ignored.
-- PlayerModel is sent when a session starts, when the player picks something else in the panel (at once: the others'
-  puppet of him is replaced live), when his story look changes, and whenever a new player appears in the session
-  (the Hello model is fixed for the session, so a late joiner would otherwise see the old pick).
+- PlayerModel is sent when a session starts, when his story look changes, whenever a new player appears in the
+  session (the Hello model is fixed for the session, so a late joiner would otherwise see the old pick), and when the
+  player picks something else in the panel: **not per step** but once the pick has stayed the same for 1 s, or at once
+  when the panel with the CHARACTER rows closes, or at once outside a loaded world (the lobby)
+  (src/game/model_change.h `Outbox`). Before (up to 0.15.0) every step went out, and the other games replaced the
+  puppet for each one: five puppets in 2 s in the 0.15.0 two-PC test, one of them released while it sat in a car.
+- Receivers make the puppet of a change that comes after a quiet time (no other change from him for 2 s) at once;
+  changes inside a burst (an older sender, a pick and a look change together) are held until the newest one has
+  stayed for 1 s, so a burst gives one more puppet, not one per step (`Gate`; a change back to what is shown cancels
+  the wait). The lobby's list shows the newest pick at once.
 - Receivers show a remote player's puppet with: `puppet_model` (this machine, tests) > his PlayerModel look > his
   PlayerModel / Hello model resolved locally. A profile that does not load within 12 s is marked bad on that machine
   and the default character for his id is used instead.
+- The old puppet goes properly (player_sync.lua `M.Release`, docs/game-api.md 3 "Removing a puppet"): its map
+  marker first, then out of its car seat, hidden, deactivated and released; the new one takes over its seat at
+  once. No wire change.
 - His own game switches the local player with the model manager's override slot (`SwitchOverridePlayerSpawnProfile`,
   docs/game-api.md 12; re-applied every 3 s and after every load, cleared when the session ends; `tommy` = no
   override). A switch that has not finished after 12 s falls back to the default for his id the same way.

@@ -204,6 +204,9 @@ local function ours(id)
   for _, pp in pairs(M.pup or {}) do
     if pp.so and valid(pp.so) and idOf(pp.so) == id then return true end
   end
+  -- an old puppet entity on its way out or left over after its release (player_sync.lua M.Release): never paired,
+  -- sent or owned as an NPC (a friend-brain human would otherwise become a guest-owned NPC on the host)
+  if M.IsRetired and M.IsRetired(id) then return true end
   local f = M.fac
   if f and f.drv and valid(f.drv) and idOf(f.drv) == id then return true end
   if N.copyIds[id] then return true end

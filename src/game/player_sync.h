@@ -31,9 +31,12 @@ public:
     static int Health(net::PlayerId id);
     // Our character (docs/protocol.md "PlayerModel"): the `model` setting, "" = the default for our player id.
     static std::string Model();
-    // Picks another character (CO-OP panel): saved as `model =` in MafiaCoop.ini, our own player switches at once
-    // (live preview while browsing), and everyone else's puppet of us follows (PlayerModel message).
+    // Picks another character (CO-OP panel): saved as `model =` in MafiaCoop.ini, our own player switches as soon as
+    // the game runs (the pause menu holds the game), and everyone else's puppet of us follows (PlayerModel message)
+    // once the pick has stayed for a second or the panel is closed (game/model_change.h: not one puppet per step).
     static void SetModel(const std::string& model);
+    // A frame of a panel with the CHARACTER rows (core asks GameModule::PanelOptions every frame while it is open).
+    static void PanelShown();
     static void GetStatus(std::vector<render::OverlayLine>& out);
 
     // The local player is in a loaded world (not the main menu or a loading screen), and the loaded save id

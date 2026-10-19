@@ -185,6 +185,13 @@ function M.FactoryReset(why)
     end
   end
   for _, pp in pairs(M.pup) do M.Unmark(pp) end  -- before the puppets go with the factory (see M.PuppetLife)
+  for _, pp in pairs(M.pup) do  -- they go with the factory: a leftover is never taken for an NPC (M.IsRetired)
+    if valid(pp.so) then
+      local good, g = pcall(pp.so.GetGUID, pp.so)
+      local id = good and tonumber(tostring(g):match("(%d+)%s*$") or "")
+      if id then M.retired[id] = { t = M.now, pid = pp.id } end
+    end
+  end
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
   M.fac = { st = "none", t = -1 }
@@ -1082,7 +1089,7 @@ local function occupants(ent)
   local me = game.game:GetActivePlayer()
   local function isPup(h)
     for _, pp in pairs(M.pup) do if same(pp.so, h) then return true end end
-    return false
+    return M.IsRetired(h)  -- an old puppet on its way out (M.Release) is no NPC
   end
   local g0, n = pcall(ent.GetSeatCount, ent)
   n = (g0 and tonumber(n)) or 4
@@ -2331,19 +2338,93 @@ function M.Burning(pp)
   return pp.burnT ~= nil and M.now - pp.burnT < 8
 end
 
--- Releasing a puppet: at once, unless it burns: the fire update keeps a list of burning humans and may read a released
--- one (docs/game-api.md 15). Such a puppet is hidden and released 4 s after the fire is out.
+-- Releasing a puppet entity (its player left or picked another character, it died here, the session ended). The
+-- 0.15.0 two-PC test (2026-10-19) released one per character step, one of them seated in the guest's car, with a bare
+-- ReleaseObjectRaw; a released human that still sits in a seat or is still listed by the game may stay on screen as
+-- a frozen copy (UNVERIFIED: no log line proved it). So the entity is taken down first, in this order:
+--   1. out of its car seat (GetOutCarFast, else GetOffVehicle: which of them frees the seat at once is UNVERIFIED),
+--   2. hidden (ShowModel false) without collision (phys state 2), its brain's script control given back,
+--   3. deactivated (Deactivate) once it is out of the car (a deactivated human in a seat: not tried),
+--   4. released (the spawner's ReleaseObjectRaw): at once when it was on foot; a seated one once it is out of the seat
+--      or after RETIRE_SEAT_WAIT s (then released where it sits, as before, logged); a burning one 4 s after the fire
+--      is out (the fire update keeps a list of burning humans and may read a released one, docs/game-api.md 15).
+-- Its map marker went before this (M.Remove, M.PuppetLife: the navigation module read a released puppet through a
+-- stale marker). The entity id stays in M.retired for RETIRE_KEEP s: npc_sync, occupants and the police scan never take
+-- a leftover of it for an NPC (a friend-brain human would otherwise become a guest-owned NPC, B3) and a seat it still
+-- holds counts as a puppet's. One second after the release the glue checks that the entity is gone ("PRT ev=check").
 M.grave = M.grave or {}
-function M.Release(pp, so)
-  if not valid(so) then return end
+M.retired = M.retired or {}  -- entity id (number) -> { t = when it was retired, pid = whose puppet it was }
+local RETIRE_SEAT_WAIT = 1.0  -- s a seated puppet is given to leave its seat before it is released anyway
+local RETIRE_KEEP = 30        -- s a retired entity id is remembered
+local RETIRE_CHECK = 1.0      -- s after the release: is the entity gone?
+
+-- Is `x` (an entity, or its id) a puppet entity we retired lately?
+function M.IsRetired(x)
+  local id = x
+  if type(x) ~= "number" then
+    if not valid(x) then return false end
+    id = tonumber(guidNum(x))
+  end
+  local r = id and M.retired[id]
+  return r ~= nil and M.now - r.t < RETIRE_KEEP
+end
+
+local function retireTrace(g, ev, extra)
+  trace("PRT", string.format("id=%s ent=%s ev=%s why=%s%s", tostring(g.pid), tostring(g.eid), ev,
+    (tostring(g.why or "-"):gsub(" ", "_")), extra or ""))
+end
+
+-- Release it now (the spawner's ReleaseObjectRaw); a check follows RETIRE_CHECK s later (M.GraveTick).
+local function retireRelease(g, how)
+  if valid(g.so) then pcall(g.so.Deactivate, g.so) end
   local f = M.fac
+  local released = false
+  if f.comp and valid(g.so) then released = pcall(f.comp.ReleaseObjectRaw, f.comp, g.so) end
+  g.relT, g.st = M.now, "released"
+  local seatNow = g.car and valid(g.car) and M.SeatHolder(g.car, g.seat, nil) or "-"
+  log(string.format("puppet %s: old entity %s released (%s)%s%s", tostring(g.pid), tostring(g.eid), how,
+    released and "" or ": no spawner (it goes with the factory)",
+    g.car and string.format(", its seat %d of car %s reads %s now", g.seat, tostring(g.vkey), seatNow) or ""))
+  retireTrace(g, "release", string.format(" how=%s ok=%d seat=%s", (how:gsub("[ %.]", "_")), released and 1 or 0,
+    seatNow))
+end
+
+function M.Release(pp, so, why)
+  if not valid(so) then return end
+  local g = { so = so, t = M.now, burnT = pp.burnT, pid = pp.id, eid = tonumber(guidNum(so)), why = why or "?",
+    st = "out" }
+  M.retired[g.eid or -1] = { t = M.now, pid = pp.id }
+  -- its brain's script control goes back first (src/game/anim_methods.h "script control"): nothing of the old
+  -- puppet's action or control is left for the game to finish on a released entity
+  if pp.scOn then pcall(M.ScriptControl, pp, so, false) end
+  M.ScriptForget(pp)
+  local good, own = pcall(so.GetOwner, so)
+  if good and valid(own) then  -- 1. out of its seat
+    g.car, g.vkey, g.seat, g.st = own, pp.vkey, pp.seat or 0, "seat"
+    local fast, err = pcall(so.GetOutCarFast, so)
+    if not fast then pcall(so.GetOffVehicle, so) end
+    local g2, ownNow = pcall(so.GetOwner, so)
+    g.outNow = not (g2 and valid(ownNow))
+    log(string.format("puppet %s: old entity %s (%s) sits in car %s seat %d: %s%s", tostring(pp.id), tostring(g.eid),
+      g.why, tostring(pp.vkey), g.seat, fast and "GetOutCarFast" or ("GetOffVehicle (GetOutCarFast: " .. tostring(err)
+      .. ")"), g.outNow and ", out at once" or ", still in the car"))
+    if g.outNow then g.st = "out" end
+  end
+  pcall(so.ShowModel, so, false)  -- 2. hidden, no collision
+  pcall(so.SetPhysState, so, 2)
+  pp.hidden = true
+  retireTrace(g, "retire", string.format(" car=%s seat=%s burns=%d", tostring(g.vkey or "-"),
+    g.car and tostring(g.seat) or "-", M.Burning(pp) and 1 or 0))
   if M.Burning(pp) then
-    pcall(so.ShowModel, so, false)
-    pcall(so.SetPhysState, so, 2)
-    M.grave[#M.grave + 1] = { so = so, t = M.now, burnT = pp.burnT }
+    if g.st == "out" then pcall(so.Deactivate, so) end
+    g.st = "burn"
+    M.grave[#M.grave + 1] = g
     log("puppet " .. tostring(pp.id) .. ": burns: hidden, released once the fire is out")
-  elseif f.comp then
-    pcall(f.comp.ReleaseObjectRaw, f.comp, so)
+  elseif g.st == "seat" then
+    M.grave[#M.grave + 1] = g  -- 3./4. once it is out of the seat (M.GraveTick)
+  else
+    retireRelease(g, "on foot")  -- 3. deactivated, 4. released
+    M.grave[#M.grave + 1] = g    -- the check a second later
   end
 end
 
@@ -2351,30 +2432,69 @@ function M.GraveTick()
   if #M.grave == 0 then return end
   local keep = {}
   for _, g in ipairs(M.grave) do
-    if not valid(g.so) then
+    if g.st == "released" then
+      if M.now - g.relT >= RETIRE_CHECK then
+        if valid(g.so) then  -- still in the entity table a second after the release: hidden and deactivated again
+          pcall(g.so.ShowModel, g.so, false)
+          pcall(g.so.SetPhysState, g.so, 2)
+          pcall(g.so.Deactivate, g.so)
+          log(string.format("puppet %s: old entity %s is STILL there %.1f s after its release (hidden and deactivated "
+            .. "again; a duplicate on screen would be this one)", tostring(g.pid), tostring(g.eid), M.now - g.relT))
+          retireTrace(g, "check", " gone=0")
+        else
+          retireTrace(g, "check", " gone=1")
+        end
+      else
+        keep[#keep + 1] = g
+      end
+    elseif not valid(g.so) then
       -- gone already (with the factory or the world)
-    elseif M.now - g.t > 4 and not (g.burnT and M.now - g.burnT < 8) then
-      if M.fac.comp then pcall(M.fac.comp.ReleaseObjectRaw, M.fac.comp, g.so) end
+      retireTrace(g, "gone", "")
+    elseif g.st == "burn" then
+      if M.now - g.t > 4 and not (g.burnT and M.now - g.burnT < 8) then
+        retireRelease(g, "the fire is out")
+        keep[#keep + 1] = g
+      else
+        keep[#keep + 1] = g
+      end
+    elseif g.st == "seat" then
+      local good, own = pcall(g.so.GetOwner, g.so)
+      local out = not (good and valid(own))
+      if out then
+        retireRelease(g, string.format("out of the car after %.1f s", M.now - g.t))
+        keep[#keep + 1] = g
+      elseif M.now - g.t >= RETIRE_SEAT_WAIT then
+        log(string.format("puppet %s: old entity %s is still in car %s seat %d after %.1f s: released where it sits",
+          tostring(g.pid), tostring(g.eid), tostring(g.vkey), g.seat, M.now - g.t))
+        retireRelease(g, "still seated")
+        keep[#keep + 1] = g
+      else
+        keep[#keep + 1] = g
+      end
     else
       keep[#keep + 1] = g
     end
   end
   M.grave = keep
+  for id, r in pairs(M.retired) do
+    if M.now - r.t >= RETIRE_KEEP then M.retired[id] = nil end
+  end
 end
 
-function M.Remove(id)
+-- why: for the log ("his character changed", "he left", "session ended")
+function M.Remove(id, why)
   local pp = M.pup[id]
   if not pp then return end
   M.Unmark(pp, "his puppet record goes")
   local f = M.fac
   if f.busy == id then f.busy = nil end
-  M.Release(pp, pp.so)
+  M.Release(pp, pp.so, why or "removed")
   M.pup[id] = nil
-  log("puppet " .. id .. " removed")
+  log("puppet " .. id .. " removed" .. (why and (" (" .. why .. ")") or ""))
 end
 
 function M.RemoveAll()
-  for id, _ in pairs(M.pup) do M.Remove(id) end
+  for id, _ in pairs(M.pup) do M.Remove(id, "session ended") end
   -- giving a wheel back (M.WheelTick) or holding the passenger seat (M.PassengerHold) ends with the session
   local okp, player = pcall(function() return game.game:GetActivePlayer() end)
   if not okp then player = nil end
@@ -2669,7 +2789,7 @@ function M.PuppetLife(pp)
     -- its map marker goes first: the navigation module updates its markers once a second and read the released
     -- puppet through a stale marker (crash in exe+0x243a915, docs/game-api.md 15)
     M.Unmark(pp)
-    M.Release(pp, so)
+    M.Release(pp, so, pp.deadShown and "its player is back" or "it died here")
     M.ScriptForget(pp)
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
@@ -3666,7 +3786,10 @@ function M.ModelTick(p)
   local good, so = pcall(p.SwitchOverridePlayerSpawnProfile, p, prof)
   M.modelSet = prof
   if first then
-    log("our model: " .. prof .. (good and "" or (" failed: " .. tostring(so))))
+    -- in a car or not: a switch while seated is not checked in game (the 0.15.0 test switched in a friend's car seat)
+    local g2, own = pcall(p.GetOwner, p)
+    log("our model: " .. prof .. (good and "" or (" failed: " .. tostring(so)))
+      .. ((g2 and valid(own)) and " (switched while we sit in a car)" or ""))
     if good and so then M.modelPend = { prof = prof, so = so, t = M.now } end
   end
 end
@@ -4225,11 +4348,31 @@ function M.Update(dt, cmds)
     if op == "T" and player then  -- no puppets until we are in the world ourselves
       local id = f[2]
       local pp = M.pup[id]
-      if pp and pp.model ~= f[3] then M.Remove(id); pp = nil end
+      local was
+      if pp and pp.model ~= f[3] then
+        -- his character changed (PlayerModel, settled: src/game/model_change.h): the old puppet is taken down and
+        -- released (M.Release), the new one takes over its car seat without the walk-in animation
+        local seated = false
+        if pp.st == "alive" and valid(pp.so) then
+          local good, own = pcall(pp.so.GetOwner, pp.so)
+          seated = good and valid(own)
+        end
+        was = { seated = seated, vkey = pp.vkey, seat = pp.seat, model = pp.model }
+        M.Remove(id, "his character changed")
+        pp = nil
+      end
       if not pp then
         pp = { id = id, st = "queued", model = f[3], profile = M.Profile(f[3], id) }
         M.pup[id] = pp
         log("puppet " .. id .. " queued (" .. f[3] .. ": " .. pp.profile .. ")")
+        if was then
+          pp.animTried = was.seated or nil  -- seated at once in the seat the old one had (M.Seat)
+          log(string.format("puppet %s: new character %s replaces %s%s", id, f[3], tostring(was.model),
+            was.seated and string.format(" (the old one sat in car %s seat %s: the new one is seated there at once)",
+              tostring(was.vkey), tostring(was.seat)) or ""))
+          trace("PRT", string.format("id=%s ev=replace from=%s to=%s seated=%d car=%s seat=%s", id, tostring(was.model),
+            f[3], was.seated and 1 or 0, tostring(was.vkey or "-"), tostring(was.seat or "-")))
+        end
       end
       pp.tx, pp.ty, pp.tz = tonumber(f[4]), tonumber(f[5]), tonumber(f[6])
       pp.hx, pp.hy = tonumber(f[7]), tonumber(f[8])
@@ -4291,7 +4434,7 @@ function M.Update(dt, cmds)
       local name = line:match("^N %S+ (.+)$")
       if f[2] and name then M.names[f[2]] = name end
     elseif op == "R" then
-      M.Remove(f[2])
+      M.Remove(f[2], "he left")
     elseif op == "X" then
       M.RemoveAll()
     end

@@ -284,7 +284,14 @@ function P.Scan(ev)
     if pp then px, py, pz = pupPos(pp) end
     local n, seers, nearest, told = 0, 0, 0, 0
     if px and valid(pp.so) then
-      t.pupId = idOf(pp.so)
+      local pid = idOf(pp.so)
+      if t.pupId and pid ~= t.pupId then
+        -- a new puppet entity (his character changed, it respawned): the cops set on the old one are set on it now
+        for copId, _ in pairs(t.told) do t.told[copId] = -1e9 end
+        log(string.format("guest %s's puppet is a new entity (%s -> %s): our cops near it are set on it again", id,
+          tostring(t.pupId), tostring(pid)))
+      end
+      t.pupId = pid
       local near = {}
       for _, c in ipairs(cops) do
         local d = math.sqrt((c.pos.x - px) ^ 2 + (c.pos.y - py) ^ 2 + (c.pos.z - pz) ^ 2)
