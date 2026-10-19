@@ -1191,6 +1191,32 @@ int McYieldSeat(lua_State* L) {
     return 1;
 }
 
+// mc_copyplace(haveCopy, aside, blockerDist, blockedFor, spotFound) -> "wait" / "at_car" / "aside" / "hold" /
+// "release": where a remote player's car copy stands (game/seats.h PlaceCopy; numbers 0/1 for the flags).
+// mc_asidespot(tx, ty, hx, hy, cars, rejected) -> index, x, y of a free spot beside his car, or nil; cars: "x,y ..."
+// of this game's other cars near it, rejected: bits of candidates the caller found unusable. GameMainThread only.
+int McCopyPlace(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const float blocker = lua::TypeOf(L, 3) == lua::TNumber ? lua::ToNumber(L, 3) : -1.0f;
+    lua::PushString(L, seats::PlaceName(seats::PlaceCopy(num(1) != 0, num(2) != 0, blocker, num(4), num(5) != 0)));
+    return 1;
+}
+
+int McAsideSpot(lua_State* L) {
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    const char* cars = lua::TypeOf(L, 5) == lua::TString ? lua::ToString(L, 5) : "";
+    const seats::Spot sp = seats::AsideSpot(num(1), num(2), num(3), num(4), seats::ParsePoints(cars ? cars : ""),
+                                            static_cast<uint32_t>(num(6)));
+    if (!sp.ok) {
+        lua::PushNil(L);
+        return 1;
+    }
+    lua::PushNumber(L, static_cast<float>(sp.index));
+    lua::PushNumber(L, sp.x);
+    lua::PushNumber(L, sp.y);
+    return 3;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1214,6 +1240,8 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_mapmark_probe", &McMapMarkProbe);
     lua::RegisterGlobal(L, "mc_rideseat", &McRideSeat);
     lua::RegisterGlobal(L, "mc_yieldseat", &McYieldSeat);
+    lua::RegisterGlobal(L, "mc_copyplace", &McCopyPlace);
+    lua::RegisterGlobal(L, "mc_asidespot", &McAsideSpot);
     return true;
 }
 

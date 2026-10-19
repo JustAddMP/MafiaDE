@@ -774,8 +774,10 @@ function RV.Idle(st, ent)
   end)
 end
 
+-- (a copy held beside his car, c.aside, is put at that spot instead, with his car's rotation)
 local function setTransform(c)
-  c.ent:SetPos(V(c.tx, c.ty, c.tz))
+  local a = c.aside
+  c.ent:SetPos(a and V(a.x, a.y, a.z) or V(c.tx, c.ty, c.tz))
   local q = Math:newQuat()
   q.v = V(c.qx, c.qy, c.qz)
   q.s = c.qw
@@ -800,34 +802,138 @@ end
 -- Driving that one instead of spawning a copy on top of it keeps the mission's own car in this game (a copy on top
 -- of it shoved it away, and the guest's mission flow failed when its car was gone).
 local ADOPT_DIST = 3
--- Returns: a free car of the same model standing there (adopt it), or nil and a car that stands in the way (ours, or
--- another model): a copy spawned into it shoved it away, and a mission car shoved like that failed the mission (the
--- game then loaded the free roam state before the quest).
-function M.FindLocalCar(c)
+-- Returns: a free car of the same model standing there (adopt it) and its distance; else nil, the nearest car that
+-- stands in the way (ours, or another model: a copy spawned into it shoved it away, and a mission car shoved like
+-- that failed the mission - the game then loaded the free roam state before the quest) and its distance. Also the
+-- distance of the nearest car that is not adopted (within NEAR_DIST, nil none) and "x,y ..." of every car within
+-- NEAR_DIST (for a spot beside his car, M.AsideSpotFor). except: a car that is not counted at all (our copy of this
+-- car, when checking whether his car is clear of ours; nothing is adopted then).
+local NEAR_DIST = 16
+function M.FindLocalCar(c, except)
   if not mc_entity_ids then return nil end
   local p = game.game:GetActivePlayer()
   local mine = p and p:GetOwner()
-  local best, bestD, block
+  local best, bestD, block, blockD
+  local near = {}
   for s in string.gmatch(mc_entity_ids(10), "%d+") do
     local e = mc_entity(tonumber(s))
     -- a hidden car is neither free nor in the way: ours behind a copy (M.Swap), or one of our own traffic cars that
     -- traffic_sync.lua hid (deactivated) while the host's traffic shows here (adopted, the other player's car would
     -- be invisible on this game)
     local th = M.Traffic and M.Traffic.hidden
-    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not (th and th[tonumber(s)]) then
+    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not (th and th[tonumber(s)])
+      and not (except and same(except, e)) then
       local q = e:GetPos()
       local d = (q.x - c.tx) ^ 2 + (q.y - c.ty) ^ 2 + (q.z - c.tz) ^ 2
-      if d <= ADOPT_DIST * ADOPT_DIST then
-        local good, model = pcall(e.GetVehicleModelName, e)
-        if good and model == c.model and not (mine and same(mine, e)) and not M.KeyOf(e) then
-          if not bestD or d < bestD then best, bestD = e, d end
-        else
-          block = e
+      if d <= NEAR_DIST * NEAR_DIST then
+        near[#near + 1] = string.format("%.2f,%.2f", q.x, q.y)
+        local adopt = false
+        if not except and d <= ADOPT_DIST * ADOPT_DIST then
+          local good, model = pcall(e.GetVehicleModelName, e)
+          adopt = good and model == c.model and not (mine and same(mine, e)) and not M.KeyOf(e)
+          if adopt and (not bestD or d < bestD) then best, bestD = e, d end
         end
+        if not adopt and (not blockD or d < blockD) then block, blockD = e, d end
       end
     end
   end
-  return best, bestD and math.sqrt(bestD), block
+  local nearD = blockD and math.sqrt(blockD)
+  if not (blockD and blockD <= ADOPT_DIST * ADOPT_DIST) then block = nil end
+  return best, bestD and math.sqrt(bestD), block, nearD, table.concat(near, " ")
+end
+
+-- His car's heading on this game (for the order of the spots tried beside it): his puppet's heading (his state's
+-- body direction, in a car the car's), else +x
+function M.CarHeading(c)
+  local pp = c.driver and M.pup[c.driver]
+  if pp and pp.hx and pp.hy and (pp.hx ~= 0 or pp.hy ~= 0) then return pp.hx, pp.hy end
+  return 1, 0
+end
+
+-- Is the spot x,y beside his car usable for a copy: ground there about at his car's height, and no wall between his
+-- car and it (mc_raycast, the game's physics ray cast; without it every spot is taken as usable). Hits within 3 m of
+-- his car's spot are not counted (the car standing there, ours). Returns ok, z, why. UNVERIFIED in game.
+function M.SpotUsable(c, x, y)
+  if not mc_raycast then return true, c.tz, "no ray cast" end
+  local hit, _, _, gz = mc_raycast(x, y, c.tz + 2.5, x, y, c.tz - 3)
+  if not hit or not gz then return false, nil, "no ground" end
+  if math.abs(gz - c.tz) > 1.5 then
+    return false, nil, string.format("ground %.1f m off his car's height", gz - c.tz)
+  end
+  local dx, dy = x - c.tx, y - c.ty
+  local len = math.sqrt(dx * dx + dy * dy)
+  if len > 3.5 then
+    local ux, uy = dx / len, dy / len
+    local wall = mc_raycast(c.tx + ux * 3, c.ty + uy * 3, c.tz + 1, x + ux * 2.5, y + uy * 2.5, c.tz + 1)
+    if wall then return false, nil, "something in the way" end
+  end
+  return true, math.max(c.tz, gz), "ok"
+end
+
+-- A free spot beside his car for its copy (src/game/seats.h AsideSpot: no car within kAsideClear; then the ground /
+-- wall check here). Spots found unusable are not tried again while his spot stays blocked (c.asideRej).
+function M.AsideSpotFor(c, near)
+  if not mc_asidespot then return nil end
+  local hx, hy = M.CarHeading(c)
+  c.asideRej = c.asideRej or 0
+  for _ = 1, 6 do
+    local i, x, y = mc_asidespot(c.tx, c.ty, hx, hy, near or "", c.asideRej)
+    if not i then return nil end
+    local ok, z, why = M.SpotUsable(c, x, y)
+    if ok then return { i = i, x = x, y = y, z = z } end
+    c.asideRej = c.asideRej + 2 ^ i
+    log(string.format("car %s: spot %d beside it (%.1f %.1f) not usable: %s", c.key, i, x, y, tostring(why)))
+  end
+  return nil
+end
+
+-- Log and trace a change of where his copy stands (mc_copyplace's answer; SEA ev=place, docs/sync-trace.md); a
+-- wait is logged again every 30 s.
+function M.PlaceLog(c, dec, blockD, spot, block)
+  local again = dec == "wait" and M.now - (c.placeT or -100) >= 30
+  if c.placeDec == dec and not again then return end
+  c.placeDec, c.placeT = dec, M.now
+  local what = "-"
+  if block then
+    local k = M.KeyOf(block)
+    local p = game.game:GetActivePlayer()
+    local own = p and p:GetOwner()
+    local good, model = pcall(block.GetVehicleModelName, block)
+    what = (own and same(own, block) and "the car we sit in" or (k and ("car " .. k) or "a car of ours"))
+      .. " (" .. (good and tostring(model) or "?") .. ")"
+  end
+  local text = {
+    wait = "waits: %s stands %.1f m from his car (%.1f s)",
+    aside = "copy goes beside his car (spot %s): %s stands %.1f m from it (%.1f s)",
+    at_car = "copy goes onto his car (%s, nearest car %.1f m)",
+    hold = "copy held beside his car: %s, nearest car %.1f m",
+    release = "his car is clear of ours now (nearest car %.1f m): the copy goes onto it",
+  }
+  local since = c.blockSince and (M.now - c.blockSince) or 0
+  local d = blockD or -1
+  local line
+  if dec == "wait" then line = string.format(text.wait, what, d, since)
+  elseif dec == "aside" then line = string.format(text.aside, spot and tostring(spot.i) or "-", what, d, since)
+  elseif dec == "at_car" then line = string.format(text.at_car, c.blockSince and "his spot is free now" or "free", d)
+  elseif dec == "hold" then line = string.format(text.hold, what, d)
+  else line = string.format(text.release, d) end
+  log("car " .. c.key .. ": " .. line)
+  trace("SEA", string.format("key=%s ev=place dec=%s blk=%.2f for=%.1f spot=%s", c.key, dec, d, since,
+    spot and string.format("%d:%.2f,%.2f,%.2f", spot.i, spot.x, spot.y, spot.z) or "-"))
+end
+
+-- A copy beside his car (c.aside): every half second, is his car clear of every other car here (mc_copyplace)?
+-- Then the copy goes onto it (released: driven or put at his transform as usual).
+function M.AsideTick(c)
+  if not c.aside or M.now - (c.asideT or -10) < 0.5 then return end
+  c.asideT = M.now
+  local _, _, _, nearD = M.FindLocalCar(c, c.ent)
+  local dec = mc_copyplace and mc_copyplace(1, 1, nearD or -1, 0, 0) or "release"
+  M.PlaceLog(c, dec, nearD, c.aside, nil)
+  if dec == "release" then
+    c.aside, c.blockSince, c.asideRej = nil, nil, nil
+    if not c.driver then setTransform(c) end  -- parked: put where his car stands; a driven one is snapped over
+  end
 end
 
 function M.CarTick(c)
@@ -839,8 +945,8 @@ function M.CarTick(c)
     if good and loading then M.loadingT = M.now end
     if M.now - (M.inWorldAt or M.now) < 5 or M.now - (M.loadingT or -10) < 4 then return end
     c.lookT = M.now
-    local own, dist, block
-    if not c.noAdopt then own, dist, block = M.FindLocalCar(c) end
+    local own, dist, block, blockD, near
+    if not c.noAdopt then own, dist, block, blockD, near = M.FindLocalCar(c) end
     if own then
       c.ent, c.st, c.adopted = own, "ready", true
       -- ambient traffic of ours (a host traffic car a guest jacked on his copy of it): its despawn immunity goes off
@@ -851,20 +957,31 @@ function M.CarTick(c)
         c.wasTraffic and " (ambient traffic)" or ""))
       return
     end
-    if block then  -- wait until the other player's car has moved off it (his puppet stays hidden meanwhile)
-      if not c.blockLogged then
-        c.blockLogged = true
-        log("car " .. c.key .. ": another car stands where it is (ours?): no copy until it moved away")
-      end
-      return
+    if block then
+      -- Another car stands where his car is. A copy of his own earlier car that nobody uses (his car's id changed:
+      -- he reloaded, or rejoined) goes: on his game there is one car there. Otherwise: wait a little (one of the
+      -- two is usually moving off), then the copy goes beside his car (src/game/seats.h PlaceCopy) - after a reload
+      -- both games put each player into his own copy of the same mission car at the same spot, and his puppet
+      -- stayed hidden for as long as both stood there (0.15.0 test, Taxi cp_020).
+      if M.DropOldCopy(c, block) then return end
+      c.blockSince = c.blockSince or M.now
+      local spot = M.AsideSpotFor(c, near)
+      local dec = mc_copyplace and mc_copyplace(0, 0, blockD or -1, M.now - c.blockSince, spot and 1 or 0) or "wait"
+      M.PlaceLog(c, dec, blockD, spot, block)
+      if dec ~= "aside" then return end
+      c.aside = spot
+    elseif c.blockSince then
+      c.blockSince, c.asideRej = nil, nil
+      M.PlaceLog(c, "at_car", blockD, nil, nil)
     end
     local so, id = try("ObtainSpecificCar", game.traffic.ObtainSpecificCar, game.traffic, c.model)
     if not so then c.st = "failed"; return end
     c.so, c.qid, c.st = so, id, "obtain"
-    log("car " .. c.key .. ": obtaining copy " .. c.model)
+    log("car " .. c.key .. ": obtaining copy " .. c.model .. (c.aside and " (beside his car)" or ""))
   elseif c.st == "obtain" then
     if c.so:IsDone() then
-      c.sp = game.traffic:SpawnCar(c.qid, V(c.tx, c.ty, c.tz + 0.3), V(1, 0, 0))
+      local a = c.aside
+      c.sp = game.traffic:SpawnCar(c.qid, a and V(a.x, a.y, a.z + 0.3) or V(c.tx, c.ty, c.tz + 0.3), V(1, 0, 0))
       c.st = "spawn"
     end
   elseif c.st == "spawn" then
@@ -890,10 +1007,19 @@ function M.CarTick(c)
     end
     if c.driver == "local" then
       setLock(c, false)
+      if c.aside then  -- we drive the copy that stood beside his car: it is ours to move now
+        c.aside, c.blockSince, c.asideRej = nil, nil, nil
+        log("car " .. c.key .. ": we drive the copy that stood beside his car")
+      end
     elseif c.driver then
       setLock(c, true)
       local pp = M.pup[c.driver]
-      if pp and pp.vcmd and pp.vkey == c.key then
+      M.AsideTick(c)
+      if c.aside then
+        -- held beside his car (src/game/seats.h PlaceCopy): not driven onto it while ours stands there; his puppet
+        -- sits in it all the same
+        if c.rv and c.rv.driven then RV.Idle(c.rv, c.ent) end
+      elseif pp and pp.vcmd and pp.vkey == c.key then
         c.rv = c.rv or {}
         RV.Drive(c.rv, c.ent, pp.vcmd, c.tx, c.ty, c.tz)
         local good, err = pcall(RV.Signals, c.rv, c.ent, pp.vcmd.sig)
@@ -913,6 +1039,7 @@ function M.CarTick(c)
           -- the local player until that car is back (M.SwapTick: he would get into the copy, not his mission's car)
       setLock(c, c.orig ~= nil and c.lockCopy == true)
       if c.rv and c.rv.driven then RV.Idle(c.rv, c.ent) end
+      M.AsideTick(c)
       if c.parkApply then  -- final resting transform from the last driver (M.SwapTick then restores ours there)
         c.parkApply = nil
         setTransform(c)
@@ -954,6 +1081,28 @@ local function occupants(ent)
     if good and own and same(own, ent) then loc = true end
   end
   return pup, loc, other
+end
+
+-- His car's spot is taken here by `block`. When that is a copy of a remote car (ours to drop: spawned by us, not a
+-- host traffic car's, no real car of ours hidden behind it) that nobody drives, sits in or names in his state, it is
+-- a picture of an earlier car: his car's id changed (he reloaded or rejoined: a checkpoint load gives the same car a
+-- new entity) and the old copy was left parked right where his car is now. On his game there is one car there, so
+-- the old copy goes and the next look spawns his. True when it was dropped.
+function M.DropOldCopy(c, block)
+  local k, bc = M.KeyOf(block)
+  if not bc or bc == c or not bc.qid or bc.driver or bc.orig or bc.localIn or bc.fromTraffic then return false end
+  if bc.st ~= "ready" or not valid(bc.ent) then return false end
+  for _, pp in pairs(M.pup) do
+    if pp.vkey == k then return false end
+  end
+  local pup, loc, other = occupants(bc.ent)
+  if pup or loc or other then return false end
+  log(string.format("car %s: the parked copy of car %s (last driven by player %s) stands where his car is: dropped "
+    .. "(his car's id changed: a reload or a rejoin?)", c.key, k, tostring(bc.lastDriver or "?")))
+  trace("SEA", string.format("key=%s ev=oldcopy drop=%s last=%s", c.key, k, tostring(bc.lastDriver or "-")))
+  M.DropCar(bc)
+  c.lookT = nil  -- look again on the next tick
+  return true
 end
 
 -- sessionOver: no session (RemoveAll, or after it); worldGone: a new world was loaded since the last tick
@@ -1029,6 +1178,25 @@ function M.CarsNewWorld()
   end
   for k, c in pairs(M.leftCars) do
     if not c.orig then M.leftCars[k] = nil end
+  end
+  -- Every other record is looked up again in the new world. Our own cars and the cars of ours that stood for a
+  -- remote car (adopted) are entities of the old world: a record kept its key, and when the new world's car compared
+  -- equal to the old entity (M.KeyOf) the local player went on reporting the old key - after the reload of a guest
+  -- whose mission taxi had stood for the host's car, that was the host's own car key. Dropped here: M.CarsUpdate
+  -- makes our car's record anew under its id now, and a remote player's car gets a fresh look (adopt, copy, or a copy
+  -- beside it) from his next state. Copies of ours (c.qid) are left to M.CarTick: one that still stands is from the
+  -- same world (a loading screen without a new world), one that went with the old world is dropped there.
+  local dropped = {}
+  for k, c in pairs(M.cars) do
+    if not c.orig and not c.qid then
+      if c.wasTraffic and valid(c.ent) then pcall(c.ent.SetDespawnImmunity, c.ent, false) end
+      M.cars[k] = nil
+      dropped[#dropped + 1] = k .. (c.adopted and "(adopted)" or "")
+    end
+  end
+  if #dropped > 0 then
+    log("new world: car records looked up again: " .. table.concat(dropped, " "))
+    trace("SEA", "ev=world dropped=" .. table.concat(dropped, ","))
   end
 end
 
@@ -1116,7 +1284,15 @@ function M.CarsUpdate(p)
               .. " drives our car again"))
           end
         end
-        c.driver, c.parkPending, c.parkApply = id, nil, nil
+        c.driver, c.parkPending, c.parkApply, c.lastDriver = id, nil, nil, id
+      end
+      if pp.carKey ~= pp.vkey then
+        if pp.carKey then
+          log(string.format("player %s drives car %s now (was %s)", id, pp.vkey, pp.carKey))
+          trace("DRV", string.format("key=%s ev=newkey id=%s was=%s st=%s", pp.vkey, id, pp.carKey,
+            tostring(M.cars[pp.vkey] and M.cars[pp.vkey].st)))
+        end
+        pp.carKey = pp.vkey
       end
     end
   end
@@ -1710,11 +1886,24 @@ function M.Drive(pp)
     pp.onLadder = nil
     if pp.cb then M.Combat(pp) end
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
+    local c = pp.vkey and M.cars[pp.vkey]
     if pp.seatKey ~= sk then
       pp.seatKey, pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = sk, 0, 0, false, nil, nil
-      pp.leaving, pp.seatCheckOff, pp.seatedT = nil, nil, nil
+      pp.leaving, pp.seatCheckOff, pp.seatedT, pp.seatCar = nil, nil, nil, nil
     end
-    local c = pp.vkey and M.cars[pp.vkey]
+    -- the same key, another car: the record was looked up again (a new world here, a copy for an adopted car, ours
+    -- back from a swap): seated anew in it, its seat counters from zero
+    if c and c.st == "ready" and valid(c.ent) and not same(pp.seatCar, c.ent) then
+      if pp.seatCar ~= nil then
+        pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = 0, 0, false, nil, nil
+        pp.leaving, pp.seatCheckOff, pp.seatedT = nil, nil, nil
+        log("puppet " .. pp.id .. ": car " .. tostring(pp.vkey) .. " is another car here now" ..
+          (c.aside and " (a copy beside his car)" or "") .. ": seated anew")
+        trace("SEA", string.format("key=%s ev=reseat id=%s seat=%d aside=%d", tostring(pp.vkey), pp.id, pp.seat,
+          c.aside and 1 or 0))
+      end
+      pp.seatCar = c.ent
+    end
     pp.dist = 0
     if pp.seat <= 3 and c and c.st == "ready" and valid(c.ent) and M.Seat(pp, c) then return end
     -- No car (yet) or no seat: hide the puppet and park it at the car.
