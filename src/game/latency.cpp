@@ -64,6 +64,7 @@ const char* Name(System s) {
 System SystemOf(uint16_t id) {
     if (id == 0x0100) return kPlayer;
     if (id == 0x0101 || id == 0x0102 || id == 0x0400) return kHit;
+    if (id == 0x0104) return kHit;  // ParkedCars (applied in the player tick, like CarParked)
     if (id >= 0x0200 && id <= 0x020F) return kWorld;
     if (id == 0x0210 || id == 0x0420) return kNpc;
     if (id == 0x0211 || id == 0x0410 || (id >= 0x0421 && id <= 0x042F)) return kNpcEvent;
@@ -104,6 +105,7 @@ void Configure(net::Session& s) {
     s.SetPriority(0x0222, 0x0222, Priority::Bulk);      // traffic car states
     s.SetPriority(0x0210, 0x0210, Priority::Normal);    // NPC states (thinned only when far over the budget)
     s.SetPriority(0x0420, 0x0420, Priority::Normal);    // a guest's own NPC states
+    s.SetPriority(0x0104, 0x0104, Priority::Normal);    // ParkedCars (a newcomer's snapshot; lane 0: player cars)
     // Car damage (0x0250-0x0252) and everything else: Normal.
 }
 

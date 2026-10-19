@@ -17,7 +17,9 @@
 #include "game/lua.h"
 #include "game/map_markers.h"
 #include "game/model_change.h"
+#include "game/parked_cars.h"
 #include "game/peer_pause.h"
+#include "game/player_motion.h"
 #include "game/pvp_hit.h"
 #include "game/seats.h"
 #include "mc/core_version.h"
@@ -76,8 +78,10 @@ net::playout::PlayoutTuning PlayoutTuning() {
     t.startDelay = InterpDelay();
     return t;
 }
-constexpr double kMaxExtrapolate = 0.25;    // then hold
-constexpr float kMaxLead = 1.5f;            // m: the most the "now" lead may move a position (see Interpolate)
+// Interpolation (Hermite through the states with their velocities), extrapolation (250 ms, then held) and the "now"
+// lead: core's replica layer through game/player_motion.h PlayerTrack, one PlayoutClock plus a body track and a car
+// track per remote player. The full states are kept here as well: their discrete fields come from the nearer state of
+// the pair the body track used, the car controls are blended between the pair the car track used.
 constexpr size_t kMaxSnaps = 64;
 constexpr float kTeleport = 20.0f;          // metres between two snapshots: a teleport, not lerped (a car copy swept
                                             // through the line would run over whoever stands on it)
@@ -85,6 +89,7 @@ constexpr size_t kMaxInCmds = 64 * 1024;  // network -> Lua lines kept while the
 
 enum Flags : uint8_t { kInVehicle = 1, kCrouch = 2, kSprint = 4, kAim = 8, kReload = 16, kInAir = 32, kCover = 64 };
 namespace motion = net::motion;
+namespace replica = net::replica;
 
 struct PlayerState {
     float pos[3] = {};
@@ -129,15 +134,19 @@ struct Remote {
     bool haveClock = false;
     double offset = 0;  // local clock - sender clock (the playout clock's: minimum over the last seconds)
     bool haveOffset = false;
-    net::playout::PlayoutClock playout{PlayoutTuning()};  // how far in the past his states are shown (adaptive)
+    // his stream: the playout clock (how far in the past his states are shown, adaptive) and the tracks of his body and
+    // of the car he drives (game/player_motion.h)
+    pmotion::PlayerTrack track{PlayoutTuning()};
     double lastRecv = 0;
     uint32_t recvCount = 0;
     double rateWindowStart = 0;
     uint32_t rateWindowCount = 0;
     float rateHz = 0;
-    // driving his puppet / his car copy here (net/remote_motion.h); fed by the Lua glue's reports
-    motion::LocomotionController loco;
-    motion::VehicleController veh;
+    // driving his puppet / his car copy here (game/player_motion.h over net/remote_motion.h); fed by the Lua glue's
+    // reports
+    pmotion::FootDriver foot;
+    pmotion::CarDriver car;
+    bool giveSpeed = false;  // this tick: his car copy is given his speed without a move
     std::string vehKey;     // the car the vehicle controller is for
     float lastCpos[3] = {};
     bool haveCpos = false;
@@ -199,6 +208,7 @@ struct Shared {
     std::string luaStatus;
     std::string inCmds;                  // network -> Lua ("K ..." car parked lines)
     std::vector<std::string> outParked;  // Lua -> network ("CP ..." lines)
+    parked::Book parkedBook;             // every shared car parked in this session (the host sends it to newcomers)
     std::vector<std::string> outEnv;     // Lua -> network ("WE ..." lines, host only)
     std::vector<std::string> outHits;    // Lua -> network ("HT ..." lines: we hit someone's puppet)
     bool isHost = false;
@@ -518,8 +528,18 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
         core::trace::Line("RXD", "from=%u sT=%u last=%.0f", from, timeMs, rem.snaps.back().t * 1000);
         return;
     }
-    rem.playout.Observe(t, now);
-    rem.offset = rem.playout.Offset();
+    rem.track.Observe(t, now);
+    rem.track.PushFoot(t, {s.pos[0], s.pos[1], s.pos[2]}, {s.vel[0], s.vel[1], s.vel[2]}, s.mode);
+    if ((s.flags & kInVehicle) && !s.model.empty()) {
+        rem.track.PushCar(t, (static_cast<uint64_t>(s.keyOwner) << 32) | s.vehId, {s.cpos[0], s.cpos[1], s.cpos[2]},
+                          {s.cvel[0], s.cvel[1], s.cvel[2]}, s.quat);
+        if (s.seat == 0 && sh.parkedBook.Driven(s.keyOwner, s.vehId))  // driven again: not parked any more
+            core::trace::Line("PKB", "ev=driven key=%u:%u by=%u n=%zu", s.keyOwner, s.vehId, from,
+                              sh.parkedBook.Size());
+    } else {
+        rem.track.NoCar();
+    }
+    rem.offset = rem.track.Clock().Offset();
     rem.haveOffset = true;
     if (rem.recvCount == 0) MC_LOG_INFO("sync: first state from player %u", from);
     if (core::trace::IsOpen())
@@ -545,97 +565,63 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
 // ---- interpolation (main thread, under the lock) -------------------------------------------------------------------
 float Lerp(float a, float b, float t) { return a + (b - a) * t; }
 
-PlayerState Interpolate(const Remote& rem, double now) {
-    const double rt = rem.playout.RenderTime(now);
-    const auto& sn = rem.snaps;
-    if (rt <= sn.front().t) return sn.front().s;
-    if (rt >= sn.back().t) {
-        PlayerState s = sn.back().s;
-        const float dt = static_cast<float>(std::min(rt - sn.back().t, kMaxExtrapolate));
-        for (int i = 0; i < 3; ++i) s.pos[i] += s.vel[i] * dt;
-        if (s.flags & kInVehicle)
-            for (int i = 0; i < 3; ++i) s.cpos[i] += s.cvel[i] * dt;
-        return s;
-    }
-    size_t i = 0;
-    while (i + 1 < sn.size() && sn[i + 1].t < rt) ++i;
-    const Snap& a = sn[i];
-    const Snap& b = sn[i + 1];
-    const float t = static_cast<float>((rt - a.t) / std::max(1e-6, b.t - a.t));
-    PlayerState s = t < 0.5f ? a.s : b.s;  // discrete fields from the nearer snapshot
-    auto jumped = [](const float* p, const float* q) {
-        const float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
-        return dx * dx + dy * dy + dz * dz > kTeleport * kTeleport;
-    };
-    if (jumped(a.s.pos, b.s.pos)) return s;
-    // Positions on the Hermite curve through both states with their velocities (no corner at every state)
-    auto hermite = [&](const float* p0, const float* v0, const float* p1, const float* v1, float* out) {
-        const net::playout::Vec3 h = net::playout::Hermite({p0[0], p0[1], p0[2]}, {v0[0], v0[1], v0[2]},
-                                                           {p1[0], p1[1], p1[2]}, {v1[0], v1[1], v1[2]}, b.t - a.t, t);
-        out[0] = h.x;
-        out[1] = h.y;
-        out[2] = h.z;
-    };
-    hermite(a.s.pos, a.s.vel, b.s.pos, b.s.vel, s.pos);
-    for (int k = 0; k < 3; ++k) s.vel[k] = Lerp(a.s.vel[k], b.s.vel[k], t);
-    float hx = Lerp(a.s.head[0], b.s.head[0], t), hy = Lerp(a.s.head[1], b.s.head[1], t);
-    const float hl = std::sqrt(hx * hx + hy * hy);
-    if (hl > 1e-4f) {
-        s.head[0] = hx / hl;
-        s.head[1] = hy / hl;
-    }
-    if ((a.s.flags & kInVehicle) && (b.s.flags & kInVehicle) && a.s.vehId == b.s.vehId &&
-        !jumped(a.s.cpos, b.s.cpos)) {
-        hermite(a.s.cpos, a.s.cvel, b.s.cpos, b.s.cvel, s.cpos);
-        for (int k = 0; k < 3; ++k) s.cvel[k] = Lerp(a.s.cvel[k], b.s.cvel[k], t);
-        float dot = 0;
-        for (int k = 0; k < 4; ++k) dot += a.s.quat[k] * b.s.quat[k];
-        const float sign = dot < 0 ? -1.0f : 1.0f;
-        float q[4], len = 0;
-        for (int k = 0; k < 4; ++k) {
-            q[k] = Lerp(a.s.quat[k], b.s.quat[k] * sign, t);
-            len += q[k] * q[k];
-        }
-        len = std::sqrt(len);
-        if (len > 1e-6f)
-            for (int k = 0; k < 4; ++k) s.quat[k] = q[k] / len;
-        if (a.s.ctlValid && b.s.ctlValid) {
-            s.steer = Lerp(a.s.steer, b.s.steer, t);
-            s.power = Lerp(a.s.power, b.s.power, t);
-            s.brake = Lerp(a.s.brake, b.s.brake, t);
-            s.handbrake = Lerp(a.s.handbrake, b.s.handbrake, t);
-        }
-    }
-    return s;
+// The full state he sent at sender time t (the tracks name their samples by it); nullptr when it is gone.
+const PlayerState* SnapAt(const Remote& rem, double t) {
+    auto it = std::lower_bound(rem.snaps.begin(), rem.snaps.end(), t,
+                               [](const Snap& a, double v) { return a.t < v; });
+    return it != rem.snaps.end() && it->t == t ? &it->s : nullptr;
 }
 
-// Where the remote player is now: the interpolated state (the playout delay in the past, smooth) moved forward along
-// his velocity by that delay, at most kMaxLead metres. Without it a car copy trails its driver by speed x delay.
+// Where the remote player is now (game/player_motion.h PlayerTrack): his body and car on the Hermite curves through his
+// states at the playout clock's render time, extrapolated at most 250 ms, moved forward by the playout delay and the
+// one-way trip. The discrete fields (mode, flags, weapon, seat ...) come from the nearer state of the pair, the heading
+// and the car controls are blended between the pair (both readable controls only), as before (0.15: Interpolate +
+// Present in this file).
 PlayerState Present(const Remote& rem, double now) {
-    PlayerState s = Interpolate(rem, now);
-    const float lead = static_cast<float>(std::max(0.0, rem.playout.Delay()));
-    auto push = [lead](float* p, const float* v) {
-        float d[3], len = 0;
-        for (int i = 0; i < 3; ++i) {
-            d[i] = v[i] * lead;
-            len += d[i] * d[i];
+    const replica::Out f = rem.track.Foot(now);
+    if (!f.valid) return rem.snaps.back().s;
+    const PlayerState* a = SnapAt(rem, f.fromT);
+    const PlayerState* b = SnapAt(rem, f.toT);
+    const PlayerState* nearer = f.u < 0.5f ? a : b;
+    PlayerState s = nearer ? *nearer : rem.snaps.back().s;
+    s.pos[0] = f.pos.x, s.pos[1] = f.pos.y, s.pos[2] = f.pos.z;
+    s.vel[0] = f.vel.x, s.vel[1] = f.vel.y, s.vel[2] = f.vel.z;
+    if (a && b && a != b && !f.teleport) {
+        const float hx = Lerp(a->head[0], b->head[0], f.u), hy = Lerp(a->head[1], b->head[1], f.u);
+        const float hl = std::sqrt(hx * hx + hy * hy);
+        if (hl > 1e-4f) {
+            s.head[0] = hx / hl;
+            s.head[1] = hy / hl;
         }
-        len = std::sqrt(len);
-        const float k = len > kMaxLead ? kMaxLead / len : 1.0f;
-        for (int i = 0; i < 3; ++i) p[i] += d[i] * k;
-    };
-    push(s.pos, s.vel);
-    if (s.flags & kInVehicle) push(s.cpos, s.cvel);
+    }
+    if ((s.flags & kInVehicle) && !s.model.empty()) {
+        const replica::Out c = rem.track.Car(now);
+        if (c.valid) {
+            s.cpos[0] = c.pos.x, s.cpos[1] = c.pos.y, s.cpos[2] = c.pos.z;
+            s.cvel[0] = c.vel.x, s.cvel[1] = c.vel.y, s.cvel[2] = c.vel.z;
+            if (c.hasRot)
+                for (int k = 0; k < 4; ++k) s.quat[k] = c.rot[k];
+            const PlayerState* ca = SnapAt(rem, c.fromT);
+            const PlayerState* cb = SnapAt(rem, c.toT);
+            if (ca && cb && ca != cb && ca->ctlValid && cb->ctlValid) {
+                s.steer = Lerp(ca->steer, cb->steer, c.u);
+                s.power = Lerp(ca->power, cb->power, c.u);
+                s.brake = Lerp(ca->brake, cb->brake, c.u);
+                s.handbrake = Lerp(ca->handbrake, cb->handbrake, c.u);
+            }
+        }
+    }
     return s;
 }
 
 // One "T" line per remote player: his state, then what to do with his puppet (lc: the locomotion command) and with
 // the car copy he drives (vc: the vehicle command, applied with his controls, then its wanted velocity, then his car
 // signals). Field order: player_sync.lua M.Update. fastHide: his state says on foot but he moves faster than anyone
-// runs (game/puppet_guard.h FastFoot): the puppet is hidden at his position (field 68).
+// runs (game/puppet_guard.h FastFoot): the puppet is hidden at his position (field 68). giveSpeed: the car copy is
+// not moved this tick but its speed is off his: it is given his (field 69; game/player_motion.h CarDriver).
 void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, const PlayerState& s,
                   const motion::LocomotionCommand& lc, const motion::VehicleCommand& vc, actions::Action act,
-                  bool fastHide) {
+                  bool fastHide, bool giveSpeed) {
     char key[32] = "-";
     const bool veh = (s.flags & kInVehicle) != 0 && !s.model.empty();
     if (veh) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
@@ -644,7 +630,7 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   "%d %d %d %u %.3f %.3f %.3f %u "
                   "%d %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f "
                   "%u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %d %d %.3f %.3f %.3f %u %u "
-                  "%.4f %u %u %d\n",
+                  "%.4f %u %u %d %d\n",
                   id, model.c_str(), s.pos[0], s.pos[1], s.pos[2], s.head[0], s.head[1], s.vel[0], s.vel[1],
                   s.vel[2], s.mode, s.weapon.empty() ? "-" : s.weapon.c_str(), veh ? s.model.c_str() : "-", key,
                   s.seat, s.cpos[0], s.cpos[1], s.cpos[2], s.quat[0], s.quat[1], s.quat[2], s.quat[3],
@@ -668,7 +654,9 @@ void AppendTarget(std::string& out, const std::string& model, net::PlayerId id, 
                   // move, game/traversal.h); 66, 67: his pose bits and the body he carries (player_actions.h)
                   lc.nudge.z, static_cast<unsigned>(s.pose.bits), static_cast<unsigned>(s.pose.body),
                   // 68: hide the puppet, he is too fast for one on foot (game/puppet_guard.h FastFoot)
-                  fastHide ? 1 : 0);
+                  fastHide ? 1 : 0,
+                  // 69: give the car copy his speed (SetSpeed) without moving it
+                  giveSpeed ? 1 : 0);
 }
 
 // Report lines from the Lua glue: "PS id x y z hx hy [busy]" (puppet on foot, after this tick's commands; busy 1:
@@ -744,7 +732,7 @@ void Freeze(Shared& sh, net::PlayerId id, Remote& rem, PlayerState& s, double no
 
 void Unfreeze(net::PlayerId id, Remote& rem, double now) {
     rem.frozen = false;
-    rem.veh.Reset();  // its copy stood still on purpose: no "too slow" carried over
+    rem.car.Reset();  // its copy stood still on purpose: no "too slow" carried over
     MC_LOG_INFO("sync: player %u's game runs again: his puppet and car follow him again (held %.1f s)", id,
                 now - rem.frozenAt);
     core::trace::Line("PAU", "id=%u ev=thaw held=%.2f", id, now - rem.frozenAt);
@@ -763,6 +751,9 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     li.heading[1] = s.head[1];
     li.sprint = (s.flags & kSprint) != 0 || s.mode == 3;
     li.inAir = (s.flags & kInAir) != 0;
+    // the gait his game reports (PlayerState mode: 0 idle, 1 walk, 2 run, 3 sprint): the puppet's gait is his, only its
+    // speed multiplier absorbs the error (net/remote_motion.h gaitHint; 0.15: chosen from the wanted speed here)
+    li.gaitHint = static_cast<int8_t>(std::min<unsigned>(s.mode, 3));
     li.haveCopy = !inCar && pr != sh.pupReports.end() && now - pr->second.at < kReportFresh;
     // While the puppet plays one of his actions (a punch, a throw) the controller must not fight it: no walk
     // re-aims, no nudges or snaps, and its standing still must not be measured as its walk speed. As if there were
@@ -781,7 +772,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         li.copyHeading[1] = pr->second.dir[1];
     }
     li.dt = dt;
-    lc = rem.loco.Update(li);
+    lc = rem.foot.Update(li);
     const bool wasSnap = lc.fix == motion::LocomotionCommand::Fix::Snap;
     const traversal::Catchup::Info tc =
         rem.catchup.Apply(busy == 2, fresh && busy != 1, copyPos, li.target, dt, lc);
@@ -822,7 +813,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     char key[32] = "-";
     if (inCar) std::snprintf(key, sizeof(key), "%u:%u", s.keyOwner, s.vehId);
     if (!inCar || s.seat != 0 || rem.vehKey != key) {
-        rem.veh.Reset();
+        rem.car.Reset();
         rem.haveCpos = false;
         rem.vehKey = inCar && s.seat == 0 ? key : "";
     }
@@ -847,6 +838,8 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     for (int k = 0; k < 3; ++k) rem.lastCpos[k] = s.cpos[k];
     rem.haveCpos = inCar && s.seat == 0;
     vi.dt = dt;
+    rem.giveSpeed = false;
+    pmotion::CarCommand cc;
     if (rem.frozen && inCar && s.seat == 0) {
         // his game is paused: the copy is held where it stood (Pin to the frozen pose, no speed, no controller: no
         // pins counted, no "physics does not follow" verdict from a car that is meant to stand)
@@ -854,7 +847,9 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         vc.fix = motion::VehicleCommand::Fix::Pin;
         for (int k = 0; k < 4; ++k) vc.rot[k] = rem.frozenQuat[k];
     } else {
-        vc = rem.veh.Update(vi);
+        cc = rem.car.Update(vi);
+        vc = cc.vc;
+        rem.giveSpeed = cc.giveSpeed;
     }
     static const char* const kWhy[] = {"-", "too slow", "ran off", "stays off"};
     if (vc.justPinned)
@@ -862,10 +857,13 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                     "%.1f m off, rotation %.0f deg off): pinned to his transform every tick (pin #%d, physics tried "
                     "again later)",
                     id, key, kWhy[static_cast<int>(vc.why) & 3], vc.cspeed, vc.tspeed, vc.error, vc.rotErrDeg,
-                    rem.veh.Pins());
+                    rem.car.Pins());
     if (vc.retried)
         MC_LOG_INFO("sync: player %u's car %s: giving its physics another try (retry #%d)", id, key,
-                    rem.veh.Retries());
+                    rem.car.Retries());
+    if (cc.skidStart)
+        MC_LOG_INFO("sync: player %u's car %s slides (its velocity is off its heading at %.1f m/s): the copy is "
+                    "blended faster meanwhile", id, key, vc.tspeed);
     rem.lastLoco = lc;
     rem.lastVeh = vc;
     rem.inCar = inCar;
@@ -875,34 +873,38 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                        vc.fix == motion::VehicleCommand::Fix::Snap;
     if (!core::trace::IsOpen() || (now - rem.traceAt < kTraceInterval && !event)) return;
     rem.traceAt = now;
-    const double rT = (now - rem.offset) * 1000.0;  // the remote clock time Present() stands for
+    const double rT = (now - rem.offset + rem.track.OneWay()) * 1000.0;  // the remote clock time Present() stands for
     const double age = pr != sh.pupReports.end() ? now - pr->second.at : -1;
     if (!inCar) {
         core::trace::Line("PUP",
                           "id=%u rT=%.0f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f have=%d age=%.3f cp=%.3f,%.3f,%.3f "
                           "ch=%.3f,%.3f err=%.3f g=%u mult=%.3f want=%.3f meas=%.3f carry=%.3f base=%.2f,%.2f,%.2f "
                           "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u busy=%d nz=%.4f tm=%d "
-                          "rec=%d pose=%u",
+                          "rec=%d pose=%u hint=%d rest=%d brk=%d stp=%d own=%.3f lead=%.1f",
                           id, rT, li.target.x, li.target.y, li.target.z, li.targetVel.x, li.targetVel.y,
                           li.haveCopy ? 1 : 0, age, li.copy.x, li.copy.y, li.copy.z, li.copyHeading[0],
                           li.copyHeading[1], lc.error, static_cast<unsigned>(lc.gait), lc.speedMult, lc.want,
-                          lc.measured, lc.carry, rem.loco.BaseSpeed(motion::Gait::Walk),
-                          rem.loco.BaseSpeed(motion::Gait::Run), rem.loco.BaseSpeed(motion::Gait::Sprint),
+                          lc.measured, lc.carry, rem.foot.Loco().BaseSpeed(motion::Gait::Walk),
+                          rem.foot.Loco().BaseSpeed(motion::Gait::Run), rem.foot.Loco().BaseSpeed(motion::Gait::Sprint),
                           static_cast<unsigned>(lc.fix), lc.nudge.x, lc.nudge.y, lc.reissue ? 1 : 0, lc.moveTo.x,
                           lc.moveTo.y, lc.turn ? 1 : 0, s.mode, s.flags, busy, lc.nudge.z, tc.moving ? 1 : 0,
-                          tc.recovering ? 1 : 0, s.pose.bits);
+                          tc.recovering ? 1 : 0, s.pose.bits, static_cast<int>(li.gaitHint), rem.foot.Resting() ? 1 : 0,
+                          rem.foot.Braking() ? 1 : 0, lc.stopping ? 1 : 0, rem.foot.CopySpeed(),
+                          rem.track.Lead() * 1000);
     } else if (s.seat == 0) {
         core::trace::Line("VEH",
                           "id=%u key=%s rT=%.0f have=%d tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
                           "cv=%.3f,%.3f,%.3f err=%.3f rot=%.2f fix=%u pin=%d why=%u jp=%d rt=%d pins=%d tsp=%.3f "
-                          "csp=%.3f vel=%.3f,%.3f,%.3f pw=%.3f ctl=%d st=%.3f br=%.3f hb=%.3f gear=%d sig=%u",
+                          "csp=%.3f vel=%.3f,%.3f,%.3f pw=%.3f ctl=%d st=%.3f br=%.3f hb=%.3f gear=%d sig=%u "
+                          "pf=%.2f ri=%.2f gs=%d skid=%d cz=%u lead=%.1f",
                           id, key, rT, vi.haveCopy ? 1 : 0, vi.target.x, vi.target.y, vi.target.z, vi.targetVel.x,
                           vi.targetVel.y, vi.targetVel.z, vi.copy.x, vi.copy.y, vi.copy.z, vi.copyVel.x,
                           vi.copyVel.y, vi.copyVel.z, vc.error, vc.rotErrDeg, static_cast<unsigned>(vc.fix),
                           vc.pinned ? 1 : 0, static_cast<unsigned>(vc.why), vc.justPinned ? 1 : 0,
-                          vc.retried ? 1 : 0, rem.veh.Pins(), vc.tspeed, vc.cspeed, vc.vel.x, vc.vel.y, vc.vel.z,
+                          vc.retried ? 1 : 0, rem.car.Pins(), vc.tspeed, vc.cspeed, vc.vel.x, vc.vel.y, vc.vel.z,
                           vc.power, s.ctlValid ? 1 : 0, s.steer, s.brake, s.handbrake, static_cast<int>(s.gear),
-                          s.signals);
+                          s.signals, vc.pinnedFor, vc.retryIn, cc.giveSpeed ? 1 : 0, cc.skid ? 1 : 0,
+                          static_cast<unsigned>(cc.corr.kind), rem.track.Lead() * 1000);
     } else {
         core::trace::Line("PAS", "id=%u key=%s rT=%.0f seat=%u cp=%.3f,%.3f,%.3f", id, key, rT, s.seat, s.cpos[0],
                           s.cpos[1], s.cpos[2]);
@@ -942,40 +944,79 @@ bool ParseKey(const std::string& k, uint8_t& owner, uint32_t& guid) {
 // (from an older build) reads as flags 0.
 constexpr uint8_t kParkedWrecked = 1;
 
-bool WriteParked(net::ByteWriter& w, const std::string& line) {
+// The Lua glue's "CP" line as a parked::Car (game/parked_cars.h); false for garbage.
+bool ParseParked(const std::string& line, parked::Car& c) {
     std::istringstream in(line);
-    std::string tag, key, model;
-    float v[7] = {};
-    in >> tag >> key >> model;
-    for (float& f : v) in >> f;
-    uint8_t owner = 0;
-    uint32_t guid = 0;
-    if (!in || tag != "CP" || !ParseKey(key, owner, guid)) return false;
+    std::string tag, key;
+    in >> tag >> key >> c.model;
+    for (float& f : c.t) in >> f;
+    if (!in || tag != "CP" || !ParseKey(key, c.owner, c.guid)) return false;
     unsigned flags = 0;
     if (!(in >> flags)) flags = 0;
-    w.U8(owner);
-    w.U32(guid);
-    w.Str(model);
-    for (float f : v) w.F32(f);
-    w.U8(static_cast<uint8_t>(flags & kParkedWrecked));
-    return true;
+    c.flags = static_cast<uint8_t>(flags & kParkedWrecked);
+    return parked::Valid(c);
+}
+
+void WriteParked(net::ByteWriter& w, const parked::Car& c) {
+    w.U8(c.owner);
+    w.U32(c.guid);
+    w.Str(c.model);
+    for (float f : c.t) w.F32(f);
+    w.U8(c.flags);
+}
+
+// A parked car from another game (CarParked, or one entry of the host's ParkedCars) becomes a "K" line for the glue
+// (player_sync.lua M.Parked). Under the lock.
+void QueueParked(Shared& sh, const parked::Car& c) {
+    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %u\n", c.owner, c.guid,
+               c.model.c_str(), c.t[0], c.t[1], c.t[2], c.t[3], c.t[4], c.t[5], c.t[6], c.flags);
 }
 
 void OnCarParked(net::PlayerId from, net::ByteReader& r) {
-    const uint8_t owner = r.U8();
-    const uint32_t guid = r.U32();
-    const std::string model = r.Str(48);
-    float v[7];
-    for (float& f : v) f = r.F32();
-    if (!r.Ok() || model.empty() || !Token(model) || !InRange(v, 3, kMaxCoord) || !InRange(v + 3, 4, 2)) return;
-    const uint8_t flags = r.Remaining() >= 1 ? static_cast<uint8_t>(r.U8() & kParkedWrecked) : 0;
+    parked::Car c;
+    c.owner = r.U8();
+    c.guid = r.U32();
+    c.model = r.Str(48);
+    for (float& f : c.t) f = r.F32();
+    if (!r.Ok() || !parked::Valid(c)) return;
+    c.flags = r.Remaining() >= 1 ? static_cast<uint8_t>(r.U8() & kParkedWrecked) : 0;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     if (!sh.active || from == sh.localId) return;
-    AppendLine(sh.inCmds, kMaxInCmds, "K %u:%u %s %.3f %.3f %.3f %.5f %.5f %.5f %.5f %u\n", owner, guid, model.c_str(),
-               v[0], v[1], v[2], v[3], v[4], v[5], v[6], flags);
-    MC_LOG_INFO("sync: player %u parked car %u:%u (%s)%s", from, owner, guid, model.c_str(),
-                (flags & kParkedWrecked) ? ", destroyed" : "");
+    sh.parkedBook.Parked(c);
+    QueueParked(sh, c);
+    MC_LOG_INFO("sync: player %u parked car %u:%u (%s)%s", from, c.owner, c.guid, c.model.c_str(),
+                (c.flags & kParkedWrecked) ? ", destroyed" : "");
+    core::trace::Line("PKB", "ev=parked key=%u:%u by=%u wrecked=%u n=%zu", c.owner, c.guid, from,
+                      static_cast<unsigned>(c.flags & kParkedWrecked), sh.parkedBook.Size());
+}
+
+// ---- ParkedCars (0x0104, reliable, host -> a player who joined or came back): the cars parked before he was here --
+// game/parked_cars.h. A destroyed car is not spawned for him (an intact copy of a wreck would stand there; its wreck
+// stays the host's picture, UNVERIFIED whether a later CarDamage would show it). Accepted before our sync is active
+// (it can come in the poll that completes our join); the "K" lines wait for the glue.
+void OnParkedCars(net::PlayerId from, net::ByteReader& r) {
+    std::vector<parked::Car> cars;
+    if (!parked::Read(r, cars)) {
+        MC_LOG_WARN("sync: a malformed ParkedCars message from player %u, ignored", from);
+        return;
+    }
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    if (from != net::kHostPlayer || from == sh.localId) return;
+    int applied = 0, wrecked = 0;
+    for (const parked::Car& c : cars) {
+        if (c.flags & kParkedWrecked) {
+            ++wrecked;
+            continue;
+        }
+        sh.parkedBook.Parked(c);
+        QueueParked(sh, c);
+        ++applied;
+    }
+    MC_LOG_INFO("sync: the host's parked cars: %zu in this message, %d placed here, %d destroyed ones left out",
+                cars.size(), applied, wrecked);
+    core::trace::Line("PKR", "from=%u n=%zu applied=%d wrecked=%d", from, cars.size(), applied, wrecked);
 }
 
 // ---- WorldEnv (0x0200, reliable, host -> guests): time of day, time flow speed, weather set -------------------------
@@ -1716,7 +1757,7 @@ void MainTick(lua_State* L, float dt) {
             }
             for (auto& [id, rem] : sh.remotes) {
                 if (rem.snaps.empty()) continue;
-                rem.playout.Update(now);  // the render clock toward its adaptive delay (net/playout.h)
+                rem.track.Update(now);  // the render clock toward its adaptive delay (net/playout.h)
                 PlayerState s = Present(rem, now);
                 if (peer_pause::Remote(static_cast<uint8_t>(id), now) == peer_pause::Quiet::Paused)
                     Freeze(sh, id, rem, s, now);
@@ -1735,7 +1776,7 @@ void MainTick(lua_State* L, float dt) {
                     core::trace::Line("ACT", "id=%u kind=%s seq=%u missed=%d", id, actions::Name(act.play),
                                       s.act.seq, act.missed);
                 }
-                AppendTarget(cmds, ProfileFor(sh, id), id, s, lc, vc, act.play, rem.fast.Hidden());
+                AppendTarget(cmds, ProfileFor(sh, id), id, s, lc, vc, act.play, rem.fast.Hidden(), rem.giveSpeed);
             }
         }
     }
@@ -1863,6 +1904,7 @@ void PlayerSync::Attach(net::Session& session) {
     _session = &session;
     session.On(kMsgPlayerState, &OnState);
     session.On(kMsgCarParked, &OnCarParked);
+    session.On(parked::kMsgParkedCars, &OnParkedCars);
     session.On(kMsgWorldEnv, &OnWorldEnv);
     session.On(kMsgHit, &OnHit);
     session.On(kMsgPlayerModel, &OnPlayerModel);
@@ -1883,6 +1925,7 @@ void PlayerSync::Detach() {
     if (_session) {
         _session->Off(kMsgPlayerState);
         _session->Off(kMsgCarParked);
+        _session->Off(parked::kMsgParkedCars);
         _session->Off(kMsgWorldEnv);
         _session->Off(kMsgHit);
         _session->Off(kMsgPlayerModel);
@@ -1903,6 +1946,7 @@ void PlayerSync::Detach() {
     sh.names.clear();
     sh.inCmds.clear();
     sh.outParked.clear();
+    sh.parkedBook.Clear();
     sh.outEnv.clear();
     sh.outHits.clear();
     sh.models.clear();
@@ -1943,6 +1987,7 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     bool send = false;
     double sampleAt = 0;
     std::vector<std::string> parked, env, hits;
+    std::vector<std::pair<net::PlayerId, std::vector<parked::Car>>> parkedTo;  // host: ParkedCars to send
     bool sendModel = false;
     std::string modelLook, modelWhy;
     int modelSteps = 0;
@@ -1993,11 +2038,15 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                     core::trace::Line("PL", "id=%u model=%s seq=%u name=%s", p.id, p.model.empty() ? "-" : p.model.c_str(),
                                       p.joinSeq, p.name.c_str());
                 if (p.id != sh.localId && fresh) sh.sendModel = true;
+                if (p.id != sh.localId && fresh && sh.isHost) parkedTo.emplace_back(p.id, sh.parkedBook.Snapshot());
                 sh.names[p.id] = p.name;
                 sh.models[p.id] = p.model;
                 seen.insert({p.id, p.joinSeq});
             }
             _seenPlayers.swap(seen);
+            // the one-way trip to each remote player: his body and car are led forward by it too (PlayerTrack)
+            for (auto& [rid, rem] : sh.remotes)
+                if (const net::PlayerInfo* pi = _session->FindPlayer(rid)) rem.track.SetOneWay(pi->rttMs / 2000.0);
             const char* why = nullptr;
             const double tnow = Now();
             if (sh.outbox.Due(tnow, sh.inWorld && tnow - sh.worldAt < 2.0, &why)) {  // our pick settled
@@ -2033,11 +2082,12 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                 const net::PlayerInfo* pi = _session->FindPlayer(id);
                 const double ahead = rem.snaps.empty() ? 0 : (rem.snaps.back().t - (clockAt - rem.offset)) * 1000;
                 core::trace::Line("CLK", "id=%u off=%.4f rtt=%.1f hz=%.1f snaps=%zu newest=%.1f recv=%u drop=%u "
-                                  "last=%.3f pd=%.1f pdt=%.1f jit=%.1f late=%u sclk=%.1f",
+                                  "last=%.3f pd=%.1f pdt=%.1f jit=%.1f late=%u sclk=%.1f ow=%.1f",
                                   id, rem.offset, pi ? pi->rttMs : -1.0f, rem.rateHz, rem.snaps.size(), ahead,
-                                  rem.recvCount, rem.dropped, clockAt - rem.lastRecv, rem.playout.Delay() * 1000,
-                                  rem.playout.TargetDelay() * 1000, rem.playout.Lateness() * 1000, rem.playout.Late(),
-                                  _session->ClockOffsetS() * 1000);
+                                  rem.recvCount, rem.dropped, clockAt - rem.lastRecv,
+                                  rem.track.Clock().Delay() * 1000, rem.track.Clock().TargetDelay() * 1000,
+                                  rem.track.Clock().Lateness() * 1000, rem.track.Clock().Late(),
+                                  _session->ClockOffsetS() * 1000, rem.track.OneWay() * 1000);
             }
         }
         // The newest sample goes out in the frame the render thread first sees it (core flushes right after this
@@ -2053,11 +2103,28 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         }
     }
     for (const std::string& line : parked) {
+        parked::Car c;
+        if (!active || !ParseParked(line, c)) continue;
         net::ByteWriter pw(96);
-        if (active && WriteParked(pw, line)) {
-            _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
-            MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
+        WriteParked(pw, c);
+        _session->Broadcast(kMsgCarParked, pw.Span(), net::Reliability::Reliable);
+        MC_LOG_INFO("sync: sent CarParked (%s)", line.c_str() + 3);
+        std::lock_guard lock(sh.mu);
+        sh.parkedBook.Parked(c);
+        core::trace::Line("PKB", "ev=parked key=%u:%u by=%u wrecked=%u n=%zu", c.owner, c.guid, sh.localId,
+                          static_cast<unsigned>(c.flags & kParkedWrecked), sh.parkedBook.Size());
+    }
+    // The host: a player who joined (or came back: a new joinSeq) gets the cars parked before he was here.
+    for (const auto& [to, cars] : parkedTo) {
+        const auto parts = parked::Split(cars);
+        for (const auto& part : parts) {
+            net::ByteWriter pw(64 + part.size() * 64);
+            parked::Write(pw, part);
+            _session->SendTo(to, parked::kMsgParkedCars, pw.Span(), net::Reliability::Reliable);
         }
+        MC_LOG_INFO("sync: sent player %u the %zu parked car(s) of this session (%zu ParkedCars message(s))", to,
+                    cars.size(), parts.size());
+        core::trace::Line("PKS", "to=%u n=%zu msgs=%zu", to, cars.size(), parts.size());
     }
     for (const std::string& line : env) {
         net::ByteWriter ew(128);
@@ -2264,7 +2331,7 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
             std::snprintf(buf, sizeof(buf),
                           "    car %s: %s (pins %d), %.2f m off, %.1f/%.1f m/s, steer %+.2f, power %.2f, brake %.2f%s, "
                           "signals %s",
-                          rem.vehKey.c_str(), rem.lastVeh.pinned ? "pinned" : "own physics", rem.veh.Pins(),
+                          rem.vehKey.c_str(), rem.lastVeh.pinned ? "pinned" : "own physics", rem.car.Pins(),
                           rem.lastVeh.error, rem.lastVeh.cspeed, rem.lastVeh.tspeed, last ? last->steer : 0.0f,
                           rem.lastVeh.power, last ? last->brake : 0.0f,
                           last && !last->ctlValid ? " (no controls from his game)" : "",
@@ -2273,8 +2340,8 @@ void PlayerSync::GetStatus(std::vector<render::OverlayLine>& out) {
             std::snprintf(buf, sizeof(buf),
                           "    on foot: %s x%.2f (walk %.1f, run %.1f, sprint %.1f m/s), %.2f m off, wants %.1f m/s%s",
                           kGaits[static_cast<int>(rem.lastLoco.gait) & 3], rem.lastLoco.speedMult,
-                          rem.loco.BaseSpeed(motion::Gait::Walk), rem.loco.BaseSpeed(motion::Gait::Run),
-                          rem.loco.BaseSpeed(motion::Gait::Sprint), rem.lastLoco.error, rem.lastLoco.want,
+                          rem.foot.Loco().BaseSpeed(motion::Gait::Walk), rem.foot.Loco().BaseSpeed(motion::Gait::Run),
+                          rem.foot.Loco().BaseSpeed(motion::Gait::Sprint), rem.lastLoco.error, rem.lastLoco.want,
                           rem.lastLoco.carry > 0 ? ", catching up" : "");
         }
         out.push_back({buf, 0xFFA0A0A0});
