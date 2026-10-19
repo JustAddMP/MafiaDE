@@ -224,6 +224,8 @@ struct BookConfig {
     double echoQuiet = 1.5;      // s after cascading writes on a copy (explode, fire, wheels, a gone part): what it
                                  // shows new is our own writes' echo, not reported
     double repairGrace = 1.0;    // s after the holder wrote damage on its own car: a drop is not read as a repair
+    double rebuildQuiet = 3.0;   // s after car look rebuilt a car (tuning installed): its part change is no damage
+                                 // of its own (copy) and no repair (holder)
 };
 
 class Book {
@@ -235,6 +237,12 @@ public:
     // We put another game's blast on our car `ref` (the holder): the copies' reports of the same blast (their own
     // games' real blast hit them too, reported 0.4 s later) are dropped for blastQuiet s, so it is not applied twice.
     void OnRemoteBlast(const CarRef& ref, double now);
+    // Car look installed tuning items on our entity of `ref` (InstallTuningItems rebuilds the car, docs/re-notes.md
+    // 13: its deform parts are made anew, maybe another list of them). A copy asks its holder for the whole state
+    // again at once, puts what it knows back on the new parts and takes what the parts show new for rebuildQuiet s
+    // as the rebuild's echo (not reported); the holder (we drove that copy last) reads no repair from the drop for
+    // as long and gives the new parts the damage everyone was shown. False: the car is not known here (yet).
+    bool OnRebuilt(const CarRef& ref, double now);
     void Round(const std::vector<CarInput>& cars, double now, Outbox& out);
     void OnPlayerLeft(int id);
     void Clear() { cars_.clear(); }
@@ -244,7 +252,8 @@ public:
         uint64_t sent = 0, fulls = 0, reports = 0, requests = 0, received = 0, applied = 0, repairs = 0,
                  explosions = 0, reportsIn = 0, blasts = 0, blastDropped = 0,
                  echoesAbsorbed = 0,  // copy: rounds whose new damage was taken as an echo of our writes (not sent)
-                 echoesDropped = 0;   // holder: reports dropped as echoes (car exploded here, exploded flag)
+                 echoesDropped = 0,   // holder: reports dropped as echoes (car exploded here, exploded flag)
+                 rebuilds = 0;        // cars rebuilt by car look (OnRebuilt)
     };
     const Stats& GetStats() const { return stats_; }
     // test access
@@ -283,6 +292,9 @@ private:
         double blastUntil = -1e9;    // authority: copies' reports dropped until then (OnRemoteBlast)
         double wroteAt = -1e9;       // authority: we last wrote damage on our own car (repairGrace)
         double echoUntil = -1e9;     // copy: what it shows new until then is an echo of our cascading writes
+        double rebuildUntil = -1e9;  // a rebuild's part change until then (OnRebuilt): echo (copy), no repair (holder)
+        bool rebuilt = false;        // OnRebuilt: the next round puts the known damage on the new parts (and a copy
+                                     // asks for the whole state)
     };
     void AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);
     void CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);

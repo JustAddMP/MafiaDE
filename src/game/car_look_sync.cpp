@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
+#include "game/car_damage_sync.h"
 #include "game/car_look.h"
 #include "game/lua.h"
 #include "game/traffic_sync.h"
@@ -184,6 +185,7 @@ uint64_t _tx = 0, _txReq = 0, _rx = 0, _rxReq = 0, _rxBad = 0, _bytes = 0, _drop
 bool _moduleLoaded = false, _moduleFailed = false, _wasActive = false;
 uint32_t _luaErrors = 0;
 std::string _luaCmds;  // for the next Lua call (applies)
+std::map<uint32_t, CarRef> _rebuildRefs;  // entity -> its car, for tuning applies sent to the glue
 double _logWindow = 0;
 uint32_t _logsInWindow = 0;
 
@@ -306,6 +308,7 @@ bool ParseCar(const std::string& line, CarInput& c) {
     if (!CarRef::Parse(ref, c.ref)) return false;
     c.entity = static_cast<uint32_t>(ent);
     c.role = role == "S" ? Role::Source : Role::Copy;
+    c.busy = role == "B";  // a copy someone sits in
     c.owner = (!owner.empty() && owner[0] >= '0' && owner[0] <= '9') ? std::atoi(owner.c_str()) : -1;
     if (c.owner > 255) c.owner = -1;
     std::string rest;
@@ -323,6 +326,10 @@ void Carry(const Apply& a) {
         what += w;
     };
     const Change& c = a.change;
+    if (c.tuning) {  // its rebuild ("LR ent" back from the glue) goes to car damage for this car
+        if (_rebuildRefs.size() > 256) _rebuildRefs.clear();
+        _rebuildRefs[a.entity] = a.ref;
+    }
     add(c.color, "color");
     add(c.plate, "plate");
     add(c.tint, "tint");
@@ -358,6 +365,7 @@ void MainTick(lua_State* L, float dt) {
         sh.book.Clear();
         sh.out.clear();
         _tuningLogged.clear();
+        _rebuildRefs.clear();
     }
     _wasActive = active;
     if (_moduleFailed) return;
@@ -411,6 +419,17 @@ void MainTick(lua_State* L, float dt) {
             if (cars.size() < 256 && ParseCar(line, c)) cars.push_back(std::move(c));
         } else if (line == "LE") {
             round = true;
+        } else if (line.rfind("LR ", 0) == 0) {
+            // the glue installed tuning items on our copy: the car was rebuilt (new deform parts) -> car damage
+            const uint32_t ent = static_cast<uint32_t>(std::strtoul(line.c_str() + 3, nullptr, 10));
+            auto it = _rebuildRefs.find(ent);
+            if (it != _rebuildRefs.end()) {
+                const CarRef ref = it->second;
+                _rebuildRefs.erase(it);
+                const bool known = CarDamageSync::OnCarRebuilt(ref);
+                if (core::trace::IsOpen())
+                    core::trace::Line("CLB", "ref=%s ent=%u damage=%d", ref.Text().c_str(), ent, known ? 1 : 0);
+            }
         } else if (line.rfind("ST ", 0) == 0) {
             std::lock_guard lock(sh.mu);
             sh.status = line.substr(3);
@@ -429,6 +448,10 @@ void MainTick(lua_State* L, float dt) {
         for (auto& [p, m] : out.requests) push(Net{Net::Request, p, std::move(m)});
     }
     for (const Apply& a : out.applies) Carry(a);
+    // the copies a puppet is not seated in yet (their look is still to come: player_sync M.Seat), every round
+    std::string holds = "LH";
+    for (uint32_t e : out.holds) holds += " " + std::to_string(e);
+    _luaCmds += holds + "\n";
     for (const auto& l : out.logs) Log(l);
     if (core::trace::IsOpen())
         for (const auto& t : out.trace) {
@@ -487,11 +510,12 @@ void CarLookSync::GetStatus(std::vector<render::OverlayLine>& out) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     const auto& st = sh.book.GetStats();
-    char buf[320];
+    char buf[400];
     std::snprintf(buf, sizeof buf,
-                  "Car looks: %u cars (%u ours, %u copies: %u match, %u waiting, %u not taken); tuning %s; tx %llu/%llu "
-                  "rx %llu/%llu, set %llu%s",
-                  st.cars, st.sources, st.copies, st.matching, st.waiting, st.failed, _t.read ? "read" : "NOT found",
+                  "Car looks: %u cars (%u ours, %u copies: %u match, %u waiting, %u not taken, %u tuning waits: "
+                  "occupied); tuning %s; tx %llu/%llu rx %llu/%llu, set %llu%s",
+                  st.cars, st.sources, st.copies, st.matching, st.waiting, st.failed, st.deferred,
+                  _t.read ? "read" : "NOT found",
                   static_cast<unsigned long long>(_tx), static_cast<unsigned long long>(_txReq),
                   static_cast<unsigned long long>(_rx), static_cast<unsigned long long>(_rxReq),
                   static_cast<unsigned long long>(st.applied), _rxBad ? " (bad msgs!)" : "");

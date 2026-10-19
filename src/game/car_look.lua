@@ -13,12 +13,19 @@
 --                                              asked for its look
 --   LA ent what ids look...                    set on our copy `ent`: `what` = comma list of color, plate, tint,
 --                                              interior, dirt, rust, painting, tuning; `ids` = the tuning items to
---                                              install ("-" none); then the look (the line form below)
+--                                              install ("-" none); then the look (the line form below). The tuning
+--                                              is left out while someone sits in the copy (InstallTuningItems
+--                                              rebuilds the car: he would be put out); the dll sets it later
+--   LH ent ent ...                             after each round: the copies a puppet is not seated in yet (their
+--                                              look is still to come; player_sync M.Seat asks K.Holds)
 -- Output (events, one per line; a round every ROUND s while a session runs):
 --   LC ref ent role owner look...              one car: ref = "o:g" (a player car's key), "t<net>" (a host traffic
 --                                              car's copy here), "h<id>" (our own traffic car as host); role S (we
---                                              have the car itself: we send its look) or C (our copy: it takes the
---                                              look); owner = the player whose game sends it (- unknown)
+--                                              have the car itself: we send its look), C (our copy: it takes the
+--                                              look) or B (our copy, someone sits in it: its tuning waits); owner =
+--                                              the player whose game sends it (- unknown)
+--   LR ent                                     tuning items were installed on our copy `ent`: it was rebuilt (the
+--                                              dll tells car damage)
 --   LE                                         end of the round
 --   ST text                                    status for the overlay (once a second)
 -- The look (game/car_look.h ToLine): model c1 c2 plate tint interior dirt rust painting tuning; strings escaped
@@ -38,6 +45,9 @@ local FRESH = 10.0
 K.read = K.read or {}      -- traffic net -> last read time
 K.born = K.born or {}      -- traffic net -> first seen
 K.want = K.want or {}      -- host: "h<id>" asked for this round
+K.hold = K.hold or {}      -- entity id -> true: a puppet is not seated in this copy yet ("LH")
+local HOLD_FRESH = 1.5     -- s an "LH" list counts (rounds come every ROUND s)
+local SEATS = 6            -- seats looked at for an occupant (0-based; a car has 2-4, a bus more)
 
 local function log(s) if mc_log then mc_log("look: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -101,8 +111,41 @@ function K.Read(e)
     esc(plate), int(tint, -1, 32767), int(inter, -1, 32767), tenth(dirt), tenth(rust), esc(paint), tun)
 end
 
+-- a player's human: ours or a puppet of another player's (not a traffic crew: their copies take the tuning as before)
+local function isPlayer(h)
+  local good, g = pcall(h.GetGUID, h)
+  if not good then return false end
+  g = tostring(g)
+  local p = M.Player and M.Player()
+  if p and valid(p) then
+    local gp, pg = pcall(p.GetGUID, p)
+    if gp and tostring(pg) == g then return true end
+  end
+  for _, pp in pairs(M.pup or {}) do
+    if pp.guid == g then return true end
+  end
+  return false
+end
+
+-- Which player sits in car `e` (a puppet, our player): the first one found (human, seat), or nil
+function K.Occupant(e)
+  if not (e and valid(e) and e.GetSeatOwner) then return nil end
+  for s = 0, SEATS - 1 do
+    local good, h = pcall(e.GetSeatOwner, e, s)
+    if not good then break end
+    if h ~= nil and valid(h) and isPlayer(h) then return h, s end
+  end
+  return nil
+end
+
+-- True while the dll holds copy entity `id` back from a puppet: its look (tuning) is still to come
+function K.Holds(id)
+  id = tonumber(id)
+  return id ~= nil and K.hold[id] == true and M.now - (K.holdT or -99) < HOLD_FRESH
+end
+
 -- "LA ent what ids look...": set what the dll says our copy lacks
-function K.Apply(f)
+function K.Apply(f, ev)
   local e = mc_entity and mc_entity(tonumber(f[2]) or -1)
   if not (e and valid(e) and e.GetVehicleModelName) then return end
   local what = {}
@@ -126,8 +169,19 @@ function K.Apply(f)
   if what.rust then put("rust", e.SetRust, (tonumber(f[12]) or 0) / 250) end
   if what.painting then put("painting", e.SetPainting, unesc(f[13])) end
   if what.tuning and #ids > 0 then
-    -- one call with every item (the binding takes them as separate numbers: InstallTuningItems(a, b, ...))
-    put("tuning " .. table.concat(ids, ","), e.InstallTuningItems, (table.unpack or unpack)(ids))
+    local occ, seat = K.Occupant(e)
+    if occ then
+      -- someone got in since the dll's round: InstallTuningItems rebuilds the car (docs/re-notes.md 13) and would
+      -- put him out. Left out: the next rounds report the copy busy and the dll sets it once it is empty.
+      res[#res + 1] = "tuning " .. table.concat(ids, ",") .. " deferred (seat " .. tostring(seat) .. " taken)"
+    else
+      -- one call with every item (the binding takes them as separate numbers: InstallTuningItems(a, b, ...))
+      local before = #res
+      put("tuning " .. table.concat(ids, ","), e.InstallTuningItems, (table.unpack or unpack)(ids))
+      if e.InstallTuningItems and res[before + 1] and not res[before + 1]:find("FAILED", 1, true) and ev then
+        ev[#ev + 1] = "LR " .. tostring(f[2])  -- rebuilt: the dll tells car damage
+      end
+    end
   end
   log(string.format("car entity %s: %s", tostring(f[2]), table.concat(res, ", ")))
   if mc_trace then mc_trace("CLW", string.format("ent=%s what=%s ids=%s res=%s", tostring(f[2]), tostring(f[3]),
@@ -138,6 +192,7 @@ local function emit(ev, ref, e, role, owner)
   local id = entId(e)
   local look = id and K.Read(e)
   if not look then return false end
+  if role == "C" and K.Occupant(e) then role = "B" end  -- a copy someone sits in: its tuning waits
   ev[#ev + 1] = string.format("LC %s %d %s %s %s", ref, id, role, owner or "-", look)
   return true
 end
@@ -199,12 +254,19 @@ function K.Update(dt, cmds)
     elseif f[1] == "LW" and f[2] then
       K.want[f[2]] = true
     elseif f[1] == "LA" then
-      local good, err = pcall(K.Apply, f)
+      local good, err = pcall(K.Apply, f, ev)
       if not good then log("apply error: " .. tostring(err)) end
+    elseif f[1] == "LH" then
+      local h = {}
+      for i = 2, #f do
+        local id = tonumber(f[i])
+        if id then h[id] = true end
+      end
+      K.hold, K.holdT = h, M.now
     end
   end
   if not K.active then
-    K.read, K.born, K.want = {}, {}, {}
+    K.read, K.born, K.want, K.hold = {}, {}, {}, {}
     return ""
   end
   K.t = (K.t or 0) + (dt or 0)

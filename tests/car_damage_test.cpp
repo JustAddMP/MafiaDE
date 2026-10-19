@@ -605,6 +605,69 @@ void TestWriteEcho() {
     Check(a.parts[7] == 100 && ep == 0, "a drop right after our write is no repair", std::to_string(ep));
 }
 
+bool Requested(const Outbox& o, int to) {
+    for (const auto& [peer, r] : o.requests)
+        if (peer == to) return true;
+    return false;
+}
+
+void TestRebuild() {
+    const CarRef ref{CarRef::kPlayer, 0, 5000};
+    // car look installed tuning items on B's copy: the car is rebuilt, its parts made anew (intact, and the game
+    // shows a part it changed as damaged)
+    Net n;
+    Snapshot a = Car(), b = Car();
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    a.parts[4] = 120;
+    a.wheels[1] = kWheelBurst;
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(b.parts[4] == 120 && b.wheels[1] == kWheelBurst, "the copy shows the driver's damage before its rebuild");
+    Check(!n.b.OnRebuilt(CarRef{CarRef::kPlayer, 0, 7777}, n.now), "a car the book does not know: nothing to do");
+    b = Car();
+    b.parts[9] = 60;  // the rebuild's part change
+    const uint64_t req = n.b.GetStats().requests;
+    Check(n.b.OnRebuilt(ref, n.now), "the rebuilt copy is known");
+    n.oa = {};
+    n.ob = {};
+    n.b.Round({In("0:5000", 22, Role::Copy, 0, b)}, n.now, n.ob);
+    Check(Requested(n.ob, 0) && n.b.GetStats().requests == req + 1, "the copy asks its holder for the whole state at once");
+    Carry(n.ob, 22, b);
+    n.Deliver();
+    n.now += 0.25;
+    n.oa = {};
+    n.a.Round({In("0:5000", 11, Role::Authority, -1, a)}, n.now, n.oa);
+    bool answered = false;
+    for (const auto& [to, u] : n.oa.to) answered = answered || (to == 1 && u.full);
+    Check(answered, "and gets it");
+    Carry(n.oa, 11, a);
+    n.Deliver();
+    n.now += 0.25;
+    for (int i = 0; i < 8; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(b.parts[4] == 120 && b.wheels[1] == kWheelBurst, "its damage is put on the new parts again");
+    Check(n.b.GetStats().reports == 0 && a.parts[9] == 0, "the rebuild's part change is not reported as damage",
+          std::to_string(n.b.GetStats().reports));
+    // after rebuildQuiet, damage it takes for real is reported as before
+    n.now += BookConfig{}.rebuildQuiet;
+    b.parts[6] = 90;
+    for (int i = 0; i < 6; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(n.b.GetStats().reports == 1 && a.parts[6] == 90, "a real hit after the rebuild window is reported",
+          std::to_string(n.b.GetStats().reports));
+
+    // the holder's own entity is rebuilt (we drove that copy last and it is parked): no repair read from the drop
+    Net h;
+    Snapshot ha = Car(), hb = Car();
+    for (int i = 0; i < 3; ++i) Step(h, ha, 11, Role::Authority, hb, 22, Role::Copy);
+    ha.parts[4] = 120;
+    for (int i = 0; i < 3; ++i) Step(h, ha, 11, Role::Authority, hb, 22, Role::Copy);
+    ha = Car();  // the rebuild: intact parts
+    Check(h.a.OnRebuilt(ref, h.now), "the holder's rebuilt car is known");
+    for (int i = 0; i < 8; ++i) Step(h, ha, 11, Role::Authority, hb, 22, Role::Copy);
+    uint16_t ep = 9;
+    h.a.Known(ref, nullptr, &ep);
+    Check(ep == 0 && ha.parts[4] == 120 && hb.parts[4] == 120 && h.a.GetStats().repairs == 0,
+          "the holder gives the new parts their damage back, nobody repairs", std::to_string(ep));
+}
+
 }  // namespace
 
 int main() {
@@ -625,6 +688,7 @@ int main() {
     TestStale();
     TestExplosionEcho();
     TestWriteEcho();
+    TestRebuild();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

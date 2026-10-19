@@ -329,6 +329,7 @@ std::vector<CarRef> Book::Wanted() const {
 
 void Book::Round(const std::vector<CarInput>& cars, double now, Outbox& out) {
     stats_.cars = stats_.sources = stats_.copies = stats_.matching = stats_.waiting = stats_.failed = 0;
+    stats_.deferred = 0;
     char buf[512];
     // sources first: a copy of our own car on our own game (our car hidden behind it) takes what we send
     for (int pass = 0; pass < 2; ++pass) {
@@ -382,10 +383,16 @@ void Book::Round(const std::vector<CarInput>& cars, double now, Outbox& out) {
                 c.tries = 0;
                 c.gaveUp = c.matchLogged = c.modelWarned = false;
                 c.triedAt = -1e9;
+                c.boundAt = now;
+                c.deferred = false;
             }
+            // a new copy of a player car: no puppet is seated in it before its look is on (a later tuning would
+            // rebuild the car under him)
+            const bool young = in.ref.kind == CarRef::kPlayer && !in.busy && now - c.boundAt < cfg_.holdMax;
             const Look* want = c.haveSent ? &c.sent : c.haveWant ? &c.want : nullptr;
             if (!want) {
                 ++stats_.waiting;
+                if (young && in.owner >= 0) out.holds.push_back(in.entity);
                 if (in.owner >= 0 && now - c.requestAt >= cfg_.requestEvery) {
                     c.requestAt = now;
                     Message m;
@@ -405,8 +412,43 @@ void Book::Round(const std::vector<CarInput>& cars, double now, Outbox& out) {
                               ref.c_str(), in.have.model.c_str(), want->model.c_str());
                 out.logs.emplace_back(buf);
             }
-            const Change ch = Diff(in.have, *want);
+            Change ch = Diff(in.have, *want);
+            if (ch.tuning && in.busy) {
+                // someone sits in our copy: InstallTuningItems would rebuild the car under him (docs/re-notes.md
+                // 13). The tuning waits until the copy is empty; the rest does not rebuild it and is set now.
+                ++stats_.deferred;
+                if (!c.deferred) {
+                    c.deferred = true;
+                    std::snprintf(buf, sizeof buf, "car %s: its tuning (%zu item(s)) waits: someone sits in our copy "
+                                                   "(entity %u)%s",
+                                  ref.c_str(), ch.tuningIds.size(), in.entity,
+                                  ch.color || ch.plate || ch.tint || ch.interior || ch.dirt || ch.rust || ch.painting
+                                      ? "; the rest of its look is set now"
+                                      : "");
+                    out.logs.emplace_back(buf);
+                    out.trace.push_back("CLD ref=" + ref + " ent=" + std::to_string(in.entity) + " ev=defer items=" +
+                                        std::to_string(ch.tuningIds.size()));
+                }
+                ch.tuning = false;
+                ch.tuningIds.clear();
+                if (ch.Empty()) continue;
+            } else if (c.deferred && !in.busy) {
+                // empty again: the tuning gets its own tries
+                c.deferred = false;
+                c.tries = 0;
+                c.gaveUp = false;
+                c.triedAt = -1e9;
+                if (ch.tuning) {
+                    std::snprintf(buf, sizeof buf, "car %s: our copy (entity %u) is empty: its tuning is set now",
+                                  ref.c_str(), in.entity);
+                    out.logs.emplace_back(buf);
+                    out.trace.push_back("CLD ref=" + ref + " ent=" + std::to_string(in.entity) + " ev=resume items=" +
+                                        std::to_string(ch.tuningIds.size()));
+                }
+            }
+            if (young && ch.tuning && !c.gaveUp) out.holds.push_back(in.entity);
             if (ch.Empty()) {
+                c.deferred = false;
                 ++stats_.matching;
                 if (!c.matchLogged) {
                     c.matchLogged = true;

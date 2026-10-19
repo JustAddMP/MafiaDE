@@ -6,6 +6,7 @@
 // 10), runs the Lua glue (car_damage.lua: which cars, which game holds each) and carries the messages CarDamage
 // (0x0250), CarDamageReport (0x0251) and CarDamageRequest (0x0252) (docs/protocol.md "Car damage").
 // Threads: messages and sending on the render thread; Lua, reads and writes on GameMainThread; a mutex in between.
+#include "game/car_damage.h"
 #include "net/session.h"
 #include "render/overlay.h"
 
@@ -19,6 +20,9 @@ public:
     static void Attach(net::Session& session);
     static void Detach();
     static void OnPlayerLeft(net::PlayerId id);
+    // GameMainThread: car look installed tuning items on our entity of this car (a rebuild: new deform parts), see
+    // car_damage::Book::OnRebuilt. False: the car is not in car damage's book (yet).
+    static bool OnCarRebuilt(const car_damage::CarRef& ref);
     static void Tick(float dt);
     static void GetStatus(std::vector<render::OverlayLine>& out);
 };

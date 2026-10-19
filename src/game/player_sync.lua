@@ -188,7 +188,7 @@ function M.FactoryReset(why)
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
   M.fac = { st = "none", t = -1 }
-  for _, pp in pairs(M.pup) do M.Unmark(pp); pp.so = nil; pp.st = "queued" end
+  for _, pp in pairs(M.pup) do M.Unmark(pp); M.ScriptForget(pp); pp.so = nil; pp.st = "queued" end
 end
 
 function M.FactoryTick(dt, need)
@@ -311,6 +311,7 @@ function M.SpawnTick()
     pp.carry, pp.stealthOn = nil, nil  -- a fresh human carries nothing, walks normally
     pp.mult, pp.noMult = nil, nil  -- a fresh human: its speed multiplier is 1
     pp.ally, pp.spawnT = nil, M.now
+    M.ScriptForget(pp)  -- a fresh human: no action of the old one runs on it, no script control is on
     -- a fresh human: its brain and seat state anew (M.Ally, M.Seat)
     pp.calm, pp.brain, pp.brainT, pp.seated, pp.leaving = nil, nil, nil, false, nil
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
@@ -1608,6 +1609,14 @@ function M.WantsBrain()
   return M.brainOk or (M.isHost and M.allyOn) or false
 end
 
+-- The puppet's friend brain switch (M.Ally) is still to come on this game (map markers: an icon on the puppet would
+-- be removed by it; script control: it would be asked on the old brain). settle: also within BRAIN_SETTLE s after it.
+function M.BrainPending(pp, so, settle)
+  if not (M.WantsBrain() and pp.st == "alive" and valid(so)) then return false end
+  if not pp.ally then return true end
+  return settle and pp.brainT ~= nil and M.now - pp.brainT < BRAIN_SETTLE or false
+end
+
 -- What a civilian brain allows (no friend brain here): no reactions to gunfire, no civil wander. Once per puppet.
 function M.Calm(pp, so)
   if pp.calm then return end
@@ -1735,6 +1744,23 @@ function M.Seat(pp, c)
   end
   if pp.brainT and M.now - pp.brainT < BRAIN_SETTLE then return true end
   if not pp.brain then M.Calm(pp, so) end
+  -- A new copy of his car takes its look first (car_look.lua K.Holds, car_look.h Book): its tuning rebuilds the car
+  -- and would put a puppet seated in it out again. The dll holds it back for a few seconds at most.
+  local L = M.CarLook
+  if c.qid and L and L.Holds and L.Holds(guidNum(car)) then
+    if pp.lookWait ~= c.ent then
+      pp.lookWait, pp.lookWaitT = c.ent, M.now
+      log(string.format("puppet %s: waits for car %s's look before it is seated (our copy, entity %s)", pp.id,
+        tostring(pp.vkey), tostring(guidNum(car))))
+      trace("SCP", string.format("key=%s ev=lookwait id=%s seat=%d", tostring(pp.vkey), pp.id, pp.seat))
+    end
+    return false
+  end
+  if pp.lookWait and same(pp.lookWait, c.ent) then
+    log(string.format("puppet %s: car %s's look is on (%.1f s): seated now", pp.id, tostring(pp.vkey),
+      M.now - (pp.lookWaitT or M.now)))
+    pp.lookWait = false
+  end
   -- The puppet walked up to a standing car (its player was getting in, docs/protocol.md seat 9): it gets in with the
   -- game's own animation, once; it is given ANIM_WAIT to finish, then seated at once like any other time. A puppet
   -- just thrown out is put back at once (fast), else once a second.
@@ -1774,6 +1800,8 @@ function M.SeatDriverNow(pp, c)
   local h = seatHolder(car, 0, so)
   if h == "ours" then return true end
   if h ~= "free" or valid(so:GetOwner()) then return false end
+  if pp.actRun then M.ActionEnd(pp, so, "he is in a car") end
+  M.ScriptRelease(pp, so, "seated at the wheel", "seat")
   if M.WantsBrain() and not pp.ally and M.Ally(pp, so) then pp.brainT = M.now end
   if pp.hidden then M.Hide(pp, false, true) end
   pp.seatT, pp.seatAnim = M.now, false
@@ -1876,12 +1904,13 @@ end
 
 function M.Drive(pp)
   local so = pp.so
-  if not valid(so) then pp.so = nil; pp.st = "queued"; return end
+  if not valid(so) then M.ScriptForget(pp); pp.so = nil; pp.st = "queued"; return end
   if M.PuppetLife(pp) then return end
   if not pp.ally and M.WantsBrain() then M.Ally(pp, so) end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     pp.act = nil  -- his punches / throws from a car seat are not shown
     if pp.actRun then M.ActionEnd(pp, so, "he is in a car") end
+    M.ScriptRelease(pp, so, "car seat", "seat")  -- given back before the seat command
     if pp.carry then M.CarryEnd(pp, so, "he is in a car") end
     pp.onLadder = nil
     if pp.cb then M.Combat(pp) end
@@ -1916,6 +1945,8 @@ function M.Drive(pp)
     return
   end
   pp.seatKey = nil
+  -- he walks to / from a car door (seat 9): script control is given back (an action may still play out, without it)
+  if pp.veh and pp.seat == 9 then M.ScriptRelease(pp, so, "door walk", "door") end
   if valid(so:GetOwner()) then  -- the player got out: let the puppet climb out, then follow on foot again
     M.GetOut(pp)
     if M.now - pp.exitT < 3 then return end
@@ -2448,6 +2479,9 @@ function M.PuppetLife(pp)
   local hp = pp.health or 100
   if hp <= 0 or (pp.deadShown and (hp < 10 or M.now - (pp.deadAt or 0) < 3)) then
     if not dead and not pp.deadShown then
+      -- it goes down (a ragdoll): its action ends and script control is given back first
+      if pp.actRun then M.ActionEnd(pp, so, "he is down") end
+      M.ScriptRelease(pp, so, "it goes down", "ragdoll")
       pcall(so.DoDamage, so, PUP_HEALTH * 100)
       log("puppet " .. pp.id .. ": its player is down, the puppet dies")
     end
@@ -2462,6 +2496,7 @@ function M.PuppetLife(pp)
     -- puppet through a stale marker (crash in exe+0x243a915, docs/game-api.md 15)
     M.Unmark(pp)
     M.Release(pp, so)
+    M.ScriptForget(pp)
     pp.so, pp.st, pp.deadShown, pp.guid = nil, "queued", nil, nil
     return true
   end
@@ -2720,6 +2755,7 @@ function M.ScriptControl(pp, so, on)
   if (pp.scOn or false) == on then return end
   local good, err = pcall(so.ScriptControl, so, on, SCRIPT_DESIRE)
   pp.scOn = on
+  pp.scFor = on and (pp.actN or 0) or nil  -- the action it was asked for (its answer is matched to it)
   pp.scAskT = M.now
   pp.scAsks = (pp.scAsks or 0) + 1
   if not good or pp.scAsks <= 6 then
@@ -2729,12 +2765,68 @@ function M.ScriptControl(pp, so, on)
   trace("SC", string.format("id=%s on=%d ok=%d", pp.id, on and 1 or 0, good and 1 or 0))
 end
 
--- SCRIPT_CONTROL / AI_CONTROL on a puppet: when (and whether) its AI took or gave back script control.
+-- Script control and the rest of a puppet's life (src/game/anim_methods.h "script control", mc_anim_sc): what the
+-- puppet is now for it ("foot", "seat", "door", "ragdoll").
+function M.ScriptState(pp, so)
+  if pp.deadShown or (valid(so) and so:IsDeath()) or (pp.health or 100) <= 0 then return "ragdoll" end
+  if pp.veh and pp.seat == 9 then return "door" end
+  if pp.veh or (valid(so) and valid(so:GetOwner())) then return "seat" end
+  return "foot"
+end
+
+-- May script control be asked for now: not before the friend brain switch is over (M.BrainPending), only on foot.
+function M.ScriptMayAsk(pp, so)
+  local pending = M.BrainPending(pp, so, true)
+  local state = M.ScriptState(pp, so)
+  if mc_anim_sc then return mc_anim_sc("ask", pending and 1 or 0, state) == true, pending, state end
+  return not pending and state == "foot", pending, state
+end
+
+-- Gives script control back before the puppet is seated, walks to a car door or goes down (why: for the log;
+-- state: what it is about to be, "seat", "door" or "ragdoll"; M.ScriptState when nil).
+function M.ScriptRelease(pp, so, why, state)
+  if not pp.scOn then return end
+  state = state or M.ScriptState(pp, so)
+  local must
+  if mc_anim_sc then must = mc_anim_sc("release", 1, state) == true else must = state ~= "foot" end
+  if not must then return end
+  if valid(so) then M.ScriptControl(pp, so, false) else pp.scOn, pp.scFor = false, nil end
+  log(string.format("puppet %s: script control given back (%s, %s)", pp.id, tostring(why), state))
+  trace("SC", string.format("id=%s release=%s state=%s", pp.id, (tostring(why):gsub(" ", "_")), state))
+end
+
+-- A puppet entity that is gone (re-queued, respawned, a fresh human): its action and script control go with it
+-- (nothing is called on the old entity: it is released or invalid).
+function M.ScriptForget(pp)
+  if pp.scOn or pp.actRun then
+    trace("SC", string.format("id=%s forget=1 on=%d act=%s", tostring(pp.id), pp.scOn and 1 or 0,
+      pp.actRun and tostring(pp.actRun.kind) or "-"))
+  end
+  pp.scOn, pp.scFor, pp.scAskT, pp.actRun = nil, nil, nil, nil
+end
+
+-- SCRIPT_CONTROL / AI_CONTROL on a puppet: when (and whether) its AI took or gave back script control. An answer
+-- for an action that is over (or after the control was given back) is late: logged as such, nothing else.
 function M.OnControlEvent(m, name)
   local g = tostring(m:GetReceiverGUID())
   for _, pp in pairs(M.pup) do
     if pp.guid == g then
       pp.scSeen = (pp.scSeen or 0) + 1
+      local running = pp.actRun and pp.actRun.n or 0
+      local late
+      if mc_anim_sc then late = mc_anim_sc("late", pp.scFor or 0, running) == true
+      else late = (pp.scFor or 0) == 0 or pp.scFor ~= running end
+      if late then
+        pp.scLate = (pp.scLate or 0) + 1
+        if pp.scLate <= 10 then
+          log(string.format("puppet %s: %s %.2f s after ScriptControl(%s) came late (asked for action #%s, now %s): "
+            .. "ignored", pp.id, name, M.now - (pp.scAskT or M.now), tostring(pp.scOn), tostring(pp.scFor or "-"),
+            running > 0 and ("#" .. running) or "none"))
+        end
+        trace("SC", string.format("id=%s msg=%s late=1 for=%s running=%d", pp.id, name, tostring(pp.scFor or 0),
+          running))
+        return
+      end
       local gs, st = pcall(m.GetState, m)
       local gn, on = pcall(m.GetObjectName, m)
       if pp.scSeen <= 20 then
@@ -2808,8 +2900,21 @@ function M.PlayAction(pp, so, kind)
     names = {}  -- the puppet carries it with the game's own carry (TakeBody): that plays the pickup itself
   end
   local probe = #names > 0 and probeStart(so) or nil
+  pp.actN = (pp.actN or 0) + 1  -- this action's serial (script control's answer is matched to it)
   if #names > 0 then
-    if how.script then M.ScriptControl(pp, so, true) end
+    if how.script then
+      local may, pending, state = M.ScriptMayAsk(pp, so)
+      if may then
+        M.ScriptControl(pp, so, true)
+      else
+        pp.scSkips = (pp.scSkips or 0) + 1
+        if pp.scSkips <= 10 then
+          log(string.format("puppet %s: script control not asked for this %s (%s): played without it", pp.id,
+            ACTION_NAMES[kind] or "?", pending and "its friend brain switch is not over yet" or state))
+        end
+        trace("SC", string.format("id=%s skip=1 pending=%d state=%s", pp.id, pending and 1 or 0, state))
+      end
+    end
     if how.pre then
       local good, err = pcall(how.pre, so)
       if not good then log(string.format("puppet %s: %s: setting up failed: %s", pp.id, method, tostring(err))) end
@@ -2841,7 +2946,7 @@ function M.PlayAction(pp, so, kind)
         #names, method))
     end
     -- a move without its animation is still followed along his path (no snap at its end)
-    if move then pp.actRun = { kind = kind, name = "-", t = M.now, untilT = M.now + dur, move = true } end
+    if move then pp.actRun = { kind = kind, name = "-", t = M.now, untilT = M.now + dur, move = true, n = pp.actN } end
     return
   end
   if pp.actsPlayed <= 40 or pp.actsPlayed % 100 == 0 then
@@ -2850,7 +2955,7 @@ function M.PlayAction(pp, so, kind)
       string.format("not confirmed: watched %.1f s", watch), pp.actsPlayed))
   end
   pp.actRun = { kind = kind, name = used, so = aso, t = M.now, untilT = M.now + watch, move = move,
-    method = method, how = how, probe = probe }
+    method = method, how = how, probe = probe, n = pp.actN }
   if kind <= 4 then M.ShieldFromSwing(pp, so, dur) end
 end
 
@@ -3626,7 +3731,7 @@ local function nav() return game.navigation end
 
 -- his puppet's friend brain switch is still to come on this game (M.Ally): it would remove an icon on the puppet
 local function markBrainPending(pp, so)
-  return M.WantsBrain() and not pp.ally and pp.st == "alive" and valid(so)
+  return M.BrainPending(pp, so)
 end
 
 -- where he is for his marker: his car while he drives or rides, else himself (from his latest state)

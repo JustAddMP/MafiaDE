@@ -514,6 +514,15 @@ void Book::OnRemoteBlast(const CarRef& ref, double now) {
     ++stats_.blasts;
 }
 
+bool Book::OnRebuilt(const CarRef& ref, double now) {
+    auto it = cars_.find(ref);
+    if (it == cars_.end()) return false;
+    it->second.rebuilt = true;
+    it->second.rebuildUntil = now + cfg_.rebuildQuiet;
+    ++stats_.rebuilds;
+    return true;
+}
+
 void Book::OnRequest(const CarRef& ref, int from) {
     Car& c = cars_[ref];
     c.wantFull.insert(from);
@@ -593,6 +602,10 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
     const Snapshot& local = in.local;
     const std::string ref = in.ref.Text();
     char buf[320];
+    // car look rebuilt our entity (OnRebuilt): its new parts get the damage everyone has been shown, like a new one
+    const bool rebuilt = c.rebuilt && !rebound;
+    c.rebuilt = false;
+    if (rebuilt) rebound = true;
     if (rebound && c.haveSent) {
         // another entity for the same car (our own car back from behind a copy, a new copy we drive now): it gets
         // the damage everyone has been shown
@@ -600,12 +613,14 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
         Apply a = Plan(local, c.sent, d);
         if (!a.Empty()) {
             a.entity = in.entity;
-            std::snprintf(buf, sizeof buf, "car %s: our entity %u for it is new here: given its damage (%s; %zu parts, "
+            std::snprintf(buf, sizeof buf, "car %s: our entity %u for it is %s: given its damage (%s; %zu parts, "
                                            "%zu wheels%s%s)",
-                          ref.c_str(), in.entity, c.sent.Describe().c_str(), a.parts.size(), a.wheels.size(),
+                          ref.c_str(), in.entity, rebuilt ? "rebuilt (tuning installed)" : "new here",
+                          c.sent.Describe().c_str(), a.parts.size(), a.wheels.size(),
                           a.burn ? ", burning" : "", a.explode ? ", explode" : "");
             out.logs.emplace_back(buf);
-            out.trace.push_back("CDA ref=" + ref + " ent=" + std::to_string(in.entity) + " why=rebind parts=" +
+            out.trace.push_back("CDA ref=" + ref + " ent=" + std::to_string(in.entity) + " why=" +
+                                (rebuilt ? "rebuild" : "rebind") + " parts=" +
                                 PartsText(a.parts) + " wheels=" + std::to_string(a.wheels.size()) +
                                 " burn=" + (a.burn ? "1" : "0") + " explode=" + (a.explode ? "1" : "0"));
             ++stats_.applied;
@@ -636,7 +651,9 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
     }
     // a drop right after our own writes on the car is the game's reaction to them (a part model swapped, a wheel
     // taken off with its part), not a repair: within repairGrace the read only becomes the new baseline
-    const bool grace = now - c.wroteAt < cfg_.repairGrace;
+    // (and for rebuildQuiet s after car look rebuilt the car: its parts were made anew)
+    const bool rebuilding = now < c.rebuildUntil;
+    const bool grace = now - c.wroteAt < cfg_.repairGrace || rebuilding;
     if (c.havePrev && !rebound && grace && Repaired(c.prev, local)) {
         std::snprintf(buf, sizeof buf, "car %s: its damage dropped right after we wrote some on it (was %s; now %s): "
                                        "taken as the game's reaction, no repair",
@@ -691,7 +708,10 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
         const bool layoutChanged = c.sent.layout != local.layout || c.sent.parts.size() != local.parts.size();
         const bool changed = !u.parts.empty() || layoutChanged || c.sent.wheels != local.wheels ||
                              c.sent.flags != local.flags;
-        if (changed) {
+        if (changed && rebuilding) {
+            // the rebuild's part change (and our writes putting the damage back on): not sent until it is over;
+            // what is still different then goes out as usual
+        } else if (changed) {
             if (layoutChanged) u = Full(in.ref, c.epoch, local);
             std::snprintf(buf, sizeof buf, "car %s: damage changed on our game: %s (%zu parts sent: %s)", ref.c_str(),
                           local.Describe().c_str(), u.parts.size(), PartsText(u.parts, 8).c_str());
@@ -739,6 +759,28 @@ void Book::CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbo
         c.reported = c.auth;
         c.layoutWarned = false;
         c.fresh = true;
+    }
+    if (c.rebuilt) {
+        // car look rebuilt our copy (OnRebuilt): new parts. What we know goes on them again (done cleared: Plan
+        // writes it anew), what they show new is the rebuild's echo (rebuildUntil, below), and the holder is asked
+        // for the whole state at once (its part list may be another one now: the copy has the car's tuning).
+        c.rebuilt = false;
+        c.done.Clear();
+        c.excessAt = -1;
+        c.quietExcess = 0;
+        c.reported = c.auth;
+        c.layoutWarned = false;
+        if (in.authPeer >= 0) {
+            c.requestAt = now;
+            out.requests.emplace_back(in.authPeer, in.ref);
+            out.trace.push_back("CDQ ref=" + ref + " to=" + std::to_string(in.authPeer) + " why=rebuilt");
+            ++stats_.requests;
+        }
+        std::snprintf(buf, sizeof buf, "car %s: our copy (entity %u) was rebuilt by its tuning: its damage is put on "
+                                       "again%s, what it shows new for %.1f s is no damage of its own",
+                      ref.c_str(), in.entity, in.authPeer >= 0 ? " and the whole state asked for" : "",
+                      cfg_.rebuildQuiet);
+        out.logs.emplace_back(buf);
     }
     if (!c.haveAuth) {
         if (in.authPeer >= 0 && now - c.requestAt >= cfg_.requestEvery) {
@@ -841,19 +883,29 @@ void Book::CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbo
     // explosion did to it here, and right after cascading writes the game's reaction shows. Taken as reported, so
     // only damage beyond it (taken later, really ours) is ever sent.
     const bool wreck = (local.flags & kExploded) || (c.auth.flags & kExploded);
-    if (wreck || now < c.echoUntil) {
+    const bool rebuild = now < c.rebuildUntil;
+    if (wreck || now < c.echoUntil || rebuild) {
         Update absorbed = rep;
-        if (absorbed.layout != c.reported.layout) absorbed.parts.clear();
-        if (MergeUp(c.reported, absorbed)) {
+        bool took = false;
+        if (rebuild && !wreck && absorbed.layout != c.reported.layout) {
+            // the rebuild gave the copy another part list: what it shows now is the baseline (reports go beyond it)
+            c.reported = local;
+            c.reported.flags &= static_cast<uint8_t>(~kExploded);
+            took = true;
+        } else {
+            if (absorbed.layout != c.reported.layout) absorbed.parts.clear();
+            took = MergeUp(c.reported, absorbed);
+        }
+        if (took) {
             ++stats_.echoesAbsorbed;
+            const char* what = wreck ? "blew it up (a wreck)" : rebuild ? "rebuilt it (its tuning)" : "wrote damage on it";
             std::snprintf(buf, sizeof buf, "car %s: our copy shows damage beyond the authority's right after we %s "
                                            "(%zu parts, %s): an echo of our own writes, not reported",
-                          ref.c_str(), wreck ? "blew it up (a wreck)" : "wrote damage on it", rep.parts.size(),
-                          local.Describe().c_str());
+                          ref.c_str(), what, rep.parts.size(), local.Describe().c_str());
             out.logs.emplace_back(buf);
             out.trace.push_back("CDX ref=" + ref + " to=" + std::to_string(in.authPeer) + " ep=" +
-                                std::to_string(c.epoch) + " echo=" + (wreck ? "wreck" : "write") + " parts=" +
-                                PartsText(rep.parts));
+                                std::to_string(c.epoch) + " echo=" +
+                                (wreck ? "wreck" : rebuild ? "rebuild" : "write") + " parts=" + PartsText(rep.parts));
         }
         c.excessAt = -1;
         return;

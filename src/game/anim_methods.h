@@ -186,4 +186,50 @@ struct Ladder {
     }
 };
 
+// ---- script control on a puppet (Method::Script / ScriptCombat) ------------------------------------------------
+// ScriptControl(true, "DesireMainScript") hands the puppet's AI over to script commands; the game answers some time
+// later (a SCRIPT_CONTROL / AI_CONTROL HUMAN message). How that meets the rest of a puppet's life (UNVERIFIED in
+// game, the rules are on the safe side): it is asked only for a puppet on its feet (not in a car seat, not walking
+// to a car door: seat 9, not a ragdoll: dying or dead) whose friend brain switch is over (M.Ally swaps the brain;
+// script control asked before it would be on the old brain), and given back before the puppet is seated, walks to a
+// door or goes down. A puppet entity that is gone (re-queued, respawned) takes nothing along: its state starts over.
+// The game's answer is matched to the action it was asked for (a serial per puppet): one that comes after that
+// action ended (or after the control was given back) is late and ignored.
+enum class PuppetState : uint8_t { OnFoot = 0, Seat, DoorWalk, Ragdoll };
+
+inline const char* Name(PuppetState s) {
+    switch (s) {
+        case PuppetState::OnFoot: return "on foot";
+        case PuppetState::Seat: return "in a car seat";
+        case PuppetState::DoorWalk: return "walking to a car door";
+        case PuppetState::Ragdoll: return "a ragdoll";
+    }
+    return "?";
+}
+
+// -1 when the name is not a state ("foot", "seat", "door", "ragdoll": the glue's words)
+inline int ParseState(const char* s) {
+    if (!s) return -1;
+    const char* names[] = {"foot", "seat", "door", "ragdoll"};
+    for (int i = 0; i < 4; ++i) {
+        const char* a = s;
+        const char* n = names[i];
+        while (*a && *n && *a == *n) { ++a; ++n; }
+        if (*a == 0 && *n == 0) return i;
+    }
+    return -1;
+}
+
+// May script control be asked for now?
+inline bool MayAskScriptControl(bool brainPending, PuppetState s) {
+    return !brainPending && s == PuppetState::OnFoot;
+}
+
+// Must script control that is on be given back now (the puppet is about to be seated, walks to a door, goes down)?
+inline bool MustReleaseScriptControl(bool on, PuppetState s) { return on && s != PuppetState::OnFoot; }
+
+// The game's answer to ScriptControl that was asked for action `askedFor` (0: none asked, or given back since),
+// while action `running` plays (0: none): late (ignored) unless it is that same action, still running.
+inline bool LateScriptReply(uint32_t askedFor, uint32_t running) { return askedFor == 0 || askedFor != running; }
+
 }  // namespace mc::game::anim_methods

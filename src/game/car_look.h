@@ -80,6 +80,11 @@ Change Diff(const Look& have, const Look& want);
 // Who sends a car's look: the game that has the car itself (not a copy of ours): a player car's first driver (the car
 // key's owner: his real car, also while it is hidden behind a copy), the host for his traffic (only when asked). Only
 // copies we spawned ever take a look (a real car is never changed: the source never takes one back, so no echo).
+// Occupied copies: InstallTuningItems rebuilds the car (docs/re-notes.md 13), which would put whoever sits in it out
+// (a puppet seated in a copy, the copy seat-reload puts beside his car once the puppet is in it). So the tuning part
+// of a look waits while a copy is busy and is set once it is empty (colours, plate, tint, interior, dirt, rust and the
+// painting do not rebuild the car: they are set at once); and a new copy of a player car (holdMax s) that still lacks
+// its look or its tuning is listed in Outbox::holds, so player_sync seats the puppet only once the look is on.
 enum class Role : uint8_t { Source, Copy };
 
 struct CarInput {
@@ -88,6 +93,7 @@ struct CarInput {
     Role role = Role::Copy;
     int owner = -1;          // Copy: the player whose game sends the look (-1 unknown: nobody to ask)
     bool read = false;       // `have` could be read
+    bool busy = false;       // Copy: someone sits in it (a puppet, our player): its tuning waits (see Role)
     Look have;
 };
 
@@ -104,6 +110,8 @@ struct Outbox {
     std::vector<std::pair<int, Message>> to;             // answers to requests
     std::vector<std::pair<int, Message>> requests;       // asks for a look
     std::vector<Apply> applies;
+    std::vector<uint32_t> holds;                         // copies (entities) a puppet is not seated in yet: their
+                                                         // look (its tuning: a rebuild) is still to come
     std::vector<std::string> logs;
     std::vector<std::string> trace;                      // "CL..." record bodies (type first)
 };
@@ -114,6 +122,7 @@ struct BookConfig {
     int tries = 3;               // tries of one look on one entity before giving up (logged once)
     double minSendGap = 1.0;     // s between two looks of the same car from us (a change waits that long at most)
     double forget = 30.0;        // s a car may be missing from the rounds before it is forgotten
+    double holdMax = 4.0;        // s after a copy entity is first seen during which a puppet waits for its look
 };
 
 class Book {
@@ -130,7 +139,8 @@ public:
     std::vector<car_damage::CarRef> Wanted() const;
 
     struct Stats {
-        uint32_t cars = 0, sources = 0, copies = 0, matching = 0, waiting = 0, failed = 0;
+        uint32_t cars = 0, sources = 0, copies = 0, matching = 0, waiting = 0, failed = 0,
+                 deferred = 0;  // copies whose tuning waits this round (someone sits in them)
         uint64_t sent = 0, answers = 0, requests = 0, received = 0, applied = 0;
     };
     const Stats& GetStats() const { return stats_; }
@@ -155,6 +165,8 @@ private:
         double triedAt = -1e9;
         double requestAt = -1e9;
         bool gaveUp = false, matchLogged = false, modelWarned = false;
+        double boundAt = -1e9;   // this entity was first seen (holdMax)
+        bool deferred = false;   // its tuning waits: someone sits in the copy
     };
     BookConfig cfg_;
     std::map<car_damage::CarRef, Car> cars_;

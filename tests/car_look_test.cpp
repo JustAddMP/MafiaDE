@@ -287,6 +287,99 @@ void TestBookTraffic() {
     Check(og.applies.size() == 1 && og.applies[0].entity == 4242, "the traffic copy gets the look");
 }
 
+bool Holds(const Outbox& o, uint32_t ent) {
+    for (uint32_t e : o.holds)
+        if (e == ent) return true;
+    return false;
+}
+
+void TestBookOccupied() {
+    // a puppet sits in our copy (or the copy seat-reload put beside his car, once he is in it): the tuning would
+    // rebuild the car under him, so it waits; colours and plate are set at once
+    Two t;
+    Look car = Sedan(), copy = OpenCar();
+    t.oa = {};
+    t.a.Round({In("0:5000", 11, Role::Source, -1, car)}, t.now, t.oa);
+    t.Deliver();
+    bool tuningSent = false;
+    for (int i = 0; i < 12; ++i) {
+        t.ob = {};
+        CarInput in = In("0:5000", 22, Role::Copy, 0, copy);
+        in.busy = true;
+        t.b.Round({in}, t.now, t.ob);
+        for (const Apply& a : t.ob.applies) tuningSent = tuningSent || a.change.tuning;
+        Carry(t.ob, copy);
+        t.now += 0.5;
+    }
+    Check(!tuningSent, "no tuning set while someone sits in the copy");
+    Check(copy.color[0] == car.color[0] && copy.plate == car.plate && copy.tuning != car.tuning,
+          "colours and plate set at once, the tuning still the copy's own", copy.Describe());
+    Check(t.b.GetStats().deferred == 1 && t.b.GetStats().failed == 0 && t.b.GetStats().applied == 1,
+          "counted as waiting, not as a failed look", std::to_string(t.b.GetStats().applied));
+    // he gets out: the tuning is set now, with tries of its own
+    t.ob = {};
+    t.b.Round({In("0:5000", 22, Role::Copy, 0, copy)}, t.now, t.ob);
+    Check(t.ob.applies.size() == 1 && t.ob.applies[0].change.tuning && !t.ob.applies[0].change.color,
+          "once the copy is empty its tuning is set", t.ob.applies.empty() ? "" : t.ob.applies[0].change.Describe());
+    Carry(t.ob, copy);
+    t.now += 0.5;
+    t.ob = {};
+    t.b.Round({In("0:5000", 22, Role::Copy, 0, copy)}, t.now, t.ob);
+    Check(copy == car && t.ob.applies.empty() && t.b.GetStats().deferred == 0, "then the copy shows the whole look");
+    // a busy copy whose look change is only colours: set at once (no rebuild)
+    Look car2 = car;
+    car2.color[1] = 12;
+    t.oa = {};
+    t.now += 2;
+    t.a.Round({In("0:5000", 11, Role::Source, -1, car2)}, t.now, t.oa);
+    t.Deliver();
+    t.ob = {};
+    CarInput in = In("0:5000", 22, Role::Copy, 0, copy);
+    in.busy = true;
+    t.b.Round({in}, t.now, t.ob);
+    Check(t.ob.applies.size() == 1 && t.ob.applies[0].change.color && !t.ob.applies[0].change.tuning,
+          "a colour change is set on an occupied copy at once");
+}
+
+void TestBookHold() {
+    // a new copy of a player car: the puppet is not seated in it before its look (with the tuning) is on
+    Two t;
+    Look car = Sedan(), copy = OpenCar();
+    t.ob = {};
+    t.b.Round({In("0:5000", 22, Role::Copy, 0, copy)}, t.now, t.ob);
+    Check(Holds(t.ob, 22), "a new copy without its look is held back from the puppet");
+    t.oa = {};
+    t.a.Round({In("0:5000", 11, Role::Source, -1, car)}, t.now, t.oa);
+    t.Deliver();
+    t.now += 0.5;
+    t.ob = {};
+    t.b.Round({In("0:5000", 22, Role::Copy, 0, copy)}, t.now, t.ob);
+    Check(Holds(t.ob, 22) && !t.ob.applies.empty() && t.ob.applies[0].change.tuning, "held while its tuning is set");
+    Carry(t.ob, copy);
+    t.now += 0.5;
+    t.ob = {};
+    t.b.Round({In("0:5000", 22, Role::Copy, 0, copy)}, t.now, t.ob);
+    Check(!Holds(t.ob, 22), "free once it shows the look");
+    // a tuning the game refuses holds the puppet back holdMax s at most
+    Two r;
+    Look copy2 = OpenCar();
+    bool heldEarly = false, heldLate = false;
+    const double start = r.now;
+    for (int i = 0; i < 20; ++i) {
+        Step(r, car, copy2, false);
+        const double at = r.now - 0.5 - start;
+        if (at >= BookConfig{}.holdMax && Holds(r.ob, 22)) heldLate = true;
+        if (at > 0.4 && at < 2 && Holds(r.ob, 22)) heldEarly = true;
+    }
+    Check(heldEarly && !heldLate, "a tuning that does not take holds the puppet back at most holdMax s");
+    // an occupied copy is never held (he sits in it already); traffic copies are not held (no puppet seats there)
+    Outbox o;
+    CarInput busy = In("0:6000", 55, Role::Copy, 0, OpenCar());
+    busy.busy = true;
+    t.b.Round({busy, In("t9", 66, Role::Copy, 0, OpenCar())}, t.now, o);
+    Check(!Holds(o, 55) && !Holds(o, 66), "occupied and traffic copies are not held");
+}
+
 }  // namespace
 
 int main() {
@@ -298,6 +391,8 @@ int main() {
     TestBookRefused();
     TestBookOwnCopy();
     TestBookTraffic();
+    TestBookOccupied();
+    TestBookHold();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

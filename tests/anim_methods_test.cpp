@@ -113,6 +113,26 @@ void Forced() {
     Check(l.Confirmed(), "back to the confirmed one: still confirmed");
 }
 
+void ScriptControlRules() {
+    Check(ParseState("foot") == 0 && ParseState("seat") == 1 && ParseState("door") == 2 && ParseState("ragdoll") == 3,
+          "the glue's state words parse");
+    Check(ParseState("fo") == -1 && ParseState("doors") == -1 && ParseState(nullptr) == -1, "others do not");
+    Check(MayAskScriptControl(false, PuppetState::OnFoot), "asked for a puppet on foot with its brain switched");
+    Check(!MayAskScriptControl(true, PuppetState::OnFoot), "not before the friend brain switch is over");
+    Check(!MayAskScriptControl(false, PuppetState::Seat) && !MayAskScriptControl(false, PuppetState::DoorWalk) &&
+              !MayAskScriptControl(false, PuppetState::Ragdoll),
+          "not in a car seat, on the way to a car door or as a ragdoll");
+    Check(MustReleaseScriptControl(true, PuppetState::Seat) && MustReleaseScriptControl(true, PuppetState::DoorWalk) &&
+              MustReleaseScriptControl(true, PuppetState::Ragdoll),
+          "given back before a seat, a door walk and a ragdoll");
+    Check(!MustReleaseScriptControl(true, PuppetState::OnFoot), "kept on foot (the action plays)");
+    Check(!MustReleaseScriptControl(false, PuppetState::Seat), "nothing to give back when it is off");
+    Check(!LateScriptReply(4, 4), "the answer for the running action is taken");
+    Check(LateScriptReply(4, 0), "an answer after its action ended is late");
+    Check(LateScriptReply(4, 5), "an answer for an earlier action while the next one runs is late");
+    Check(LateScriptReply(0, 5), "an answer when nothing was asked (given back since) is late");
+}
+
 }  // namespace
 
 int main() {
@@ -123,6 +143,7 @@ int main() {
     Unknowns();
     Wrap();
     Forced();
+    ScriptControlRules();
     std::printf("%s (%d failure(s))\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
     return g_failures ? 1 : 0;
 }

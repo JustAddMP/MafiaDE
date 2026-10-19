@@ -845,6 +845,19 @@ void CarDamageSync::OnPlayerLeft(net::PlayerId id) {
     sh.book.OnPlayerLeft(static_cast<int>(id));
 }
 
+bool CarDamageSync::OnCarRebuilt(const car_damage::CarRef& ref) {
+    Shared& sh = S();
+    bool known;
+    {
+        std::lock_guard lock(sh.mu);
+        known = sh.book.OnRebuilt(ref, Now());
+    }
+    MC_LOG_INFO("damage: car %s was rebuilt by its look (tuning installed)%s", ref.Text().c_str(),
+                known ? ": its damage is put on the new parts, the rebuild's part change is no damage"
+                      : " before car damage knew it: nothing to do");
+    return known;
+}
+
 void CarDamageSync::Tick(float) {
     if (!_session) return;
     Shared& sh = S();

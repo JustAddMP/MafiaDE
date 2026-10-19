@@ -44,12 +44,13 @@ connection was lost keeps playing while core rejoins the host; the host holds hi
 Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
 
 Car damage: CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252); additive (a peer without them
-ignores them and keeps its own car damage). See "Car damage". Since fix-car-look a copy never reports its wreck, the
-exploded flag or the game's reaction to our own writes, and the holder drops such reports (rules only, the bodies are
-unchanged; an older peer's echoes are dropped by a newer holder).
+ignores them and keeps its own car damage). See "Car damage". Since the car damage echo fix a copy never reports its
+wreck, the exploded flag, the game's reaction to our own writes or the part change of a rebuild by its tuning, and
+the holder drops such reports (rules only, the bodies are unchanged; an older peer's echoes are dropped by a newer
+holder).
 
-Car look (fix-car-look): CarLook (0x0253), additive (a peer without it ignores it and keeps its copies as the game
-spawns them). See "Car look".
+Car look (a copy shows its car's colours, plate, tint, interior, painting and body variant): CarLook (0x0253),
+additive (a peer without it ignores it and keeps its copies as the game spawns them). See "Car look".
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -680,7 +681,7 @@ u8  n                     parts listed
 - A message that does not parse is dropped (counted, `bad msgs` in the overlay). Car refs of player cars that this
   game does not know are kept for 30 s (the copy may come a moment later).
 
-### Car look (fix-car-look; not yet checked in game)
+### Car look (a copy shows its car's look; not yet checked in game)
 
 Code: `src/game/car_look.{h,cpp}` (wire format, line form, the Book; unit-tested in `tests/car_look_test.cpp`),
 `src/game/car_look_sync.cpp` (messages, the native tuning read), `src/game/car_look.lua` (which cars, the reads and
@@ -727,6 +728,15 @@ About 30-40 bytes for a player car with a few tuning items; a request is 4 (traf
   (colours, plate, tint, interior, painting, the tuning items it lacks: `InstallTuningItems(ids...)`), up to 3 tries 2
   s apart; then it is given up (logged with what still differs) until a new look arrives or the copy is a new entity.
   Without a look it asks the car's game every 3 s.
+- **Occupied copies:** `InstallTuningItems` rebuilds the car (docs/re-notes.md 13), which would put whoever sits in
+  it out. So the tuning waits while a player (our own or another player's puppet) sits in a copy, and is set once it
+  is empty; colours, plate, tint, interior and painting do not rebuild the car and are set at once. A new copy of a
+  player car is held back from the puppet (player_sync seats it only after the look, with its tuning, is on) for 4 s
+  at most. Traffic copies with their own crew take the tuning as before. UNVERIFIED in game: that the rebuild puts a
+  seated human out, and that the other setters do not.
+- **Car damage:** after a rebuild by the tuning, car damage asks the holder for the whole state at once (a
+  CarDamageRequest), puts what it knows back on the new parts and does not report what the parts show new for 3 s
+  (the holder, when it is our own entity, reads no repair from the drop for as long).
 - **Car damage:** a copy of another body variant has another deform part list (CarDamage's layout hash differs, only
   tyres and the explosion are synced); once the tuning items match, the layout should too (UNVERIFIED).
 

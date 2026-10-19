@@ -34,6 +34,13 @@ Fixed (unverified in game):
   the copy's parts as well.
 - Car damage after an explosion is no longer undone: a copy never reports its wreck or the game's reaction to damage
   we set on it, and the holder never reads a wreck's change as a repair.
+- A car look no longer rebuilds a copy someone sits in (unverified in game): installing its tuning rebuilds the car,
+  so a remote player's puppet is seated in a new copy only once its look is on, and a tuning change that arrives
+  while he sits in it waits until the copy is empty (colours, plate and the rest are set at once). After a rebuild
+  car damage asks for the car's whole damage again and does not report the rebuild's part change.
+- Script control on puppets (unverified in game): it is no longer asked before the friend brain switch is done,
+  is given back before a car seat, a walk to a car door or a fall, is cleared when the puppet is re-created or
+  respawns, and a late answer for an action that is already over is ignored.
 
 ## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 

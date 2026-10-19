@@ -1278,6 +1278,29 @@ int McAnimSet(lua_State* L) {
     return 1;
 }
 
+// mc_anim_sc(op, ...) -> bool: script control on a puppet (game/anim_methods.h "script control"):
+//   mc_anim_sc("ask", brainPending, state)      may it be asked now (brainPending 1/0; state "foot", "seat",
+//                                               "door", "ragdoll")
+//   mc_anim_sc("release", on, state)            must it be given back now (on 1/0)
+//   mc_anim_sc("late", askedFor, running)       the game's answer is late (the action it was asked for is over)
+int McAnimSc(lua_State* L) {
+    const char* op = lua::ToString(L, 1);
+    auto num = [L](int i) { return lua::TypeOf(L, i) == lua::TNumber ? lua::ToNumber(L, i) : 0.0f; };
+    auto state = [L](int i) {
+        const int s = anim_methods::ParseState(lua::TypeOf(L, i) == lua::TString ? lua::ToString(L, i) : nullptr);
+        return s < 0 ? anim_methods::PuppetState::OnFoot : static_cast<anim_methods::PuppetState>(s);
+    };
+    bool r = false;
+    if (op && std::strcmp(op, "ask") == 0)
+        r = anim_methods::MayAskScriptControl(num(2) != 0.0f, state(3));
+    else if (op && std::strcmp(op, "release") == 0)
+        r = anim_methods::MustReleaseScriptControl(num(2) != 0.0f, state(3));
+    else if (op && std::strcmp(op, "late") == 0)
+        r = anim_methods::LateScriptReply(static_cast<uint32_t>(num(2)), static_cast<uint32_t>(num(3)));
+    lua::PushBool(L, r);
+    return 1;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1306,6 +1329,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_anim_method", &McAnimMethod);
     lua::RegisterGlobal(L, "mc_anim_report", &McAnimReport);
     lua::RegisterGlobal(L, "mc_anim_set", &McAnimSet);
+    lua::RegisterGlobal(L, "mc_anim_sc", &McAnimSc);
     return true;
 }
 
