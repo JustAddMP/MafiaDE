@@ -621,6 +621,18 @@ in-game check (README-dev.md "Test checklist: animation and car controls").
   really has (controls, wheel angle, engine, gear) against the driver's car. On foot the calibrated sprint was only
   ~3.3 m/s (the AI's), so sprinting players got 1.3-3.2 m ahead: the shortfall is now carried.
 
+- **The puppet's walk measured (0.15.0 traces, 2026-10-19; unreleased change built on it).** The controller's own
+  measurement (PUP `base`, `meas`) and 0.5 s windows of the puppet's reported positions (nudges taken out) per
+  commanded gait and multiplier: the game's AI walks ~1.3, runs ~2.2 and sprints ~3.3 m/s at multiplier 1, and sprint
+  at 1.8 reached a median 5.7 m/s (3.2 per unit of multiplier): `SetMovementSpeedMult` does scale the speed (partly
+  verified; whether the animation's stride follows is not). These are now the first guesses (game/player_motion.h
+  `FootTuning`); the calibration still runs. The puppet now walks with the gait its player's game reports (PlayerState
+  `mode`), and a changed multiplier re-issues `MoveVec` at once (up to 10 times a second instead of ~3; UNVERIFIED that
+  the AI takes re-issues that often without a hitch). A stop is a `MoveVec(point, "WALK")` to a point on the puppet's
+  own line of motion at most 0.35 s ahead (or its own position when it stands) instead of a walk to its player's spot;
+  UNVERIFIED that a walk to a point that close ends at once and stands it still (the rest of the gap is slid at
+  0.15 m/s).
+
 ## 15. Mission NPCs and cars on two games, the entity table - checked 2026-10-15
 
 Two instances on one PC; chapters Taxi (`mm_20_taxi` cp_010/cp_020) and Bon Appetit (`mm_140_salieri` cp_020). Used by
@@ -1131,6 +1143,19 @@ a seat holds; `puppet N: seat S of car K is taken here by ...` once per seat. Th
 the puppet's seat: ours / free / other / ?), `brain` (friend brain set), `ai` (GetAIType), `back` (put-backs),
 `leaving` and `ejAll` (docs/sync-trace.md); `tools/sync_compare.py` lists the throw-outs, the brain / put-back lines
 and the ride-along lines per player.
+
+**The 0.15.0 two-PC test (2026-10-19, session 2), one car model throws puppets out at once.** The host's
+`manta_prototype` (key 0:17647882) threw a puppet out 1-3 frames after every non-animated `GetOnVehicle`, on both
+games and in both seats: the host's puppet from seat 0 of the guest's freshly spawned, standing copy (guest
+21:06:49.27-49.94, four times, then "retrying slower") and the guest's puppet from seat 1 of the host's real car while
+the host drove it slowly (host 21:07:17.58-18.27 four times, again at 19.99; once it then stayed seated for 8.7 s).
+Each time the puppet landed 0.8 m from the car's origin, 1.3-1.4 m up (on the roof), with its physics state back to
+0 (PR `phys` 2 while seated), the seat reading free; the car got a downward kick (LR `cv` z -0.58). Between the seat
+command and the throw-out our code only seats (the in-car path of `M.Drive` makes no `SetPos`, no physics change;
+the friend brain was set, the puppet not hidden), and every other car of both sessions kept its puppets. So it is
+taken to be the game's doing for that car model (UNVERIFIED: a test with the manta and another car side by side
+would tell); the thrown-out line now names the model (`thrown out of car K (model) seat S ...`). Not ours to fix
+without knowing why; the slower retries hide the puppet at the car meanwhile as before.
 
 ## 19. Traffic and police on two games (B4) - static only, NOT verified in game
 

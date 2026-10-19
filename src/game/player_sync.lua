@@ -846,7 +846,8 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
   if cmd.fix == 2 or cmd.fix == 3 then
     ent:SetPos(V(tx, ty, tz))
     st.setPosT = M.now  -- car_damage.lua: a copy put in place by SetPos does not report its own bumps as damage
-  elseif cmd.fix == 1 then
+  elseif cmd.fix == 1 and math.abs(cmd.nx) + math.abs(cmd.ny) + math.abs(cmd.nz) > 1e-4 then
+    -- (a blend of the rotation alone, game/player_motion.h CarDriver, moves nothing: no SetPos)
     local p = ent:GetPos()
     ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
   end
@@ -864,6 +865,11 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
         .. "SetSpeed %.2f (wanted %.2f, SetSpeed as %s)", tostring(ent), st.probes, cmd.fix == 1 and "blend" or "pin",
         s0, s1, s2, speedOf(ent), want, tostring(st.speedHow)))
     end
+  end
+  -- not moved, but its own speed is off the driver's (the C++ side's CarDriver): his speed alone, no SetPos / SetRot
+  if cmd.fix == 0 and cmd.spd then
+    RV.GiveSpeed(st, ent, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0, cmd.rev or (cmd.gear or 0) < 0)
+    st.speedFixes = (st.speedFixes or 0) + 1
   end
   if cmd.fix == 3 and not st.snapLogged then
     st.snapLogged = true
@@ -2177,9 +2183,10 @@ function M.Seat(pp, c)
       local sp = M.SpeedMs(car)
       local cmd = pp.vcmd or {}
       local q, cp = so:GetPos(), car:GetPos()
-      log(string.format("puppet %s thrown out of car %s seat %d (#%d, %d this session): %.1f s after seating, car %.1f "
-        .. "m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, put-backs "
-        .. "%d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects, pp.ejectsAll,
+      log(string.format("puppet %s thrown out of car %s (%s) seat %d (#%d, %d this session): %.1f s after seating, car "
+        .. "%.1f m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, "
+        .. "put-backs %d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), tostring(c.model),
+        pp.seat, pp.ejects, pp.ejectsAll,
         M.now - (pp.seatedT or pp.seatT or M.now), sp, tostring(cmd.fix),
         cmd.pinned and " pinned" or "", g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
         seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.brain and "yes" or "no",
@@ -2819,9 +2826,12 @@ function M.Walk(pp, so)
     so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z + (lc.nz or 0)))  -- nz: after a traversal move (a ledge, a ladder)
   end
   if lc.reissue then
-    if lc.gait == 0 then  -- stop: walk the last bit to his spot and stand there
+    if lc.gait == 0 then
+      -- stop: a walk to where the puppet comes to rest by itself on its own line of motion (the C++ side's stop point,
+      -- game/player_motion.h FootDriver; never back to a point it passed, no shuffle for the last bit); the rest
+      -- blend slides it onto his spot (UNVERIFIED in game: a MoveVec to a point this close ends the walk at once)
       M.SpeedMult(pp, so, 1)
-      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
+      so:MoveVec(V(lc.mx, lc.my, lc.mz), "WALK")
       pp.moving = false
     else
       M.SpeedMult(pp, so, lc.mult)
@@ -5466,7 +5476,8 @@ function M.Update(dt, cmds)
         qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
         ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0,
-        sig = n(f[64]) or 0 }
+        sig = n(f[64]) or 0,
+        spd = f[69] == "1" }  -- not moved this tick, but its speed is off his: give it his (game/player_motion.h)
       pp.lc.nz = n(f[65]) or 0
       pp.pose, pp.body = math.floor(n(f[66]) or 0), n(f[67]) or 0
       pp.fast = f[68] == "1"  -- too fast for one on foot: hidden (game/puppet_guard.h FastFoot)

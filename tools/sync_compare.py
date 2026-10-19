@@ -437,6 +437,52 @@ def compare(sender, receiver, args, worst):
         print("  car note: %s" % s.split("sync: ", 1)[-1][:160])
 
 
+def players(sender, receiver):
+    """Package `players` (docs/sync-architecture.md section 8): how the puppet and the car copy of `sender` were driven
+    on `receiver`'s game - the new PUP / VEH fields (hint, rest blend, brake slide, lead; pinned time, speed fixes,
+    skids) and the parked cars a newcomer got. Traces from before the package have none of it ("older trace")."""
+    sid = sender.local
+    pup = [f for _, f in receiver.records["PUP"] if num(f.get("id"), -1) == sid and f.get("have") == "1"]
+    veh = [f for _, f in receiver.records["VEH"] if num(f.get("id"), -1) == sid and f.get("have") == "1"]
+    pks = [f for _, f in sender.records["PKS"] if num(f.get("to"), -1) == receiver.local]
+    pkr = [f for _, f in receiver.records["PKR"]]
+    if not (pup or veh or pks or pkr):
+        return
+    section("Driving %s (player %d) on %s's game: puppet and car copy" % (sender.name, sid, receiver.name))
+    hinted = [f for f in pup if "hint" in f]
+    if pup and not hinted:
+        print("  on foot: older trace (no hint / rest / brake fields)")
+    elif hinted:
+        n = len(hinted)
+        same = sum(1 for f in hinted if f.get("hint") == f.get("g"))
+        rest = sum(1 for f in hinted if f.get("rest") == "1")
+        brk = sum(1 for f in hinted if f.get("brk") == "1")
+        stp = sum(1 for f in hinted if f.get("stp") == "1")
+        lead = [num(f.get("lead"), 0) for f in hinted]
+        print("  on foot: %d samples; commanded gait = his reported gait %.1f %% (the rest: he stands, it walks to his"
+              " spot)" % (n, 100.0 * same / n))
+        print("    rest blend %.1f %%, brake slide %.1f %%, walking to his stop point %.1f %% of samples; lead median "
+              "%.0f ms" % (100.0 * rest / n, 100.0 * brk / n, 100.0 * stp / n, pct(lead, 50)))
+    new_veh = [f for f in veh if "pf" in f]
+    if veh and not new_veh:
+        print("  car: older trace (no pinned-for / speed-fix fields)")
+    elif new_veh:
+        n = len(new_veh)
+        pf = [num(f.get("pf"), 0) for f in new_veh if f.get("pin") == "1"]
+        gs = sum(1 for f in new_veh if f.get("gs") == "1")
+        skid = sum(1 for f in new_veh if f.get("skid") == "1")
+        quiet = sum(1 for f in new_veh if f.get("fix") == "0")
+        print("  car: %d samples; nothing set on the copy %.1f %%, given his speed alone %d times, his car sliding "
+              "%.1f %%" % (n, 100.0 * quiet / n, gs, 100.0 * skid / n))
+        if pf:
+            print("    pinned: longest %.1f s (retried after 1.5 s doubling to 8 s)" % max(pf))
+    for f in pks:
+        print("  parked cars sent to %s on joining: %s in %s message(s)" % (receiver.name, f.get("n"), f.get("msgs")))
+    for f in pkr:
+        print("  parked cars received from the host: %s, placed %s, destroyed ones left out %s" % (
+            f.get("n"), f.get("applied"), f.get("wrecked")))
+
+
 def npcs(guest):
     ngs = [f for _, f in guest.records["NGS"]]
     if not ngs:
@@ -1334,6 +1380,8 @@ def main():
     worst = []
     compare(a, b, args, worst)
     compare(b, a, args, worst)
+    players(a, b)
+    players(b, a)
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
