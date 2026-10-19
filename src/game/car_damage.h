@@ -18,6 +18,14 @@
 // authority (a part's damage went down, a tyre came back, the explosion was undone) moves the car's epoch on, and a
 // copy that sees a newer epoch repairs itself first. Damage a copy takes on its own game (a guest shooting the host's
 // tyres) is reported to the authority, which applies it to the real car and sends it back to everyone.
+// Echoes (0.15.0 in-game test: a copy's wreck came back to the host as a report, and the host read the drop that
+// followed as a repair): only damage a copy really took on its own game is reported. A copy never reports anything
+// while it or the authority's car is exploded, never reports the exploded flag (it never blows up by itself), and
+// for echoQuiet s after we wrote cascading damage on it (an explosion, a fire, a wheel, a part broken off) whatever
+// new damage it shows is taken as the game's reaction to our own writes (absorbed, not reported). The holder ignores
+// reports of a car that is exploded on its game and the exploded flag in any report, and a car that stays exploded is
+// never "repaired" (a wreck's parts change by themselves); for repairGrace s after it wrote damage on its own car
+// (a report, a blast, a new entity) a drop is no repair either.
 #include <cstdint>
 #include <map>
 #include <set>
@@ -213,6 +221,9 @@ struct BookConfig {
     int quietRepairMin = 30;     // quanta of such damage (summed) before a copy is repaired and set again
     double forget = 30.0;        // s a car may be missing from the rounds before it is forgotten
     double blastQuiet = 1.5;     // s after we put another game's blast on our car: copies' reports of it are dropped
+    double echoQuiet = 1.5;      // s after cascading writes on a copy (explode, fire, wheels, a gone part): what it
+                                 // shows new is our own writes' echo, not reported
+    double repairGrace = 1.0;    // s after the holder wrote damage on its own car: a drop is not read as a repair
 };
 
 class Book {
@@ -231,7 +242,9 @@ public:
     struct Stats {
         uint32_t cars = 0, authority = 0, copies = 0, damaged = 0;
         uint64_t sent = 0, fulls = 0, reports = 0, requests = 0, received = 0, applied = 0, repairs = 0,
-                 explosions = 0, reportsIn = 0, blasts = 0, blastDropped = 0;
+                 explosions = 0, reportsIn = 0, blasts = 0, blastDropped = 0,
+                 echoesAbsorbed = 0,  // copy: rounds whose new damage was taken as an echo of our writes (not sent)
+                 echoesDropped = 0;   // holder: reports dropped as echoes (car exploded here, exploded flag)
     };
     const Stats& GetStats() const { return stats_; }
     // test access
@@ -268,6 +281,8 @@ private:
         bool layoutWarned = false;
         bool fresh = false;          // a new entity: checked once for damage the car does not have
         double blastUntil = -1e9;    // authority: copies' reports dropped until then (OnRemoteBlast)
+        double wroteAt = -1e9;       // authority: we last wrote damage on our own car (repairGrace)
+        double echoUntil = -1e9;     // copy: what it shows new until then is an echo of our cascading writes
     };
     void AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);
     void CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbox& out);

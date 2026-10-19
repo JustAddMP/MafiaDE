@@ -887,7 +887,7 @@ function M.AsideSpotFor(c, near)
   return nil
 end
 
--- Log and trace a change of where his copy stands (mc_copyplace's answer; SEA ev=place, docs/sync-trace.md); a
+-- Log and trace a change of where his copy stands (mc_copyplace's answer; SCP ev=place, docs/sync-trace.md); a
 -- wait is logged again every 30 s.
 function M.PlaceLog(c, dec, blockD, spot, block)
   local again = dec == "wait" and M.now - (c.placeT or -100) >= 30
@@ -918,7 +918,7 @@ function M.PlaceLog(c, dec, blockD, spot, block)
   elseif dec == "hold" then line = string.format(text.hold, what, d)
   else line = string.format(text.release, d) end
   log("car " .. c.key .. ": " .. line)
-  trace("SEA", string.format("key=%s ev=place dec=%s blk=%.2f for=%.1f spot=%s", c.key, dec, d, since,
+  trace("SCP", string.format("key=%s ev=place dec=%s blk=%.2f for=%.1f spot=%s", c.key, dec, d, since,
     spot and string.format("%d:%.2f,%.2f,%.2f", spot.i, spot.x, spot.y, spot.z) or "-"))
 end
 
@@ -1099,7 +1099,7 @@ function M.DropOldCopy(c, block)
   if pup or loc or other then return false end
   log(string.format("car %s: the parked copy of car %s (last driven by player %s) stands where his car is: dropped "
     .. "(his car's id changed: a reload or a rejoin?)", c.key, k, tostring(bc.lastDriver or "?")))
-  trace("SEA", string.format("key=%s ev=oldcopy drop=%s last=%s", c.key, k, tostring(bc.lastDriver or "-")))
+  trace("SCP", string.format("key=%s ev=oldcopy drop=%s last=%s", c.key, k, tostring(bc.lastDriver or "-")))
   M.DropCar(bc)
   c.lookT = nil  -- look again on the next tick
   return true
@@ -1196,7 +1196,7 @@ function M.CarsNewWorld()
   end
   if #dropped > 0 then
     log("new world: car records looked up again: " .. table.concat(dropped, " "))
-    trace("SEA", "ev=world dropped=" .. table.concat(dropped, ","))
+    trace("SCP", "ev=world dropped=" .. table.concat(dropped, ","))
   end
 end
 
@@ -1289,7 +1289,7 @@ function M.CarsUpdate(p)
       if pp.carKey ~= pp.vkey then
         if pp.carKey then
           log(string.format("player %s drives car %s now (was %s)", id, pp.vkey, pp.carKey))
-          trace("DRV", string.format("key=%s ev=newkey id=%s was=%s st=%s", pp.vkey, id, pp.carKey,
+          trace("DRK", string.format("key=%s ev=newkey id=%s was=%s st=%s", pp.vkey, id, pp.carKey,
             tostring(M.cars[pp.vkey] and M.cars[pp.vkey].st)))
         end
         pp.carKey = pp.vkey
@@ -1899,7 +1899,7 @@ function M.Drive(pp)
         pp.leaving, pp.seatCheckOff, pp.seatedT = nil, nil, nil
         log("puppet " .. pp.id .. ": car " .. tostring(pp.vkey) .. " is another car here now" ..
           (c.aside and " (a copy beside his car)" or "") .. ": seated anew")
-        trace("SEA", string.format("key=%s ev=reseat id=%s seat=%d aside=%d", tostring(pp.vkey), pp.id, pp.seat,
+        trace("SCP", string.format("key=%s ev=reseat id=%s seat=%d aside=%d", tostring(pp.vkey), pp.id, pp.seat,
           c.aside and 1 or 0))
       end
       pp.seatCar = c.ent

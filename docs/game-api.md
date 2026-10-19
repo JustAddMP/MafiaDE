@@ -1364,10 +1364,33 @@ left. Same model = same part list: a layout hash of the part types tells whether
   (raise-only) and its next change brings it back to everyone. While a copy is moved by SetPos (pinned / snapped
   by the car controller, the last second) its own part damage is **not** reported (those are bumps from being put in
   place, not real damage); once such damage adds up (30 quanta) the copy is repaired and set to the authority's
-  again (at most every 20 s). Tyres, the fire and the explosion of a copy are reported even then.
+  again (at most every 20 s). Tyres and the fire of a copy are reported even then.
+- **Echoes never come back** (0.15.0 one-PC test: `car:Explode()` on the host's car; the guest's copy was blown up
+  through the one explode routine, its wreck - 3 wheels off - came back as a CarDamageReport, the host put it on his
+  wreck (`damage another game's copy took is put on our car (0 parts, 3 wheels)`) and read the drop that followed as
+  a repair (`repaired on our game (was ... exploded; now parts 18/33 ...)`), so every copy repaired itself: the
+  explosion undid the host's damage). Only damage a copy really took on its own game is reported now:
+  - a copy never reports anything while it or the holder's car is exploded (a wreck shows what the explosion did to
+    it on this game; the explosion is the holder's), and never the exploded flag (a copy never blows up by itself);
+  - for 1.5 s after we wrote cascading damage on a copy (an explosion, a fire, a wheel taken off, a part broken off)
+    whatever new damage it shows is the game's reaction to our writes: taken as reported (logged `an echo of our own
+    writes, not reported`, traced `CDX ... echo=wreck|write`), so only damage beyond it is ever sent;
+  - the holder drops every report of a car that is exploded on its game and the exploded flag in any report (older
+    builds' copies still send them; counted `echoesDropped`);
+  - a car that stays exploded is never "repaired" (its wreck changes by itself), and for 1 s after the holder wrote
+    damage on its own car (a report, another game's blast, a new entity) a drop is taken as the game's reaction, not
+    a repair (logged `taken as the game's reaction, no repair`, traced `CDT kind=drop-after-write`). A real repair in
+    that second is missed (the car's next change still goes out; copies only ever raise). UNVERIFIED that the game's
+    own reactions all come within these windows.
+  Tests: `TestExplosionEcho`, `TestWriteEcho` in tests/car_damage_test.cpp.
 - **A new entity for a car** (our own car back from behind a copy, section 15 "Mission car back"; a fresh copy for
   a new driver): it gets the authority's damage at once; if it has damage the car does not (the driver had it
   repaired while ours was hidden), it is repaired first. The authority's own new entity gets what everyone was told.
+- **The same parts:** a copy of another body variant has another part list (0.15.0 test: `our copy's parts differ
+  from the authority's (... layout 7d84a644 vs fe918d3f): only tyres and the explosion are synced`, the copy was the
+  open smith_v12, the car the closed one). The car look sync below gives the copy the car's tuning items (its body);
+  the damage book reads the layout every round, so once the copy's body matches, its parts are synced too
+  (UNVERIFIED that the tuning items make the part lists equal).
 - **The fire and the explosion - one explosion, on the holder's game only.** A car blows up for real only on the
   game that holds its damage. On every other game (a copy, or a real car another game holds) it never blows up by
   itself:
@@ -1411,7 +1434,8 @@ left. Same model = same part list: a layout hash of the part types tells whether
 (...)`, `car entity N: 2 of 2 parts set (0 refused by the game, 0 failed), 1 of 1 wheels, fire started / blown up`,
 `our copy took damage of its own (...): reported to player N's game`, `damage another game's copy took is put on our
 car`, `repaired on our game ...: epoch N`, `our copy is repaired (why ...)`, `our game holds its damage now`,
-`its damage cannot be read (why)`. Sync trace: CDS, CDT, CDR, CDA, CDX, CDQ (docs/sync-trace.md);
+`its damage cannot be read (why)`, `an echo of our own writes, not reported`, `taken as the game's reaction, no
+repair`. Sync trace: CDS, CDT, CDR, CDA, CDX, CDQ (docs/sync-trace.md);
 `tools/sync_compare.py` lists them and each player car's last state on both games side by side.
 
 **UNVERIFIED (all of it, static only):** the field offsets and flag meanings (part list, energy and maximum, gone
@@ -1423,3 +1447,50 @@ exact shape); that the tyre and wheel functions are safe to call with r8 = false
 `DisableExplosion` stops the native fire / explosion on a copy (read back and logged; Lua fallback for the
 explosion); that a part the game refuses (inactive, already gone) is reported as refused, not crashed (guarded);
 GetDamage's scale (read from the code: 100 = exploded) in a running game; which part type is which beyond the engine.
+
+### Car look: a copy looks like the car - static only, NOT verified in game
+
+0.15.0 one-PC test: the host drove a black closed smith_v12 sedan (plate ZK-299); the guest's copy was a light-blue
+open smith_v12 (plate NY 858). A player car's copy was spawned with `ObtainSpecificCar(model)` and nothing else, so
+the game picked its own variant, colours and plate (TrafficSpawn carried colours and plate for traffic copies only).
+Now the game that has the car itself sends its look once (and on change) in CarLook (0x0253, docs/protocol.md "Car
+look"), and every copy we spawned takes it. Code: src/game/car_look.{h,cpp} (wire, line form, diff, the Book; tests in
+tests/car_look_test.cpp), src/game/car_look_sync.cpp (messages, the native tuning read), src/game/car_look.lua (which
+cars, the reads and setters).
+
+**What makes a car's look** (found statically, docs/re-notes.md 13):
+
+| what | how it is read / set | notes |
+|---|---|---|
+| model | `car:GetVehicleModelName()` | the vehicles table row's name (entity + 0x1FA8 -> the row, its name at +0x14; `GetCarTableId()` is the row's id at +0). The vehicles table has **one row per model** (tables.sds: `smith_v12` once), so the variant is not a table row; `ObtainSpecificCar` takes only the model name (one argument) |
+| look flags | `car:HasVehicleLookFlag({enums...})` | `C_WrapE_TrafficVehicleLookFlags` CONVERTIBLE_CLOSED, CONVERTIBLE_OPENED, HARDTOP, ROOFRACK, PICKUP, ... are read from the **table row** (row + 4, 16 bytes of flags), the same for every car of a model: what the model can be, not what this car is. Not used |
+| body variant: tuning items | `mc_car_tuning(id)` (ours) / `car:InstallTuningItems(id, id, ...)` | **the per-car part**: entity + 0x1B20 is the car's tuning; +0xF0 / +0xF8 its slots (0x18 bytes: +0 the tuning table item installed there or null, +0x10 u16 the slot kind). The global tuning table: 0xD0-byte items, +0 u16 item id, +2 u16 slot kind. `InstallTuningItems` takes the item ids as separate numbers (variadic, read as u16) and puts each in the car's slot of its kind (exe+0x2586E90), then rebuilds the car (exe+0x256CC30). The traffic generator picks a car's tuning (`car_traffic_tuning` in tables.sds); `IsInstalledTuning(id)` reads one. That the open / closed roof is a tuning slot is **UNVERIFIED** (the strings `E_SE_CAR_CUSTOMIZATION_PURCHASE_ROOF`, `Car_No_Roof`, `CarRoof` point there) |
+| colours | `car:GetColor(1)`, `GetColor(2)` / `car:SetColor(c1, c2)` | GetColor passes `slot - 1` to its native (exe+0x254C0C0): the slots are 1 and 2 (section 19's question answered). What the number is (a colour table index) is not known; `SetColor` takes two numbers (it also has a string form) |
+| plate | `car:GetSPZText()` / `car:SetSPZText(text, true)` | a string; may hold a space (`NY 858`): escaped on the line form, never cut to letters and digits |
+| window tint, interior | `GetWindowTint()` / `SetWindowTint(n)`, `GetInteriorColorsSet()` / `SetInteriorColorsSet(n)` | numbers |
+| painting | `GetPainting()` / `SetPainting(s)` | a string (entity + 0x1FC0, or the game's default) |
+| dirt, rust | `GetDirty()` (entity + 0xD58), `GetRust()` | floats of an unknown scale, and a car gets dirtier while it drives: **not carried** (always sent as unknown; the wire has the fields) |
+
+**Who sends, who takes:** the game that has the car itself: a player car's first driver (the car key's owner: his
+real car, also while it is hidden behind a copy because another player drives it), the host for his traffic (only to
+a guest who asks: a guest's traffic copy asks once it is ready). Only copies we spawned (player_sync's copies,
+traffic_sync's copies) ever take a look: a real car (ours, an adopted mission or traffic car) is never changed, and
+the car's game never takes a look back, so a look cannot echo. A copy without a look asks every 3 s; a look that
+does not take is tried 3 times (2 s apart), then given up and logged with what still differs; a new entity for the
+car (a fresh copy) is tried again. A copy of another model (it should not happen: player_sync spawns the driver's
+model) gets what can be set.
+
+**Logs** (main log, `look: ...`): `car tuning layout confirmed` at start, per car `its look from our game (#n):
+smith_v12 colours 3/7 plate 'ZK-299' ... tuning 12,40,77`, `player N's car K (#n): ...` (received), `its look set on
+our copy (entity E, try n: colours, plate, tuning 1 item(s) 40; it had ...)`, `car entity E: colours, plate, tuning
+40` (what the setters said), `our copy (entity E) shows its look` (the read back matches), `does not take its look
+after 3 tries: still differs in ...`, `car entity E: tuning slots (slot:item) 3:12,5:40,9:77` (each car once). Sync
+trace: CLS, CLR, CLQ, CLA, CLW, CLM, CLF (docs/sync-trace.md). The overlay: `Car looks: N cars (ours, copies: match,
+waiting, not taken); tuning read`.
+
+**UNVERIFIED (all of it):** the tuning layout (offsets above; the dll checks the install function's and the
+InstallTuningItems loop's bytes, which hold them, and disables the tuning read otherwise: `car tuning layout not
+found`); that the open / closed body (and the other visible variant parts) are tuning items; that `InstallTuningItems`
+on a spawned car changes its body (and its deform part list: car damage's layout then matches); that `SetColor(c1,
+c2)` with `GetColor`'s numbers gives the same paint; `SetSPZText`'s bool; whether a traffic copy's colours / tuning
+are already what TrafficSpawn set (the copy is checked against the look either way).

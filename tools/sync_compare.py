@@ -493,11 +493,15 @@ def car_damage(a, b):
         sent = Counter(f.get("kind", "?") for _, f in tr.records["CDT"])
         got = Counter(f.get("kind", "?") for _, f in tr.records["CDR"])
         applied = Counter(f.get("why", "?") for _, f in tr.records["CDA"])
-        print("  %s's game (%s): sent %s; received %s; set on cars %s; own damage reported %d, state asked for %d" % (
-            tr.name, tr.role, ", ".join("%s %d" % kv for kv in sorted(sent.items())) or "-",
-            ", ".join("%s %d" % kv for kv in sorted(got.items())) or "-",
-            ", ".join("%s %d" % kv for kv in sorted(applied.items())) or "-",
-            len(tr.records["CDX"]), len(tr.records["CDQ"])))
+        reported = [f for _, f in tr.records["CDX"] if "echo" not in f]
+        echoes = Counter(f.get("echo") for _, f in tr.records["CDX"] if "echo" in f)
+        print("  %s's game (%s): sent %s; received %s; set on cars %s; own damage reported %d, state asked for %d; "
+              "echoes not reported %s" % (
+                  tr.name, tr.role, ", ".join("%s %d" % kv for kv in sorted(sent.items())) or "-",
+                  ", ".join("%s %d" % kv for kv in sorted(got.items())) or "-",
+                  ", ".join("%s %d" % kv for kv in sorted(applied.items())) or "-",
+                  len(reported), len(tr.records["CDQ"]),
+                  ", ".join("%s %d" % kv for kv in sorted(echoes.items())) or "-"))
         for t, f in tr.records["CDS"]:
             last[(tr.name, f.get("ref"))] = (t, f)
         unread = sorted({f.get("ref") for _, f in tr.records["CDS"] if f.get("read") == "0"})
@@ -531,6 +535,27 @@ def car_damage(a, b):
         if tc:
             dmg = [r for r in tc if num(last[(tr.name, r)][1].get("dmg"), 0) or last[(tr.name, r)][1].get("tyres") != "0"]
             print("  %s's traffic cars: %d (%d damaged: %s)" % (tr.name, len(tc), len(dmg), ", ".join(dmg[:10]) or "-"))
+
+
+def car_looks(a, b):
+    """Car look sync (docs/sync-trace.md CLS / CLR / CLQ / CLA / CLW / CLM / CLF): the looks each game sent, and per
+    copy whether it took the car's look."""
+    if not any(tr.records[k] for tr in (a, b) for k in ("CLS", "CLR", "CLA", "CLQ")):
+        return
+    section("Car looks")
+    for tr in (a, b):
+        sent = [f for _, f in tr.records["CLS"] if "answer" not in f]
+        answers = [f for _, f in tr.records["CLS"] if "answer" in f]
+        print("  %s's game (%s): looks sent %d, answers %d, received %d, asked %d, set on copies %d, matching %d, "
+              "given up %d" % (tr.name, tr.role, len(sent), len(answers), len(tr.records["CLR"]), len(tr.records["CLQ"]),
+                               len(tr.records["CLA"]), len(tr.records["CLM"]), len(tr.records["CLF"])))
+        for f in sent[:6]:
+            print("    ours %-12s %s" % (f.get("ref"), (f.get("look") or "").replace("|", " ")))
+        for _, f in tr.records["CLW"][:6]:
+            print("    set on entity %s: %s" % (f.get("ent"), (f.get("res") or "").replace(";", ", ").replace("_", " ")))
+        for _, f in tr.records["CLF"][:6]:
+            print("    NOT taken: %s entity %s still differs in %s" % (f.get("ref"), f.get("ent"),
+                                                                     (f.get("what") or "").replace("|", " ")))
 
 
 def reconnects(tr):
@@ -769,6 +794,7 @@ def main():
     host = a if a.role == "host" else b if b.role == "host" else None
     traffic(host, guest)
     car_damage(a, b)
+    car_looks(a, b)
     bandwidth((a, b))
     latency((a, b))
     if worst:

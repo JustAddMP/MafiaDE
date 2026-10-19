@@ -43,8 +43,13 @@ connection was lost keeps playing while core rejoins the host; the host holds hi
 
 Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
 
-Car damage: CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252), 0x0253 reserved; additive (a
-peer without them ignores them and keeps its own car damage). See "Car damage".
+Car damage: CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252); additive (a peer without them
+ignores them and keeps its own car damage). See "Car damage". Since fix-car-look a copy never reports its wreck, the
+exploded flag or the game's reaction to our own writes, and the holder drops such reports (rules only, the bodies are
+unchanged; an older peer's echoes are dropped by a newer holder).
+
+Car look (fix-car-look): CarLook (0x0253), additive (a peer without it ignores it and keeps its copies as the game
+spawns them). See "Car look".
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -623,7 +628,7 @@ messages ignores them (and keeps each game's own car damage, as before).
 | 0x0250 | CarDamage | the game that holds a car's damage -> everyone (`Broadcast`; the host's traffic: host -> guests); an answer to a request -> that player (`SendTo`) | R | see below |
 | 0x0251 | CarDamageReport | a game with a copy -> the game that holds the car (`SendTo`; `SendToHost` for the host and his traffic) | R | the same body: what the copy has beyond the holder's state (parts, wheels, the fire / explosion bits) |
 | 0x0252 | CarDamageRequest | a game with a new copy or entity for a car -> the game that holds it | R | car ref only: send me the whole state (answered with a full CarDamage) |
-| 0x0253 | reserved (car damage) | | | |
+| 0x0253 | CarLook | see "Car look" | | |
 
 Body (CarDamage and CarDamageReport; 18 bytes for a player car, 15 for traffic, + 1 per 4 wheels + 2 per listed part; at most ~520):
 
@@ -656,7 +661,13 @@ u8  n                     parts listed
   asks (CarDamageRequest, every 3 s) until it has a full state. A copy whose own damage stands above the holder's for
   0.4 s reports it (CarDamageReport, only what it did not report yet); not while it was moved by SetPos in the last
   second (pinned or snapped by the car controller), except tyres and the fire / explosion bits; such bumps are
-  undone by a repair once they add up (see docs/game-api.md 24). A copy never blows up by itself: a burning copy
+  undone by a repair once they add up (see docs/game-api.md 24). **Echoes are never reported** (0.15.0 test: a
+  copy's wreck came back as a report and the holder read the drop that followed as a repair): nothing while the copy
+  or the holder's car is exploded, never the exploded flag, and nothing new for 1.5 s after this game wrote cascading
+  damage on the copy (an explosion, a fire, a wheel, a part broken off: the game's reaction to our writes is taken as
+  reported). The holder drops reports of a car that is exploded on its game and the exploded flag in any report; a
+  car that stays exploded is never a repair, nor is a drop within 1 s of the holder's own writes on its car (a
+  report, a blast, a new entity). A copy never blows up by itself: a burning copy
   burns with its countdown held, and the holder's exploded flag (or the explosions sync's CarExploded, whichever comes
   first) sets it exploded once, with a visual-only picture ("Explosions"; docs/game-api.md 24 "One explosion").
 - **Blasts on other games:** an Explosion from another game (a picture here) is put on the cars this game holds
@@ -668,6 +679,56 @@ u8  n                     parts listed
   to his car.
 - A message that does not parse is dropped (counted, `bad msgs` in the overlay). Car refs of player cars that this
   game does not know are kept for 30 s (the copy may come a moment later).
+
+### Car look (fix-car-look; not yet checked in game)
+
+Code: `src/game/car_look.{h,cpp}` (wire format, line form, the Book; unit-tested in `tests/car_look_test.cpp`),
+`src/game/car_look_sync.cpp` (messages, the native tuning read), `src/game/car_look.lua` (which cars, the reads and
+setters). What is read and set on the game: docs/game-api.md 24 "Car look", docs/re-notes.md 13. Additive: a build
+without it ignores CarLook and keeps its copies as the game spawns them (another variant, colour and plate).
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0253 | CarLook | a player car's look: its key owner's game -> everyone (`Broadcast`, on change) or -> one player (`SendTo`, an answer); a request: a game with a copy -> the game that has the car (`SendTo`; `SendToHost` for the host and his traffic); a traffic car's look: host -> the guest who asked (`SendTo`) | R | see below |
+
+Body:
+
+```
+u8  op                    0 look, 1 request (the car ref follows; nothing more)
+u8  refKind               0 player car: u8 keyOwner, u32 vehId (the car key, Phase 3 "Shared cars");
+                          1 the host's traffic car: u16 net (TrafficSpawn's net id)
+op 0 only:
+u16 seq                   the sender's look number for this car (moves on with every change)
+str model                 GetVehicleModelName (at most 64)
+i16 color1, color2        GetColor(1), GetColor(2) (-1 unknown)
+str plate                 GetSPZText ("" unknown; at most 16, may hold spaces)
+i16 tint                  GetWindowTint (-1 unknown)
+i16 interior              GetInteriorColorsSet (-1 unknown)
+u8  dirt, rust            0..250 (x 250 of a 0..1 scale), 255 unknown: always 255 for now (scale UNVERIFIED)
+str painting              GetPainting ("" none / unknown; at most 64)
+u8  flags                 bit0: the tuning was read (else the list is empty and means "unknown")
+u8  n                     tuning items (at most 32)
+    n x u16               the installed tuning item ids, slot order (mc_car_tuning)
+```
+
+About 30-40 bytes for a player car with a few tuning items; a request is 4 (traffic) or 7 bytes (player car).
+
+- **Who sends:** the game that has the car itself, never a copy: a player car's key owner (its first driver: his
+  real car, also while it is hidden behind a copy because another player drives it), once when it is first seen and
+  whenever the look changes (at most once a second), plus an answer to whoever asks; the host for his traffic, only
+  to a guest who asks (by net id on the wire, his entity id inside his book, like car damage). A message that does
+  not parse is dropped (`bad msgs` in the overlay); a traffic look from anyone but the host, or a traffic request to a
+  guest, is ignored.
+- **Who takes it:** only copies this game spawned (player_sync's copies of player cars, traffic_sync's copies of the
+  host's traffic). A real car (ours, an adopted mission or traffic car) is never changed, and the car's own game
+  never takes a look, so a look cannot echo. The newest `seq` of the sender counts; a look from another sender
+  replaces it (the car changed hands).
+- **A copy:** reads its own look every round (0.5 s; a traffic copy older than 10 s every 3 s) and sets what differs
+  (colours, plate, tint, interior, painting, the tuning items it lacks: `InstallTuningItems(ids...)`), up to 3 tries 2
+  s apart; then it is given up (logged with what still differs) until a new look arrives or the copy is a new entity.
+  Without a look it asks the car's game every 3 s.
+- **Car damage:** a copy of another body variant has another deform part list (CarDamage's layout hash differs, only
+  tyres and the explosion are synced); once the tuning items match, the layout should too (UNVERIFIED).
 
 ### World items (not yet checked in game)
 

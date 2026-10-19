@@ -7,7 +7,7 @@ All addresses are **RVAs**. Add the runtime module base to get an address; the p
 
 ```
 python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" "48 8B 0D ?? ?? ?? ?? 48 85 C9 74 07 48 8B 01 48 FF 60 20 C3"
-python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 81 patterns below; prints OK/FAIL each)
+python docs/re-tools/scan.py "<game>\mafiadefinitiveedition.exe" --file docs/re-tools/patterns.txt   (all 83 patterns below; prints OK/FAIL each)
 ```
 
 Confidence tags:
@@ -1012,6 +1012,52 @@ Why a puppet showed no punch in the 0.15.0 test (docs/game-api.md 17 "Why no pun
 - Animation sets: tables.sds lists `/sds/basic_anim/{skeletons, anim_project, basic_anim, hitmelee_anim,
   pedestrians_anim, takedowns_anim, script_anim, script_prop_grips}.sds` in the `Persistent` group (always loaded).
 
+---------------------------------------------------------------------------------------------------------------
+
+## 13. Car look: model, variant (tuning items), colours, plate [static, unverified: found 2026-10-19]
+
+Read from the C_WrapperCar bindings (table 0x5AD4CB0), C_ScriptWrapperTraffic (0x5AE4650) and tables.sds, without
+running the game. Used by src/game/car_look_sync.cpp / car_look.lua (docs/game-api.md 24 "Car look").
+
+**The vehicles table row.** entity + 0x1FA8 -> the car's vehicles table row (`S_VehiclesTableItem`):
+`GetCarTableId` (0x23ADD70) returns the dword at +0, `GetVehicleModelName` (0x23A1750) the string at +0x14,
+`HasVehicleLookFlag(s)` (0x23B43F0 / 0x23B47D0) build a flag set from their arguments (exe+0x2EA7220) and test it
+against the 16 bytes at row + 4 (exe+0x2563C00 / 0x2563C40). The vehicles table (tables.sds, `/xbin/vehicles_game_group
+.xbin`, `VehiclesTableMP`) has **one row per model** (`smith_v12` and `smith_v12_chicago` once each), so the look flags
+(`E_TrafficVehicleLookFlags`: CONVERTIBLE_CLOSED, CONVERTIBLE_OPENED, HARDTOP, ROOFRACK, PICKUP, STATION, VAN, ...;
+Lua `C_WrapE_TrafficVehicleLookFlags` 0x5AE3880) say what a model can be, not what one car is.
+
+**Obtaining a car.** `ObtainSpecificCar` (0x267C3D0) takes exactly one argument (the model name; `(top - base) >> 4 ==
+2` with self) -> exe+0x2EF70E0 -> a 0x310-byte request (exe+0x2EA0550: +0x164 = 4, +0x168 = 1 "specific", the name
+at +0x170). `ObtainCar` (0x267BB10) takes one number instead (exe+0x2EA0820: +0x164 = that number, +0x168 = 0): a
+category for the generator to pick from, not a table row (not used). Neither takes a variant, colours or a plate.
+
+**Tuning (the per-car variant).** entity + 0x1B20 is the car's tuning; +0xF0 / +0xF8 begin / end of its slots, 0x18
+bytes each: +0x00 pointer to the tuning table item installed there (null: empty), +0x10 u16 the slot kind. The tuning
+table is a global vector at exe+0x6379C58 / +0x6379C60 (begin / end) of 0xD0-byte items: +0x00 u16 item id, +0x02
+u16 slot kind.
+
+| function | what it does |
+|---|---|
+| `IsInstalledTuning(id)` 0x23A0990 -> exe+0x256EA80(entity + 0x1B20, id) | finds the item by id in the global table, then the car's slot of its kind; true when that slot holds that item |
+| `InstallTuningItems(id, id, ...)` 0x23B5650 | variadic: every argument after self read as a number (`cvttss2si`, stored as u16), then per id exe+0x2586E90(entity + 0x1B20, id) (loop at 0x23B5990), then exe+0x256CC30(entity) (rebuilds the car) |
+| exe+0x2586E90 (tuning, id) -> bool | the item by id (global table, stride 0xD0), the car's slot of the item's kind (+0xF0 / +0xF8, stride 0x18, kind at +0x10), stores the item pointer there; false when either is missing (a car without that slot kind takes nothing) |
+
+The dll's `mc_car_tuning(id)` reads the slots with these offsets after checking the install function's bytes (they
+hold the table globals, both strides and the slot fields) and that the InstallTuningItems loop calls it with
+`lea rcx, [r14 + 0x1B20]`. Strings that point at the body being tuning: `E_SE_CAR_CUSTOMIZATION_PURCHASE_ROOF`,
+`Car_No_Roof`, `CarRoof`, the tables `car_traffic_tuning` (`TrafficTuning`), `car_tuning_pack_availability`,
+`car_tuning_modificators` (the traffic generator gives each car its tuning). NOT checked in game: that the open /
+closed smith_v12 differ in a tuning item.
+
+**Colours and the rest.** `GetColor(slot)` (0x23B1A60) calls exe+0x254C0C0(entity, slot - 1): slots 1 and 2.
+`SetColor` (0x23B1370) has a two-number form and a string form (a named colour set, exe+0x265A550; not used).
+`GetPainting` (0x239CF30) returns the string at entity + 0x1FC0 (or the game's default), `GetDirty` (0x23AE560) the
+float at entity + 0xD58, `GetRust` (0x23AFD10) a native (exe+0x255A650); their scales are not known.
+`GetWindowTint` (0x23B2F00) and `GetInteriorColorsSet` (0x23B5C40) return numbers, `GetSPZText` (0x23A73C0) a string.
+
+---------------------------------------------------------------------------------------------------------------
+
 ## Pattern table (all verified unique in .text of this build)
 
 The name says what the pattern's first byte is: the start of that function, unless noted otherwise. To re-verify,
@@ -1101,6 +1147,8 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | Car_Explode (section 11; +0x47 `or [rdi+0x1EF0], 0x80`, +0x63 `movss xmm1, [rdi+0x1FB8]`, checked by the dll) | 0x2540380 | `F3 0F 11 4C 24 10 4C 8B DC 55 57 49 8D AB E8 FE FF FF 48 81 EC 08 02 00 00 48 8B F9 41 0F 29 73 C8 48 8B 89 80 12 00 00` |
 | Car_MotorDamage (GetMotorDamage's native; section 11: confirms the part list, the exploded bit, the part fields) | 0x2559A30 | `8B 81 80 12 00 00 48 C1 E8 10 A8 01 74 09 F3 0F 10 05 ?? ?? ?? ?? C3 48 8B 81 00 01 00 00 48 8B 89 08 01 00 00 48 3B C1 74 36 48 8B 10 48 85 D2 74 06 83 7A 08 0D 74 06 48 83 C0 08 EB E7 F3 0F 10 05 ?? ?? ?? ?? F3 0F 10 4A 24 48 8B 42 70 F3 0F 59 C8 F3 0F 5E 88 48 01 00 00` |
 | CarWheels_BurstAll (a loop inside a function, not its start; section 11: confirms the wheel layout) | 0x1BB8CC0 | `48 8B 83 F8 04 00 00 48 2B 83 F0 04 00 00 48 C1 F8 03 48 03 C0 74 74 66 0F 1F 84 00 00 00 00 00 48 8B 93 F0 04 00 00 48 8B C6 83 E0 01 4C 8B C6 48 69 C8 20 06 00 00 49 D1 E8 4A 8B 3C C2 48 03 F9 F6 87 48 07 00 00 60 75 24 45 33 C0 48 8D 97 98 01 00 00 48 8B CB E8` |
+| CarTuning_Install (section 13; +3 / +10 rel32 = the tuning table's begin / end globals, strides 0xD0 / 0x18, slots +0xF0 / +0xF8, slot kind +0x10) | 0x2586E90 | `4C 8B 05 ?? ?? ?? ?? 48 8B 05 ?? ?? ?? ?? 4C 3B C0 74 12 66 41 39 10 74 0F 49 81 C0 D0 00 00 00 4C 3B C0 75 EE 32 C0 C3 4D 85 C0 74 F8 48 8B 81 F0 00 00 00 48 8B 89 F8 00 00 00 41 0F B7 50 02 48 3B C1 74 E0 66 39 50 10 74 0C 48 83 C0 18` |
+| CarTuning_InstallLoop (inside InstallTuningItems, not a function start; section 13: `lea rcx, [r14+0x1B20]` and the call at +12 to CarTuning_Install, checked by the dll) | 0x23B5990 | `42 0F B7 14 7F 49 8D 8E 20 1B 00 00 E8 ?? ?? ?? ?? 49 FF C7` |
 
 Rip/call operand offsets used above: `C_GameScriptModule_Tick` +3 (disp) / +7 (end) gives g_ScriptGameMachine; `Steam_MemLoadApi` +9/+0xD gives g_SteamApiTable; `Steam_Init` +0x2F/+0x33 gives the SteamAPI_Init slot, +0x39/+0x3D SteamUser slot, +0x60/+0x64 SteamClient slot; `Lua_Game_GetActivePlayer` E8 rel32 at +0x14 gives the C_Game getter; `ScriptGameMachine_Create` mov [rip+disp],rax at +0x2B (disp +0x2E, end +0x32) also gives g_ScriptGameMachine.
 

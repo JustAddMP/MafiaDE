@@ -57,6 +57,10 @@ src/game/
                          happened (Explosion / CarExploded), shown elsewhere as visual-only explosions; the damage guard
                          that undoes a picture's damage (damage stays with the sender's hit paths)
   explosion_model.{h,cpp} the game-free part (wire, detector, zones, guard), tests/explosion_test.cpp
+  car_look_sync.{h,cpp}, car_look.lua  a copy of a player car or of the host's traffic shows the car's look: the
+                         game that has the car sends it (CarLook: model, colours, plate, tint, interior, painting, the
+                         installed tuning items read natively = the body variant), copies we spawned set it
+  car_look.{h,cpp}       the game-free part (wire, line form, diff, Book), tests/car_look_test.cpp
   throw_sync.{h,cpp}, throw_arc.lua  the flight of thrown explosives: the thrower's game logs the aim, follows the
                          real projectile's launch and sends it once (Throw), then a few correction events (ThrowFix:
                          bounces, turns, settled); the others simulate the flight against their world (ray casts,
