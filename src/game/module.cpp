@@ -56,8 +56,11 @@ bool AimHeld() {
 
 // The CO-OP panel's CHARACTER and OUTFIT rows (docs/PLAN.md "F"). CHARACTER steps through DEFAULT (the character
 // for your player id: host Tommy, then Paulie, Sam, Salieri) and the list in game/characters.cpp; OUTFIT through that
-// character's outfits. Every step applies at once: you change in the world while browsing, and the others see it.
+// character's outfits. Every step is saved at once; you change in the world as soon as the game runs again (the pause
+// menu holds it), and the others see the pick once it has stayed for a second or the panel is closed
+// (game/model_change.h), not every step on the way.
 void CharacterOptions(std::vector<PanelOption>& out) {
+    PlayerSync::PanelShown();  // asked every frame while a panel with these rows is open
     const std::string model = PlayerSync::Model();
     size_t c = 0, o = 0;
     if (model.empty()) {

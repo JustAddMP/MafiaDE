@@ -13,6 +13,7 @@
 #include "game/traversal.h"
 #include "game/lua.h"
 #include "game/map_markers.h"
+#include "game/model_change.h"
 #include "game/seats.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
@@ -169,10 +170,14 @@ struct Shared {
     struct Look {
         std::string model;  // what he picked (alias or profile)
         std::string look;   // the spawn profile his own game uses for it ("" = resolve the model here)
+        bool operator==(const Look& o) const { return model == o.model && look == o.look; }
     };
-    std::map<net::PlayerId, Look> live;  // PlayerModel messages; win over the Hello model
+    std::map<net::PlayerId, Look> live;  // PlayerModel messages as his puppet shows them; win over the Hello model
+    // PlayerModel messages as they arrive: a burst of changes becomes one puppet (game/model_change.h Gate)
+    std::map<net::PlayerId, modelchange::Gate<Look>> gates;
     std::string localLook;               // our own story Tommy's profile (decimal hash), reported by the Lua glue
-    bool sendModel = false;              // our PlayerModel must go out (changed, or somebody joined)
+    bool sendModel = false;              // our PlayerModel must go out (somebody joined, our story look changed)
+    modelchange::Outbox outbox;          // our CO-OP panel picks: sent once stable or when the panel closes
     std::vector<net::PlayerId> removed;
     bool removeAll = false;
     PlayerState local;
@@ -260,6 +265,25 @@ std::string ProfileFor(const Shared& sh, net::PlayerId id) {
 
 // Our own pick: `model` from MafiaCoop.ini / --model / the CO-OP panel (Config::Set), "" = default for our id.
 std::string LocalModelSetting() { return core::Config::Get().GetString("model"); }
+
+// A remote player's character change that is due (model_change.h Gate) becomes what his puppet is made of (under
+// the lock). The Lua glue sees the new profile in his next "T" line and replaces the puppet (player_sync.lua
+// M.Remove: unseated, hidden, deactivated, then released).
+void ApplyModelGates(Shared& sh, double now) {
+    for (auto& [id, gate] : sh.gates) {
+        Shared::Look v;
+        double held = 0;
+        int skipped = 0;
+        if (!gate.Poll(now, &v, &held, &skipped)) continue;
+        sh.live[id] = v;
+        if (held > 0.01 || skipped > 0)
+            MC_LOG_INFO("sync: player %u's puppet becomes '%s' now (his changes came in a burst: held %.1f s, %d "
+                        "earlier pick(s) never shown)",
+                        id, v.model.c_str(), held, skipped);
+        core::trace::Line("CHM", "id=%u ev=apply model=%s held=%.2f skipped=%d", id,
+                          v.model.empty() ? "-" : v.model.c_str(), held, skipped);
+    }
+}
 
 // ---- the game's player model manager (docs/re-notes.md 4): which profile the story put on our player -------------
 // C_PlayerModelManager global: found through the setter behind SwitchDefaultPlayerSpawnProfile (+0x30 default slot,
@@ -924,17 +948,22 @@ void OnPlayerModel(net::PlayerId from, net::ByteReader& r) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);  // kept even before we are active: it can arrive in the poll that completes our join
     if (from == sh.localId || from >= net::kMaxPlayers) return;
-    auto& cur = sh.live[from];
-    if (cur.model == model && cur.look == look) return;
-    cur.model = model;
-    cur.look = look;
-    MC_LOG_INFO("sync: player %u is %s (model '%s', look '%s')", from,
+    auto& gate = sh.gates[from];
+    const Shared::Look* before = gate.Newest();
+    if (before && before->model == model && before->look == look) return;
+    const double now = Now();
+    gate.Offer({model, look}, now);
+    ApplyModelGates(sh, now);  // a lone change applies at once; inside a burst it waits (MainTick applies it)
+    core::trace::Line("CHM", "id=%u ev=recv model=%s wait=%d", from, model.empty() ? "-" : model.c_str(),
+                      gate.Waiting() ? 1 : 0);
+    MC_LOG_INFO("sync: player %u is %s (model '%s', look '%s')%s", from,
                 characters::DisplayName(model.empty() || (!characters::Find(model, nullptr, nullptr) &&
                                                            characters::Resolve(model, from) != model)
                                             ? characters::DefaultModel(from)
                                             : model)
                     .c_str(),
-                model.c_str(), look.c_str());
+                model.c_str(), look.c_str(),
+                gate.Waiting() ? ": his puppet waits until his pick settles (changes in a burst)" : "");
 }
 
 // ---- local sample ---------------------------------------------------------------------------------------------------
@@ -1349,6 +1378,7 @@ void MainTick(lua_State* L, float dt) {
     {
         std::lock_guard lock(sh.mu);
         active = sh.active;
+        ApplyModelGates(sh, Now());
         if (sh.removeAll) {
             cmds += "X\n";
             sh.removeAll = false;
@@ -1532,6 +1562,7 @@ void PlayerSync::Attach(net::Session& session) {
     std::lock_guard lock(sh.mu);
     sh.active = false;  // becomes active in Tick once the session is
     sh.live.clear();
+    sh.gates.clear();
     sh.sendModel = true;
     sh.remotes.clear();
     sh.localId = net::kNoPlayer;
@@ -1562,6 +1593,7 @@ void PlayerSync::Detach() {
     sh.outHits.clear();
     sh.models.clear();
     sh.live.clear();
+    sh.gates.clear();
     sh.lastWeather.clear();
     sh.tags.clear();
     sh.pupReports.clear();
@@ -1579,6 +1611,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.names.erase(id);
     sh.models.erase(id);
     sh.live.erase(id);
+    sh.gates.erase(id);
     sh.tags.erase(id);
     sh.pupReports.erase(id);
     sh.carReports.erase(id);
@@ -1596,7 +1629,8 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
     double sampleAt = 0;
     std::vector<std::string> parked, env, hits;
     bool sendModel = false;
-    std::string modelLook;
+    std::string modelLook, modelWhy;
+    int modelSteps = 0;
     const bool enterEdge = enterDown && !_enterWasDown;
     _enterWasDown = enterDown;
     {
@@ -1648,7 +1682,18 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
                 seen.insert({p.id, p.joinSeq});
             }
             _seenPlayers.swap(seen);
-            if (sh.sendModel) {  // a player joined, our pick changed, or our story look changed
+            const char* why = nullptr;
+            const double tnow = Now();
+            if (sh.outbox.Due(tnow, sh.inWorld && tnow - sh.worldAt < 2.0, &why)) {  // our pick settled
+                sh.sendModel = true;
+                modelWhy = why;
+                modelSteps = sh.outbox.LastSteps();
+            } else if (sh.sendModel && sh.outbox.Pending()) {  // a join / look change sends the pick as it is now
+                sh.outbox.SentWithOther();
+                modelWhy = "with-join";
+                modelSteps = sh.outbox.LastSteps();
+            }
+            if (sh.sendModel) {  // a player joined, our pick settled, or our story look changed
                 sh.sendModel = false;
                 sendModel = true;
                 const std::string resolved = characters::Resolve(LocalModelSetting(), sh.localId);
@@ -1719,7 +1764,14 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         mw.Str(characters::SafeProfile(model) ? model : std::string());
         mw.Str(modelLook);
         _session->Broadcast(kMsgPlayerModel, mw.Span(), net::Reliability::Reliable);
-        MC_LOG_INFO("sync: sent PlayerModel (model '%s', look '%s')", model.c_str(), modelLook.c_str());
+        if (modelSteps > 0)
+            MC_LOG_INFO("sync: sent PlayerModel (model '%s', look '%s'; our pick after %d panel step(s), %s)",
+                        model.c_str(), modelLook.c_str(), modelSteps, modelWhy.c_str());
+        else
+            MC_LOG_INFO("sync: sent PlayerModel (model '%s', look '%s')", model.c_str(), modelLook.c_str());
+        core::trace::Line("CHM", "id=%u ev=send model=%s steps=%d why=%s", _session->LocalId(),
+                          model.empty() ? "-" : model.c_str(), modelSteps,
+                          modelSteps > 0 ? modelWhy.c_str() : "join");
     }
     if (!send) return;
     net::ByteWriter w(128);
@@ -1766,9 +1818,14 @@ std::string PlayerSync::CharacterName(net::PlayerId id) {
     if (id == sh.localId || !sh.active) {
         picked = LocalModelSetting();
     } else {
+        auto gate = sh.gates.find(id);  // the newest pick (his puppet may still wait for it to settle)
+        const Shared::Look* newest = gate != sh.gates.end() ? gate->second.Newest() : nullptr;
         auto live = sh.live.find(id);
         auto hello = sh.models.find(id);
-        picked = live != sh.live.end() ? live->second.model : hello != sh.models.end() ? hello->second : std::string();
+        picked = newest                 ? newest->model
+                 : live != sh.live.end() ? live->second.model
+                 : hello != sh.models.end() ? hello->second
+                                            : std::string();
     }
     if (picked.empty() || (!characters::Find(picked, nullptr, nullptr) && characters::Resolve(picked, id) != picked))
         picked = characters::DefaultModel(id);
@@ -1794,7 +1851,15 @@ void PlayerSync::SetModel(const std::string& model) {
     MC_LOG_INFO("sync: our character is now %s (%s)", characters::DisplayName(model).c_str(), model.c_str());
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    sh.sendModel = true;
+    // not sent per step: once the pick stays for a second, or when the panel closes (model_change.h Outbox)
+    sh.outbox.Picked(Now());
+    core::trace::Line("CHM", "id=%u ev=pick model=%s", sh.localId, model.empty() ? "-" : model.c_str());
+}
+
+void PlayerSync::PanelShown() {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    sh.outbox.PanelShown(Now());
 }
 
 int PlayerSync::Health(net::PlayerId id) {
