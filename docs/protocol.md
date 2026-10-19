@@ -369,10 +369,10 @@ report back).
   - his puppet and the car copy he drives are held where they stand here (from their last reports): the puppet stands,
     the car is pinned to that pose every tick, braked, without speed; no pin is counted. Logged `player N's game is
     paused: his puppet and his car held ...` / `... runs again ... (held N s)`, trace `PAU ev=freeze/thaw`;
-  - the host paused: every copy of his traffic is held the same way (`GuestTraffic::SetHostPaused`), none goes stale
-    for the missing states and none is spawned; after his resume they are driven again and no knock (TrafficBump) is
-    reported for 1 s (counted as `quiet` in `TRG`); logged `traffic: the host paused his game: N copies ... held`,
-    trace `TRZ`;
+  - a traffic authority paused (the host, or unreleased any guest whose traffic we show): every copy of its traffic is
+    held the same way (`ReceiverTraffic::SetPaused`), none goes stale for the missing states and none is spawned; after
+    its resume they are driven again and no knock (TrafficBump) is reported for 1 s (counted as `quiet` in `TRG`);
+    logged `traffic: player N paused his game: N copies ... held`, trace `TRZ`;
   - the host's NPCs on a guest are not pulled back while he is paused or within 1 s of his resume (npc_sync.lua,
     `not put back: the host's game is paused or just resumed`).
 - **Our own pause** counts too: after a tick gap of more than 0.5 s (our game stood while the host's cars drove on)
@@ -563,8 +563,8 @@ scripts may change things in between; the next WorldEnv puts them back.
   guest's own game spawns that NPC after all (a free local NPC at the same spot, or of the same tag within 40 m), his
   own takes over and the copy is released: no doubles. At most 10 copies at a time, one spawn profile loading at a
   time. Unpaired NPCs without a job (ambient pedestrians that differ per game) still get no copy.
-- Ambient pedestrians stay local to each game; ambient traffic and police cars are the host's near him (below,
-  "Traffic"). Cars a player drives are shared as before (Phase 3); a
+- Ambient pedestrians stay local to each game; ambient traffic and police cars are shared by region (unreleased;
+  0.15: the host's near him; below, "Traffic"). Cars a player drives are shared as before (Phase 3); a
   remote driver's car is first looked for here: a car of the same model standing where his car stands (within 3 m)
   is taken as his car (mission cars are not doubled), and no copy is spawned into another car standing there.
   Such a mission car does not keep an NPC at its wheel: when the remote driver's puppet is thrown out of it twice
@@ -646,74 +646,118 @@ npc_sync.lua.
   mirror without a state for 5 s ends on the host; a guest who leaves takes his mirrors along.
 - Bandwidth: at most 16 NPCs x 10 Hz x ~45 bytes = ~7 KB/s per guest (like the host's 48 x 10 Hz).
 
-### Traffic (0.15.0; not yet checked in game)
+### Traffic (0.15.0; by region unreleased; not yet checked in game)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0220 | TrafficSpawn | host -> one guest (`SendTo`) | R | u8 n (at most 16), then n x: u16 net, u8 kind (0 traffic, 1 police), str model, i16 color1 color2 (`GetColor(1)` / `GetColor(2)`, -1 unknown), str plate ("" unknown), f32 x y z, u32 quat (smallest three), i16 vx vy vz (1/100 m/s), u8 flags |
-| 0x0221 | TrafficDespawn | host -> one guest (`SendTo`) | R | u8 n, then n x u16 net |
-| 0x0222 | TrafficStates | host -> one guest (`SendTo`) | U, up to 20 Hz per car | u32 hostMs (the host's clock), f32 origin x y z, u8 n (at most 40: 897 bytes), then n x 22 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i16 vx vy vz (1/100 m/s), u32 quat, i8 steer (x127), u8 power, u8 brake (x255), u8 flags |
-| 0x0223 | TrafficBump | guest -> host (`SendToHost`) | R | u16 net, f32 error (m), f32 copySpeed, f32 hostSpeed |
+| 0x0220 | TrafficSpawn | host -> one player (`SendTo`) | R | u8 n (at most 16), then n x: u16 net, u8 kind (0 traffic, 1 police), str model, i16 color1 color2 (`GetColor(1)` / `GetColor(2)`, -1 unknown), str plate ("" unknown), f32 x y z, u32 quat (smallest three), i16 vx vy vz (1/100 m/s), u8 flags |
+| 0x0221 | TrafficDespawn | host -> one player (`SendTo`) | R | u8 n, then n x u16 net |
+| 0x0222 | TrafficStates | host -> one player (`SendTo`) | U, up to 20 Hz per car | u32 ms (the sender's clock), f32 origin x y z, u8 n (at most 40: 897 bytes), then n x 22 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i16 vx vy vz (1/100 m/s), u32 quat, i8 steer (x127), u8 power, u8 brake (x255), u8 flags |
+| 0x0223 | TrafficBump | a player -> host (`SendToHost`) | R | u16 net, f32 error (m), f32 copySpeed, f32 hostSpeed (his copy of a host car was knocked off) |
+| 0x0224 | TrafficSpawn2 | a guest -> one other player (`SendTo`; to another guest through core's relay) | R | u8 authority (= the sender), then the TrafficSpawn body (unreleased) |
+| 0x0225 | TrafficDespawn2 | the same | R | u8 authority, then the TrafficDespawn body (unreleased) |
+| 0x0226 | TrafficStates2 | the same | U, up to 20 Hz per car | u8 authority, then the TrafficStates body (the guest's clock; unreleased) |
+| 0x0227 | TrafficBump2 | a player -> that guest (`SendTo`) | R | u8 authority (the car's game), then the TrafficBump body (unreleased) |
 
-- **What is traffic:** a car of the host's game whose driver the traffic or police generators made (its name is
+0x0224-0x0227 are 0x0220-0x0223 with the authority in front. A receiver takes 0x0220-0x0222 only from the host (the
+host's cars, authority 0) and 0x0224-0x0226 only when the authority byte is the sender (core's relay keeps the real
+sender of a guest -> guest message), so no game can send cars as another. The latency trace counts 0x0222 / 0x0226 as
+"traffic", the rest as "traffic-event"; 0x0226 is sent with the Bulk priority like 0x0222. A 0.15 game ignores
+0x0224-0x0227 (no handler): it sees the host's traffic as before and no guest's.
+
+- **Every game is the authority for its own traffic** (docs/sync-architecture.md principle 1; unreleased: before, the
+  host's only). Its Lua glue (`traffic_sync.lua`) scans the car table once a second and reports, 20 times a second
+  while another player is in the world, its traffic cars within 380 m of any other player (his puppet, or his car):
+  transform, velocity, the driver's controls (`mc_car_controls`, flag 8), reversing (velocity against the car's
+  heading, flag 16), handbrake (flag 1), siren (flag 2, police only: the car's own siren / beacon bits via
+  `mc_car_signals`; when they cannot be read, on while the car goes faster than 14 m/s or is near a hunted player, and 8
+  s after; see "Police"). The dll (`game/traffic_model.h` AuthorityTraffic) gives each car a net id (u16 per authority,
+  kept while the car lives and never reused while a player has it) and keeps core's InterestManager with **every other
+  player** as a peer (Kind::Vehicle: enter 260 m / leave 320 m from him, every tick up to 60 m, every 0.4 s at 260 m,
+  x4 for cars below 0.3 m/s, at most every 2 s; 40 KB/s per player). Each player gets the **nearest 24** relevant cars
+  (a car beyond 150 m gives way to one within 90 m): a spawn when one is admitted, a despawn when it leaves his range,
+  is pushed out or is no longer traffic on its game, and its states when the interest manager says it is due and its
+  quantised state changed (an unchanged one is sent again after 1.5 s). The host sends with 0x0220-0x0222, a guest with
+  0x0224-0x0226 (to the host directly, to another guest through the host's relay, which costs the guest's relay
+  budget, `net_budget_kbps`). About 22 bytes x 20 Hz per car near a player: ~10-15 KB/s for a busy street.
+- **What is traffic:** a car of this game whose driver the traffic or police generators made (its name is
   `behavior_object_prime-NN-` with an empty suffix, docs/game-api.md 15), not a player car (player_sync's, Phase 3),
-  not a puppet factory's, not the one the host sits in; police when the driver's AI type is 4 or the model name says
-  so. Parked cars (no driver) and mission cars (drivers named after a mission spawner) stay local to each game as
-  before. A traffic car whose driver died or got out stays shared; once it has stood (under 2 m/s) for 20 s without
-  a driver it counts as parked.
-- **Driverless (flag 4, unreleased):** the host's Lua reads seat 0 of each car every second (and every round while
+  not a puppet factory's, not one of our copies of another game's cars, not the one we sit in; police when the
+  driver's AI type is 4 or the model name says so. Parked cars (no driver) and mission cars (drivers named after a
+  mission spawner) stay local to each game as before. A traffic car whose driver died or got out stays shared; once it
+  has stood (under 2 m/s) for 20 s without a driver it counts as parked.
+- **Driverless (flag 4, unreleased):** the authority's Lua reads seat 0 of each car every second (and every round while
   it read no driver): flag 4 in its TC line is "no living generator driver read now". That read flickers (0.15.0
   two-PC test: 179 cars flagged, 118 of them still moving, 84 still at speed 4 s later, mostly 50-100 m from the host's
   player). The dll (`game/traffic_model.h` DriverWatch) sends flag 4 only when no driver was read for **1 s while the
   car was slower than 2 m/s** all that time; it clears it when a driver is read again or the car speeds up past
   4 m/s (someone drives it). UNVERIFIED in game: why the read fails on moving cars (the log names the reason, `seat 0
-  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the host's player: driver
+  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the authority's player: driver
   culling or level of detail far from him was the suspicion; trace `TRO`).
-- **Host:** the Lua glue (`traffic_sync.lua`) scans the car table once a second and reports the traffic cars within
-  380 m of any guest (his puppet, or his car) 20 times a second: transform, velocity, the driver's controls
-  (`mc_car_controls`, flag 8), reversing (velocity against the car's heading, flag 16), handbrake (flag 1), siren
-  (flag 2, police only: the car's own siren / beacon bits via `mc_car_signals`; when they cannot be read, on while the car goes faster than 14 m/s or is near a hunted player, and 8 s after; see "Police"). The
-  dll (`game/traffic_model.h` HostTraffic) gives each car a net id (u16, never reused while a guest has it) and keeps
-  core's InterestManager (Kind::Vehicle: enter 260 m / leave 320 m from the guest, every tick up to 60 m, every 0.4 s
-  at 260 m, x4 for cars below 0.3 m/s, at most every 2 s; 40 KB/s per guest). Each guest gets the **nearest 24**
-  relevant cars (a car beyond 150 m gives way to one within 90 m): a TrafficSpawn when one is admitted, a
-  TrafficDespawn when it leaves his range, is pushed out or is no longer traffic on the host's game, and its states in
-  TrafficStates when the interest manager says it is due and its quantised state changed (an unchanged one is sent
-  again after 1.5 s). About 22 bytes x 20 Hz per car near him: ~10-15 KB/s for a busy street.
-- **Guest:** within 250 m of the host (back to his own beyond 400 m; the host's puppet or car gives his position) the
-  guest shows the host's traffic: his ambient traffic spawning (`SetEnableAmbientTrafficSpawning(false)`) and police
-  spawning (`PreventPoliceSpawning(true)`) go off, and 6 s later his own moving traffic cars farther than 70 m are
-  hidden (`Deactivate`, the car and its crew; shown again when he goes back to his own traffic). The nearest **20**
-  host cars within 240 m (dropped beyond 290 m; a far copy gives way to a car at less than half its distance) get a
-  copy: `ObtainCarWithCrew(model, {profile})` (unreleased: a civilian or police spawn profile of this game,
-  `characters/traffic/traffic_base_ambient_combined` / `characters/ai/police_scotch/ai_police_triggerman` and
-  fallbacks, docs/game-api.md 19; one that fails twice before it ever worked is dropped; the puppet factory's Tommy
-  last; `ObtainSpecificCar` when that fails), `SetDespawnImmunity`, `DisableExplosion`, the crew locked
-  (`LockControls(true)`, no reaction to sounds), the host's colours and plate. Each copy is driven like a remote
-  player's car (Phase 3 "Driving the puppet and the car copy"): the states are interpolated 120 ms behind the newest
-  (host clock: the smallest local-minus-host offset seen), moved forward by velocity x 120 ms (at most 2 m), then
-  core's VehicleController: the host car's controls, a blended correction, pinned when its physics does not follow,
-  snapped when more than 4 m off. Copies farther than 90 m are driven every third tick. A copy goes when its car is
-  despawned (1 s later, so player sync can take it first), after 5 s without a state, when the guest goes back to
-  his own traffic, and with the world; near ones (80 m) with `DespawnEntity` (when unseen), others at once. Siren
-  and beacons follow flag 2. The copy's driver gets out only when the host car is driverless (flag 4, confirmed as
-  above) **and** both the host's car and the copy stand (under 2 m/s; the dll adds flag 32 to the copy's drive
-  command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4 goes again its crew gets back in.
-  Twice a second the crew is checked: a member out of his seat (alive, the seat free, our player not within 8 m) is
-  put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in a row). npc_sync kills the copy's
-  driver when the host's driver died: traffic drivers are NPCs too and pair by position.
-- **Taking a traffic car:** when the host takes a car that is a traffic copy on a guest's game, the guest's player
-  sync finds that copy where the host's car is (same model, within 3 m) and adopts it; the traffic glue then hands
-  it over (its crew gets out, `TH`) and no longer drives or removes it. When a guest takes a copy, his game makes it
-  his car (player sync), the host's game adopts its own traffic car there as the guest's car, and its traffic
-  driver gets out.
-- **Hits and rams:** a guest's copy is a real car on his game: his bullets and his car hit it there. The host's car
-  is not moved by a guest's game; the guest's own car is a copy on the host's game (Phase 3) and hits the host's car
-  there by itself. A copy knocked more than 3 m off its target (that was on it a moment before) is put back by the
-  controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
-  through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves (dents, parts, tyres, fire, the
-  explosion) is shared since the car damage sync: the host's game holds it, a guest's copy reports its own ("Car
-  damage").
+- **Every game shows every other game's cars near it** (unreleased; before: a guest the host's, only while near him).
+  A receiver (`game/traffic_model.h` ReceiverTraffic) keeps the cars of each authority by `{authority, net}` (as one
+  number `authority << 16 | net`; the host's cars keep their net id, so car damage, car look and explosions, which only
+  know the host's traffic, are unchanged) and gives the nearest **20** of all of them within 240 m a copy (dropped
+  beyond 290 m; a far copy gives way to a car at less than half its distance): `ObtainCarWithCrew(model, {profile})`
+  (a civilian or police spawn profile of this game, `characters/traffic/traffic_base_ambient_combined` /
+  `characters/ai/police_scotch/ai_police_triggerman` and fallbacks, docs/game-api.md 19; one that fails twice before
+  it ever worked is dropped; the puppet factory's Tommy last; `ObtainSpecificCar` when that fails),
+  `SetDespawnImmunity`, `DisableExplosion`, the crew locked (`LockControls(true)`, no reaction to sounds), the
+  authority's colours and plate. Each copy is driven like a remote player's car (Phase 3 "Driving the puppet and the car
+  copy"): the states of each authority go through one core `replica::Stream` (its own playout clock: the adaptive delay
+  over that authority's jitter and state interval, 120 ms until it has enough states; Hermite between the states,
+  extrapolated at most 0.5 s; the same result as the 0.15 interpolation, tests/traffic_test.cpp), moved forward by
+  velocity x the playout delay (at most 9 m, was 2: a car 150 m away, sent every ~0.2 s, was shown 4.6 m behind), then
+  core's VehicleController (the driver's controls, the wanted velocity, pinned when its physics does not follow) and
+  core's Corrector with the traffic preset as tuned on a recorded car path (`TrafficCorrection()`: nothing within 0.5
+  m, beyond it 8 /s of the excess but at most 70 % of the car's speed, a snap beyond 8 m, after 3 s stuck 2 m off or
+  when the target jumps 20 m; was: 8 /s of any error, a snap beyond 4 m). Copies farther than 90 m are driven every
+  third tick. A copy goes when its car is despawned (1 s later, so player sync can take it first), after 5 s without a
+  state, when we drive off, when its authority leaves the session, and with the world; near ones (80 m) with
+  `DespawnEntity` (when unseen), others at once. Siren and beacons follow flag 2. The copy's driver gets out only when
+  the car is driverless (flag 4, confirmed as above) **and** both the authority's car and the copy stand (under 2 m/s;
+  the dll adds flag 32 to the copy's drive command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4
+  goes again its crew gets back in. Twice a second the crew is checked: a member out of his seat (alive, the seat
+  free, our player not within 8 m) is put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in
+  a row). npc_sync kills the copy's driver when the host's driver died: traffic drivers are NPCs too and pair by
+  position.
+- **Regions: whose spawning runs** (`game/traffic_model.h` RegionFollow over core's `RegionAuthority`, every game for
+  itself from every player's position). The host's game always runs its own traffic. A guest's game runs its own unless
+  it is in another player's region: within **250 m** of a region's owner it joins it, and it runs its own again only
+  beyond **400 m** of every region owner before it. The regions are the host's, then (in id order) each guest farther
+  than 400 m from the host and from the owners before him: two guests together far from the host share the lower id's
+  region (the higher id's spawning goes off), and a guest far from everyone runs his own. In another player's region
+  a game switches its ambient traffic spawning (`SetEnableAmbientTrafficSpawning(false)`) and police spawning
+  (`PreventPoliceSpawning(true)`) off, back on in its own (and when the session ends). The shown traffic does not
+  depend on the region: every game shows every other game's cars near it, so between 250 and 400 m (both spawn) both
+  games show both games' cars.
+- **Hand-over without pops** (unreleased). When players converge or part, cars that already exist keep their
+  authority until they leave (their net id and authority never change while they live; tests/traffic_test.cpp
+  "hand-over"); the new region owner's spawning takes over for new cars. A game whose spawning went off keeps its own
+  cars driving and shares them like all its traffic (the other player near them gets a copy); 6 s after the switch
+  they are hidden (`Deactivate`, the car and its crew) once out of everyone's sight, farther than **70 m** from us and
+  from every other player (before: from us only, while they were not shared), and shown again when our own spawning
+  comes back. A hidden car is no longer reported, so its copies go where nobody sees them. Trace `TRL near` counts our
+  cars within 70 m of us that a player within 240 m of them has not got for 2 s (the target: 0 ten seconds after a
+  region change).
+- **Taking a traffic car:** when a player takes a car that is a traffic copy on another game, that game's player
+  sync finds the copy where the car is (same model, within 3 m) and adopts it; the traffic glue then hands it over (its
+  crew gets out, `TH`) and no longer drives or removes it. When a player takes a copy on his own game, his game makes
+  it his car (player sync), the authority's game adopts its own traffic car there as his car, and its traffic driver
+  gets out (the same player sync and scan on every game; UNVERIFIED for a guest's traffic).
+- **Hits and rams:** a copy is a real car on its game: bullets and cars hit it there. The authority's car is not moved
+  by another game; the other player's own car is a copy on the authority's game (Phase 3) and hits the car there by
+  itself. A copy knocked more than 3 m off its target (that was on it a moment before) is blended back (snapped beyond
+  8 m) and reported to its authority (TrafficBump to the host, TrafficBump2 to a guest; at most every 2 s per car),
+  which logs it. Shots at a copy's driver go through npc_sync (NpcHit) like any paired NPC. Damage to the cars
+  themselves (dents, parts, tyres, fire, the explosion) is shared for the host's traffic since the car damage sync
+  (the host's game holds it, a copy reports its own, "Car damage"); a guest's traffic cars are not covered by it yet
+  (their copies keep `DisableExplosion` and show only their own dents).
+- **Known limits (unreleased, UNVERIFIED in game):** a guest's traffic copies on the host's game are humans of the
+  host's game in cars: the host's npc_sync does not know them as copies (`M.Traffic.IsCopyCrew(h)` says so; npc_sync
+  does not ask yet) and may send them to the guests as host NPCs; a guest's own traffic drivers with a job (police,
+  AI type 4) may still be reported to the host as his own NPCs (as in 0.15). A guest's own traffic has no car damage /
+  car look sync yet.
 
 ### Car damage (not yet checked in game)
 
@@ -971,7 +1015,7 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
   puppet, it starts a fresh one (not after a fine, an arrest or his death, not with offences off) (`ZoneCreate`, at
   most every 5 s). No wire change: all of this follows the existing PoliceChase (host-authoritative). The host's own
   zone is never touched. Far from the host no chase comes: his own police work as always (traffic sync turns his police spawning off
-  only near the host).
+  only in another player's region: near the host, or near a lower-id guest far from the host).
 - **Police copies** (traffic): the host reads the real siren / beacon of its police cars (`mc_car_signals`) for the
   copies' flag 2 (TrafficStates); the speed guess is only the fallback, now also "near a hunted player".
 - Additive: a peer without these messages ignores them. Logs `police: ...`; trace records POL / POE / POR / POT /
@@ -1110,7 +1154,7 @@ Sessions take up to 4 players (host + 3 guests, core `kMaxPlayers`). What change
 | NpcStates | at most 48, in turns from each player's nearest (was: the 48 nearest to anyone) |
 | Guest-owned NPCs | relayed by the host to the other guests (relay keys); hits forwarded to the owner with the attacker; one owner per NPC (lower id) |
 | Seats | ride along skips seats the other players' states claim; the same passenger seat twice: the lower id keeps it, the other slides; the wheel of one car claimed by two other players: the current one keeps it |
-| Traffic | per guest (HostTraffic: own interest set, 24 cars, 40 KB/s budget); a car near two guests has one net id; a guest who drops is a new peer when back |
+| Traffic | every game is an authority for its own traffic, with an interest set per other player (24 cars, 40 KB/s budget); a car near two players has one net id; a guest's traffic goes to the other guests through the host's relay (0x0224-0x0226); two guests together far from the host share the lower id's region; a player who drops is a new peer when back and his cars' copies go everywhere (unreleased) |
 | Failed missions | a guest's failure is his own (MissionFail -> FailVerdict to him only, the others play on); the host's failure is everyone's (HostFailed broadcast); tests/fail_flow_test.cpp "3 guests" |
 | Story, cutscenes, saves | per guest by `(id, joinSeq)`: a newcomer or a reconnected guest gets state, save and cutscene; the others nothing extra |
 | Lobby | ready per guest, START needs all of them; a fifth player is refused (core tests/net_lobby.cpp "4 players") |
@@ -1127,9 +1171,6 @@ every `net_log_interval` s, per peer), the overlay's traffic line on the host ("
 trace `TRP` per guest.
 
 Known limits (documented, not fixed):
-- Traffic is only the host's: two guests together far from the host (beyond 250 m) each run their own ambient
-  traffic and do not see each other's (a guest's traffic is never shared). The host-traffic switch uses the distance
-  to the host only.
 - A guest's own NPCs reach the other guests only through the host (one more hop: ~1 RTT later than the host's own).
 - Puppets are spawned one at a time (one runtime spawner): with three others the last one may appear a few seconds
   after the first.
