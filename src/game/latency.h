@@ -38,6 +38,8 @@ enum System : uint8_t {
     kItem,       // item states 0x0270 (stream)
     kItemEvent,  // item takes, gone, collectibles
     kHit,        // Hit 0x0400, CarParked, PlayerModel
+    kPed,        // pedestrian states 0x0280 (stream)
+    kPedEvent,   // pedestrian spawn / gone / death / kill 0x0281-0x0287
     kCount
 };
 const char* Name(System s);

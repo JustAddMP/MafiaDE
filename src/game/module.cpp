@@ -22,6 +22,7 @@
 #include "game/sectors_guard.h"
 #include "game/throw_sync.h"
 #include "game/traffic_sync.h"
+#include "game/ped_sync.h"
 #include "game/door_sync.h"
 #include "game/police_sync.h"
 #include "game/world_env.h"
@@ -220,6 +221,7 @@ public:
             NpcSync::Install();
             TrafficSync::Install();
             PoliceSync::Install();  // after TrafficSync: traffic_sync.lua asks police_sync.lua
+            PedSync::Install();     // after NpcSync / TrafficSync: ped_sync.lua reads their copies
             ItemSync::Install();
             DoorSync::Install();
             CarDamageSync::Install();  // after traffic: its Lua reads player_sync's and traffic_sync's cars
@@ -242,6 +244,7 @@ public:
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
+        PedSync::Attach(session);
         ItemSync::Attach(session);
         DoorSync::Attach(session);
         PoliceSync::Attach(session);
@@ -257,6 +260,7 @@ public:
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        PedSync::Detach();
         ItemSync::Detach();
         DoorSync::Detach();
         PoliceSync::Detach();
@@ -271,6 +275,7 @@ public:
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);
         TrafficSync::OnPlayerLeft(id);
+        PedSync::OnPlayerLeft(id);
         PoliceSync::OnPlayerLeft(id);
         ExplosionSync::OnPlayerLeft(id);
         CarDamageSync::OnPlayerLeft(id);
@@ -287,6 +292,7 @@ public:
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);      // his own NPCs' mirrors go; he sends them again when back
         TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
+        PedSync::OnPlayerLeft(id);      // his pedestrians' replicas go; ours are sent to him anew when back
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
         ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
         CarDamageSync::OnPlayerLeft(id);  // his copies ask for the cars' damage again when back
@@ -318,6 +324,7 @@ public:
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
+        PedSync::Tick(dt);
         ItemSync::Tick(dt);
         DoorSync::Tick(dt);
         PoliceSync::Tick(dt);
@@ -371,6 +378,11 @@ public:
         case 0x0271: return "ItemTake";
         case 0x0272: return "ItemGone";
         case 0x0273: return "Collectible";
+        case 0x0280: return "PedStates";
+        case 0x0281: return "PedSpawn";
+        case 0x0282: return "PedGone";
+        case 0x0283: return "PedDeath";
+        case 0x0284: return "PedKill";
         case 0x0242: return "Throw";
         case 0x0243: return "ThrowFix";
         case 0x0400: return "Hit";
@@ -388,6 +400,7 @@ public:
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);
+        PedSync::GetStatus(out);
         ItemSync::GetStatus(out);
         DoorSync::GetStatus(out);
         PoliceSync::GetStatus(out);
