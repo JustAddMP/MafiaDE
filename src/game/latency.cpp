@@ -67,8 +67,8 @@ System SystemOf(uint16_t id) {
     if (id >= 0x0200 && id <= 0x020F) return kWorld;
     if (id == 0x0210 || id == 0x0420) return kNpc;
     if (id == 0x0211 || id == 0x0410 || (id >= 0x0421 && id <= 0x042F)) return kNpcEvent;
-    if (id == 0x0222) return kTraffic;
-    if (id >= 0x0220 && id <= 0x022F) return kTrafficEvent;
+    if (id == 0x0222 || id == 0x0226) return kTraffic;  // the host's / a guest's traffic states
+    if (id >= 0x0220 && id <= 0x022F) return kTrafficEvent;  // spawn, despawn, bump (0x0224-0x0227: a guest's)
     if (id >= 0x0230 && id <= 0x023F) return kDoor;
     if (id >= 0x0240 && id <= 0x024F) return kExplosion;
     if (id >= 0x0250 && id <= 0x025F) return kCarDamage;
@@ -102,6 +102,7 @@ void Configure(net::Session& s) {
     s.SetPriority(0x0202, 0x0202, Priority::Bulk);      // the host's checkpoint save
     s.SetPriority(0x0211, 0x0211, Priority::Critical);  // NPC death
     s.SetPriority(0x0222, 0x0222, Priority::Bulk);      // traffic car states
+    s.SetPriority(0x0226, 0x0226, Priority::Bulk);      // a guest's traffic car states
     s.SetPriority(0x0210, 0x0210, Priority::Normal);    // NPC states (thinned only when far over the budget)
     s.SetPriority(0x0420, 0x0420, Priority::Normal);    // a guest's own NPC states
     // Car damage (0x0250-0x0252) and everything else: Normal.
