@@ -307,10 +307,41 @@ void HostPolice::Tick(double now, std::vector<HostCmd>& cmds, std::vector<ChaseO
 }
 
 // ---- GuestPolice ----------------------------------------------------------------------------------------------------------
+const char* ZoneWhyName(ZoneWhy w) {
+    switch (w) {
+        case ZoneWhy::Seen: return "seen";
+        case ZoneWhy::Refresh: return "refresh";
+        case ZoneWhy::Revive: return "revive";
+    }
+    return "?";
+}
+
 void GuestPolice::OnChase(const Chase& c, double now) {
     chase_ = c;
     chaseAt_ = now;
     if (c.active) activeAt_ = now;
+}
+
+void GuestPolice::SetLocal(const WantedState& own) {
+    own_ = own;
+    if (own.Wanted() && (own.flags & kInWorld)) lastWanted_ = own;
+}
+
+void GuestPolice::OnOwnEvent(Event e, double now) {
+    switch (e) {
+        case Event::PlayerFine:
+        case Event::FineStarted:
+        case Event::FineFinished:
+        case Event::ArrestStarted:
+        case Event::Arrested:
+        case Event::PlayerArrest:
+        case Event::HumanArrested:
+        case Event::PlayerDeath:
+            endedAt_ = now;
+            break;
+        default:
+            break;
+    }
 }
 
 bool GuestPolice::Chased(double now) const { return chase_.active && now - chaseAt_ < kChaseStale; }
@@ -318,29 +349,87 @@ bool GuestPolice::Chased(double now) const { return chase_.active && now - chase
 void GuestPolice::Tick(double now, std::vector<GuestCmd>& out) {
     const bool active = Chased(now);
     if (active) activeAt_ = now;
+    const bool tail = !active && now - activeAt_ < kForceHold;  // the chase ended a moment ago
+    const uint8_t level = std::clamp<uint8_t>(chase_.level, 1, kMaxLevel);
     uint8_t want = 0;
     if (active)
-        want = std::clamp<uint8_t>(chase_.level, 1, kMaxLevel);
-    else if (now - activeAt_ < kForceHold)
+        want = level;
+    else if (tail)
         want = forced_;
     if (want != forced_) {
         out.push_back({GuestCmd::Type::ForceMin, want, active && chase_.hunt});
         forced_ = want;
     }
-    if (active && chase_.seers > 0 && (own_.flags & kInWorld) && !own_.Wanted() && now - zoneAt_ >= kZoneRetry) {
-        out.push_back({GuestCmd::Type::Zone, std::clamp<uint8_t>(chase_.level, 1, kMaxLevel), chase_.hunt});
-        zoneAt_ = now;
-        ++zones_;
+    // our zone does not decay while the host's police are on us (and kForceHold after); a red zone follows us while
+    // one of them saw us or is close, as it does when our own police see us
+    const bool hold = active || (tail && held_);
+    const bool follow = hold && active && chase_.hunt && own_.Hunt() &&
+                        (chase_.seers > 0 || (chase_.nearest > 0 && chase_.nearest <= kFollowNear));
+    if (hold != held_ || follow != follow_ || (hold && now - holdAt_ >= kHoldRefresh)) {
+        GuestCmd c;
+        c.type = GuestCmd::Type::Hold;
+        c.hold = hold;
+        c.follow = follow;
+        c.refresh = hold == held_ && follow == follow_;
+        if (!c.refresh && hold && !held_) ++holds_;
+        out.push_back(c);
+        held_ = hold;
+        follow_ = follow;
+        holdAt_ = hold ? now : -1e9;
     }
+    if (active && own_.Wanted()) wantedInChase_ = true;
+    if (!active && !tail) wantedInChase_ = false;
+    if (!(own_.flags & kDecaying)) refreshed_ = false;
+    // a zone of our own
+    const bool inWorld = (own_.flags & kInWorld) != 0;
+    const bool offOk = !(own_.flags & kOffencesOff);
+    const bool policeEnded = now - endedAt_ < kEndedKeep;  // fined, arrested or dead: the zone ended for good
+    if (!active || !inWorld || now - zoneAt_ < kZoneRetry) return;
+    GuestCmd z;
+    z.type = GuestCmd::Type::Zone;
+    z.level = level;
+    z.hunt = chase_.hunt;
+    bool start = false;
+    if (!own_.Wanted() && chase_.seers > 0) {
+        z.why = ZoneWhy::Seen;
+        start = true;
+    } else if (!own_.Wanted() && wantedInChase_ && chase_.cops > 0 && offOk && !policeEnded &&
+               !(lastWanted_.flags & (kFining | kArresting))) {
+        z.why = ZoneWhy::Revive;
+        z.level = std::max(level, std::clamp<uint8_t>(lastWanted_.level, 1, kMaxLevel));
+        z.hunt = chase_.hunt || lastWanted_.Hunt();
+        start = true;
+    } else if (own_.Wanted() && (own_.flags & kDecaying) && !refreshed_ && chase_.cops > 0 && offOk &&
+               !(own_.flags & (kFining | kArresting))) {
+        z.why = ZoneWhy::Refresh;
+        z.level = std::max(level, std::clamp<uint8_t>(own_.level, 1, kMaxLevel));
+        z.hunt = chase_.hunt || own_.Hunt();
+        refreshed_ = true;
+        start = true;
+    }
+    if (!start) return;
+    out.push_back(z);
+    zoneAt_ = now;
+    ++zones_;
 }
 
 void GuestPolice::Reset(std::vector<GuestCmd>& out) {
     if (forced_) out.push_back({GuestCmd::Type::ForceMin, 0, false});
+    if (held_) {
+        GuestCmd c;
+        c.type = GuestCmd::Type::Hold;
+        out.push_back(c);
+    }
     forced_ = 0;
+    held_ = follow_ = false;
+    holdAt_ = -1e9;
     chase_ = {};
     chaseAt_ = -1e9;
     activeAt_ = -1e9;
     zoneAt_ = -1e9;
+    endedAt_ = -1e9;
+    wantedInChase_ = refreshed_ = false;
+    lastWanted_ = {};
 }
 
 }  // namespace mc::game::police

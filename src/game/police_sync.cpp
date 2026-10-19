@@ -146,8 +146,9 @@ void OnChase(net::PlayerId from, net::ByteReader& r) {
                     c.nearest);
     sh.guest.OnChase(c, now);
     if (core::trace::IsOpen())
-        core::trace::Line("POC", "dir=rx active=%d hunt=%d lvl=%u cops=%u seers=%u near=%.1f forced=%u", c.active ? 1 : 0,
-                          c.hunt ? 1 : 0, c.level, c.cops, c.seers, c.nearest, sh.guest.Forced());
+        core::trace::Line("POC", "dir=rx active=%d hunt=%d lvl=%u cops=%u seers=%u near=%.1f forced=%u held=%d",
+                          c.active ? 1 : 0, c.hunt ? 1 : 0, c.level, c.cops, c.seers, c.nearest, sh.guest.Forced(),
+                          sh.guest.Held() ? 1 : 0);
 }
 
 // ---- Lua (main thread) -------------------------------------------------------------------------------------------------
@@ -189,11 +190,25 @@ void AppendGuestCmds(std::string& cmds, const std::vector<GuestCmd>& list) {
             MC_LOG_INFO("police: our wanted level is %s", c.level ? ("held at least at " + std::to_string(c.level) +
                                                                      " while the host's police chase us").c_str()
                                                                   : "no longer held (the host's police stopped)");
+        } else if (c.type == GuestCmd::Type::Hold) {
+            std::snprintf(buf, sizeof buf, "D %d %d %d\n", c.hold ? 1 : 0, c.follow ? 1 : 0, c.refresh ? 1 : 0);
+            if (!c.refresh) {
+                MC_LOG_INFO("police: our police zone %s",
+                            !c.hold     ? "decays again (the host's police are not on us any more)"
+                            : c.follow ? "is held and follows us (the host's police are on us and see us / are close)"
+                                       : "is held: it does not decay while the host's police are on us");
+                if (core::trace::IsOpen())
+                    core::trace::Line("POD", "hold=%d follow=%d", c.hold ? 1 : 0, c.follow ? 1 : 0);
+            }
         } else {
-            std::snprintf(buf, sizeof buf, "Z %u %d\n", c.level, c.hunt ? 1 : 0);
-            MC_LOG_INFO("police: the host's police see us and our game has no police zone: starting one here (%s, "
-                        "level %u)",
+            std::snprintf(buf, sizeof buf, "Z %u %d %u\n", c.level, c.hunt ? 1 : 0, static_cast<unsigned>(c.why));
+            MC_LOG_INFO("police: %s: starting a police zone of ours here (%s, level %u)",
+                        c.why == ZoneWhy::Seen      ? "the host's police see us and our game has no police zone"
+                        : c.why == ZoneWhy::Refresh ? "our police zone decays while the host's police are on us"
+                                                    : "our police zone decayed while the host's police are still on us",
                         c.hunt ? "hunt" : "search", c.level);
+            if (core::trace::IsOpen())
+                core::trace::Line("POZ", "why=%s lvl=%u hunt=%d", ZoneWhyName(c.why), c.level, c.hunt ? 1 : 0);
         }
         cmds += buf;
     }
@@ -225,6 +240,7 @@ void ParseEvents(Shared& sh, const char* events, double now) {
             const Event e = EventFromName(name);
             if (e == Event::None) continue;
             MC_LOG_INFO("police: our game: %s (%lu)", name, arg);
+            if (!sh.isHost) sh.guest.OnOwnEvent(e, now);
             if (sh.active && sh.outEvents.size() < kMaxOut)
                 sh.outEvents.push_back({e, static_cast<uint32_t>(arg)});
         } else if (line.rfind("PH ", 0) == 0) {  // host: where we are
@@ -452,8 +468,9 @@ void PoliceSync::GetStatus(std::vector<render::OverlayLine>& out) {
     }
     if (!sh.isHost && sh.guest.Chased(now)) {
         const Chase& c = sh.guest.Last();
-        std::snprintf(buf, sizeof buf, " | the host's police chase us (%u cops, %u see us, level held %u)", c.cops,
-                      c.seers, sh.guest.Forced());
+        std::snprintf(buf, sizeof buf, " | the host's police chase us (%u cops, %u see us, level held %u, zone %s)",
+                      c.cops, c.seers, sh.guest.Forced(),
+                      sh.guest.Following() ? "held, follows us" : sh.guest.Held() ? "held" : "not held");
         line += buf;
     }
     std::snprintf(buf, sizeof buf, " (msgs %u/%u ev %u/%u chase %u/%u)", sh.statesSent, sh.statesRecv, sh.eventsSent,

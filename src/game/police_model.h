@@ -2,8 +2,9 @@
 // Police in co-op, the part without the game (docs/protocol.md "Police", docs/game-api.md 22): the wire format of the
 // police messages, when a player's own wanted state is sent, what the host's game does about a wanted guest (his
 // puppet becomes a target of the host's police while he is near the host) and what a guest's game does when the
-// host's police chase him (his own wanted level is held at least at the chase's level, a zone of his own is started
-// when the host's police see him and his game has none). Pure data in, decisions out: no Lua, no session, no OS calls,
+// host's police chase him (his own wanted level is held at least at the chase's level, his zone does not decay while
+// they are on him, a zone of his own is started when the host's police see him and his game has none, or again when
+// it decayed while they were still on him). Pure data in, decisions out: no Lua, no session, no OS calls,
 // so tests/police_test.cpp runs it without the game. game/police_sync.cpp feeds it from the Lua glue
 // (police_sync.lua) and the session. Single-threaded (the caller locks).
 //
@@ -215,39 +216,68 @@ private:
 
 // ---- guest: the host's police chase us ---------------------------------------------------------------------------------
 constexpr double kChaseStale = 3.0;    // s without a PoliceChase: the chase is over (the host sends 2 Hz)
-constexpr double kForceHold = 4.0;     // s our wanted level stays held after the chase ended
+constexpr double kForceHold = 4.0;     // s our wanted level (and the decay hold) stays after the chase ended
 constexpr double kZoneRetry = 5.0;     // s between two zones we start ourselves
+constexpr double kHoldRefresh = 2.0;   // s: a held decay is set again this often (a world load may reset it)
+constexpr float kFollowNear = 40.0f;   // m: a host cop this near (or one that saw us) in a hunt: the red zone follows us
+constexpr double kEndedKeep = 30.0;    // s after our fine / arrest / death: a zone that ended is not started again
+
+// Why we start a zone of our own (GuestCmd::Zone).
+enum class ZoneWhy : uint8_t {
+    Seen = 0,     // the host's police see us and our game has no zone
+    Refresh = 1,  // our zone decays while the host's police are on us: a fresh one here (the game merges zones)
+    Revive = 2,   // our zone decayed away while the host's police were still on us: started again here
+};
+const char* ZoneWhyName(ZoneWhy w);  // "seen" / "refresh" / "revive"
 
 struct GuestCmd {
     enum class Type : uint8_t {
         ForceMin,  // game.police:ForceMinEscalationLevel(level) (0 = released)
-        Zone,      // game.police:ZoneCreate(our position, hunt ? HUNT : SEARCH, level): our game has no zone yet
+        Zone,      // game.police:ZoneCreate(our position, hunt ? HUNT : SEARCH, level) (why: ZoneWhy)
+        Hold,      // game.police:PreventZonesDecay(hold, follow): our zone does not decay while the host's police are
+                   // on us; follow: a red zone's centre follows us (as when our own police see us). (false, false)
+                   // releases. docs/re-notes.md 10
     };
     Type type = Type::ForceMin;
     uint8_t level = 0;
     bool hunt = false;
+    bool hold = false, follow = false;  // Hold
+    bool refresh = false;               // Hold: the same as before, set again (not logged)
+    ZoneWhy why = ZoneWhy::Seen;        // Zone
 };
 
 class GuestPolice {
 public:
     void OnChase(const Chase& c, double now);
-    void SetLocal(const WantedState& own) { own_ = own; }
+    void SetLocal(const WantedState& own);
+    // A police event of our own game (PE lines): a fine, an arrest or our death ends a zone for good.
+    void OnOwnEvent(Event e, double now);
     void Tick(double now, std::vector<GuestCmd>& out);
-    // Session end / host gone: what to undo now (ForceMin 0 when we hold a level). Forgets the chase.
+    // Session end / host gone: what to undo now (ForceMin 0 when we hold a level, Hold off when we hold the decay).
+    // Forgets the chase.
     void Reset(std::vector<GuestCmd>& out);
     uint8_t Forced() const { return forced_; }
+    bool Held() const { return held_; }
+    bool Following() const { return follow_; }
     bool Chased(double now) const;
     const Chase& Last() const { return chase_; }
     uint32_t Zones() const { return zones_; }
+    uint32_t Holds() const { return holds_; }
 
 private:
     Chase chase_;
     double chaseAt_ = -1e9;
     double activeAt_ = -1e9;  // the last moment the chase was active
     WantedState own_;
+    WantedState lastWanted_;      // our last state that said wanted (how it ended: decayed, fined, arrested)
+    bool wantedInChase_ = false;  // we were wanted while this chase went on (a decayed zone may be started again)
     uint8_t forced_ = 0;
+    bool held_ = false, follow_ = false;
+    double holdAt_ = -1e9;
     double zoneAt_ = -1e9;
-    uint32_t zones_ = 0;
+    double endedAt_ = -1e9;     // our last fine / arrest / death (OnOwnEvent)
+    bool refreshed_ = false;    // this decay of our zone was answered with a fresh zone (once per decay)
+    uint32_t zones_ = 0, holds_ = 0;
 };
 
 }  // namespace mc::game::police

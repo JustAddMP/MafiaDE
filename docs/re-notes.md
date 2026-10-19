@@ -840,6 +840,21 @@ adaptor, `0x785B30` number, `0x1AC6B10` bool, `0x3810FF0` vector, `0x3819C20` "w
     `+0x10` level (u32), `+0x14` type (i32: 0 SEARCH / blue, 1 HUNT / red).
   - `+0x104` the escalation clamp (`ClampEscalationLevel(n)`, 0x2DB3930: `cvttss2si`, stored as int), `+0x108` the
     forced minimum (`ForceMinEscalationLevel(n)`, 0x2DB39E0). What reads them was not followed.
+  - `+0xFC` / `+0xFD`: **the decay hold** (found 2026-10-19 for the guest decay fix, static only). `PreventZonesDecay`
+    (0x2DB2190, argc dispatch): one bool (0x2DB5F80) -> `[module+0xFC] = b`, `[module+0xFD] = 0`; two bools
+    (0x2DB6000) -> `+0xFC = a`, `+0xFD = b`. The only other readers are the police module's update (0x2DCEC40 ..):
+    - it counts a timer at `+0xF4` down; when it runs out and the player is not seen (`[[0x639E120]+0x25E]`), a
+      zone `[module+0xE8]` exists and `+0xFC` is 0, that zone gets the decaying flag (`+0x78 |= 4`). `+0xFC` set: never.
+    - the player's zone `[module+0x38]` is ticked by 0x2DCC870(zone, ..., `+0x104` clamp, `+0xFC`, `+0xFD`, ...),
+      which (for an active zone that is not decaying: `flags & 0x14 == 0x10`) calls the decay step 0x2DCD9B0(zone,
+      &player pos, seen, prevent = `+0xFC`, follow = `+0xFD`, dt):
+      `if ((seen || follow) && zone.type == HUNT) { zone.centre = player pos; prevent = 1 }`;
+      `if (!prevent) zone[+0x40] -= dt` (the **decay timer**, float seconds); `timer <= 0` -> 2 (HUNT: down to
+      search) or 4 (SEARCH: decayed); a HUNT zone the player is outside of (`+0x0C` radius) -> 2; else 0.
+      So `PreventZonesDecay(true)` stops the timer (the zone stays as long as it is set), and the second bool makes
+      a red zone follow the player as if the police saw him. `+0xFC` is also passed to 0x2DCC990 (not followed).
+    - Nothing in the module resets `+0xFC` (only the two thunks write it); whether a world load does is UNVERIFIED.
+      The game's own scripts may use it (not checked: a mission's hold is released by ours).
   - `+0x128` a queue of zone requests (`ZoneCreate` adds one only when it is empty and `+0xE4` (enabled) is set),
     `+0x210` the police event listeners (`RegisterForPoliceEvent`), `+0x238` pending police events, `+0x290` offences
     disabled (`AreOffencesDisabled`, 0x2DB3740).
