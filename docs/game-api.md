@@ -211,6 +211,14 @@ traffic states carry m/s; the glue converts at the two game calls only (`mc_car_
   sync object) sets it. `GetTimeFlowSpeed()` / `SetTimeFlowSpeed(n)` (1 arg): 0 in missions (time stands still), the
   game's day cycle runs when it is > 0 (flow 20 = 1 game hour per ~3 s). The game's own node scripts
   (`Game.Weather.SetTime`, `Game.Game.SetMissionWeatherAndTime`) make the same calls.
+- **Time of day in co-op (world-join, unreleased): UNVERIFIED in game.** Assumed: the clock advances by
+  `rate x flow` game hours per real second with one fixed rate (the follower starts from 1/60, read off "flow 20 = 1
+  game hour per ~3 s", and measures the real rate from the host's WorldEnv samples: the WEG trace shows it as `rate`,
+  `measured=1`); `SetTimeFlowSpeed(n)` takes effect at once and smoothly for any n > 0 (the catch-up changes it
+  by up to 25 % for a few seconds); `GetTimeFlowSpeed()` reads back what was set; `SetTime(h, 0)` shows on the next
+  ticks (the follower waits 2 s after one). The 2026-10-19 two-PC test's Free Ride had flow 0 on the host (time stands
+  still), where only SetTime can correct the clock. To check: the WEG `rate` is about the same in every session, and
+  a catch-up does not make the sky, shadows or street lights jump.
 - Globals useful for exploring: `scripts`, `mm_spawn_profiles`, `enums`, `Game.*` / `Human.*` / `Vehicle.*` (viscript
   node tables: their functions show, via `string.dump`, which wrapper methods a node calls).
 - `package.loaded.traffic.GetSpawnProfiles(...)`, `Game.Traffic.SpawnProfileHuman`, `Testscenes.SpawnEnemies`
@@ -613,6 +621,18 @@ in-game check (README-dev.md "Test checklist: animation and car controls").
   really has (controls, wheel angle, engine, gear) against the driver's car. On foot the calibrated sprint was only
   ~3.3 m/s (the AI's), so sprinting players got 1.3-3.2 m ahead: the shortfall is now carried.
 
+- **The puppet's walk measured (0.15.0 traces, 2026-10-19; unreleased change built on it).** The controller's own
+  measurement (PUP `base`, `meas`) and 0.5 s windows of the puppet's reported positions (nudges taken out) per
+  commanded gait and multiplier: the game's AI walks ~1.3, runs ~2.2 and sprints ~3.3 m/s at multiplier 1, and sprint
+  at 1.8 reached a median 5.7 m/s (3.2 per unit of multiplier): `SetMovementSpeedMult` does scale the speed (partly
+  verified; whether the animation's stride follows is not). These are now the first guesses (game/player_motion.h
+  `FootTuning`); the calibration still runs. The puppet now walks with the gait its player's game reports (PlayerState
+  `mode`), and a changed multiplier re-issues `MoveVec` at once (up to 10 times a second instead of ~3; UNVERIFIED that
+  the AI takes re-issues that often without a hitch). A stop is a `MoveVec(point, "WALK")` to a point on the puppet's
+  own line of motion at most 0.35 s ahead (or its own position when it stands) instead of a walk to its player's spot;
+  UNVERIFIED that a walk to a point that close ends at once and stands it still (the rest of the gap is slid at
+  0.15 m/s).
+
 ## 15. Mission NPCs and cars on two games, the entity table - checked 2026-10-15
 
 Two instances on one PC; chapters Taxi (`mm_20_taxi` cp_010/cp_020) and Bon Appetit (`mm_140_salieri` cp_020). Used by
@@ -701,6 +721,29 @@ begin with a drive or a walk the tests cannot follow).
   is looked up again (a guest whose taxi had stood for the host's car went on reporting the host's car key after a
   reload when the new car compared equal to the old entity; UNVERIFIED that it does). All of it UNVERIFIED in game:
   the ray checks, that SpawnCar takes the spot, that the snap onto his car looks right.
+
+**Replicas: one authority per NPC (unreleased, `npc-authority`; NOT checked in game).** A guest's NPC paired with a
+host NPC no longer runs its own fight and walk: it is a replica driven from the host's states (docs/protocol.md "NPCs",
+src/game/npc_replica.h), like a player puppet. What the glue (npc_sync.lua) calls on it, and what is not known yet:
+
+| call | when | expected / UNVERIFIED |
+|---|---|---|
+| `h:InterruptBattle()` | on pairing, then every 2 s while driven | the NPC leaves its fight (cover, shooting, its own targets). UNVERIFIED that it stays out of it: the mission's flow may order it into battle again (hence the repeat), and whether a later `MoveVec` is honoured while a battle runs is unknown |
+| `h:InterruptCivilWander()`, `h:InterruptPatrol()`, `h:InterruptAvoidingCar()` | on pairing | its idle wandering, patrol route and car dodging stop (the copies have used the first and last since 0.12.0; on paired mission NPCs UNVERIFIED) |
+| `h:SetReactionOnSound(false)` | on pairing (`true` again when unpaired) | it does not turn to gunfire on its own (as the copies and the copy spawner's driver) |
+| `h:ResumeBattle()` | when the pairing ends (out of range 5 s, host NPC in a car, gone) | its own AI back. UNVERIFIED that it resumes a fight it was in |
+| `h:MoveVec(point, "WALK" / "RUN" / "SPRINT")`, `h:SetMovementSpeedMult(m)`, `SetPos`, `SetDir` | every tick from the C++ side's command | as the player puppets (section 4: MoveVec on AI humans works for puppets and copies; SetMovementSpeedMult is UNVERIFIED, on mission NPCs as well) |
+| not used | | `SwitchBrain` (crashed the game, above), `ScriptControl`, `PreventAIScriptThisPrioAndLower` (could also block the MoveVec AI command), `SetAggressivity` (no way to read the old value back), `Deactivate` (the NPC would stop moving and taking damage, above) |
+
+If none of it holds and the NPC keeps walking off (three snaps within 20 s), it is given up: hidden where the host's
+NPC is (`ShowModel(false)`, `SetPhysState(2)`, `SetDemigod(true)`), still paired (it dies with the host's NPC; never
+despawned: the mission may need it), and a spawned copy shows the host's NPC instead. Its bullets that hit the guest
+anyway, like a copy's, are given back (player_sync.lua `M.OnLocalDamage`); the guest's damage from host NPCs comes from
+the host. Which humans are not npc_sync's at all (ambient pedestrians, the `ambient-peds` package): `GetAIType() == 0`,
+`GetOwner()` nil (on foot) and a `GetName()` that is not `behavior_object_prime-NN-<mission spawner>` (`mc_npc_class`,
+src/game/npc_replica.h `IsAmbientHuman`); mission civilians (AI type 0, spawner-named) stay npc_sync's. The logs say
+`npc: freeze <call> on our <id>: ok / failed`, `npc: our <id> does not follow ... hidden, a copy shows it`, and the
+trace `NGS frozen= refused= snaps=`.
 
 **Mission car back (0.15; built from the code paths above, NOT checked in game).** The swap keeps the real car
 (`c.orig` in player_sync.lua): this game's mission scripts reference that entity, not the copy. Since 0.15 every
@@ -1101,29 +1144,46 @@ the puppet's seat: ours / free / other / ?), `brain` (friend brain set), `ai` (G
 `leaving` and `ejAll` (docs/sync-trace.md); `tools/sync_compare.py` lists the throw-outs, the brain / put-back lines
 and the ride-along lines per player.
 
+**The 0.15.0 two-PC test (2026-10-19, session 2), one car model throws puppets out at once.** The host's
+`manta_prototype` (key 0:17647882) threw a puppet out 1-3 frames after every non-animated `GetOnVehicle`, on both
+games and in both seats: the host's puppet from seat 0 of the guest's freshly spawned, standing copy (guest
+21:06:49.27-49.94, four times, then "retrying slower") and the guest's puppet from seat 1 of the host's real car while
+the host drove it slowly (host 21:07:17.58-18.27 four times, again at 19.99; once it then stayed seated for 8.7 s).
+Each time the puppet landed 0.8 m from the car's origin, 1.3-1.4 m up (on the roof), with its physics state back to
+0 (PR `phys` 2 while seated), the seat reading free; the car got a downward kick (LR `cv` z -0.58). Between the seat
+command and the throw-out our code only seats (the in-car path of `M.Drive` makes no `SetPos`, no physics change;
+the friend brain was set, the puppet not hidden), and every other car of both sessions kept its puppets. So it is
+taken to be the game's doing for that car model (UNVERIFIED: a test with the manta and another car side by side
+would tell); the thrown-out line now names the model (`thrown out of car K (model) seat S ...`). Not ours to fix
+without knowing why; the slower retries hide the puppet at the car meanwhile as before.
+
 ## 19. Traffic and police on two games (B4) - static only, NOT verified in game
 
 Used by src/game/traffic_sync.* (messages in docs/protocol.md "Traffic"). Nothing here has been run in the game yet;
-each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`).
+each call is wrapped in `pcall` and its failure logged (`traffic: ... failed`). Unreleased: every game (not only the
+host's) scans and shares its own traffic, and every game shows the others' (traffic by region); "the authority" below
+is the game whose generators made the car, "the receiver" a game with a copy of it.
 
 | call | notes |
 |---|---|
-| traffic car = generator driver | a car whose seat 0 holds a human named `behavior_object_prime-NN-` (empty suffix, section 15) is moving traffic or police from the generators; the host shares those. **UNVERIFIED** that every generator car has such a driver and that no mission car does |
+| traffic car = generator driver | a car whose seat 0 holds a human named `behavior_object_prime-NN-` (empty suffix, section 15) is moving traffic or police from the generators; its game shares those (0.15: the host only). **UNVERIFIED** that every generator car has such a driver and that no mission car does, and (unreleased) that a guest's generator cars read the same way as the host's (the same game, so expected) |
 | the driver read flickers | **Seen in the 0.15.0 two-PC test (2026-10-19):** of ~280 host cars shared with the guest, 224 had seat 0 read as "no living generator driver" at some point; 152 of them were still moving at 2-15 m/s when that happened and 107 kept their speed 4 s later (someone drove them), 32 had the read come back later. The distance from the host's player was 50-100 m for most (median 59-67 m), 0-50 m for 35, farther for the rest (the guest's area). Cause **UNVERIFIED**: the game culling or swapping traffic drivers away from the player (level of detail) is the suspicion; seat 0 may read nil, another human or a dead one. Since then (unreleased) the host logs the reason and distance of each miss (`host traffic car N: no driver read (seat 0 empty / seat 0 holds NAME (no generator human) / its driver is dead, active/inactive), S m/s, D m from us`, trace `TRO ev=miss`) and when it is read again (`TRO ev=back`), and a car only counts as driverless after 1 s of this while slower than 2 m/s (src/game/traffic_model.h DriverWatch) |
 | police | the driver's `GetAIType()` is 4 (POLICE), or the model name contains `police`. **UNVERIFIED** for police cars of the generators |
 | `car:GetColor(1)`, `car:GetColor(2)` / `car:SetColor(c1, c2)` | the copy gets the host car's two colour numbers (only when both read). **UNVERIFIED**: slot meaning (research-world-sync B4-3) |
 | `car:GetSPZText()` / `car:SetSPZText(text, true)` | the plate, copied (letters, digits, `-`, `_` only). **UNVERIFIED** |
-| `game.traffic:SetEnableAmbientTrafficSpawning(false/true)` | guest near the host: his ambient traffic spawning off, back on when he leaves (and when the session ends). **UNVERIFIED**: whether it removes the cars already there (the glue hides them itself, below) and whether it touches mission traffic (it is the narrower switch; `SwitchGenerators` is not used) |
-| `game.police:PreventPoliceSpawning(true/false)` | the same moments: no police cars of the guest's own while the host's are shown. **UNVERIFIED**; a mission that sets it itself is overridden only on those switches |
-| `car:Deactivate()` / `Activate()` on a traffic car and its crew | the guest's own moving traffic cars farther than 70 m are hidden this way while the host's traffic shows, shown again afterwards. **UNVERIFIED** for crewed traffic cars (verified only for an empty mission car, section 7) |
-| `ObtainCarWithCrew(model, {profile})` for a copy | 0.15.0 used the first profile path found in `data_traffic.crew_presets.<preset>`: none was ever found (the presets hold `human_models` keys such as `civilian`, `civilian_white_man`, not paths), so every crew was the fallback Tommy (46 of 46 in the two-PC test). Unreleased: traffic copies `characters/traffic/traffic_base_ambient_combined`, then `characters/game/game_attractivemen`, `characters/traffic/traffic_workers_male`; police copies `characters/ai/police_scotch/ai_police_triggerman`, then `..._shotgunner`, then the traffic ones; Tommy last. See "Spawn profile names" below for how they were found. A profile that fails twice before it ever gave a crew (obtain refused or timed out, a car without crew) is dropped (`crew profile P failed N times ... not used again`; `crew profile P works`). **UNVERIFIED** in game that they load as crews and look like the host's drivers (the host's real driver's profile cannot be read: no getter on a human). `ObtainSpecificCar(model)` (no crew) when it is refused |
+| `game.traffic:SetEnableAmbientTrafficSpawning(false/true)` | a guest in another player's region (near the host; unreleased: or near a lower-id guest far from the host): his ambient traffic spawning off, back on in his own region (and when the session ends). **UNVERIFIED**: whether it removes the cars already there (the glue hides them itself, below) and whether it touches mission traffic (it is the narrower switch; `SwitchGenerators` is not used) |
+| `game.police:PreventPoliceSpawning(true/false)` | the same moments: no police cars of his own while another player's are shown. **UNVERIFIED**; a mission that sets it itself is overridden only on those switches |
+| `car:Deactivate()` / `Activate()` on a traffic car and its crew | a guest's own moving traffic cars left over in another player's region are hidden this way 6 s after the switch once out of everyone's sight (unreleased: farther than 70 m from him and from every other player; until then they drive on and are shared; 0.15: farther than 70 m from him, never shared), shown again in his own region. **UNVERIFIED** for crewed traffic cars (verified only for an empty mission car, section 7) |
+| `ObtainCarWithCrew(model, {profile})` for a copy (of any authority's car; unreleased: also on the host for a guest's traffic) | 0.15.0 used the first profile path found in `data_traffic.crew_presets.<preset>`: none was ever found (the presets hold `human_models` keys such as `civilian`, `civilian_white_man`, not paths), so every crew was the fallback Tommy (46 of 46 in the two-PC test). Unreleased: traffic copies `characters/traffic/traffic_base_ambient_combined`, then `characters/game/game_attractivemen`, `characters/traffic/traffic_workers_male`; police copies `characters/ai/police_scotch/ai_police_triggerman`, then `..._shotgunner`, then the traffic ones; Tommy last. See "Spawn profile names" below for how they were found. A profile that fails twice before it ever gave a crew (obtain refused or timed out, a car without crew) is dropped (`crew profile P failed N times ... not used again`; `crew profile P works`). **UNVERIFIED** in game that they load as crews and look like the host's drivers (the host's real driver's profile cannot be read: no getter on a human). `ObtainSpecificCar(model)` (no crew) when it is refused |
 | Spawn profile names (static, 2026-10-19) | The game knows a spawn profile by its name's FNV-1 64 hash (multiply, then xor; `mc_fnv`, src/game/name_hash.h). `sds_retail/combinables/spawnprofiles.sds` (decompressed with the game's oodle dll) lists the profiles by that hash: the hashes our logs got from mission spawners are in it, and so are `visuals/hero/game_main_tommy_*`, `characters/traffic/traffic_base_ambient_combined`, `characters/traffic/traffic_workers_male/female`, `characters/game/game_attractivemen/girls`, `characters/game/game_blackmen/women`, `characters/ai/police_scotch/ai_police_triggerman/shotgunner/machinegunner/rifleman`, `characters/ai/detective/*`, `characters/ai/morello/*`, `characters/ai/streetthug/*`. Not in it: `characters/ai/police/ai_police_lvl1` (what `data_traffic.human_models.police_lvl1` names; that table is partly a leftover of the engine's older game). The names come from strings in scripts.sds, tables.sds and the exe; a profile whose name is in no string cannot be found this way |
 | crew `LockControls(true)` | so the copy's own AI driver does not steer against the host car's controls. **UNVERIFIED** that it stops a traffic AI (if not, the VehicleController pins the copy, as for player car copies) |
 | `car:SetSirenOn(b)`, `car:SetBeaconLightOn(b)` | police copies, from the host's siren flag: the host reads its police car's siren / beacon bits (`mc_car_signals`, section 22); only when they cannot be read the flag is a guess: on while a police car goes faster than 14 m/s (or is near a hunted player) and 8 s after |
 | `car:DisableExplosion(true)` on copies | an explosion on one game only would leave the host's car driving on. Since the car damage sync (section 24) the host's car's fire and explosion reach the copy through that sync instead, and its dents, tyres and parts too |
 | `h:GetOffVehicle()` | the copy's crew when a player takes the car (handed over to player_sync), the host's traffic driver when a guest took the car, the copy's driver when the host's car lost its driver. Does nothing while the car is moved by `SetPos` every tick (section 7). 0.15.0 called it as soon as the host's car read no driver: 249 times for ~430 copies, mostly on moving copies, which left empty copies driving on and their drivers standing in the road. Unreleased: only when the host's car is confirmed driverless and both cars stand (under 2 m/s) |
 | crew kept seated (unreleased) | twice a second each crew member of a copy (alive; his seat free; our player not within 8 m) that is not in the seat he had when the copy spawned is put back: `m:GetOnVehicle(car, seat + 1, false, "WALK")` (the puppet recipe, section 7), at most once a second and 8 times in a row. Log `copy of host car N: crew member I was out of seat S (D m from the car, car V m/s): put back`, trace `TRO ev=reseat`. **UNVERIFIED** for traffic crews (verified for puppets) |
-| `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the guest go when unseen, others at once |
+| `game.traffic:DespawnEntity(id)` / `DespawnEntityImmediately(id)` | copies within 80 m of the receiver's player go when unseen, others at once |
+| a car's heading from its rotation (unreleased; tests/traffic_test.cpp) | in the 0.15.0 host trace (TX `q` and `cv` of a car driven 45 s) the car moves along (0, 1, 0) rotated by the **conjugate** of the quaternion we read and set (`x y z w` = `r.v.x r.v.y r.v.z r.s`): mean alignment 0.99 against 0.09 / 0.24 for the other axes. The recorded-path test drives its simulated copy along that axis (SetSpeed's speed along the car's heading). Found from our own trace, not from the exe |
+| a copy's crew is no NPC of ours (unreleased) | `M.Traffic.IsCopyCrew(h)`: true for a human of the crew one of our current traffic copies came with (seated or got out). On the host a guest's traffic copies have crews of the host's game; npc_sync (not changed here) does not ask yet, so the host may send them to the guests as host NPCs. **UNVERIFIED** what that looks like (a guest pairs them with his own drivers by position) |
 
 ## 20. Things lying in the world: dropped weapons, pickups, collectibles - static only, NOT verified in game
 
@@ -1665,3 +1725,30 @@ GetSpawnedSceneObject is the bike; that SetPos / SetRot move a bike; that GetOnV
 GetOutCarFast takes it off; the saddle offsets; that IN_DEEP_WATER is sent to the player and when; the surface and
 depth thresholds; that SetPhysState(1) keeps the water's physics off a puppet; that a demigod NPC does not drown; that
 any swim or moto animation shows on a puppet; CAR_IS_UNDERWATER.
+
+## 26. Pedestrians on two games (unreleased) - static only, NOT verified in game
+
+Used by src/game/ped_sync.* (messages in docs/protocol.md "Pedestrians"). Before this every game kept its own
+ambient pedestrians: in the 0.15.0 two-PC test 47-48 of the host's humans were near the guest and 0.6-1.1 were paired
+(npc_sync pairs by spot, which only mission NPCs share), so ~2 % of the street was the same on both screens.
+
+| call | notes |
+|---|---|
+| ambient pedestrian (the contract with npc_sync) | a human (`mc_entity_ids(8)`) that is not ours (players, puppets, the puppet factory's driver, npc_sync's copies and their spawner's driver, traffic copy crews, `MafiaCoop.PedOwned`), `IsActive()`, `GetAIType()` 0, `GetOwner()` nil (not in a vehicle) and whose `GetName()` is not `behavior_object_prime-NN-<suffix>` with a non-empty suffix (section 15: mission spawners' humans carry the spawner's name; generator humans have an empty suffix; area spawners' pedestrians were not found as scene objects). `MafiaCoop.IsAmbientHuman(h)` (ped_sync.lua) |
+| `h:GetCivilArchetype()` | exists (re-notes appendix); sent hashed to 32 bits as the pedestrian's "look" for the log. UNVERIFIED what it returns for pedestrians and whether it tells looks apart; nothing on our side can pick a model by it |
+| `h:GetCurrentReactionPriority()` | read as "panic" when > 0. UNVERIFIED (by its name; a calm pedestrian may read > 0 too). Only traced and sent, a replica does nothing with it |
+| `h:IsCoverCrouch()` / `h:PanicCrouch(s)` | the authority's pedestrian crouching (UNVERIFIED that a civilian's panic crouch reads as cover crouch) makes a standing replica `PanicCrouch(1.5)` at most every 1.2 s (section 10: PanicCrouch is the hands-over-the-head crouch) |
+| `h:InterruptCivilWander()` / `ResumeCivilWander()`, `InterruptAvoidingCar()` / `ResumeAvoidingCar()`, `SetReactionOnSound(b)`, `DespawnImmunity(b)` | an adopted pedestrian's own AI off while it is a replica, back on when released. UNVERIFIED which of these the civilian brain honours; the replica gets a `MoveVec` every few tenths of a second anyway (section 4), which is what moved the puppets |
+| `h:ShowModel(false)` + `h:Deactivate()`; back: `Activate()`, `ShowModel(true)`, `SetPhysState(<as read with GetPhysState before>)` | a surplus pedestrian hidden while nobody looks (traffic hides its own cars with `Deactivate`, section 19). UNVERIFIED that the game does not despawn or reuse a deactivated pedestrian meanwhile (the glue reports it gone, `PGL`, when its wrapper is no longer valid) |
+| `game.cameramanager:GetPlayerCamera():GetPos()` / `GetDir()` | the camera for "in view": the dll's cone test (60 degrees around the camera direction, up to 150 m; 4 m around the camera always). No occlusion test (a pedestrian behind a wall in front of the camera counts as seen, which only makes it wait longer) |
+| `game.traffic:SetMaxHumanElements(n)` | **static (2026-10-19):** thunk 0x2677360 reads one number (self adaptor 0x3811340, number 0x785B30, converted to an int) and calls 0x2DA3C60(traffic manager, n): it stores n at `[manager + 0x100]` when it differs and calls a notifier (`[[manager + 0x50]] + 0x18`) and a global update. A global pedestrian budget with **no getter**, so the value to go back to is not known. **Not used**: turning it down on a receiver would empty its whole world and the pool of humans it adopts from, and it could not be restored exactly |
+| `game.traffic:BlockSpawnersInSphere(pos, r, b)` | **static (2026-10-19):** thunk 0x2670BE0 reads a vector, a number and a bool and calls 0x2D86A60(manager, {pos, r}, b) -> 0x2D86710, which walks the spawner list (`[manager + 0x168]`) and applies the flag to the spawners inside the sphere **at that moment**: a one-shot flag on spawners, not a lasting zone. The glue calls it with `true` around us (60 m) every 20 m we move while another game's pedestrians show here, and with `false` on every spot afterwards. UNVERIFIED that `true` blocks, that pedestrian (area) spawners are among them, and what happens to spawners streamed in later |
+| copies | spawned by a runtime spawner of our own (section 3, the puppet factory recipe: a crewed `shubert_e_six` 40 m below the player, `C_RuntimeSpawnerComponent` on its driver), profile `characters/traffic/traffic_base_ambient_combined` (its FNV-1 64 hash, as npc_sync's civilian fallback; section 19). Every copy looks like that. UNVERIFIED that it loads through a runtime spawner; a profile that does not load in 12 s stops the copies for 30 s |
+
+**UNVERIFIED (all of it):** whether an adopted pedestrian's own AI stays off between `MoveVec` orders (or walks off
+toward its old wander goal), whether `SetMovementSpeedMult` works on pedestrians, how many ambient humans each game
+has near a player (the coverage target, 80 %, assumes about as many as the authority's; a short pool is covered by at
+most 10 copies), whether hidden pedestrians come back intact, and the BlockSpawnersInSphere semantics above.
+What to look for in the log: `peds: our human N is the replica of pedestrian ...`, `spawned a copy for pedestrian
+...`, `copy profile ... loaded` / `did not load`, `our pedestrian spawners blocked around us: ok`; trace `PDC`
+(coverage), `PDR` (error), `PDL` (the glue's counts).

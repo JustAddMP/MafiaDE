@@ -9,6 +9,7 @@
 #include "core/trace.h"
 #include "dll/ui_input.h"
 #include "game/fail_flow.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/player_sync.h"
@@ -640,6 +641,7 @@ void OnMissionState(net::PlayerId from, net::ByteReader& r) {
         !SafeToken(v.saveId))
         return;
     v.known = true;
+    join::Mark(join::System::Mission);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     v.cutscene = sh.host.cutscene;

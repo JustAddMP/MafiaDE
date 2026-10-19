@@ -80,9 +80,51 @@ Added (unverified in game):
   traffic copies, and report no knocks, pull back no NPCs and start no driverless-car or NPC-pairing decisions until
   1 s after the resume.
 
+Sync architecture (2026-10-20; docs/sync-architecture.md; core v0.12.0's replication layer). Built from the
+2026-10-19 two-PC traces and unit tests with simulated copies (the game's AI walk, car physics and civilians are
+modelled, not run). **None of it is verified in game**; the next two-PC test checks it with
+`tools/sync_compare.py <host trace> <guest trace> --check` (README-dev.md "Sync architecture checks"):
+- Puppets walk with the gait their player's game reports (the gait matched only 63-76 % of the time), speed changes
+  reach them at once, small errors are corrected inside the motion (from 0.3 m, was 0.9 m), a standing puppet is slid
+  to its player's spot slowly instead of shuffling there, and one that runs on after its player stopped is held back
+  instead of walking back. Remote players and their cars are shown where they are now, including the network trip.
+  Simulated: p95 0.65-0.75 m (measured in the test: 2.0-2.3 m), standing 0.25-0.27 m, gait 99.8 %.
+- Car copies drive on their own physics most of the time: nothing is set within 0.5 m, the speed is given along the
+  copy's heading, a copy can get the driver's speed without being moved, slides are followed, and a pinned copy gets
+  its physics back after 1.5 s (was 5-40 s). Simulated: p95 0.88-0.98 m, pinned 0-0.1 % (measured: pinned 56-74 %).
+- A player who joins late or reconnects sees the cars parked before he came (new message ParkedCars 0x0104).
+- NPCs: one authority per NPC. The host's NPCs are no longer run by a second AI on the guest's game (the host's cops
+  chasing the guest were 60 m apart at p95): the guest's own NPC has its AI stopped and is driven from the host's
+  states (interpolated, the puppets' walk controller and correction); one that does not follow is hidden and a copy
+  shows it. Its shots there are pictures, the host's NPC's real hits come as Hits. NPC states are compact,
+  time-stamped and sent per guest by distance (NpcStates2 / NpcInfo / NpcLeave 0x0212-0x0214, a guest's own NPCs
+  0x0424-0x0426; NpcStates 0x0210 and GuestNpcStates 0x0420 are retired): about 6 KB/s per guest at 48 NPCs (was
+  ~21). Simulated on two of the test's cops: p95 0.97 m.
+- Pedestrians are shared (only ~2 % of the street was the same): the game that simulates the ambient world in a place
+  (the host within 250 m of him, elsewhere the nearest player) sends its pedestrians near each other player
+  (0x0280-0x0284, ~5.5 KB/s for 32). The others turn their own pedestrians there into replicas of them (one-to-one,
+  nearest first), spawn copies for missing ones (up to 10, a generic civilian look) and hide their extra ones while
+  nobody looks. Deaths follow the authority; a pedestrian you kill dies on every game.
+- Traffic is shared by region: every player's game shares the traffic it spawned with every player near it and shows
+  everyone else's (a guest far from the host, and two guests together, now see each other's cars; 0x0224-0x0227
+  through the host's relay). Near the host a guest's own spawning goes off; his cars already there keep driving and
+  are shared until out of everyone's sight, so nothing pops. Far copies are no longer shown metres behind their cars.
+  Simulated: true error p95 0.9-1.3 m.
+- Time of day follows the host without visible jumps (it was corrected only beyond 3 game minutes): WorldEnv carries
+  the host's sample time and goes to a joining or reconnecting player at once and every 2 s; small drifts are closed
+  by running the clock up to 25 % faster or slower for a few seconds.
+- A guest's log (and the host's) says when his world is complete after a join or a reconnect (JoinReport 0x0207).
+- Measuring: truth records on the game that owns a thing and replica records where it is shown (NPT / NPR, TRS / TRC,
+  PDT / PDR, WEH / WEG, JN and more, docs/sync-trace.md), and `sync_compare.py --check` prints every target of
+  docs/sync-architecture.md section 4 as PASS / FAIL.
+
 Protocol: PeerPaused (0x0103) is a new message (CarLook 0x0253 above is one too); the pose bits 8 / 16 / 32 use the
 existing PlayerState pose byte (no format change). The next release needs a protocol / version bump (not done here),
-so that players on different builds are told instead of half-syncing.
+so that players on different builds are told instead of half-syncing. The sync architecture makes it a must: NPC
+states moved to new messages (an older build would see no NPCs), and ParkedCars 0x0104, JoinReport 0x0207,
+NpcStates2 / NpcInfo / NpcLeave 0x0212-0x0214, TrafficSpawn2 / Despawn2 / States2 / Bump2 0x0224-0x0227,
+GuestNpcStates2 / Info / Leave 0x0424-0x0426 and the pedestrian messages 0x0280-0x0284 are new; WorldEnv gets an
+optional trailing sample time (older readers ignore it). Core goes to v0.12.0 (its protocol stays 9).
 
 ## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 

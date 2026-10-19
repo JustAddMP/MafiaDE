@@ -5,6 +5,7 @@
 #include "core/mem.h"
 #include "core/trace.h"
 #include "game/car_damage.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/traffic_sync.h"
 #include "net/wire.h"
@@ -410,6 +411,7 @@ void OnDamageMsg(net::PlayerId from, net::ByteReader& r) {
     }
     if (u.ref.kind == CarRef::kTraffic && (!_session || _session->IsHost() || from != net::kHostPlayer)) return;
     ++_rxDamage;
+    join::Mark(join::System::CarDamage, u.ref.Text());
     if (core::trace::IsOpen())
         core::trace::Line("CDR", "from=%u ref=%s kind=damage ep=%u n=%zu flags=%u full=%d repaired=%d", from,
                           u.ref.Text().c_str(), u.epoch, u.parts.size(), u.flags, u.full ? 1 : 0, u.repaired ? 1 : 0);
@@ -482,6 +484,7 @@ bool SendOne(Net& n) {
             const uint16_t id = n.kind == Net::Report ? kMsgReport : kMsgRequest;
             _bytes += b.size();
             ++(n.kind == Net::Report ? _txReport : _txRequest);
+            if (n.kind == Net::Request) join::Expect(join::System::CarDamage, n.ref.Text());
             if (n.peer == net::kHostPlayer) return _session->SendToHost(id, b, net::Reliability::Reliable);
             return _session->SendTo(static_cast<net::PlayerId>(n.peer), id, b, net::Reliability::Reliable);
         }

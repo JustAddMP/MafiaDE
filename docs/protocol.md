@@ -33,6 +33,10 @@ Car damage (0.15.0): CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequ
 additive (see "Car damage").
 Several guests (3-4 players; 0.15.0): HostNpcHit (0x0422) gets a trailing u8 attacker (read as the
 host when missing), NpcStates carry the other guests' own NPCs under relay keys (see "Several guests").
+One authority per NPC (unreleased, `npc-authority`): NpcStates2 (0x0212), NpcInfo (0x0213), NpcLeave (0x0214),
+GuestNpcStates2 (0x0424), GuestNpcInfo (0x0425), GuestNpcLeave (0x0426); NpcStates (0x0210) and GuestNpcStates
+(0x0420) are retired, neither sent nor read: a peer of an older build sees none of the other game's NPCs, so this needs
+a `modVersion` bump (see "NPCs").
 
 Latency (0.15.0; core `kProtocolVersion` 9: lanes, session clock, app message send stamps, core
 docs/protocol.md "Latency"): no message of ours changes; PlayerState's u32 time is now the moment the state was
@@ -51,6 +55,9 @@ holder).
 
 Car look (a copy shows its car's colours, plate, tint, interior, painting and body variant): CarLook (0x0253),
 additive (a peer without it ignores it and keeps its copies as the game spawns them). See "Car look".
+
+Pedestrians (unreleased): PedStates (0x0280), PedSpawn (0x0281), PedGone (0x0282), PedDeath (0x0283), PedKill
+(0x0284), additive (a peer without them keeps its own pedestrians, as before). See "Pedestrians".
 
 App id allocation (core reserves 0x0000-0x00FF):
 
@@ -72,7 +79,9 @@ Code: `src/game/player_sync.{h,cpp}` (C++: wire format, buffering, interpolation
 | 0x0101 | CarParked | last driver -> everyone (`Broadcast`) | R | u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags (0.15: bit 0 the car is destroyed; read as 0 when missing, older builds ignore it) |
 | 0x0102 | PlayerModel | every peer -> everyone (`Broadcast`) | R | str model, str look |
 | 0x0103 | PeerPaused | every peer -> everyone (`Broadcast`) | R | u8 flags (bit0 paused), u8 reason (0 resumed, 1 no script tick, 2 the game's paused tick only), u32 ms paused so far (on the resume: how long it lasted). Unreleased; see "A paused game" below |
-| 0x0104-0x01FF | reserved (phase 3 events) | | | |
+| 0x0104 | ParkedCars | host -> a player who joined or came back (`SendTo`) | R | u8 version (1), u8 count (<= 24), count x { u8 keyOwner, u32 vehId, str model, f32 x, y, z, f32 qx, qy, qz, qw, u8 flags } (unreleased; see "Parked cars for late joiners") |
+| 0x0105-0x0107 | reserved (player sync events, sync architecture package `players`) | | | |
+| 0x0108-0x01FF | reserved (phase 3 events) | | | |
 
 PlayerState body (56 bytes on foot + weapon name, ~139 bytes in a car):
 
@@ -171,6 +180,16 @@ and a puppet whose player is sent as on foot faster than 12 m/s (a vehicle the s
 position until he is below 9 m/s (docs/game-api.md 25). Older senders (0.15.0) send a bike ride as an on-foot sprint:
 a receiver with this change hides that puppet instead of letting it sprint and "jump".
 
+**Unreleased (sync architecture, package `players`): PlayerState unchanged on the wire.** The receiver now drives
+the puppet's gait from `mode` (the sender's own gait, see "Driving the puppet and the car copy"), and interpolates
+through core's shared replication layer (`net/replica.h`; `src/game/player_motion.h` `PlayerTrack`: one adaptive
+playout clock per sender, a track for his body and one for the car he drives - cleared when he is in another car or
+on foot, so two cars are never blended). Same curve and limits as below (Hermite through the states with their
+velocities, 250 ms extrapolation, then held, discrete fields from the nearer state, controls blended); two changes:
+the "now" lead is the playout delay **plus the one-way trip** (rtt / 2 of the session, at most 150 ms: the playout
+clock's offset contains the smallest one-way delay, so without it the copies trailed by ~14 ms, 0.35 m at 25 m/s),
+and it may move a position up to **4 m** (was 1.5 m: a car at 30 m/s is 1.5 m ahead after 50 ms).
+
 Since 0.9.0 a game sends its state up to 60 times a second (`net_state_hz`, 10..120; at most once per frame, so a game
 running in the background at 20 fps sends 20) and receivers render it **50 ms in the past** (`net_interp_ms`, 0..500;
 before 0.9.0: 20 Hz and 100 ms): `renderTime = now - offset - 0.05`, where `offset = localReceiveTime - senderTime` is tracked as a running minimum
@@ -195,32 +214,58 @@ animation played at its own pace), see "Driving the puppet and the car copy" bel
 3.5), guest -> host 4.4 KB/s, no loss, no resends, no relay drops; the checkpoint save (HostSave, ~36 KB) goes out only
 when the file changed.
 
-### Driving the puppet and the car copy (0.13.0; not yet checked in game)
+### Driving the puppet and the car copy (unreleased rewrite; NOT checked in game)
 
-The receiver turns the interpolated state into commands with core's controllers (`external/core/src/net/
-remote_motion.h`, unit-tested in core's `net_motion`), one pair per remote player, in `player_sync.cpp`; the Lua glue
-carries them out and reports back where the puppet / car copy is after each tick ("PS" / "VS" lines).
+The receiver turns his presented state (the interpolated state led to "now", above) into commands, one set per remote
+player, in `player_sync.cpp` through `src/game/player_motion.h` (game-side policy over core's
+`net/remote_motion.h` controllers and `net/correction.h` rules; unit-tested in tests/player_motion_test.cpp against
+recorded 0.15.0 paths); the Lua glue carries them out and reports back where the puppet / car copy is after each tick
+("PS" / "VS" lines).
 
-- **On foot** (`LocomotionController`): a gait from his speed (stand / walk / run / sprint, with hysteresis; his sprint
-  flag allows sprint from 3.5 m/s), a speed multiplier for that gait (`SetMovementSpeedMult`, given right before each
-  `MoveVec` so a walk is never interrupted by it), and a walk point ahead along the wanted velocity (his velocity plus
-  1.2/s of the error, at most 2.5 m/s of correction), re-aimed every 0.35 s, on a gait change or a turn of more than
-  12 degrees. The walk/run/sprint speed at multiplier 1 is measured on the puppet itself (0.25 s windows while gait
-  and multiplier are steady, nudges not counted), so the multiplier makes the game's own animation run at his speed.
-  Position fixes stay small: only the error beyond 0.9 m is nudged (2/s); a snap beyond 3.5 m (or 3 m height, 6 m while
-  he is in the air), when he stands and the puppet is more than 0.5 m off for 2 s, or when it walks but does not get
-  anywhere for 1.5 s while more than 0.9 m off. Standing, it turns to his heading at up to 400 degrees/s; when he
-  stops it walks the last bit to his spot. While he gets in or out of a car (seat 9) his puppet stays on foot and
-  walks with him to the door; next to a standing car it gets in with the game's animation (`GetOnVehicle(..., true)`,
-  4 s, then seated at once as before).
-- **His car** (`VehicleController`): his controls are applied to the copy every tick (`SetSteer` with the response
-  curve inverted, `SetPower`, `SetBrake`, `SetHandbrake`), so its wheels steer, brake lights and engine react and its
-  own physics drives it; the transform is corrected toward his (8/s for position and rotation) only as far as needed,
-  and nothing is set while it is on target. If its physics does not keep up (the copy slower than 35 % of his speed for
-  1 s above 3 m/s, more than 8 m/s faster, or more than 1.5 m off for 1.5 s) the copy is pinned to his transform every
-  tick from then on (the pre-0.13.0 way, logged "pinned to his transform every tick"). Snap on a teleport (> 20 m
-  between snapshots) or > 4 m off. No throttle while the copy is faster than him (+1.5 m/s) or he reverses. When he
-  gets out the controls are released (power, brake, handbrake, steering 0).
+- **On foot** (`FootDriver` over core's `LocomotionController`):
+  - **Gait = his.** The gait is the `mode` his game reports (`gaitHint`: idle / walk / run / sprint), not one chosen
+    from the wanted speed (0.15.0: gait matched 63-76 % of the time, "player run, puppet sprint" 8-15 %). Only the
+    speed multiplier (`SetMovementSpeedMult`, 0.6-1.8, given right before each `MoveVec`) absorbs the error; when even
+    1.8 is too slow (the game's AI sprint is ~3.3 m/s at 1, a player's 6.5-7.5) the shortfall is carried as a small
+    nudge along his direction. The AI's speeds at multiplier 1 are first guessed as the 0.15.0 traces measured them
+    (walk 1.3, run 2.2, sprint 3.3 m/s) and calibrated on the puppet itself at run time.
+  - **Commands land in time.** The controller plans for the AI's command lag (0.15 s: the error and his velocity it
+    will have then, his stop point when he brakes); a changed speed multiplier re-issues the walk at once (at most
+    every 0.1 s) instead of at the next 0.35 s re-aim.
+  - **Hidden corrections.** Errors beyond 0.3 m are slid away (2 / s) at most 35 % of the faster of him and the
+    puppet (a puppet still running after he stopped is pulled back within its own motion); when he brakes or turns
+    away and the puppet runs on level with him or ahead, its body is held back to his speed (at most 70 % of its own,
+    its legs keep running: a moment of foot sliding instead of an overshoot it would walk back). Snap beyond 3.5 m
+    (3 m height, 6 m in the air), when he stands and it is 0.5 m off for 2 s, or when blocked 1.5 s.
+  - **Standing.** His game says idle: within 0.6 m the puppet stands at once (no walk for the last bit: a shuffle) -
+    its stop is a walk to where it comes to rest by itself along its own line of motion, never back to a point it
+    passed - and the rest blend slides it onto his spot (from 0.1 m off, 4 / s, at most 0.15 m/s, or 35 % of its own
+    speed while it still brakes). Farther off it walks there. It turns to his heading at up to 400 degrees/s.
+  - Simulated (tests/player_motion_test.cpp: 73 s of the host's real running, sprinting and stopping from the 0.15.0
+    traces, sent at 60 Hz over 14 ms + jitter, against an AI walker 150-250 ms late, speeds off +-20 %, turning at
+    most 360 degrees/s): p95 0.65-0.75 m, mean 0.25-0.31 m, standing p95 0.25-0.27 m, gait 99.8-99.9 %, no snaps.
+    How closely the game's AI walk matches that walker is UNVERIFIED.
+  - Unchanged: while he gets in or out of a car (seat 9) his puppet walks with him to the door; next to a standing car
+    it gets in with the game's animation; actions, traversal moves, ladders, swimming and bikes pause the controller
+    (busy flags) as before.
+- **His car** (`CarDriver` over core's `VehicleController`): his controls are applied to the copy every tick
+  (`SetSteer` with the response curve inverted, `SetPower`, `SetBrake`, `SetHandbrake`), so its own physics drives it.
+  - **Position: the car preset.** Nothing is set while the copy is within 0.5 m and turned less than 3 degrees (most
+    ticks: no `SetPos`, no `SetRot`); beyond, a blend of 5 / s of the excess at most 50 % of his speed (core's
+    `ForCar` preset with a faster blend: a copy whose steering acts ~0.15 s late drifts wide in turns); while his car
+    slides (its velocity more than 15 degrees off its heading above 2 m/s: a skid, a spin, a crash) at most his whole
+    speed. Snap beyond 4 m, when stuck (he stands, 1 m off for 2 s) or on a teleport (> 20 m between snapshots).
+  - **Speed.** After every move the copy gets his speed back (`SetSpeed`, km/h, Round 4) - his speed plus the error
+    along the copy's own heading (1.5 / s, at most 4 m/s; a sideways error given as speed along the heading made a
+    turning copy run wide). Not moved but its own speed is off his by more than 1 m/s or 12 %: given his speed alone
+    (`T` field 69, at most every 0.25 s; UNVERIFIED that `SetSpeed` alone keeps the car's physics sane).
+  - **Pins only as a last resort** (core 0.12 policy): pinned to his transform every tick when its physics does not
+    keep up (slower than 35 % of him for 1 s above 3 m/s, more than 8 m/s faster, or more than 1.5 m off for 1.5 s),
+    its physics retried after 1.5 s, doubling to 8 s, the doubling reset after 10 s kept up (was 5-40 s). VEH `pf` /
+    `ri` say how long and until when.
+  - Simulated (tests/player_motion_test.cpp: 30 s of the host's driving, 0-29 m/s, with a crash, against a copy whose
+    physics reaches 85 % or 115 % of his speed 150-300 ms late): p95 0.88-0.98 m, pinned 0-0.1 %, copy / driver speed
+    1.01-1.02. UNVERIFIED in game.
 - **His car's signals** (`signals` byte; `RV.Signals` in player_sync.lua, NOT checked in game): applied to the copy
   when they change, each change logged on both sides ("player N's car signals: ..." from the C++ side when it arrives,
   "remote car ...: signals A -> B" when it is applied, "our car's signals: ..." on the driver's game). Lights and
@@ -306,11 +351,30 @@ once he got out) until he gets out, then it is despawned when unseen (0.15 multi
 it stayed with despawn immunity for the rest of the game). The same for a host traffic car's copy that a player took
 (traffic_sync.lua hands its obtain id over with it, so player sync despawns it like its own copies: at the session
 end, on a lost connection, when it is trimmed) and for an adopted ambient traffic car of this game (its despawn
-immunity goes off again). A player who joins late
-does not see cars parked before he joined until somebody drives them.
+immunity goes off again). A player who joins late, or comes back after a lost connection, gets the cars parked
+before (ParkedCars, below; before this he did not see them until somebody drove them).
+
+#### Parked cars for late joiners (ParkedCars 0x0104; unreleased, NOT checked in game)
+
+`src/game/parked_cars.h`, unit-tested in tests/parked_cars_test.cpp. Every game keeps a book of the CarParked
+messages it sent or received in this session (key, model, final transform, flags); a car that somebody drives again
+(a PlayerState with seat 0 of that key) leaves it. The **host** sends a player the whole book as soon as he appears
+in the session with a new `(id, joinSeq)` - a late joiner, or a guest back after a lost connection - in messages of
+at most 24 cars, reliable, lane 0 (the player-car order), priority Normal. The receiver takes each car as if its
+CarParked had just come (player_sync.lua `M.Parked`: a copy at that transform, or his own car of that key if it
+stands there), except destroyed ones (flags bit 0): an intact copy of a wreck would stand there, so they are left
+out (logged). Accepted before the receiver's sync is active (it can arrive in the poll that completes the join); the
+cars are placed once he is in the world. Trace `PKB` (book changes), `PKS` (sent), `PKR` (received). Older builds
+ignore the message (unknown app id).
+
+
 
 Puppets that cannot be seated (seat taken, the game keeps throwing them out) are hidden at the car and retried every
-4 s.
+4 s. The 0.15.0 two-PC test: the host's car `manta_prototype` threw puppets out 1-3 frames after every non-animated
+`GetOnVehicle` on both games (seat 0 of a standing copy on the guest at 21:06:49, seat 1 of the host's moving car at
+21:07:17-19), the puppet landing 0.8 m off on the car's roof with physics on; no `SetPos` / physics change of ours in
+between (the in-car path of `M.Drive` only seats), the other cars of both sessions kept their puppets. Taken to be the
+game's (that car model), UNVERIFIED; the thrown-out log line now names the model.
 
 Puppet lifetime: created when the first PlayerState of a player arrives, removed on `PeerLeft` / transport timeout /
 session end (the whole set, including the hidden "factory" car, is removed when the session ends).
@@ -369,10 +433,10 @@ report back).
   - his puppet and the car copy he drives are held where they stand here (from their last reports): the puppet stands,
     the car is pinned to that pose every tick, braked, without speed; no pin is counted. Logged `player N's game is
     paused: his puppet and his car held ...` / `... runs again ... (held N s)`, trace `PAU ev=freeze/thaw`;
-  - the host paused: every copy of his traffic is held the same way (`GuestTraffic::SetHostPaused`), none goes stale
-    for the missing states and none is spawned; after his resume they are driven again and no knock (TrafficBump) is
-    reported for 1 s (counted as `quiet` in `TRG`); logged `traffic: the host paused his game: N copies ... held`,
-    trace `TRZ`;
+  - a traffic authority paused (the host, or unreleased any guest whose traffic we show): every copy of its traffic is
+    held the same way (`ReceiverTraffic::SetPaused`), none goes stale for the missing states and none is spawned; after
+    its resume they are driven again and no knock (TrafficBump) is reported for 1 s (counted as `quiet` in `TRG`);
+    logged `traffic: player N paused his game: N copies ... held`, trace `TRZ`;
   - the host's NPCs on a guest are not pulled back while he is paused or within 1 s of his resume (npc_sync.lua,
     `not put back: the host's game is paused or just resumed`).
 - **Our own pause** counts too: after a tick gap of more than 0.5 s (our game stood while the host's cars drove on)
@@ -433,12 +497,53 @@ he gets.
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0200 | WorldEnv | host -> guests (`Broadcast`) | R | f32 timeOfDay (hours 0..24), f32 timeFlowSpeed, str weatherSet |
+| 0x0200 | WorldEnv | host -> guests (`Broadcast`; `SendTo` a newcomer) | R | f32 timeOfDay (hours 0..24), f32 timeFlowSpeed, str weatherSet, u32 sampleMs (unreleased, optional) |
+| 0x0207 | JoinReport | guest -> host (`SendToHost`) | R | u8 flags (1 reconnect, 2 complete, 4 late), u32 afterMs, u8 n, n x (u8 system, i32 ms of its first arrival, -1 none), str missing (at most 200 bytes) |
 
-WorldEnv is sent while the host is in the world: every 4 s and at once when the weather set or the time flow speed
-changes. A guest in the world sets the weather set when it differs (`SetWeatherSet(name, 0, 0)`), the flow speed when it
-differs, and its clock when it is more than 0.05 h (3 game minutes) off (`SetTime(t, 0)`). Guests' own weather/time
-scripts may change things in between; the next WorldEnv puts them back.
+WorldEnv (src/game/world_env.h, world_env.cpp, world_env.lua; since the world-join change no longer in PlayerSync) is
+sent while the host is in the world: at once to every newcomer (also a guest back after a lost connection: newcomers
+are keyed by `(id, joinSeq)`; one who arrives before the host has a reading gets it with the first one), at once when
+the weather set or the time flow speed changes, and every 2 s (was 4 s). Priority Critical, lane 1.
+
+- `sampleMs` (new, unreleased): the moment the host's game was read, on the session clock (ms). It is a trailing
+  field: the reader before this change reads the three fields and never checks for the end of the body (verified in
+  the 0.15 code: `OnWorldEnv` read f32, f32, str and `ByteReader` leaves the rest), so an older guest still works; a
+  newer guest that gets no `sampleMs` from an older host takes the message's send stamp (core's, `MessageStampMs`)
+  or, without one, its arrival. No protocol / version bump is needed for it.
+- A guest predicts the host's time now: `timeOfDay + age x rate x timeFlowSpeed` (age = session clock now -
+  `sampleMs`, 0..600 s; rate = game hours per real second per unit of flow speed, measured from the host's samples: the hours
+  between two WorldEnv over the session time between them x his flow speed, two agreeing observations (~4 s) for the
+  first value, one more than 2x off ignored (a jump of his clock); the first guess is 1/60 from docs/game-api.md 8,
+  UNVERIFIED). The error is the host's predicted time
+  minus ours, the short way round 24 h.
+- The first time after a join, a reconnect or a new world of ours: `SetTime(t, 0)` once when 0.5 game minutes or
+  more off. During play: below 0.5 game minutes nothing; up to 15 game minutes the guest's flow speed is the host's
+  x (1 + share), share = error / (2 s x the host's game minutes per second), at most +-25 % in 1 % steps, until the
+  error is under 0.1 game minutes, then exactly the host's flow speed again (no overshoot: the error closes at most at
+  error / 2 s per second); beyond 15 game minutes, when the host's time stands still (flow 0, missions, the Free Ride
+  of the 2026-10-19 test) or when a catch-up would take over 30 s: `SetTime` once (then 2 s for it to show). Until the
+  rate is measured (~4 s), only errors beyond 15 game minutes are corrected. When the session ends during a catch-up,
+  the host's flow speed is put back.
+- The weather set is set at once when it differs (`SetWeatherSet(name, 0, 0)`; asked again every 2 s while the game
+  reports another name).
+- Guests' own weather/time scripts may change things in between; the next WorldEnv (or the guest's own reading of a
+  different flow speed) puts them back.
+- Trace: `WEH` (host), `WEG` (guest), docs/sync-trace.md; `tools/sync_compare.py` "World" and the
+  `world.time_err` target. UNVERIFIED in game: how smoothly the game's clock (sun, shadows, street lights) follows a
+  changed `SetTimeFlowSpeed`, and that `GetTimeFlowSpeed` reads back what was set.
+
+### Join and reconnect: when is a guest's world complete (unreleased, not checked in game)
+
+On a guest, from the moment the session became active (a join, or back after a lost connection; src/game/join_sync.h)
+each system's handler marks the first time it got its part of the world: the first PlayerState of every other player,
+the host's MissionState, WorldEnv, the DoorSnapshot (asked 3 s after we are in the world), the first NpcStates and
+TrafficSpawn (optional: the host may have none for us), the first PoliceState of every other player, and the first
+CarDamage answer for every car copy that asked for one meanwhile. The world is complete when every required part is
+here and we are in the world (log `join: world complete in X s`, trace `JN ev=complete`); when something required has
+not come 15 s after we are in the world, `join: still missing ... after 15 s` (`JN ev=complete missing=...`), and a
+late complete follows if it comes. The guest sends the result in JoinReport 0x0207 (once per verdict); the host logs
+it (`join: player N's world is complete in X s (...)`) and traces it (`JN ev=report`). An older host ignores the
+message. `tools/sync_compare.py` "Join and reconnect" and the `join.complete_s` target (<= 10 s).
 
 ### Story: chapter, checkpoint, objectives, cutscenes (0.6.0)
 
@@ -501,70 +606,105 @@ scripts may change things in between; the next WorldEnv puts them back.
 - A guest's game in a co-op session writes its saves (checkpoints, quest state, quit, Free Ride autosaves) to `%TEMP%\MafiaCoop\coop-saves\<pid>`
   instead of his save slots (docs/re-notes.md 7); his real slots are never opened for writing during the session.
 
-### NPCs (0.7.0; 0.11.0 changed NpcStates and NpcHit; 0.12.0 NpcStates)
+### NPCs (0.7.0; 0.11.0 changed NpcStates and NpcHit; 0.12.0 NpcStates; unreleased: one authority per NPC)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0210 | NpcStates | host -> guests (`Broadcast`) | U, 10 Hz (0.9.0; was 5) | u8 n (at most 16, fewer so the payload stays under 1000 bytes), then n x: u32 key, f32 x y z, i8 hx hy (heading x127), u16 health (0.11.0; was u8), u8 flags (1 dead, 2 in a car), u8 aiType, u32 tag (0.11.0: the battle archetype, hashed; 0 = none), str weapon ("-" = none), u64 profile (0.12.0: its spawn profile hash, 0 = unknown), u8 shots (0.12.0: shots it fired, mod 256) |
+| 0x0210 | NpcStates | - | - | retired (unreleased): neither sent nor read. Was: u8 n, then n x the full record (u32 key, f32 x y z, i8 hx hy, u16 health, u8 flags, u8 aiType, u32 tag, str weapon, u64 profile, u8 shots), host -> guests, 10-15 Hz, no time stamp |
 | 0x0211 | NpcDeath | host -> guests (`Broadcast`) | R | u32 key |
-| 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (0.11.0: 1 = lethal, the guest's copy died of his hits) |
+| 0x0212 | NpcStates2 | host -> each guest (`SendTo`) | U, per NPC 15 Hz near to 5 Hz at 120 m | u32 sampleMs (the host's steady clock when its Lua round read the NPCs: the clock of PlayerState's time), f32 origin x y z, u8 n (at most 48: 929 bytes), then n x 19 bytes: u16 net, i16 x y z (cm from the origin; NPCs more than 327 m from it go into another message), i8 hx hy (heading x127), i16 vx vy (ground velocity, cm/s), u16 health, u8 flags (1 dead, 2 in a car), u8 shots (fired, mod 256), u8 gait (0 stand, 1 walk, 2 run, 3 sprint: from its speed on the host) |
+| 0x0213 | NpcInfo | host -> each guest (`SendTo`) | R | u8 n, then n x: u16 net, u32 key, u8 aiType, u32 tag (battle archetype, hashed; 0 none), str weapon ("-" none), u64 profile (spawn profile hash, 0 unknown), u8 nameClass (0 unknown, 1 a mission spawner's human, 2 a generator's); at most 1000 bytes per message |
+| 0x0214 | NpcLeave | host -> each guest (`SendTo`) | R | u8 n, then n x u16 net: no longer sent to him (out of his interest, gone) |
+| 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (0.11.0: 1 = lethal, the guest's replica died of his hits) |
 
-- key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`). The host sends at most 48 NPCs
-  within 120 m of himself or any guest's puppet, 10 times a second (several messages when more than 16); a death also
-  goes out reliably at once. With several guests in different places the 48 are taken in turns from each player's
-  nearest (the host's, then every guest's; 0.15 multi-guest, `N.PickSend`), so a guest far from the others still gets
-  the NPCs around him; before, the 48 nearest to anyone went out and a big fight around the host could take them all.
-  With two or more guests the same message also carries the other guests' own NPCs under relay keys (below,
-  "Guest-owned NPCs", "Several guests").
-- A guest pairs each host NPC with the nearest human of his own world within 1.5 m of it (the same mission scripts
-  spawn the same NPCs at the same spots on every game, docs/game-api.md 15) and keeps the pairing. 0.11.0: a host NPC
-  with a job (AI type not 0) that found none there within 2 s is paired with the nearest free local human of the same
-  tag (or, when one side has no tag, the same AI type) within 40 m: after a guest's reload, a late join or NPCs that
-  streamed in late the fight has moved on. All candidate pairs are taken nearest first (same spot before moved apart,
-  the same tag counts at half its distance); dead host NPCs are paired too (their copy is killed). Deactivated humans
-  (`IsActive()` false) are neither sent nor paired. A pairing is released after 5 s without a state. A paired copy:
-  dies when the host's dies (killed; one that still does not die after 3 tries is hidden); its health follows the host's
-  NPC down (never up); is put back to the host's position when it is more than 6 m off for 1.5 s (NPCs with a job
-  only: AI type not 0, not in a car). Unreleased (0.15.0 two-PC test: host cops chasing the guest 30-50 m off his
-  copies, p95 60 m): a host NPC in a vehicle (its car flag, or faster than 11 m/s smoothed, held 2 s) is never pulled,
-  never loose-paired with a local NPC on foot (nor one on foot with a local in a car), and a pairing whose host NPC
-  drives while ours walks more than 40 m away is released after 2 s; a cop (AI type 4) on foot that runs (over
-  1.8 m/s) is steered after the host's every 0.4 s with `MoveVec` (RUN/SPRINT) when more than 3 m off (UNVERIFIED that
-  a police AI follows it). A hit by the guest on a copy hurts it on his game and goes to the host as NpcHit;
-  the host replays a bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit reaction and
-  damage apply), else `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`. When the guest's
-  copy dies within 1.5 s of his hit, he sends a lethal NpcHit (no damage of its own): 0.8 s later the host kills his
-  NPC if it still lives (an enemy that his mission keeps invulnerable is made vulnerable for it; an invulnerable
-  ally or civilian is left alone).
+**One authority per NPC** (unreleased; `src/game/npc_replica.h`, `tests/npc_replica_test.cpp`; NOT checked in game).
+Every NPC is simulated by exactly one game: the host for its NPCs (mission NPCs, police, anything with a job, mission
+civilians), a guest for the NPCs only his game has ("Guest-owned NPCs" below). Every other game shows a **replica**
+(its own NPC paired with it, or a spawned copy) that is driven from the authority's states every tick and never runs
+its own AI for it. Before, the guest's paired NPC ran its own combat and movement AI and was only pulled back after
+6 m (12 m in a fight) for 1.5 s: host cops chasing the guest were p95 60 m, max 252 m off in the first two-PC test.
+
+- key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`), as in NpcDeath, NpcHit, Hit's npc,
+  NpcClaim and the relay keys. **net** = a u16 the host gives an NPC while it publishes it (one number space for all
+  guests; freed when the NPC is gone, reused only after the 65535 others), named by NpcInfo. Ordering: a guest gets
+  NpcLeave, then NpcInfo, then NpcStates2 of a round (the two reliable ones on lane 0 in order); states of a net id
+  whose info has not arrived yet are kept and shown once it has; an NpcInfo naming a known net id with another key
+  replaces it (the old NPC's replica target goes).
+- **What the host sends (interest, per guest):** every round (15 Hz) the host's Lua glue lists the NPCs within 140 m of
+  any guest's puppet (128 at most, nearest first) that are not **ambient humans** (not a player / puppet / copy, not in
+  a vehicle, AI type 0 and not named after a mission spawner: `npcrep::IsAmbientHuman`, the contract with the
+  `ambient-peds` package, whose humans in `MafiaCoop.PedOwned` are skipped as well), not deactivated and not a copy of
+  a guest's NPC. Core's `InterestManager` (Kind::Npc) decides per guest: viewpoint = his puppet; enter within 120 m,
+  leave beyond 140 m; one state every 1/15 s up to 30 m, linearly down to one every 0.2 s at 120 m (5 Hz; the plan's
+  2 Hz left the far target 0.6-0.7 m off at p95 in the unit test), an NPC slower than 0.35 m/s half as often (at most
+  1 s apart), a dead one at most once a second; a byte budget of 7000 B/s of records per guest (~8 KB/s with the
+  message headers; deferred NPCs go next round, oldest first). NpcStates2 per guest: 48 NPCs in range measured
+  6.3 KB/s in the unit test (NpcStates was ~21 KB/s at 48 NPCs). The velocity and the gait are the host's (from its
+  last two rounds); the slow fields go once per guest in NpcInfo and again when they change.
+- **The replica (guest):** one `replica::Stream` (core net/replica.h) for the host's NPCs: its playout clock from the
+  messages' sample times, a track per net id; each NPC is shown further in the past by its own sample interval (a
+  5 Hz far NPC is interpolated like a 15 Hz near one, changing at most 0.3 s per s) and led to "now" along its velocity
+  and acceleration (bounded: 6 m/s^2, 3 m). Per replica a `LocomotionController` (core net/remote_motion.h; the gait it
+  chooses itself from the wanted speed and the target's acceleration: the host's gait byte, derived from speed, lagged
+  every start and stop) plans the walk and a `Corrector` (preset ForNpc with the dead zone 0.3 m and at most 50 % of
+  the speed: snap beyond 5 m, 3 m high, stuck 0.8 m for 3 s, a teleport of the target; the controller's own snap when
+  the walk gets nowhere for 1.5 s) fixes the position. Every tick the C++ side sends the Lua glue one command per
+  replica (walk to a point with a gait and a speed multiplier, a nudge, a snap, a turn) and gets where it is after it
+  (`npc_sync.lua` `N.DriveAll`). Simulated (unit test, the session-1 cops' recorded paths through a lagged AI walker,
+  latency 25-40 ms, 0-2 % loss): replica vs the host's NPC p95 0.97 m, max 2.15 m, no snaps (UNVERIFIED in game).
+- **Pairing (guest):** a guest pairs each host NPC with the nearest human of his own world within 1.5 m of it (the same
+  mission scripts spawn the same NPCs at the same spots on every game, docs/game-api.md 15) and keeps the pairing.
+  0.11.0: a host NPC with a job (AI type not 0) that found none there within 2 s is paired with the nearest free local
+  human of the same tag (or, when one side has no tag, the same AI type) within 40 m (unreleased: and put at the host
+  NPC's spot when more than 5 m off); all candidate pairs are taken nearest first (same spot before moved apart, the
+  same tag counts at half its distance); dead host NPCs are paired too (their replica is killed). Deactivated humans
+  (`IsActive()` false), ambient humans and `MafiaCoop.PedOwned` humans are never paired. A pairing is released after
+  5 s without a state (out of the guest's interest, gone); a host NPC in a vehicle (its car flag, or faster than
+  11 m/s, held 2 s) is never loose-paired with a local NPC on foot (nor the other way round), and a pairing whose host
+  NPC drives while ours walks more than 40 m away is released after 2 s.
+- **The paired NPC's own AI is stopped** while it is a replica (unreleased; UNVERIFIED which call holds, docs/game-api.md
+  15 "Replicas"): `InterruptBattle`, `InterruptCivilWander`, `InterruptPatrol`, `InterruptAvoidingCar`,
+  `SetReactionOnSound(false)` on pairing, `InterruptBattle` again every 2 s while it is driven; `ResumeBattle` and
+  `SetReactionOnSound(true)` when the pairing ends. A paired NPC that does not follow (three snaps within 20 s, not
+  counting the host NPC's own teleports) is given up: hidden where the host's NPC is (no model, physics state 2,
+  demigod), kept paired so it is not paired again and dies with the host's NPC, and a spawned copy shows the host's
+  NPC instead. Mission scripts keep running on the guest: a mission NPC is never despawned.
+- **Health and death:** the replica's health follows the host's NPC down (never up); it dies when the host's dies
+  (killed; one that still does not die after 3 tries is hidden).
+- **Shots and damage (one authority):** a replica's shots are pictures (a copy's and, unreleased, an armed paired NPC's:
+  the host's shot counter fires its gun along its heading, past the guest when it faces him). A replica's bullet that
+  hits the guest here is given back (player_sync.lua `M.OnLocalDamage`, `N.IsPicture`). The guest's damage from host
+  NPCs always comes from the host: their hits on his puppet there go to him as a Hit with source 1 and the NPC's key,
+  and are always applied (unreleased: before, a hostile paired NPC that "fought him on his own game" skipped them; now
+  only an NPC his own game is the authority for skips it, `npcrep::SkipRelayedHit`).
+- **The guest's hits:** a hit on a replica hurts it on his game and goes to the host as NpcHit; the host replays a
+  bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit reaction and damage apply), else
+  `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`. When the guest's replica dies within
+  1.5 s of his hit, he sends a lethal NpcHit (no damage of its own): 0.8 s later the host kills his NPC if it still
+  lives (an enemy that his mission keeps invulnerable is made vulnerable for it; an invulnerable ally or civilian is
+  left alone).
 - Enemies and guests (0.9.0): on the host each guest's puppet gets the FRIEND brain 2 s after it spawned
   (`SwitchBrain(1)`, docs/game-api.md 15; ini `enemies_target_guests = 0` turns it off), so the host's enemies shoot at
-  it. Their hits on a puppet go to that guest as a Hit with source 1 and the NPC's key; the guest takes it (an NPC
-  bullet as ~2.6x its DAMAGE amount, the downed rules apply, friendly fire does not matter) unless his own copy of
-  that NPC is alive and hostile: then it fights him on his own game already and the relayed hit is skipped, so he is
-  not hurt twice. Hostile copies are put back only when more than 12 m off (6 m for other NPCs with a job).
+  it; an NPC that a guest attacked fights back at his puppet (hostile NPCs only).
 - Spawned copies (0.12.0): a host NPC with a job (AI type not 0), on foot, alive, with a known profile, within 90 m of
   the guest, that found no partner for 5 s (2 s for the loose pairing, then 3 s more; none in the first 10 s after
-  the guest's world loaded) gets a copy on the guest's game: a human from a runtime spawner (like the player
-  puppets) with that spawn profile, its health, and the NPC's weapon. The host knows the profile from the NPC's name:
-  a human a mission spawner made is called `behavior_object_prime-NN-<spawner name>`, and the spawner (entity type
-  65, by that name, the nearest when several share it) tells its profile (docs/game-api.md 15); 0 for NPCs from
-  traffic or police generators. Unreleased: an NPC with profile 0 gets a fallback by its AI type (4: the police
-  profile `characters/ai/police_scotch/ai_police_triggerman`, else the civilian
-  `characters/traffic/traffic_base_ambient_combined`, as their FNV-1 64 hashes, `mc_fnv`); before, it got no copy.
-  An NPC moving faster than 11 m/s counts as in a car whatever its car flag says (no copy, a copy is released, no
-  pull). The copy is driven from the states like a player puppet
-  (walk/run toward the position plus the velocity of the last two states, pulled along, heading when standing), aims
-  and fires when the shot counter goes up (along its heading; past the guest, 1.6 m beside and 2 m above him, when it
-  faces him: its bullets are only a picture, the host's NPC already shot at the guest's puppet and that hit comes as
-  a Hit). It is paired like any copy: the guest's hits go to the host as NpcHit, a lethal one kills the host's NPC,
-  the host's death kills it; relayed hits of that NPC are always applied (it never fights the guest itself). It is
-  released 12 s after its death, 5 s after the last state (out of range, gone), when the NPC gets into a car, when
-  the guest is more than 110 m away, during a cutscene, when the session ends and with the world (loads). When the
-  guest's own game spawns that NPC after all (a free local NPC at the same spot, or of the same tag within 40 m), his
-  own takes over and the copy is released: no doubles. At most 10 copies at a time, one spawn profile loading at a
-  time. Unpaired NPCs without a job (ambient pedestrians that differ per game) still get no copy.
-- Ambient pedestrians stay local to each game; ambient traffic and police cars are the host's near him (below,
-  "Traffic"). Cars a player drives are shared as before (Phase 3); a
+  the guest's world loaded; at once for a paired NPC that did not follow) gets a copy on the guest's game: a human
+  from a runtime spawner (like the player puppets) with that spawn profile, its health, and the NPC's weapon. The
+  host knows the profile from the NPC's name: a human a mission spawner made is called
+  `behavior_object_prime-NN-<spawner name>`, and the spawner (entity type 65, by that name, the nearest when several
+  share it) tells its profile (docs/game-api.md 15); 0 for NPCs from traffic or police generators: an NPC with
+  profile 0 gets a fallback by its AI type (4: the police profile `characters/ai/police_scotch/ai_police_triggerman`,
+  else the civilian `characters/traffic/traffic_base_ambient_combined`, as their FNV-1 64 hashes, `mc_fnv`). The copy
+  is a replica like a paired NPC (driven the same way, unreleased; before: walk/run toward the newest state plus its
+  velocity, pulled along), released 12 s after its death, 5 s after the last state, when the NPC gets into a car,
+  when the guest is more than 110 m away, during a cutscene, when the session ends and with the world. When the
+  guest's own game spawns that NPC after all, his own takes over and the copy is released: no doubles. At most 10
+  copies at a time, one spawn profile loading at a time.
+- Measuring (docs/sync-trace.md): the host writes `NPT` for every NPC state it sends (its sample time and position),
+  the guest `NPR` per replica at 10 Hz; `tools/sync_compare.py` lines them up (`npc.p95`, `npc.max`) and reads the
+  NPC bandwidth per guest from `NBW` (`npc.bw`).
+- Ambient pedestrians are not npc_sync's: they are replicated by ped_sync (below, "Pedestrians"); npc_sync never
+  sends, pairs or drives one. Ambient traffic and police cars are shared by region (unreleased; 0.15: the host's near him; below, "Traffic"). Cars a player drives are shared as before (Phase 3); a
   remote driver's car is first looked for here: a car of the same model standing where his car stands (within 3 m)
   is taken as his car (mission cars are not doubled), and no copy is spawned into another car standing there.
   Such a mission car does not keep an NPC at its wheel: when the remote driver's puppet is thrown out of it twice
@@ -581,7 +721,10 @@ nothing of them before.
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0420 | GuestNpcStates | guest -> host (`SendToHost`) | U, 10 Hz | the NpcStates body (u8 n at most 16, then n x the same NPC record); key = the NPC's entity id on the guest's game |
+| 0x0420 | GuestNpcStates | - | - | retired (unreleased): neither sent nor read (was the full NpcStates body, guest -> host, 10-15 Hz) |
+| 0x0424 | GuestNpcStates2 | guest -> host (`SendToHost`) | U, per NPC 15 Hz near another player to 5 Hz at 120 m | the NpcStates2 body (the guest's sample time on his steady clock, net ids of the guest's own numbering) |
+| 0x0425 | GuestNpcInfo | guest -> host (`SendToHost`) | R | the NpcInfo body; key = the NPC's entity id on the guest's game |
+| 0x0426 | GuestNpcLeave | guest -> host (`SendToHost`) | R | the NpcLeave body |
 | 0x0421 | GuestNpcEnd | guest -> host (`SendToHost`) | R | u32 key, u8 reason (0 died, 1 handed back, 2 gone, 3 claim refused), u32 hostKey (1 and 3: the host NPC), u16 health (its last), u8 flags (1: it died of the host's hit) |
 | 0x0422 | HostNpcHit | host -> that guest (`SendTo`) | R | u32 key (the guest's NPC), f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (1 = lethal: the host's copy died of his hits), u8 attacker (0.15 multi-guest, trailing: the player whose hit it was, 0 the host; another guest when he hit the NPC relayed to him; read as 0 when missing, older readers stop before it) |
 | 0x0423 | NpcClaim | host -> that guest (`SendTo`) | R | u32 guestKey, u32 hostKey, u8 flags (1: the guest's NPC is dead) |
@@ -592,7 +735,9 @@ npc_sync.lua.
 - **Which NPCs (guest):** 10 times a second the guest reports his NPCs with a job (AI type not 0) within 100 m (the
   64 nearest; none in the first 10 s after his world loaded or during a cutscene) with the host NPC each is paired
   with. One that stays unpaired for 5 s (alive) becomes **his own**: the 16 nearest at most, their states go to the
-  host as GuestNpcStates (at most 16 a round, one message). Spawned copies (his copies of host NPCs) are never
+  host as GuestNpcStates2 through the same publisher as the host's (unreleased): the guest is their authority; the
+  interest viewpoints are the other players (their puppets on his game), so an NPC of his that no other player is
+  within 120 m of is not sent (its mirror on the host ends after 5 s and comes back when someone gets near). Spawned copies (his copies of host NPCs) are never
   reported, and the C++ side drops any id in the copy list again (no feedback loop). A paired moment restarts the 5 s;
   an NPC that died before it was his own is never sent.
 - **Mirrors (host):** every guest NPC gets a mirror id (unique on the host; at most 24 per guest). It is shown like a
@@ -600,13 +745,15 @@ npc_sync.lua.
   (the guest reads it from the NPC's spawner name like the host does; unreleased: profile 0, e.g. the guest's cops,
   gets the fallback by AI type as above: the 0.15.0 test showed 0 of 179 samples of 12 such cops), its weapon and
   health, driven from the
-  guest's states (walk/run, heading, its shots as pictures), a civilian on the host's game (no fight of its own), at
-  most 10 at a time, within 90 m of the host, released 12 s after its death, 5 s after the last state, in a car, in
-  a cutscene, with the session and the world. Mirror copies are never in the host's NpcStates (no NPC goes back to the
-  game it came from).
+  guest's states (unreleased: a replica driven like the guest's replicas of host NPCs: the host keeps one
+  replica::Stream per guest and drives the mirror's copy with the same controller and correction; its shots as
+  pictures), a civilian on the host's game (no fight of its own), at most 10 at a time, within 90 m of the host,
+  released 12 s after its death, 5 s after the last state, in a car, in a cutscene, with the session and the world.
+  Mirror copies are never in the host's NpcStates2 (no NPC goes back to the game it came from).
 - **Other guests (several guests, 0.15 multi-guest; not yet checked in game):** the host relays its mirrors of guest
-  A's own NPCs to every other guest in its NpcStates (SendTo per guest, 10 Hz, at most 48 per guest and round; never
-  to A himself), keyed by a **relay key**: A's entity id for it with its type byte (8, a human: an id is `slot << 8 |
+  A's own NPCs to every other guest in its NpcStates2 (unreleased: through the host's publisher like its own NPCs,
+  stamped with the host's round time, only to the guests whose share it is and within their interest; never to A
+  himself), keyed by a **relay key**: A's entity id for it with its type byte (8, a human: an id is `slot << 8 |
   type`, docs/game-api.md `mc_entity_ids`) replaced by `0xF0 + A` (`npcown::RelayKey`). No entity id has such a type
   byte, so it never collides with a host NPC, and it stays below 2^24, so the game's Lua (32-bit float numbers) holds
   it exactly; an id that does not fit (slot >= 65536) is not relayed. Guest B treats it like any host
@@ -625,8 +772,8 @@ npc_sync.lua.
   shoot at every puppet on his game (all puppets get the FRIEND brain where the game-sectors guard is in,
   player_sync.lua `M.Ally`); their hits go to that puppet's player as a Hit with source 1 (0.15 multi-guest: to any
   player; before, only hits on the host's puppet were sent and another guest's puppet drew the fire for nothing). The
-  host takes them like any NPC's; another guest skips one when his own version of that NPC (paired with its relay
-  key) is alive and hostile and fights him on his own game already (`N.FightsUs(key, from)`).
+  host takes them like any NPC's, and so does another guest (unreleased: his own version of that NPC, paired with its
+  relay key, is a replica driven from the relay and never fights him itself; before, a hostile one skipped them).
 - **Deaths:** the guest's NPC dies -> GuestNpcEnd died -> the mirror's copy dies on the host (health also follows the
   guest's down, never up). The host kills the copy -> lethal HostNpcHit -> the guest's NPC dies.
 - **Back to the host (no doubles):** when the host's own game spawns that NPC (the host arrives), it is paired again
@@ -637,83 +784,127 @@ npc_sync.lua.
   guest pairs them (a spawned copy of that host NPC goes), or answers GuestNpcEnd claim refused (his NPC is paired
   with another host NPC, that host NPC with another of his, or no state of it yet); no answer in 3 s counts as
   refused, and a refused pair is not tried again for 15 s. On the pairing the guest sends GuestNpcEnd handed back
-  with its health: the host releases the copy and lowers his own NPC's health to it. A late GuestNpcStates of an
+  with its health: the host releases the copy and lowers his own NPC's health to it. A late GuestNpcStates2 of an
   ended NPC (unreliable after reliable) makes no new mirror for 3 s.
 - **Dead mirrors:** a mirror that died is remembered for 60 s: a host NPC that spawns at its place (same rules)
   in that time is claimed dead: the host kills his NPC (the guest already killed it) and the guest pairs it with his
   dead one, so it gets no copy there.
 - **Gone:** an NPC of his own out of the guest's rounds for 2 s (out of 100 m, despawned) ends (GuestNpcEnd gone); a
   mirror without a state for 5 s ends on the host; a guest who leaves takes his mirrors along.
-- Bandwidth: at most 16 NPCs x 10 Hz x ~45 bytes = ~7 KB/s per guest (like the host's 48 x 10 Hz).
+- Bandwidth: at most 16 NPCs x 15 Hz x 19 bytes = ~4.6 KB/s per guest at most (was ~7 KB/s with GuestNpcStates).
 
-### Traffic (0.15.0; not yet checked in game)
+### Traffic (0.15.0; by region unreleased; not yet checked in game)
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0220 | TrafficSpawn | host -> one guest (`SendTo`) | R | u8 n (at most 16), then n x: u16 net, u8 kind (0 traffic, 1 police), str model, i16 color1 color2 (`GetColor(1)` / `GetColor(2)`, -1 unknown), str plate ("" unknown), f32 x y z, u32 quat (smallest three), i16 vx vy vz (1/100 m/s), u8 flags |
-| 0x0221 | TrafficDespawn | host -> one guest (`SendTo`) | R | u8 n, then n x u16 net |
-| 0x0222 | TrafficStates | host -> one guest (`SendTo`) | U, up to 20 Hz per car | u32 hostMs (the host's clock), f32 origin x y z, u8 n (at most 40: 897 bytes), then n x 22 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i16 vx vy vz (1/100 m/s), u32 quat, i8 steer (x127), u8 power, u8 brake (x255), u8 flags |
-| 0x0223 | TrafficBump | guest -> host (`SendToHost`) | R | u16 net, f32 error (m), f32 copySpeed, f32 hostSpeed |
+| 0x0220 | TrafficSpawn | host -> one player (`SendTo`) | R | u8 n (at most 16), then n x: u16 net, u8 kind (0 traffic, 1 police), str model, i16 color1 color2 (`GetColor(1)` / `GetColor(2)`, -1 unknown), str plate ("" unknown), f32 x y z, u32 quat (smallest three), i16 vx vy vz (1/100 m/s), u8 flags |
+| 0x0221 | TrafficDespawn | host -> one player (`SendTo`) | R | u8 n, then n x u16 net |
+| 0x0222 | TrafficStates | host -> one player (`SendTo`) | U, up to 20 Hz per car | u32 ms (the sender's clock), f32 origin x y z, u8 n (at most 40: 897 bytes), then n x 22 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i16 vx vy vz (1/100 m/s), u32 quat, i8 steer (x127), u8 power, u8 brake (x255), u8 flags |
+| 0x0223 | TrafficBump | a player -> host (`SendToHost`) | R | u16 net, f32 error (m), f32 copySpeed, f32 hostSpeed (his copy of a host car was knocked off) |
+| 0x0224 | TrafficSpawn2 | a guest -> one other player (`SendTo`; to another guest through core's relay) | R | u8 authority (= the sender), then the TrafficSpawn body (unreleased) |
+| 0x0225 | TrafficDespawn2 | the same | R | u8 authority, then the TrafficDespawn body (unreleased) |
+| 0x0226 | TrafficStates2 | the same | U, up to 20 Hz per car | u8 authority, then the TrafficStates body (the guest's clock; unreleased) |
+| 0x0227 | TrafficBump2 | a player -> that guest (`SendTo`) | R | u8 authority (the car's game), then the TrafficBump body (unreleased) |
 
-- **What is traffic:** a car of the host's game whose driver the traffic or police generators made (its name is
+0x0224-0x0227 are 0x0220-0x0223 with the authority in front. A receiver takes 0x0220-0x0222 only from the host (the
+host's cars, authority 0) and 0x0224-0x0226 only when the authority byte is the sender (core's relay keeps the real
+sender of a guest -> guest message), so no game can send cars as another. The latency trace counts 0x0222 / 0x0226 as
+"traffic", the rest as "traffic-event"; 0x0226 is sent with the Bulk priority like 0x0222. A 0.15 game ignores
+0x0224-0x0227 (no handler): it sees the host's traffic as before and no guest's.
+
+- **Every game is the authority for its own traffic** (docs/sync-architecture.md principle 1; unreleased: before, the
+  host's only). Its Lua glue (`traffic_sync.lua`) scans the car table once a second and reports, 20 times a second
+  while another player is in the world, its traffic cars within 380 m of any other player (his puppet, or his car):
+  transform, velocity, the driver's controls (`mc_car_controls`, flag 8), reversing (velocity against the car's
+  heading, flag 16), handbrake (flag 1), siren (flag 2, police only: the car's own siren / beacon bits via
+  `mc_car_signals`; when they cannot be read, on while the car goes faster than 14 m/s or is near a hunted player, and 8
+  s after; see "Police"). The dll (`game/traffic_model.h` AuthorityTraffic) gives each car a net id (u16 per authority,
+  kept while the car lives and never reused while a player has it) and keeps core's InterestManager with **every other
+  player** as a peer (Kind::Vehicle: enter 260 m / leave 320 m from him, every tick up to 60 m, every 0.4 s at 260 m,
+  x4 for cars below 0.3 m/s, at most every 2 s; 40 KB/s per player). Each player gets the **nearest 24** relevant cars
+  (a car beyond 150 m gives way to one within 90 m): a spawn when one is admitted, a despawn when it leaves his range,
+  is pushed out or is no longer traffic on its game, and its states when the interest manager says it is due and its
+  quantised state changed (an unchanged one is sent again after 1.5 s). The host sends with 0x0220-0x0222, a guest with
+  0x0224-0x0226 (to the host directly, to another guest through the host's relay, which costs the guest's relay
+  budget, `net_budget_kbps`). About 22 bytes x 20 Hz per car near a player: ~10-15 KB/s for a busy street.
+- **What is traffic:** a car of this game whose driver the traffic or police generators made (its name is
   `behavior_object_prime-NN-` with an empty suffix, docs/game-api.md 15), not a player car (player_sync's, Phase 3),
-  not a puppet factory's, not the one the host sits in; police when the driver's AI type is 4 or the model name says
-  so. Parked cars (no driver) and mission cars (drivers named after a mission spawner) stay local to each game as
-  before. A traffic car whose driver died or got out stays shared; once it has stood (under 2 m/s) for 20 s without
-  a driver it counts as parked.
-- **Driverless (flag 4, unreleased):** the host's Lua reads seat 0 of each car every second (and every round while
+  not a puppet factory's, not one of our copies of another game's cars, not the one we sit in; police when the
+  driver's AI type is 4 or the model name says so. Parked cars (no driver) and mission cars (drivers named after a
+  mission spawner) stay local to each game as before. A traffic car whose driver died or got out stays shared; once it
+  has stood (under 2 m/s) for 20 s without a driver it counts as parked.
+- **Driverless (flag 4, unreleased):** the authority's Lua reads seat 0 of each car every second (and every round while
   it read no driver): flag 4 in its TC line is "no living generator driver read now". That read flickers (0.15.0
   two-PC test: 179 cars flagged, 118 of them still moving, 84 still at speed 4 s later, mostly 50-100 m from the host's
   player). The dll (`game/traffic_model.h` DriverWatch) sends flag 4 only when no driver was read for **1 s while the
   car was slower than 2 m/s** all that time; it clears it when a driver is read again or the car speeds up past
   4 m/s (someone drives it). UNVERIFIED in game: why the read fails on moving cars (the log names the reason, `seat 0
-  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the host's player: driver
+  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the authority's player: driver
   culling or level of detail far from him was the suspicion; trace `TRO`).
-- **Host:** the Lua glue (`traffic_sync.lua`) scans the car table once a second and reports the traffic cars within
-  380 m of any guest (his puppet, or his car) 20 times a second: transform, velocity, the driver's controls
-  (`mc_car_controls`, flag 8), reversing (velocity against the car's heading, flag 16), handbrake (flag 1), siren
-  (flag 2, police only: the car's own siren / beacon bits via `mc_car_signals`; when they cannot be read, on while the car goes faster than 14 m/s or is near a hunted player, and 8 s after; see "Police"). The
-  dll (`game/traffic_model.h` HostTraffic) gives each car a net id (u16, never reused while a guest has it) and keeps
-  core's InterestManager (Kind::Vehicle: enter 260 m / leave 320 m from the guest, every tick up to 60 m, every 0.4 s
-  at 260 m, x4 for cars below 0.3 m/s, at most every 2 s; 40 KB/s per guest). Each guest gets the **nearest 24**
-  relevant cars (a car beyond 150 m gives way to one within 90 m): a TrafficSpawn when one is admitted, a
-  TrafficDespawn when it leaves his range, is pushed out or is no longer traffic on the host's game, and its states in
-  TrafficStates when the interest manager says it is due and its quantised state changed (an unchanged one is sent
-  again after 1.5 s). About 22 bytes x 20 Hz per car near him: ~10-15 KB/s for a busy street.
-- **Guest:** within 250 m of the host (back to his own beyond 400 m; the host's puppet or car gives his position) the
-  guest shows the host's traffic: his ambient traffic spawning (`SetEnableAmbientTrafficSpawning(false)`) and police
-  spawning (`PreventPoliceSpawning(true)`) go off, and 6 s later his own moving traffic cars farther than 70 m are
-  hidden (`Deactivate`, the car and its crew; shown again when he goes back to his own traffic). The nearest **20**
-  host cars within 240 m (dropped beyond 290 m; a far copy gives way to a car at less than half its distance) get a
-  copy: `ObtainCarWithCrew(model, {profile})` (unreleased: a civilian or police spawn profile of this game,
-  `characters/traffic/traffic_base_ambient_combined` / `characters/ai/police_scotch/ai_police_triggerman` and
-  fallbacks, docs/game-api.md 19; one that fails twice before it ever worked is dropped; the puppet factory's Tommy
-  last; `ObtainSpecificCar` when that fails), `SetDespawnImmunity`, `DisableExplosion`, the crew locked
-  (`LockControls(true)`, no reaction to sounds), the host's colours and plate. Each copy is driven like a remote
-  player's car (Phase 3 "Driving the puppet and the car copy"): the states are interpolated 120 ms behind the newest
-  (host clock: the smallest local-minus-host offset seen), moved forward by velocity x 120 ms (at most 2 m), then
-  core's VehicleController: the host car's controls, a blended correction, pinned when its physics does not follow,
-  snapped when more than 4 m off. Copies farther than 90 m are driven every third tick. A copy goes when its car is
-  despawned (1 s later, so player sync can take it first), after 5 s without a state, when the guest goes back to
-  his own traffic, and with the world; near ones (80 m) with `DespawnEntity` (when unseen), others at once. Siren
-  and beacons follow flag 2. The copy's driver gets out only when the host car is driverless (flag 4, confirmed as
-  above) **and** both the host's car and the copy stand (under 2 m/s; the dll adds flag 32 to the copy's drive
-  command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4 goes again its crew gets back in.
-  Twice a second the crew is checked: a member out of his seat (alive, the seat free, our player not within 8 m) is
-  put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in a row). npc_sync kills the copy's
-  driver when the host's driver died: traffic drivers are NPCs too and pair by position.
-- **Taking a traffic car:** when the host takes a car that is a traffic copy on a guest's game, the guest's player
-  sync finds that copy where the host's car is (same model, within 3 m) and adopts it; the traffic glue then hands
-  it over (its crew gets out, `TH`) and no longer drives or removes it. When a guest takes a copy, his game makes it
-  his car (player sync), the host's game adopts its own traffic car there as the guest's car, and its traffic
-  driver gets out.
-- **Hits and rams:** a guest's copy is a real car on his game: his bullets and his car hit it there. The host's car
-  is not moved by a guest's game; the guest's own car is a copy on the host's game (Phase 3) and hits the host's car
-  there by itself. A copy knocked more than 3 m off its target (that was on it a moment before) is put back by the
-  controller and reported (TrafficBump, at most every 2 s per car), which the host logs. Shots at a copy's driver go
-  through npc_sync (NpcHit) like any paired NPC. Damage to the cars themselves (dents, parts, tyres, fire, the
-  explosion) is shared since the car damage sync: the host's game holds it, a guest's copy reports its own ("Car
-  damage").
+- **Every game shows every other game's cars near it** (unreleased; before: a guest the host's, only while near him).
+  A receiver (`game/traffic_model.h` ReceiverTraffic) keeps the cars of each authority by `{authority, net}` (as one
+  number `authority << 16 | net`; the host's cars keep their net id, so car damage, car look and explosions, which only
+  know the host's traffic, are unchanged) and gives the nearest **20** of all of them within 240 m a copy (dropped
+  beyond 290 m; a far copy gives way to a car at less than half its distance): `ObtainCarWithCrew(model, {profile})`
+  (a civilian or police spawn profile of this game, `characters/traffic/traffic_base_ambient_combined` /
+  `characters/ai/police_scotch/ai_police_triggerman` and fallbacks, docs/game-api.md 19; one that fails twice before
+  it ever worked is dropped; the puppet factory's Tommy last; `ObtainSpecificCar` when that fails),
+  `SetDespawnImmunity`, `DisableExplosion`, the crew locked (`LockControls(true)`, no reaction to sounds), the
+  authority's colours and plate. Each copy is driven like a remote player's car (Phase 3 "Driving the puppet and the car
+  copy"): the states of each authority go through one core `replica::Stream` (its own playout clock: the adaptive delay
+  over that authority's jitter and state interval, 120 ms until it has enough states; Hermite between the states,
+  extrapolated at most 0.5 s; the same result as the 0.15 interpolation, tests/traffic_test.cpp), moved forward by
+  velocity x the playout delay (at most 9 m, was 2: a car 150 m away, sent every ~0.2 s, was shown 4.6 m behind), then
+  core's VehicleController (the driver's controls, the wanted velocity, pinned when its physics does not follow) and
+  core's Corrector with the traffic preset as tuned on a recorded car path (`TrafficCorrection()`: nothing within 0.5
+  m, beyond it 8 /s of the excess but at most 70 % of the car's speed, a snap beyond 8 m, after 3 s stuck 2 m off or
+  when the target jumps 20 m; was: 8 /s of any error, a snap beyond 4 m). Copies farther than 90 m are driven every
+  third tick. A copy goes when its car is despawned (1 s later, so player sync can take it first), after 5 s without a
+  state, when we drive off, when its authority leaves the session, and with the world; near ones (80 m) with
+  `DespawnEntity` (when unseen), others at once. Siren and beacons follow flag 2. The copy's driver gets out only when
+  the car is driverless (flag 4, confirmed as above) **and** both the authority's car and the copy stand (under 2 m/s;
+  the dll adds flag 32 to the copy's drive command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4
+  goes again its crew gets back in. Twice a second the crew is checked: a member out of his seat (alive, the seat
+  free, our player not within 8 m) is put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in
+  a row). npc_sync kills the copy's driver when the host's driver died: traffic drivers are NPCs too and pair by
+  position.
+- **Regions: whose spawning runs** (`game/traffic_model.h` RegionFollow over core's `RegionAuthority`, every game for
+  itself from every player's position). The host's game always runs its own traffic. A guest's game runs its own unless
+  it is in another player's region: within **250 m** of a region's owner it joins it, and it runs its own again only
+  beyond **400 m** of every region owner before it. The regions are the host's, then (in id order) each guest farther
+  than 400 m from the host and from the owners before him: two guests together far from the host share the lower id's
+  region (the higher id's spawning goes off), and a guest far from everyone runs his own. In another player's region
+  a game switches its ambient traffic spawning (`SetEnableAmbientTrafficSpawning(false)`) and police spawning
+  (`PreventPoliceSpawning(true)`) off, back on in its own (and when the session ends). The shown traffic does not
+  depend on the region: every game shows every other game's cars near it, so between 250 and 400 m (both spawn) both
+  games show both games' cars.
+- **Hand-over without pops** (unreleased). When players converge or part, cars that already exist keep their
+  authority until they leave (their net id and authority never change while they live; tests/traffic_test.cpp
+  "hand-over"); the new region owner's spawning takes over for new cars. A game whose spawning went off keeps its own
+  cars driving and shares them like all its traffic (the other player near them gets a copy); 6 s after the switch
+  they are hidden (`Deactivate`, the car and its crew) once out of everyone's sight, farther than **70 m** from us and
+  from every other player (before: from us only, while they were not shared), and shown again when our own spawning
+  comes back. A hidden car is no longer reported, so its copies go where nobody sees them. Trace `TRL near` counts our
+  cars within 70 m of us that a player within 240 m of them has not got for 2 s (the target: 0 ten seconds after a
+  region change).
+- **Taking a traffic car:** when a player takes a car that is a traffic copy on another game, that game's player
+  sync finds the copy where the car is (same model, within 3 m) and adopts it; the traffic glue then hands it over (its
+  crew gets out, `TH`) and no longer drives or removes it. When a player takes a copy on his own game, his game makes
+  it his car (player sync), the authority's game adopts its own traffic car there as his car, and its traffic driver
+  gets out (the same player sync and scan on every game; UNVERIFIED for a guest's traffic).
+- **Hits and rams:** a copy is a real car on its game: bullets and cars hit it there. The authority's car is not moved
+  by another game; the other player's own car is a copy on the authority's game (Phase 3) and hits the car there by
+  itself. A copy knocked more than 3 m off its target (that was on it a moment before) is blended back (snapped beyond
+  8 m) and reported to its authority (TrafficBump to the host, TrafficBump2 to a guest; at most every 2 s per car),
+  which logs it. Shots at a copy's driver go through npc_sync (NpcHit) like any paired NPC. Damage to the cars
+  themselves (dents, parts, tyres, fire, the explosion) is shared for the host's traffic since the car damage sync
+  (the host's game holds it, a copy reports its own, "Car damage"); a guest's traffic cars are not covered by it yet
+  (their copies keep `DisableExplosion` and show only their own dents).
+- **Known limits (unreleased, UNVERIFIED in game):** a guest's traffic copies on the host's game are humans of the
+  host's game in cars: the host's npc_sync does not know them as copies (`M.Traffic.IsCopyCrew(h)` says so; npc_sync
+  does not ask yet) and may send them to the guests as host NPCs; a guest's own traffic drivers with a job (police,
+  AI type 4) may still be reported to the host as his own NPCs (as in 0.15). A guest's own traffic has no car damage /
+  car look sync yet.
 
 ### Car damage (not yet checked in game)
 
@@ -971,7 +1162,7 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
   puppet, it starts a fresh one (not after a fine, an arrest or his death, not with offences off) (`ZoneCreate`, at
   most every 5 s). No wire change: all of this follows the existing PoliceChase (host-authoritative). The host's own
   zone is never touched. Far from the host no chase comes: his own police work as always (traffic sync turns his police spawning off
-  only near the host).
+  only in another player's region: near the host, or near a lower-id guest far from the host).
 - **Police copies** (traffic): the host reads the real siren / beacon of its police cars (`mc_car_signals`) for the
   copies' flag 2 (TrafficStates); the speed guess is only the fallback, now also "near a hunted player".
 - Additive: a peer without these messages ignores them. Logs `police: ...`; trace records POL / POE / POR / POT /
@@ -981,7 +1172,7 @@ The host's game decides the story doors. Code: `src/game/door_model.h` (the rule
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0240 | Explosion | the game where it happened -> everyone (`Broadcast`; a guest's is relayed by the host) | R | u32 seq (per sender; a new session starts elsewhere: `(GetTickCount() & 0xFFFF) << 16`), u8 kind (0 unknown, 1 grenade, 2 molotov, 3 dynamite `exp_satchel`, 4 crash object, 5 car blast), u8 flags (1 fire: the picture burns too; 2 one of the sender's NPCs threw it), f32 x y z, str weapon (`exp_grenade`, ...; "" unknown; at most 32 of `[A-Za-z0-9_-.:/]`), u32 npc (flag 2: the NPC's key on the sender's game: on the host its entity id, as in NpcStates; on a guest his own NPC's key, as in GuestNpcStates), str object (kind 4: the crash object's scene name, at most 64; "" none), **[u32 throwSeq]** (grenade arc: the Throw 0x0242 whose explosion this is, 0 none; older senders end before it, older readers ignore it; 1-3 trailing bytes = malformed) |
+| 0x0240 | Explosion | the game where it happened -> everyone (`Broadcast`; a guest's is relayed by the host) | R | u32 seq (per sender; a new session starts elsewhere: `(GetTickCount() & 0xFFFF) << 16`), u8 kind (0 unknown, 1 grenade, 2 molotov, 3 dynamite `exp_satchel`, 4 crash object, 5 car blast), u8 flags (1 fire: the picture burns too; 2 one of the sender's NPCs threw it), f32 x y z, str weapon (`exp_grenade`, ...; "" unknown; at most 32 of `[A-Za-z0-9_-.:/]`), u32 npc (flag 2: the NPC's key on the sender's game: on the host its entity id, as in NpcInfo; on a guest his own NPC's key, as in GuestNpcInfo), str object (kind 4: the crash object's scene name, at most 64; "" none), **[u32 throwSeq]** (grenade arc: the Throw 0x0242 whose explosion this is, 0 none; older senders end before it, older readers ignore it; 1-3 trailing bytes = malformed) |
 | 0x0241 | CarExploded | the car's authoritative game -> everyone (`Broadcast`) | R | u8 what (0 a shared player car; 1 a host traffic car, only from the host), str key (what 0: the shared car key `o:g`, Phase 3; what 1: its traffic net id, Traffic above), f32 x y z |
 | 0x0242 | Throw | the thrower's game -> everyone (`Broadcast`; relayed by the host) | R | u32 seq (per sender, below 2^24; a new session starts elsewhere: `(GetTickCount() & 0x3FF) << 12`), u8 kind (as Explosion: 0 other/unknown, 1 grenade, 2 molotov, 3 dynamite), u8 flags (1 fire: a molotov; 2 measured on the real projectile, else the aim model's guess), f32 origin x y z, f32 velocity x y z (m/s, at the origin; at most 80), f32 gravity (m/s^2, 0.5..50; sent 9.81), u16 delayMs (how old the origin was when sent), u16 fuseMs (origin to explosion, 0 unknown: sent 0 for now), str weapon (at most 32). About 40-50 bytes, **one per throw** |
 | 0x0243 | ThrowFix | the thrower's game -> everyone (`Broadcast`) | U (settled / gone: R) | u32 seq (the Throw's), u16 tMs (since the Throw's origin), u8 flags (1 bounce: our EXPLOSIVE_BOUNCE sound; 2 settled: it lies still here; 4 stop: it is gone, its last position; 8 turn: the readings left the predicted path; 16 position only: no projectile to read, keep your own velocity), f32 x y z, i16 vx vy vz (cm/s, clamped to +-327 m/s). **25 bytes**, at most 8 per throw (the 8th only for settled / gone), each sent the moment it is made |
@@ -1064,6 +1255,70 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   a car puts another game's blast on it itself ("Car damage", blasts on other games), so a remote player's grenade
   does wreck your car, on every game, once; a copy never blows up by itself.
 
+### Pedestrians (unreleased; not yet checked in game)
+
+| App id | Name | Dir | Channel | Body |
+|---|---|---|---|---|
+| 0x0280 | PedStates | authority -> one player (`SendTo`; guest -> guest through the host's relay) | U, 10 Hz near, 3 Hz at 50 m | u32 authMs (the authority's clock at the sample), f32 origin x y z, u8 n (at most 50: 817 bytes), then n x 16 bytes: u16 net, i16 x y z (1/32 m from the origin, +-1023 m), i8 hx hy (heading x127), i16 vx vy (1/100 m/s), u8 flags (1 dead, 2 panic, 4 crouch, 8 running), u8 gait (0 idle, 1 walk, 2 run, 3 sprint) |
+| 0x0281 | PedSpawn | authority -> one player | R | u8 n (at most 24), then n x 22 bytes: u16 net, u8 class (0: unknown, nothing readable yet), u32 look (the authority's `GetCivilArchetype` hashed to 32 bits, 0 unknown; logged, not applied), f32 x y z, i8 hx hy, u8 flags |
+| 0x0282 | PedGone | authority -> one player | R | u8 n, then n x u16 net |
+| 0x0283 | PedDeath | authority -> one player | R | u16 net, f32 x y z (where it died) |
+| 0x0284 | PedKill | receiver -> the authority | R | u16 net: the receiver's replica of it died by his hand |
+
+0x0285-0x0287 are reserved. All of it is additive: a build without it ignores these ids and keeps its own
+pedestrians (every game had its own before). Identity: `NetRef {authority, Pedestrian, net}` (core
+`net/authority.h`); a receiver keys a pedestrian by (sender, net), so two authorities' net ids never mix.
+
+- **What is an ambient pedestrian** (the contract with npc_sync): a human of this game that is not a player, puppet
+  or any copy (MafiaCoop's own), not in a vehicle, `GetAIType()` 0, and not named after a mission spawner
+  (`behavior_object_prime-NN-<suffix>` with a non-empty suffix, docs/game-api.md 15). `MafiaCoop.IsAmbientHuman(h)`
+  says so; `MafiaCoop.PedOwned` (entity id -> true) lists every local human ped_sync controls (adopted and spawned
+  replicas, hidden humans, its spawner's driver). npc_sync never pairs, sends or steers either.
+- **Authority by region** (core `RegionAuthority`, the traffic rules): the host's game within 250 m of the host,
+  elsewhere the nearest player's game in the world (ties: the lower id); a pedestrian keeps its owner until it is
+  400 m from him and another player is 50 m nearer (`Keep`), so when players converge the pedestrians already there
+  stay with their game until they leave or despawn (no hand-over of a living pedestrian's AI). Every game decides this
+  from the positions it has (its own and the puppets'); at a border two games can briefly both send.
+- **Authority side** (`game/ped_model.h` PedAuthority): ped_sync.lua scans the human table every 0.25 s and reports
+  the ambient humans within 75 m of any player 20 times a second (position, heading, dead / panic / crouch read; the
+  velocity and the gait come from the measured positions, smoothed, gait with hysteresis 0.5 / 2.4 / 4.8 m/s up,
+  0.3 / 2.0 / 4.3 down). The dll gives each pedestrian it owns a net id (u16, not reused while a player has it) and
+  keeps core's InterestManager per other player (Kind::Npc: enter 50 m / leave 60 m from him or his car; every 0.1 s
+  up to 15 m, every 0.33 s at 50 m; 16 KB/s budget; the nearest 40 at most): PedSpawn when one comes into his range,
+  PedGone when it leaves (or is no longer ours / gone), PedDeath once when it dies, its state when due and changed
+  (an unchanged one again after 1 s). States carry the sample time on the authority's own clock.
+- **Receiver side** (PedReceiver): one `replica::Stream` per authority (its playout clock, Hermite interpolation,
+  the "now" lead). Within 50 m of us, the authority's living pedestrians get a replica: **adopted first**, one of our
+  own ambient humans of that region (one-to-one, nearest first, kept; within 3 m always, up to 45 m only when neither
+  it nor the target is in view: the camera cone of 60 degrees, 4 m around the camera always counts as in view), its
+  wandering interrupted (`InterruptCivilWander`, `InterruptAvoidingCar`, `SetReactionOnSound(false)`,
+  `DespawnImmunity(true)`; UNVERIFIED which of these the civilian AI honours); **spawned second**, a pedestrian
+  unmatched for 0.8 s (2.5 s when its spot is in view) within 45 m gets a copy from our own spawner (the puppet
+  factory recipe, profile `characters/traffic/traffic_base_ambient_combined`: every copy looks like that, the
+  authority's look is not readable), at most 10 copies and 2 requests at once. Our surplus ambient humans in our 50 m
+  zone (of another's region) are **hidden** while nobody looks (`ShowModel(false)`, `Deactivate`), only while that
+  authority's pedestrians arrive; they are shown again (out of view) where the region is ours again for 2 s, or when
+  150 m away, and all at the session's end. While another's pedestrians show near us our pedestrian spawners around
+  us are blocked (`BlockSpawnersInSphere(pos, 60, true)` every 20 m we move, released after; UNVERIFIED, see
+  docs/game-api.md 26). Every replica is walked like a puppet: core's LocomotionController with the sender's gait as
+  the hint and the correction rules of `Corrector::ForNpc` (0.5 m dead zone, a nudge capped at 35 % of its speed or
+  0.15 m/s standing, a snap beyond 5 m or 3 m up, stuck 0.8 m for 3 s), applied with `MoveVec`,
+  `SetMovementSpeedMult`, `SetPos` / `SetDir`.
+- **Deaths and panic** follow the authority: a PedDeath (or the dead flag) kills the replica (`DoDamage`); the crouch
+  flag makes a standing replica `PanicCrouch` (UNVERIFIED read and picture); running is in the gait. A replica that
+  dies here by our hand sends PedKill to its authority, whose pedestrian then dies (and that death reaches everyone).
+- **Gone / stale:** a pedestrian's replica goes on PedGone or after 3 s without a state: an adopted human gets its own
+  AI back (`ResumeCivilWander`, `ResumeAvoidingCar`, `SetReactionOnSound(true)`), a spawned copy is released when
+  nobody looks (at the latest 3 s later). A player who leaves or loses his connection: his pedestrians' replicas go.
+- **Bandwidth** (per receiving player): 16 bytes per pedestrian per state + 17 bytes per packet. 32 pedestrians near
+  him at 10 Hz: 32 x 10 x 16 = 5.1 KB/s + ~0.2 KB/s headers = **~5.5 KB/s** (worst case, everyone within 15 m and
+  moving; farther ones 3-10 Hz, standing ones once a second), plus PedSpawn 22 bytes per pedestrian when it comes
+  into range. Lane 5, PedStates Bulk (thinned first), PedDeath / PedKill Critical. With 4 players the host uploads at
+  most ~3 x 6 = 18 KB/s for its pedestrians (docs/sync-architecture.md section 7).
+- **Measured:** trace `PDT` (authority truth), `PDR` (replica at 10 Hz, keyed by the authority's sample time), `PDC`
+  (coverage, 1 Hz) and `PDS` / `PDP` / `PDE` / `PDL` (docs/sync-trace.md); `tools/sync_compare.py` "Pedestrians"
+  computes `ped.p95` and `ped.coverage`.
+
 ## Reconnect (no messages of its own)
 
 Core does the transport and session part (external/core/docs/protocol.md "Reconnect": slot held 60 s on the host,
@@ -1074,7 +1329,7 @@ the game layer does with it:
 |---|---|---|
 | host, other guests | a player is dropped (`GameModule::OnPlayerDropped`) | his puppet is removed (`PlayerSync::OnPlayerLeft`, as when he leaves); banner "<NAME> LOST THE CONNECTION - WAITING FOR THE PLAYER TO RECONNECT... 45 S" (`Session::DroppedPlayers`; several at once: "SAM AND PAULIE LOST THE CONNECTION - WAITING FOR THEM ..." with the longest wait) |
 | lost guest | `OnConnectionLost` | the game keeps running (no menu, no load). The session is inactive: PlayerSync removes the puppets and stops sending (the trace stays open: `RCN ev=sync-paused`), MissionSync keeps the host's point and our `_followPoint` (nothing reloads by itself) and forgets the host's cutscene, NpcSync's Lua drops the copies it spawned (it does that whenever the session is inactive); banner "CONNECTION LOST - RECONNECTING... 12 S" |
-| host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
+| host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; WorldEnvSync sends him WorldEnv at once; PlayerSync sends our PlayerModel; NpcInfo / NpcStates2 reach him in the next round (he is a new peer of the NPC publisher) |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
 
 | lost guest | the session is inactive / back | DoorSync: nothing is sent or applied meanwhile; when the session is active again the glue reads its doors again and asks the host for a DoorSnapshot (reason reconnect) |
@@ -1082,7 +1337,11 @@ the game layer does with it:
 | host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
 | lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
-- Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`), so a drop and a resume
+- A lost guest that is back: his WorldEnv follower starts with a first sync again (one SetTime when off), a catch-up
+  that ran when the connection was lost has had the host's flow speed put back; JoinSync times his world anew
+  ("Join and reconnect" above).
+- Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`, WorldEnvSync
+  `HostSender`), so a drop and a resume
   between two ticks (a guest's new Hello on the live Steam connection) still re-sends everything.
 - A guest that comes back after the 60 s hold is a new player for the host (maybe another id): the same re-send
   happens; his characters default by the new id unless he picked one (`model =`, re-sent as PlayerModel).
@@ -1107,10 +1366,10 @@ Sessions take up to 4 players (host + 3 guests, core `kMaxPlayers`). What change
 | PlayerState, PlayerModel, CarParked | every peer `Broadcast`s, the host relays to the other guests: each game drives one puppet per other player (`Remote` per id) |
 | Hit (player -> player) | `SendTo(victim)`, guest -> guest through the host relay; the victim replays from the attacker's puppet; friendly fire as before |
 | NPC hits on puppets | host NPCs -> any guest's puppet (as before); a guest's own NPC -> any puppet on his game, sent to that puppet's player (was: the host's only) |
-| NpcStates | at most 48, in turns from each player's nearest (was: the 48 nearest to anyone) |
+| NpcStates2 | per guest by interest around his puppet (unreleased; before: NpcStates broadcast, at most 48 in turns from each player's nearest) |
 | Guest-owned NPCs | relayed by the host to the other guests (relay keys); hits forwarded to the owner with the attacker; one owner per NPC (lower id) |
 | Seats | ride along skips seats the other players' states claim; the same passenger seat twice: the lower id keeps it, the other slides; the wheel of one car claimed by two other players: the current one keeps it |
-| Traffic | per guest (HostTraffic: own interest set, 24 cars, 40 KB/s budget); a car near two guests has one net id; a guest who drops is a new peer when back |
+| Traffic | every game is an authority for its own traffic, with an interest set per other player (24 cars, 40 KB/s budget); a car near two players has one net id; a guest's traffic goes to the other guests through the host's relay (0x0224-0x0226); two guests together far from the host share the lower id's region; a player who drops is a new peer when back and his cars' copies go everywhere (unreleased) |
 | Failed missions | a guest's failure is his own (MissionFail -> FailVerdict to him only, the others play on); the host's failure is everyone's (HostFailed broadcast); tests/fail_flow_test.cpp "3 guests" |
 | Story, cutscenes, saves | per guest by `(id, joinSeq)`: a newcomer or a reconnected guest gets state, save and cutscene; the others nothing extra |
 | Lobby | ready per guest, START needs all of them; a fifth player is refused (core tests/net_lobby.cpp "4 players") |
@@ -1119,17 +1378,14 @@ Sessions take up to 4 players (host + 3 guests, core `kMaxPlayers`). What change
 
 Bandwidth with 4 players (estimates from the per-message sizes above, host upstream): PlayerState ~60-140 B x 60 Hz
 per player, the host sends his own and relays two others' to each guest: ~3 x 3 x 6 KB/s = ~55 KB/s in cars; NpcStates
-~45 B x 48 x 10 Hz = ~22 KB/s per guest (broadcast); relayed guest NPCs up to 48 x 45 B x 10 Hz = ~22 KB/s per guest
-(only with guests' own NPCs); traffic up to 40 KB/s per guest (its budget). Worst case ~3 x (18 + 22 + 22 + 40) = ~300
+~45 B x 48 x 10 Hz = ~22 KB/s per guest (broadcast; unreleased: NpcStates2 by interest, <= 8 KB/s per guest including
+the relayed guests' own NPCs); traffic up to 40 KB/s per guest (its budget). Worst case ~3 x (18 + 22 + 22 + 40) = ~300
 KB/s up from the host, ~100 KB/s down to each guest; the relay limit per guest (`net_budget_kbps`, 1024 KB/s) is far
 above what one guest sends. Per-guest totals: core's traffic log (`net: <name> (<id>): ... out .. KB/s, in ..`
 every `net_log_interval` s, per peer), the overlay's traffic line on the host ("guest N: cars of relevant (KB)"),
 trace `TRP` per guest.
 
 Known limits (documented, not fixed):
-- Traffic is only the host's: two guests together far from the host (beyond 250 m) each run their own ambient
-  traffic and do not see each other's (a guest's traffic is never shared). The host-traffic switch uses the distance
-  to the host only.
 - A guest's own NPCs reach the other guests only through the host (one more hop: ~1 RTT later than the host's own).
 - Puppets are spawned one at a time (one runtime spawner): with three others the last one may appear a few seconds
   after the first.
@@ -1150,6 +1406,7 @@ session-clock stamp. Ours (`src/game/latency.cpp`, `Configure`):
 | 2 | doors 0x0230-0x023F | |
 | 3 | police 0x0260-0x026F | |
 | 4 | items 0x0270-0x027F | |
+| 5 | pedestrians 0x0280-0x0287 | many small states; their spawn / gone / death need no order with the rest |
 
 A lane message still comes after the lane-0 messages sent before it; lane 0 does not wait for the lanes, so e.g. an
 NPC death sent after a mission change can arrive before it (UNVERIFIED that no handler minds; none checks for it).
@@ -1157,8 +1414,10 @@ NPC death sent after a mission change can arrive before it (UNVERIFIED that no h
 Priorities against the per-peer send budget (`net_budget_kbps`, lowered automatically on a lossy / backed-up link):
 Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
 NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
-(0x0260-0x0262), MissionFail / FailVerdict. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
-DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, car damage, the rest.
+(0x0260-0x0262), MissionFail / FailVerdict, WorldEnv. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
+DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates2, NpcInfo, NpcLeave, GuestNpcStates2,
+GuestNpcInfo, GuestNpcLeave (unreleased; their rates and the per-guest budget are the NPC publisher's), car damage, the
+rest.
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
 parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way
@@ -1169,14 +1428,16 @@ network delay N. "Before" is 0.15 main (core 0.11).
 | PlayerState (on foot, car) | 60 Hz | sample -> send 0..1 frame (E) + send queued until the next Poll 16.7 ms (measured) + N + 0..1 frame + fixed 50 ms playout (led forward by 50 ms) | sent in the frame it is first seen, flushed at once (0.06 ms measured) + N + 0..1 frame + adaptive playout 24.5 ms at a quiet 60 Hz (measured, net_latency; grows with jitter), stamped with the sample time | ~4 KB/s per player on foot (~60 B x 60), ~6 KB/s in a car (E; +4 B stamp per state = +0.24 KB/s) |
 | Actions (punch, throw, jump ...) | ride on PlayerState | as PlayerState | as PlayerState | none extra |
 | Traffic cars | 20 Hz host rounds | 16.7 ms queue + N + fixed 120 ms playout | flushed + N + adaptive ~57 ms (traffic_test, quiet link; 140 ms under 80 ms jitter) | ~25 B per car per state: 20 cars x 20 Hz = ~10 KB/s typical, ~20 KB/s worst (cap 20 copies, E); Bulk: thinned first |
-| NPC states | 10 Hz -> 15 Hz | 0..100 ms round + 16.7 + N | 0..66 ms + N (no playout delay: the AI walks to the newest state) | ~15 KB/s for 48 NPCs (was ~10; E) |
+| NPC states | 10 Hz -> 15 Hz; unreleased: per NPC 15 Hz near to 5 Hz at 120 m (NpcStates2) | 0..100 ms round + 16.7 + N | 0..66 ms + N + adaptive playout (one replica::Stream per sender; a slow NPC further back by its interval), led to now along its velocity and acceleration | ~6 KB/s per guest for 48 NPCs in range (unit test; was ~21 measured) |
 | NPC deaths / hits / claims | event | 16.7 + N (+ RTO 50 ms+ on a loss) | N (+ ~1 RTT on a loss) | < 0.5 KB/s (E) |
 | Doors | door message -> next tick; poll 5 Hz -> 10 Hz | 0..200 ms poll + 16.7 + N | next tick on a door message, else 0..100 ms + N | < 0.2 KB/s events; snapshots on request ~2-6 KB each (E), Bulk |
 | Items | scan 2 Hz -> 4 Hz | 0..500 ms + 16.7 + N | 0..250 ms + N | ItemStates ~1-3 KB/s near items (E), Bulk |
 | Police | read 5 Hz -> 10 Hz | 0..200 ms + 16.7 + N | 0..100 ms + N | < 0.3 KB/s (E) |
 | Car damage | rounds 4 Hz -> ~6.7 Hz | 0..250 ms + 16.7 + N | 0..150 ms + N | only changes: < 1 KB/s typical, a few KB in a crash (E) |
+| Pedestrian states (unreleased) | 20 Hz authority rounds, 10 Hz near / 3 Hz at 50 m per pedestrian | - | flushed + N + adaptive playout per authority (ped_test: ~125 ms quiet, ~160 ms under 60 ms jitter at 10 Hz) | 16 B per pedestrian per state: ~5.5 KB/s for 32 near one player (worst case, E); Bulk |
 | Explosions, throws | event (detector) | 16.7 + N | N | < 0.2 KB/s (E) |
 | Mission state / fail | on change | 16.7 + N (HostSave held back everything after it) | N; HostSave on its own lane | HostSave up to 256 KB once per checkpoint, Bulk |
+| WorldEnv (time, weather) | every 4 s, on change | a newcomer waited up to 4 s; corrected only beyond 3 game minutes, by a jump | at once to a newcomer, on a change, every 2 s; the sample's age compensated, small errors closed by the flow speed | ~40 B every 2 s (< 0.03 KB/s) |
 
 Everything is also behind one hop more for guest -> guest traffic (via the host's relay, which forwards in the Poll
 that received it). Lua <-> C++: every system's tick hands what arrived to its Lua glue in the same script tick

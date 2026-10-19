@@ -509,6 +509,32 @@ Unexplained (2026-10-18):
 - [ ] CHAPTER 13: SALIERI: the guest's scripts stopped about 10 s after the opening cutscene (no Lua lines, status
   `no local player`, no error). Play the chapter start again and watch the guest's log.
 
+## Sync architecture checks (next two-PC test)
+
+The targets of docs/sync-architecture.md section 4. After the test, zip both `logs` folders and run
+`python tools/sync_compare.py <host trace> <guest trace> --check` on each session's pair (the newest trace of each PC
+in `logs\trace`); every line must say PASS. "no data" means the scenario below was not played long enough.
+
+Play in this order, both players together unless a step says otherwise (about 25 minutes):
+1. **On foot, 3 min:** run, sprint, stop sharply, zig-zag, stand still; both players take turns leading.
+   `foot.p95` <= 0.8 m, `foot.mean` <= 0.35 m, `foot.stand.p95` <= 0.3 m, `foot.gait` >= 90 %,
+   `foot.snaps_per_min` <= 0.5, both directions. Watch: no foot sliding beyond a short stop slide, no walking back.
+2. **Driving, 4 min:** each player drives his own car through town, then crashes and drifts.
+   `car.p95` <= 1.0 m, `car.pinned` <= 10 %, `car.speed_ratio` 0.9-1.1. VEH `gs=1` rare, `pf` short.
+3. **Traffic, 4 min:** together near the host, then the guest drives more than 400 m away and back.
+   `traffic.true_p95` <= 1.5 m, `traffic.shown` >= 95 %, `traffic.unshared_near` 0 (both directions). No car pops in
+   view when the guest comes back (`TRR` changes, `TRL near=0` 10 s later).
+4. **Pedestrians, 3 min:** walk a busy street together, look around; shoot one pedestrian each.
+   `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m; the shot pedestrians die on both games (`PDE ev=killreq` / `death`).
+5. **NPCs, 5 min:** get a wanted level and let the host's cops chase the guest on foot; then a mission fight if one is
+   at hand (Bon Appetit cp_040/050). `npc.p95` <= 1.0 m, `npc.max` <= 4 m, `npc.bw` <= 8 KB/s. Guest log:
+   `freeze ... ok`; any `does not follow ... hidden, a copy shows it` means the AI freeze did not hold (note which).
+   No double damage on the guest (only Hits with source 1).
+6. **World and join, 3 min:** the host sets the time flow fast (`game.gfx:SetTimeFlowSpeed(20)`) for a minute, then
+   back; the guest leaves the session and joins again. `world.time_err` <= 0.5, `join.complete_s` <= 10;
+   guest log `join: world complete in X s`; the cars parked before the rejoin are there (`PKR`).
+7. **Always:** `lat.player.p95` <= 40 ms, `bw.host_up` <= 160 KB/s (with 3-4 players if available).
+
 ## Test checklist: animation and car controls (0.13.0; 0.14.0 fixes not yet tested in game)
 
 First two-PC test of 0.13.0 (2026-10-17): see docs/PLAN.md A/B. After each test, compare the two sync traces

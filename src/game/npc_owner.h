@@ -6,9 +6,10 @@
 // The host is authoritative for the NPCs both games have (npc_sync.lua pairs them). An NPC that only a guest's game
 // spawned (he got somewhere first: his mission spawned the wave, the host's did not) has no host NPC to pair with:
 //   - GuestOwner (guest): a local NPC with a job (AI type not 0) that stayed unpaired for kOwnWait s becomes *owned*
-//     by this guest: its state goes to the host (GuestNpcStates, 10 Hz, nearest first, at most kMaxSend), its death
-//     once (GuestNpcEnd died). When it gets paired with a host NPC after all (the host's own game spawned it: the guest's
-//     usual pairing found it, or the host claimed it, NpcClaim) authority goes back to the host (GuestNpcEnd handed
+//     by this guest: its state goes to the host (GuestNpcStates2 through npc_replica.h's publisher, nearest first,
+//     at most kMaxSend), its death once (GuestNpcEnd died). When it gets paired with a host NPC after all (the host's
+//     own game spawned it: the guest's usual pairing found it, or the host claimed it, NpcClaim) authority goes back
+//     to the host (GuestNpcEnd handed
 //     back, with its health); when it is gone from the guest's world, GuestNpcEnd gone.
 //   - HostMirrors (host): the guests' owned NPCs, each with a mirror id (mid, unique on the host) for the Lua side,
 //     which shows it as a spawned copy driven by the guest's states. Natives (the host's own NPCs, from its own
@@ -181,6 +182,7 @@ public:
     void Expire(double now);
     bool Lookup(uint32_t mid, PlayerId& from, uint32_t& key) const;
     bool Has(PlayerId from, uint32_t key) const { return byKey_.count({from, key}) != 0; }
+    uint32_t MidOf(PlayerId from, uint32_t key) const;  // 0: no mirror of it
 
     // Relay (several guests): guest `to`'s share of the other guests' mirrors this round, keyed by RelayKey: live ones
     // with a state of the last kRelayFresh s and dead ones (so his copy dies too), none with a claim under way (it is

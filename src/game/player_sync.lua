@@ -34,7 +34,6 @@
 --                                                                                puppet (game/puppet_guard.h)
 --   K vkey model x y z qx qy qz qw wrecked                                       a car was parked (CarParked;
 --                                                                                wrecked 1 = it is destroyed)
---   W time flow weather                                                          the host's time of day and weather
 --   H from amount dtype zone weapon dx dy dz                                     player `from` hit us on his screen (Hit)
 --   M profile                                                                    our own model (profile; "tommy" = as the
 --                                                                                story dresses him)
@@ -64,7 +63,6 @@
 --             getter's answer, -1 none (M.SwimGetter); bike: 1 our vehicle is a motorbike (M.VehicleOf))
 --   status = "factory|id:state:dist;...|cars" for the overlay
 --   events = lines for the network: "CP vkey model x y z qx qy qz qw wrecked" (we parked a car we drove),
---            "WE time flow weather" (host: time of day and weather, every few seconds and on change),
 --            "HT victim amount dtype zone weapon dx dy dz" (the local player hit victim's puppet: send a Hit),
 --            "ML profile" (as story Tommy: the profile the story put on us changed; sent in PlayerModel);
 --            for the C++ side's controllers: "PS id x y z hx hy busy" (puppet of player id on foot, after this tick's
@@ -91,7 +89,6 @@ M.cars = M.cars or {}
 M.localId = M.localId or "0"
 M.events = {}
 M.shots = M.shots or 0  -- shots the local player fired (mod 256), counted from his ammo
-M.env = M.env or {}
 M.hitq = M.hitq or {}   -- hits on puppets by the local player, filled by the DAMAGE event callbacks
 M.actSeq = M.actSeq or 0   -- visible actions of the local player so far (mod 256; M.LocalAction), sent in every state
 M.actKind = M.actKind or 0 -- the latest one (player_actions.h codes)
@@ -849,7 +846,8 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
   if cmd.fix == 2 or cmd.fix == 3 then
     ent:SetPos(V(tx, ty, tz))
     st.setPosT = M.now  -- car_damage.lua: a copy put in place by SetPos does not report its own bumps as damage
-  elseif cmd.fix == 1 then
+  elseif cmd.fix == 1 and math.abs(cmd.nx) + math.abs(cmd.ny) + math.abs(cmd.nz) > 1e-4 then
+    -- (a blend of the rotation alone, game/player_motion.h CarDriver, moves nothing: no SetPos)
     local p = ent:GetPos()
     ent:SetPos(V(p.x + cmd.nx, p.y + cmd.ny, p.z + cmd.nz))
   end
@@ -867,6 +865,11 @@ function RV.Drive(st, ent, cmd, tx, ty, tz)
         .. "SetSpeed %.2f (wanted %.2f, SetSpeed as %s)", tostring(ent), st.probes, cmd.fix == 1 and "blend" or "pin",
         s0, s1, s2, speedOf(ent), want, tostring(st.speedHow)))
     end
+  end
+  -- not moved, but its own speed is off the driver's (the C++ side's CarDriver): his speed alone, no SetPos / SetRot
+  if cmd.fix == 0 and cmd.spd then
+    RV.GiveSpeed(st, ent, cmd.vx or 0, cmd.vy or 0, cmd.vz or 0, cmd.rev or (cmd.gear or 0) < 0)
+    st.speedFixes = (st.speedFixes or 0) + 1
   end
   if cmd.fix == 3 and not st.snapLogged then
     st.snapLogged = true
@@ -2180,9 +2183,10 @@ function M.Seat(pp, c)
       local sp = M.SpeedMs(car)
       local cmd = pp.vcmd or {}
       local q, cp = so:GetPos(), car:GetPos()
-      log(string.format("puppet %s thrown out of car %s seat %d (#%d, %d this session): %.1f s after seating, car %.1f "
-        .. "m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, put-backs "
-        .. "%d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), pp.seat, pp.ejects, pp.ejectsAll,
+      log(string.format("puppet %s thrown out of car %s (%s) seat %d (#%d, %d this session): %.1f s after seating, car "
+        .. "%.1f m/s, car fix %s%s, phys %s, owner now %s, seat now %s, animated %s, hidden %s, friend brain %s, "
+        .. "put-backs %d, %.1f m from the car, car driven by %s%s", pp.id, tostring(pp.vkey), tostring(c.model),
+        pp.seat, pp.ejects, pp.ejectsAll,
         M.now - (pp.seatedT or pp.seatT or M.now), sp, tostring(cmd.fix),
         cmd.pinned and " pinned" or "", g1 and tostring(phys) or "?", valid(own) and tostring(guidNum(own)) or "none",
         seatHolder(car, pp.seat, so), tostring(pp.seatAnim), tostring(pp.hidden), pp.brain and "yes" or "no",
@@ -2822,9 +2826,12 @@ function M.Walk(pp, so)
     so:SetPos(V(q.x + lc.nx, q.y + lc.ny, q.z + (lc.nz or 0)))  -- nz: after a traversal move (a ledge, a ladder)
   end
   if lc.reissue then
-    if lc.gait == 0 then  -- stop: walk the last bit to his spot and stand there
+    if lc.gait == 0 then
+      -- stop: a walk to where the puppet comes to rest by itself on its own line of motion (the C++ side's stop point,
+      -- game/player_motion.h FootDriver; never back to a point it passed, no shuffle for the last bit); the rest
+      -- blend slides it onto his spot (UNVERIFIED in game: a MoveVec to a point this close ends the walk at once)
       M.SpeedMult(pp, so, 1)
-      so:MoveVec(V(pp.tx, pp.ty, pp.tz), "WALK")
+      so:MoveVec(V(lc.mx, lc.my, lc.mz), "WALK")
       pp.moving = false
     else
       M.SpeedMult(pp, so, lc.mult)
@@ -3174,7 +3181,6 @@ function M.RemoveAll()
     end
   end
   M.cars = {}
-  M.env = {}
   M.replays, M.down, M.died = {}, nil, nil
   pcall(M.UnwatchDamage)
   pcall(M.ModelReset)
@@ -3309,9 +3315,10 @@ end
 function M.OnLocalDamage(m)
   local enemy = tostring(m:GetEnemyGUID())
   local eid = tonumber(enemy:match("(%d+)%s*$"))
-  if eid and M.Npc and M.Npc.copyIds and M.Npc.copyIds[eid] then
-    -- a spawned copy of a host NPC hit us (npc_sync.lua): its shots are only pictures (they aim past us, but its gun
-    -- still found us sometimes): undone on the next tick; the host's NPC's real hits come as Hits from the host
+  if eid and M.Npc and M.Npc.IsPicture and M.Npc.IsPicture(eid) then
+    -- a replica of another game's NPC hit us (npc_sync.lua: a spawned copy, or a paired NPC driven from its authority):
+    -- its shots are only pictures (a copy aims past us, but its gun still found us sometimes): undone on the next
+    -- tick; the authority NPC's real hits come as Hits from its game
     M.copyHits = (M.copyHits or 0) + 1
     M.undoTo = math.max(M.undoTo or 0, M.lastHealth or 0)
     if M.copyHits <= 10 or M.copyHits % 50 == 0 then
@@ -5031,51 +5038,6 @@ function M.Sample(aimInput)
 end
 
 -- ---------------------------------------------------------------------------------------------------------------
--- Weather and time of day: the host's game is the clock. The host reports its time (hours, 0..24), time flow speed
--- and weather set every few seconds and at once when the weather or flow changes; guests apply them and correct
--- their clock when it drifts (game.gfx, docs/game-api.md 8).
--- ---------------------------------------------------------------------------------------------------------------
-local ENV_PERIOD = 4      -- s between host reports
-local ENV_MAX_DRIFT = 0.05  -- hours (3 game minutes) before a guest's clock is set
-
-function M.EnvHost()
-  local g = game.gfx
-  local t, flow, w = g:GetTime(), g:GetTimeFlowSpeed(), g:GetCurrentWeatherSetName()
-  if not t or not w then return end
-  local e = M.env
-  local changed = w ~= e.w or flow ~= e.flow
-  if changed or not e.at or M.now - e.at >= ENV_PERIOD then
-    if changed then log(string.format("env: weather %s, time %.2f h, flow %.2f", tostring(w), t, flow or 0)) end
-    e.w, e.flow, e.at = w, flow, M.now
-    M.events[#M.events + 1] = string.format("WE %.4f %.4f %s", t, flow or 0, tostring(w))
-  end
-end
-
-local function hourDiff(a, b)
-  local d = (a - b) % 24
-  if d > 12 then d = d - 24 end
-  return d
-end
-
-function M.EnvGuest(t, flow, w)
-  local g = game.gfx
-  local e = M.env
-  if w and w ~= "" and g:GetCurrentWeatherSetName() ~= w then
-    try("SetWeatherSet", g.SetWeatherSet, g, w, 0, 0)
-    log("env: weather set to " .. w .. " (host)")
-  end
-  if flow and g:GetTimeFlowSpeed() ~= flow then try("SetTimeFlowSpeed", g.SetTimeFlowSpeed, g, flow) end
-  local cur = g:GetTime()
-  if t and cur and math.abs(hourDiff(cur, t)) > ENV_MAX_DRIFT then
-    try("SetTime", g.SetTime, g, t, 0)
-    if not e.synced or math.abs(hourDiff(cur, t)) > 0.5 then
-      log(string.format("env: time %.2f h -> %.2f h (host)", cur, t))
-    end
-  end
-  e.synced = true
-end
-
--- ---------------------------------------------------------------------------------------------------------------
 -- Entry point
 -- ---------------------------------------------------------------------------------------------------------------
 -- ---------------------------------------------------------------------------------------------------------------
@@ -5456,7 +5418,7 @@ function M.Update(dt, cmds)
   elseif not player then
     M.inWorldAt = nil
   end
-  local enter, aimInput, active, host, env = false, false, false, false, nil
+  local enter, aimInput, active, host = false, false, false, false
   local hits = {}
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
@@ -5514,7 +5476,8 @@ function M.Update(dt, cmds)
         qx = n(f[49]) or pp.qx, qy = n(f[50]) or pp.qy, qz = n(f[51]) or pp.qz, qw = n(f[52]) or pp.qw,
         power = n(f[53]) or 0, steer = n(f[54]) or 0, brake = n(f[55]) or 0, hb = n(f[56]) or 0, gear = n(f[57]) or 0,
         ctl = f[58] == "1", pinned = f[59] == "1", vx = n(f[60]) or 0, vy = n(f[61]) or 0, vz = n(f[62]) or 0,
-        sig = n(f[64]) or 0 }
+        sig = n(f[64]) or 0,
+        spd = f[69] == "1" }  -- not moved this tick, but its speed is off his: give it his (game/player_motion.h)
       pp.lc.nz = n(f[65]) or 0
       pp.pose, pp.body = math.floor(n(f[66]) or 0), n(f[67]) or 0
       pp.fast = f[68] == "1"  -- too fast for one on foot: hidden (game/puppet_guard.h FastFoot)
@@ -5539,8 +5502,6 @@ function M.Update(dt, cmds)
       hits[#hits + 1] = f
     elseif op == "M" then
       M.myModel = f[2] or ""
-    elseif op == "W" then
-      env = { tonumber(f[2]), tonumber(f[3]), f[4] }
     elseif op == "E" then
       enter = true
     elseif op == "A" then
@@ -5562,15 +5523,6 @@ function M.Update(dt, cmds)
   -- player shows up (he may still be loading; then his puppet appears the moment his first state arrives)
   local need = active
   for _, _ in pairs(M.pup) do need = true break end
-  if player and active then
-    if host then
-      local good, err = pcall(M.EnvHost)
-      if not good then logErr("env", err) end
-    elseif env then
-      local good, err = pcall(M.EnvGuest, env[1], env[2], env[3])
-      if not good then logErr("env", err) end
-    end
-  end
   M.isHost, M.inSession = host, active
   if player then
     if active then

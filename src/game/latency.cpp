@@ -43,7 +43,7 @@ State& S() {
     return s;
 }
 
-bool IsStream(System s) { return s == kPlayer || s == kNpc || s == kTraffic || s == kItem; }
+bool IsStream(System s) { return s == kPlayer || s == kNpc || s == kTraffic || s == kItem || s == kPed; }
 
 constexpr size_t kMaxPending = 512;  // a system whose tick does not run (paused) keeps only the newest
 constexpr size_t kMaxWindow = 4096;
@@ -57,24 +57,29 @@ constexpr double kTickGapS = 1.0;
 const char* Name(System s) {
     static const char* const kNames[kCount] = {"player", "world",  "npc",     "npc-event", "traffic",
                                                "traffic-event", "door", "explosion", "car-damage", "police",
-                                               "item",   "item-event", "hit"};
+                                               "item",   "item-event", "hit", "ped", "ped-event"};
     return s < kCount ? kNames[s] : "?";
 }
 
 System SystemOf(uint16_t id) {
     if (id == 0x0100) return kPlayer;
     if (id == 0x0101 || id == 0x0102 || id == 0x0400) return kHit;
+    if (id == 0x0104) return kHit;  // ParkedCars (applied in the player tick, like CarParked)
     if (id >= 0x0200 && id <= 0x020F) return kWorld;
     if (id == 0x0210 || id == 0x0420) return kNpc;
+    if (id == 0x0212 || id == 0x0424) return kNpc;  // NpcStates2, GuestNpcStates2 (npc-authority)
+    if ((id >= 0x0213 && id <= 0x0217) || (id >= 0x0425 && id <= 0x0427)) return kNpcEvent;  // NPC infos, leaves
     if (id == 0x0211 || id == 0x0410 || (id >= 0x0421 && id <= 0x042F)) return kNpcEvent;
-    if (id == 0x0222) return kTraffic;
-    if (id >= 0x0220 && id <= 0x022F) return kTrafficEvent;
+    if (id == 0x0222 || id == 0x0226) return kTraffic;  // the host's / a guest's traffic states
+    if (id >= 0x0220 && id <= 0x022F) return kTrafficEvent;  // spawn, despawn, bump (0x0224-0x0227: a guest's)
     if (id >= 0x0230 && id <= 0x023F) return kDoor;
     if (id >= 0x0240 && id <= 0x024F) return kExplosion;
     if (id >= 0x0250 && id <= 0x025F) return kCarDamage;
     if (id >= 0x0260 && id <= 0x026F) return kPolice;
     if (id == 0x0270) return kItem;
     if (id >= 0x0271 && id <= 0x027F) return kItemEvent;
+    if (id == 0x0280) return kPed;
+    if (id >= 0x0281 && id <= 0x0287) return kPedEvent;
     return kCount;
 }
 
@@ -87,6 +92,7 @@ void Configure(net::Session& s) {
     s.SetLane(0x0230, 0x023F, 2);  // doors
     s.SetLane(0x0260, 0x026F, 3);  // police
     s.SetLane(0x0270, 0x027F, 4);  // items
+    s.SetLane(0x0280, 0x0287, 5);  // pedestrians
     // Priorities: what a player does and sees first; bulk that can wait or be thinned when the link is full.
     s.SetPriority(0x0100, 0x0102, Priority::Critical);  // PlayerState, CarParked, PlayerModel
     s.SetPriority(0x0400, 0x040F, Priority::Critical);  // Hit
@@ -100,10 +106,19 @@ void Configure(net::Session& s) {
     s.SetPriority(0x0260, 0x0262, Priority::Critical);  // police state / event / chase
     s.SetPriority(0x0205, 0x0206, Priority::Critical);  // mission fail / verdict
     s.SetPriority(0x0202, 0x0202, Priority::Bulk);      // the host's checkpoint save
+    s.SetPriority(0x0200, 0x0200, Priority::Critical);  // WorldEnv (small, every 2 s: a newcomer's clock at once)
+    s.SetPriority(0x0207, 0x0207, Priority::Normal);    // JoinReport (guest -> host, once per join / reconnect)
     s.SetPriority(0x0211, 0x0211, Priority::Critical);  // NPC death
     s.SetPriority(0x0222, 0x0222, Priority::Bulk);      // traffic car states
+    s.SetPriority(0x0226, 0x0226, Priority::Bulk);      // a guest's traffic car states
     s.SetPriority(0x0210, 0x0210, Priority::Normal);    // NPC states (thinned only when far over the budget)
     s.SetPriority(0x0420, 0x0420, Priority::Normal);    // a guest's own NPC states
+    s.SetPriority(0x0280, 0x0280, Priority::Bulk);      // pedestrian states (thinned first)
+    s.SetPriority(0x0283, 0x0284, Priority::Critical);  // pedestrian death / kill
+    s.SetPriority(0x0212, 0x0212, Priority::Normal);    // NpcStates2 (rates and budget per guest: npc_replica.h)
+    s.SetPriority(0x0213, 0x0214, Priority::Normal);    // NpcInfo, NpcLeave (reliable, lane 0, before the states)
+    s.SetPriority(0x0424, 0x0426, Priority::Normal);    // GuestNpcStates2, GuestNpcInfo, GuestNpcLeave
+    s.SetPriority(0x0104, 0x0104, Priority::Normal);    // ParkedCars (a newcomer's snapshot; lane 0: player cars)
     // Car damage (0x0250-0x0252) and everything else: Normal.
 }
 

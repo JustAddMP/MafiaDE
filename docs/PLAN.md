@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-19 (0.15.0 pre-release, first two-PC test; the Round 3 and Round 4 fixes merged, in-game check pending).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-20 (0.15.0 pre-release, first two-PC test; the Round 3 and Round 4 fixes and the sync architecture (G) merged, in-game check pending).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -481,6 +481,33 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
   end. A cutscene that binds live entities (cars) was not checked.
 - [x] Interest management: only stream within ~300 m of any player; bandwidth budget. (Module + tests in
   core: external/core/src/net/interest.*, external/core/docs/interest.md; NPC/vehicle mirroring (B3/B4) plugs into it.)
+
+### G. Sync architecture (docs/sync-architecture.md)
+
+Planned and built 2026-10-19/20 from the first two-PC test (merge `feat/merge-sync`, core v0.12.0). Fixed in code, in-game
+check pending: nothing here is ticked until the next two-PC test passes its targets (`sync_compare.py --check`,
+README-dev.md "Sync architecture checks").
+- [ ] Shared replication layer in core (replica / correction / authority, gait hint, pin retry): used by players,
+  traffic, NPCs and pedestrians.
+- [ ] Players on foot: gait from the sender, hidden corrections, rest slide, brake hold. Gate: `foot.p95` <= 0.8 m,
+  `foot.stand.p95` <= 0.3 m, `foot.mean` <= 0.35 m, `foot.gait` >= 90 %, `foot.snaps_per_min` <= 0.5 (simulated
+  0.65-0.75 / 0.25-0.27 / 0.25-0.31 / 99.8 % / 0; test 2026-10-19: 2.0-2.3 m, 63-76 %).
+- [ ] Player car copies on their own physics. Gate: `car.p95` <= 1.0 m, `car.pinned` <= 10 %, `car.speed_ratio`
+  0.9-1.1 (simulated 0.88-0.98 m, 0-0.1 %, 1.01).
+- [ ] Parked cars for late joiners and reconnects (ParkedCars 0x0104).
+- [ ] One authority per NPC (replicas driven from the host's states, AI stopped; NpcStates2 per guest by distance).
+  Gate: `npc.p95` <= 1.0 m, `npc.max` <= 4 m, `npc.bw` <= 8 KB/s (simulated 0.97 m / 2.15 m / 6.3 KB/s). Open: does the
+  AI freeze hold on a mission NPC (else hidden + copy).
+- [ ] Pedestrians by region authority (adopt, spawn, hide). Gate: `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m. Open:
+  the civilian AI interrupt, BlockSpawnersInSphere, the copy profile, double density when players meet.
+- [ ] Traffic by region authority (every game shares its own cars, relay, no pops). Gate: `traffic.true_p95` <= 1.5 m,
+  `traffic.shown` >= 95 %, `traffic.unshared_near` 0. Open: car damage / look for a guest's traffic.
+- [ ] Time of day without jumps, join / reconnect completeness. Gate: `world.time_err` <= 0.5 game minutes,
+  `join.complete_s` <= 10 s.
+- [ ] Bandwidth with 4 players: `bw.host_up` <= 160 KB/s (needs a 3-4 player test).
+- Follow-ups (not built): thinning relayed PlayerStates by distance; the manta_prototype seat throw-outs (the game's,
+  seen on both games); car damage / look of a guest's traffic; OwnershipBook for player cars (they keep their tested
+  holder / lower-id rule).
 
 ### C. Phase 5 polish (native UI)
 - [x] Hide the debug status text by default (F7 shows it); keep banners. `debug_overlay = 1` / `--debug-overlay` shows it at start.

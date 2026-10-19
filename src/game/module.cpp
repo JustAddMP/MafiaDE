@@ -10,6 +10,7 @@
 #include "game/latency.h"
 #include "game/explosion_sync.h"
 #include "game/item_sync.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
@@ -21,8 +22,10 @@
 #include "game/sectors_guard.h"
 #include "game/throw_sync.h"
 #include "game/traffic_sync.h"
+#include "game/ped_sync.h"
 #include "game/door_sync.h"
 #include "game/police_sync.h"
+#include "game/world_env.h"
 
 #include <windows.h>
 #include <algorithm>
@@ -213,10 +216,12 @@ public:
         // Lua bridge: hooks the script tick (GameMainThread); player sync runs on it. Failure only disables it.
         if (lua::Install(dllDir, logTag)) {
             PlayerSync::Install();
+            WorldEnvSync::Install();  // after PlayerSync: its glue asks player_sync.lua whether we are in the world
             MissionSync::Install();
             NpcSync::Install();
             TrafficSync::Install();
             PoliceSync::Install();  // after TrafficSync: traffic_sync.lua asks police_sync.lua
+            PedSync::Install();     // after NpcSync / TrafficSync: ped_sync.lua reads their copies
             ItemSync::Install();
             DoorSync::Install();
             CarDamageSync::Install();  // after traffic: its Lua reads player_sync's and traffic_sync's cars
@@ -234,9 +239,12 @@ public:
         _session = &session;
         latency::Attach(&session);  // lanes, send priorities, the LAT trace (game/latency.h)
         PlayerSync::Attach(session);
+        WorldEnvSync::Attach(session);
+        JoinSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
+        PedSync::Attach(session);
         ItemSync::Attach(session);
         DoorSync::Attach(session);
         PoliceSync::Attach(session);
@@ -247,9 +255,12 @@ public:
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
+        WorldEnvSync::Detach();
+        JoinSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
+        PedSync::Detach();
         ItemSync::Detach();
         DoorSync::Detach();
         PoliceSync::Detach();
@@ -264,6 +275,7 @@ public:
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);
         TrafficSync::OnPlayerLeft(id);
+        PedSync::OnPlayerLeft(id);
         PoliceSync::OnPlayerLeft(id);
         ExplosionSync::OnPlayerLeft(id);
         CarDamageSync::OnPlayerLeft(id);
@@ -280,6 +292,7 @@ public:
         PlayerSync::OnPlayerLeft(id);
         NpcSync::OnPlayerLeft(id);      // his own NPCs' mirrors go; he sends them again when back
         TrafficSync::OnPlayerLeft(id);  // his traffic copies are spawned again for him when back
+        PedSync::OnPlayerLeft(id);      // his pedestrians' replicas go; ours are sent to him anew when back
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
         ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
         CarDamageSync::OnPlayerLeft(id);  // his copies ask for the cars' damage again when back
@@ -307,9 +320,11 @@ public:
     }
     void SessionTick(float dt) override {
         PlayerSync::Tick(dt, EnterVehicleHeld(), AimHeld());
+        WorldEnvSync::Tick(dt);
         MissionSync::Tick(dt);
         NpcSync::Tick(dt);
         TrafficSync::Tick(dt);
+        PedSync::Tick(dt);
         ItemSync::Tick(dt);
         DoorSync::Tick(dt);
         PoliceSync::Tick(dt);
@@ -317,6 +332,7 @@ public:
         ThrowSync::Tick(dt);
         CarDamageSync::Tick(dt);
         CarLookSync::Tick(dt);
+        JoinSync::Tick(dt);  // last: after every system's handlers and ticks of this frame
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
             _latencyLogIn = 10;
@@ -338,12 +354,20 @@ public:
         case 0x0203: return "Cutscene";
         case 0x0205: return "MissionFail";
         case 0x0206: return "FailVerdict";
+        case 0x0207: return "JoinReport";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
+        case 0x0212: return "NpcStates2";
+        case 0x0213: return "NpcInfo";
+        case 0x0214: return "NpcLeave";
         case 0x0220: return "TrafficSpawn";
         case 0x0221: return "TrafficDespawn";
         case 0x0222: return "TrafficStates";
         case 0x0223: return "TrafficBump";
+        case 0x0224: return "TrafficSpawn2";
+        case 0x0225: return "TrafficDespawn2";
+        case 0x0226: return "TrafficStates2";
+        case 0x0227: return "TrafficBump2";
         case 0x0230: return "DoorEvent";
         case 0x0231: return "DoorApply";
         case 0x0232: return "DoorSnapshot";
@@ -361,6 +385,11 @@ public:
         case 0x0271: return "ItemTake";
         case 0x0272: return "ItemGone";
         case 0x0273: return "Collectible";
+        case 0x0280: return "PedStates";
+        case 0x0281: return "PedSpawn";
+        case 0x0282: return "PedGone";
+        case 0x0283: return "PedDeath";
+        case 0x0284: return "PedKill";
         case 0x0242: return "Throw";
         case 0x0243: return "ThrowFix";
         case 0x0400: return "Hit";
@@ -369,14 +398,19 @@ public:
         case 0x0421: return "GuestNpcEnd";
         case 0x0422: return "HostNpcHit";
         case 0x0423: return "NpcClaim";
+        case 0x0424: return "GuestNpcStates2";
+        case 0x0425: return "GuestNpcInfo";
+        case 0x0426: return "GuestNpcLeave";
         default: return nullptr;
         }
     }
     void AppendStatus(std::vector<render::OverlayLine>& out) override {
         PlayerSync::GetStatus(out);
+        WorldEnvSync::GetStatus(out);
         MissionSync::GetStatus(out);
         NpcSync::GetStatus(out);
         TrafficSync::GetStatus(out);
+        PedSync::GetStatus(out);
         ItemSync::GetStatus(out);
         DoorSync::GetStatus(out);
         PoliceSync::GetStatus(out);

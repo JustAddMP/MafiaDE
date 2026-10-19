@@ -3,6 +3,7 @@
 
 #include "core/log.h"
 #include "core/trace.h"
+#include "game/join_sync.h"
 #include "game/lua.h"
 #include "game/police_model.h"
 #include "net/wire.h"
@@ -96,6 +97,7 @@ void OnState(net::PlayerId from, net::ByteReader& r) {
     const double now = Now();
     std::lock_guard lock(sh.mu);
     if (from == sh.localId) return;
+    join::Mark(join::System::Police, from);
     ++sh.statesRecv;
     Remote& rm = sh.remote[from];
     const bool changed = !rm.any || !SameState(rm.st, s);

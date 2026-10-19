@@ -14,6 +14,7 @@ seen on the other's game:
 - seats: puppets thrown out of cars (from the copied log lines)
 - NPCs: how far the guest's NPCs were from the host's
 - swapped cars: real cars hidden behind a copy and how they came back (SWR / SWP records)
+- pedestrians: each game's pedestrians as replicas on the other (PDT / PDR / PDC): true error, coverage
 - bandwidth per system (from the copied "net: messages:" log lines of core's NetMonitor): typical (median) and
   worst (max) KB/s out and in, plus what the send budget thinned or deferred
 - latency per system (LAT records): how long a message took from the sender's send to this game applying it,
@@ -59,9 +60,11 @@ TARGETS = {
     "traffic.unshared_near": ("<=", 0, "own traffic cars still driving near a receiver (max)"),
     "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
     "npc.max": ("<=", 4.0, "NPC replica vs the authority's NPC, max (m)"),
+    "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
+    "join.complete_s": ("<=", 10.0, "a guest's world complete after a join / reconnect (s)"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
     "bw.host_up": ("<=", 160.0, "host upload, all systems, median (KB/s)"),
 }
@@ -434,6 +437,52 @@ def compare(sender, receiver, args, worst):
         print("  car note: %s" % s.split("sync: ", 1)[-1][:160])
 
 
+def players(sender, receiver):
+    """Package `players` (docs/sync-architecture.md section 8): how the puppet and the car copy of `sender` were driven
+    on `receiver`'s game - the new PUP / VEH fields (hint, rest blend, brake slide, lead; pinned time, speed fixes,
+    skids) and the parked cars a newcomer got. Traces from before the package have none of it ("older trace")."""
+    sid = sender.local
+    pup = [f for _, f in receiver.records["PUP"] if num(f.get("id"), -1) == sid and f.get("have") == "1"]
+    veh = [f for _, f in receiver.records["VEH"] if num(f.get("id"), -1) == sid and f.get("have") == "1"]
+    pks = [f for _, f in sender.records["PKS"] if num(f.get("to"), -1) == receiver.local]
+    pkr = [f for _, f in receiver.records["PKR"]]
+    if not (pup or veh or pks or pkr):
+        return
+    section("Driving %s (player %d) on %s's game: puppet and car copy" % (sender.name, sid, receiver.name))
+    hinted = [f for f in pup if "hint" in f]
+    if pup and not hinted:
+        print("  on foot: older trace (no hint / rest / brake fields)")
+    elif hinted:
+        n = len(hinted)
+        same = sum(1 for f in hinted if f.get("hint") == f.get("g"))
+        rest = sum(1 for f in hinted if f.get("rest") == "1")
+        brk = sum(1 for f in hinted if f.get("brk") == "1")
+        stp = sum(1 for f in hinted if f.get("stp") == "1")
+        lead = [num(f.get("lead"), 0) for f in hinted]
+        print("  on foot: %d samples; commanded gait = his reported gait %.1f %% (the rest: he stands, it walks to his"
+              " spot)" % (n, 100.0 * same / n))
+        print("    rest blend %.1f %%, brake slide %.1f %%, walking to his stop point %.1f %% of samples; lead median "
+              "%.0f ms" % (100.0 * rest / n, 100.0 * brk / n, 100.0 * stp / n, pct(lead, 50)))
+    new_veh = [f for f in veh if "pf" in f]
+    if veh and not new_veh:
+        print("  car: older trace (no pinned-for / speed-fix fields)")
+    elif new_veh:
+        n = len(new_veh)
+        pf = [num(f.get("pf"), 0) for f in new_veh if f.get("pin") == "1"]
+        gs = sum(1 for f in new_veh if f.get("gs") == "1")
+        skid = sum(1 for f in new_veh if f.get("skid") == "1")
+        quiet = sum(1 for f in new_veh if f.get("fix") == "0")
+        print("  car: %d samples; nothing set on the copy %.1f %%, given his speed alone %d times, his car sliding "
+              "%.1f %%" % (n, 100.0 * quiet / n, gs, 100.0 * skid / n))
+        if pf:
+            print("    pinned: longest %.1f s (retried after 1.5 s doubling to 8 s)" % max(pf))
+    for f in pks:
+        print("  parked cars sent to %s on joining: %s in %s message(s)" % (receiver.name, f.get("n"), f.get("msgs")))
+    for f in pkr:
+        print("  parked cars received from the host: %s, placed %s, destroyed ones left out %s" % (
+            f.get("n"), f.get("applied"), f.get("wrecked")))
+
+
 def npcs(guest):
     ngs = [f for _, f in guest.records["NGS"]]
     if not ngs:
@@ -448,12 +497,8 @@ def npcs(guest):
     if avg:
         print("  distance ours vs the host's (per sample mean): %s" % stats_line(avg))
         print("  worst NPC per sample: %s" % stats_line(mx))
-    nd = [num(f.get("d"), -1) for _, f in guest.records["NP"] if num(f.get("d"), -1) >= 0]
-    if nd:
-        # NP: per paired host NPC, our NPC vs the host's newest state (not yet lined up in time: an upper bound
-        # of the real error by the state's age; npc-authority adds a truth record)
-        record("npc.p95", pct(nd, 95), "host NPCs on the guest")
-        record("npc.max", max(nd), "host NPCs on the guest")
+    # (NP: our NPC vs the target the C++ side computed for it, not lined up with the host's NPC in time; the true
+    # error and the npc.* targets come from NPT / NPR, npc_replicas())
     far = Counter()
     for _, f in guest.records["NP"]:
         if num(f.get("d"), -1) > 3:
@@ -467,10 +512,130 @@ def npcs(guest):
     if foot:
         print("  paired host NPCs on foot: distance %s" % stats_line(foot))
     last = ngs[-1]
-    if "unpairs" in last:
+    if "refused" in last:
+        print("  driven: %d commands, snaps %d, paired NPCs frozen %d, refused (hidden, a copy shown) %d, unpaired (in a "
+              "vehicle, ours on foot) %d, copies with a fallback profile %d" % (
+                  num(last.get("drives"), 0), num(last.get("snaps"), 0), num(last.get("frozen"), 0),
+                  num(last.get("refused"), 0), num(last.get("unpairs"), 0), num(last.get("fallbacks"), 0)))
+    elif "unpairs" in last:
         print("  pulls %d, unpaired (in a vehicle, ours on foot) %d, cops steered %d, copies with a fallback profile %d"
               % (num(last.get("pulls"), 0), num(last.get("unpairs"), 0), num(last.get("steers"), 0),
                  num(last.get("fallbacks"), 0)))
+
+
+def hermite_at(samples, t, gap):
+    """samples: sorted [(t, (x, y, z), (vx, vy))]. Position at t on the Hermite curve through the two samples around it
+    (their velocities), None outside or across a gap."""
+    ts = [x[0] for x in samples]
+    i = bisect.bisect_left(ts, t)
+    if i <= 0 or i >= len(samples):
+        if samples and abs(samples[0 if i <= 0 else -1][0] - t) < 1e-3:
+            return samples[0 if i <= 0 else -1][1]
+        return None
+    t0, p0, v0 = samples[i - 1]
+    t1, p1, v1 = samples[i]
+    h = t1 - t0
+    if h <= 0 or h > gap:
+        return None
+    u = (t - t0) / h
+    h00, h10, h01, h11 = 2 * u ** 3 - 3 * u ** 2 + 1, u ** 3 - 2 * u ** 2 + u, -2 * u ** 3 + 3 * u ** 2, u ** 3 - u ** 2
+    x = h00 * p0[0] + h10 * h * v0[0] + h01 * p1[0] + h11 * h * v1[0]
+    y = h00 * p0[1] + h10 * h * v0[1] + h01 * p1[1] + h11 * h * v1[1]
+    return (x, y, p0[2] + (p1[2] - p0[2]) * u)
+
+
+def npc_replicas(authority, receiver, worst):
+    """One authority per NPC (docs/sync-trace.md NPT / NPR): each replica on the receiver vs the authority's NPC at the
+    same moment. NPT = the authority's NPC as sent (its sample time sT on its steady clock, the clock of TX); NPR = the
+    replica where the receiver's game shows it (10 Hz), lined up through the receiver's clock relation to the authority
+    (as the player section). npc.p95 / npc.max (host NPCs on a guest, on foot)."""
+    aid = authority.local
+    npr = [(t, f) for t, f in receiver.records["NPR"] if int(num(f.get("from"), -1)) == aid]
+    npt = authority.records["NPT"]
+    if not npr and not npt:
+        return
+    what = "host NPCs on %s's game" % receiver.name if authority.role == "host" else \
+        "%s's own NPCs on the host's game" % authority.name
+    section("NPC replicas: %s (one authority per NPC)" % what)
+    if not npr or not npt:
+        print("  %d truth records (NPT) on the authority, %d replica records (NPR) on the receiver: nothing to line up" % (
+            len(npt), len(npr)))
+        return
+    diff, _, _ = clock_relation(receiver, authority, aid)
+    if diff is None:
+        print("  no player states from the authority in the receiver's trace: the clocks cannot be related")
+        return
+    truth = defaultdict(list)
+    for _, f in npt:
+        p, v = vec(f.get("p")), vec(f.get("v"))
+        if p and v:
+            truth[f.get("key")].append((num(f.get("sT"), 0) / 1000.0, p, v))
+    for k in truth:
+        truth[k].sort()
+    errs, foot, copies, paired, ctl, lag = [], [], [], [], [], []
+    fixes = Counter()
+    by_key = Counter()
+    for t, f in npr:
+        cp = vec(f.get("cp"))
+        if not cp:
+            continue
+        ctl.append(num(f.get("err"), 0))
+        fixes[f.get("fix", "0")] += 1
+        ts = t - diff
+        tp = hermite_at(truth.get(f.get("key"), []), ts, 1.2)
+        if tp is None:
+            continue
+        e = dist2(cp, tp)
+        errs.append(e)
+        (copies if f.get("kind") == "2" else paired).append(e)
+        rt = num(f.get("rT"))
+        if rt is not None:
+            lag.append(ts * 1000.0 - rt)
+        if e > 3:
+            by_key[f.get("key")] += 1
+        worst.append((e, "NPC", "%s NPC %s" % (authority.name, f.get("key")), receiver.wall(t), authority.wall(ts),
+                      "kind %s, fix %s" % (f.get("kind"), f.get("why", "-"))))
+        foot.append(e)
+    print("  %d replica records, %d lined up with the authority's NPC (truth records %d of %d NPCs)" % (
+        len(npr), len(errs), len(npt), len(truth)))
+    if errs:
+        print("  replica vs the authority's NPC at the same moment: %s" % stats_line(errs))
+        if paired:
+            print("    paired NPCs (driven):  %s" % stats_line(paired))
+        if copies:
+            print("    spawned copies:        %s" % stats_line(copies))
+        who = "%s on %s" % (what.split(" on ")[0], receiver.role)
+        record("npc.p95", pct(foot, 95), who)
+        record("npc.max", max(foot), who)
+    if ctl:
+        print("  replica vs its target (controller error): %s" % stats_line(ctl))
+    if lag:
+        print("  target time behind the true moment (ms; 0 = the lead reaches now): median %.0f, p95 %.0f" % (
+            pct(lag, 50), pct(lag, 95)))
+    print("  fixes: none %d, nudge %d, snap %d" % (fixes.get("0", 0), fixes.get("1", 0), fixes.get("2", 0)))
+    snaps = Counter(f.get("why") for _, f in receiver.records["NPS"] if int(num(f.get("from"), -1)) == aid)
+    if snaps:
+        print("  snaps by reason: %s" % ", ".join("%s %d" % kv for kv in snaps.most_common()))
+    if by_key:
+        print("  NPCs most often more than 3 m off: %s" % ", ".join("%s (%d)" % kv for kv in by_key.most_common(5)))
+
+
+def npc_bandwidth(host):
+    """NBW (host, every 10 s): NPC states + infos + leaves sent to each guest (KB/s), the NPCs near him."""
+    nbw = host.records["NBW"] if host else []
+    if not nbw:
+        return
+    section("NPC bandwidth per guest (host upload)")
+    by = defaultdict(list)
+    near = defaultdict(list)
+    for _, f in nbw:
+        by[f.get("to")].append(num(f.get("kbs"), 0))
+        near[f.get("to")].append(num(f.get("near"), 0))
+    for g in sorted(by):
+        v = by[g]
+        print("  to guest %s: median %.2f, max %.2f KB/s; NPCs in his interest median %.0f, max %.0f" % (
+            g, pct(v, 50), max(v), pct(near[g], 50), max(near[g])))
+        record("npc.bw", pct(v, 50), "to guest %s" % g)
 
 
 def swapped_cars(tr):
@@ -516,78 +681,269 @@ def own_npcs(guest, host):
             print("  distance of the host's copy from the guest's NPC: %s" % stats_line(d))
 
 
-def traffic(host, guest):
-    """Traffic sync (docs/sync-trace.md TRH / TRP / TRG / TRC / TRL)."""
-    trg = [f for _, f in guest.records["TRG"]] if guest else []
-    trh = host.records["TRH"] if host else []
-    if not trg and not trh:
+def _hermite(p0, v0, p1, v1, dt, u):
+    u2, u3 = u * u, u * u * u
+    h00, h10, h01, h11 = 2 * u3 - 3 * u2 + 1, u3 - 2 * u2 + u, -2 * u3 + 3 * u2, u3 - u2
+    return tuple(h00 * a + h10 * dt * va + h01 * b + h11 * dt * vb for a, va, b, vb in zip(p0, v0, p1, v1))
+
+
+class TruthTrack:
+    """An authority's TRS records of one car: where it was at a time on the authority's clock (Hermite between the
+    records with their velocities; None outside them or across a gap)."""
+
+    def __init__(self, items, gap=0.6):
+        self.items = sorted(items)
+        self.t = [i[0] for i in self.items]
+        self.gap = gap
+
+    def at(self, t):
+        i = bisect.bisect_left(self.t, t)
+        if i <= 0 or i >= len(self.t):
+            return None
+        t0, p0, v0 = self.items[i - 1]
+        t1, p1, v1 = self.items[i]
+        if t1 - t0 > self.gap or t1 <= t0:
+            return None
+        return _hermite(p0, v0, p1, v1, t1 - t0, (t - t0) / (t1 - t0))
+
+
+def _truth(auth_tr):
+    """net -> TruthTrack from an authority's TRS records (sT: its state clock, ms)."""
+    per = defaultdict(list)
+    for _, f in auth_tr.records["TRS"]:
+        st, p, v = num(f.get("sT")), vec(f.get("p")), vec(f.get("v"))
+        if st is not None and p and v:
+            per[f.get("net")].append((st / 1000.0, p, v))
+    return {k: TruthTrack(v) for k, v in per.items()}
+
+
+def traffic(a, b):
+    """Traffic sync by region (docs/sync-trace.md TRS / TRC / TRG / TRA / TRL / TRR / TRH / TRP / TRO): every game is
+    the authority for its own traffic and shows the other's; per direction the true error of the copies (TRC on the
+    receiver against the authority's TRS at the same moment), what was shown, and the receiver's own cars left
+    unshared."""
+    if not any(tr.records[k] for tr in (a, b) for k in ("TRG", "TRH", "TRC", "TRS")):
         return
-    section("Traffic (the host's cars on %s's game)" % (guest.name if guest else "the guest"))
-    if len(trh) >= 2:
-        (t0, a), (t1, b) = trh[0], trh[-1]
-        secs = max(t1 - t0, 1e-6)
-        cars = [num(f.get("cars"), 0) for _, f in trh]
-        print("  host: %.0f traffic cars near guests on average (max %d), %.1f KB/s sent, %d spawn / %d state / %d "
-              "despawn messages, bumps reported %d" % (
-                  statistics.fmean(cars), max(cars), (num(b.get("bytes"), 0) - num(a.get("bytes"), 0)) / 1024 / secs,
-                  num(b.get("spawnMsgs"), 0), num(b.get("stateMsgs"), 0), num(b.get("despawnMsgs"), 0),
-                  num(b.get("bumps"), 0)))
-        trp = [f for _, f in host.records["TRP"]]
-        if trp:
-            print("  host per guest: relevant mean %.1f, admitted mean %.1f, states skipped as unchanged %d of %d, "
-                  "deferred by the budget (max) %d" % (
-                      statistics.fmean(num(f.get("relevant"), 0) for f in trp),
-                      statistics.fmean(num(f.get("admitted"), 0) for f in trp), num(trp[-1].get("skipped"), 0),
-                      num(trp[-1].get("skipped"), 0) + num(trp[-1].get("states"), 0),
-                      max(num(f.get("deferred"), 0) for f in trp)))
-    if trg:
-        on = [f for f in trg if num(f.get("mode"), 0) == 1]
-        print("  guest: host traffic shown %.0f%% of the time; copies mean %.1f (max %d) of %.1f host cars" % (
-            100.0 * len(on) / len(trg), statistics.fmean(num(f.get("copies"), 0) for f in trg),
-            max(num(f.get("copies"), 0) for f in trg), statistics.fmean(num(f.get("live"), 0) for f in trg)))
-        record("traffic.shown", 100.0 * len(on) / len(trg), "host traffic on the guest")
-        last = trg[-1]
-        print("  guest: pins %d, snaps %d, bumps %d, states received %d (dropped as old %d)" % (
-            num(last.get("pins"), 0), num(last.get("snaps"), 0), num(last.get("bumps"), 0),
-            num(last.get("states"), 0), num(last.get("old"), 0)))
-    errs = [num(f.get("err"), 0) for _, f in guest.records["TRC"]] if guest else []
-    errs = [e for e in errs if e < 1e6]
-    if errs:
-        print("  copy vs host car (target, per sample): %s" % stats_line(errs))
-        far = Counter()
-        for _, f in guest.records["TRC"]:
-            if 3 < num(f.get("err"), 0) < 1e6:
-                far[f.get("net")] += 1
-        if far:
-            print("  copies most often more than 3 m off: %s" % ", ".join("net %s (%d)" % kv for kv in far.most_common(5)))
-    trl = [f for _, f in guest.records["TRL"]] if guest else []
-    if trl:
-        print("  our own traffic while the host's showed: hidden max %d, still driving near us max %d" % (
-            max(num(f.get("hidden"), 0) for f in trl), max(num(f.get("near"), 0) for f in trl)))
-        record("traffic.unshared_near", max(num(f.get("near"), 0) for f in trl), "guest's own cars")
-    # drivers and crews (TRO): the host's driver reads that failed and came back, the guest's crews out / in / put back
-    if host and host.records["TRO"]:
-        tro = [f for _, f in host.records["TRO"]]
+    section("Traffic (every game's cars on the other's game)")
+    for auth, recv in ((a, b), (b, a)):
+        trh = auth.records["TRH"]
+        trc = [f for _, f in recv.records["TRC"] if num(f.get("a"), 0) == auth.local or
+               ("a" not in f and auth.role == "host")]  # 0.15 traces: TRC without a= are the host's cars
+        trs = auth.records["TRS"]
+        if not trh and not trc and not trs:
+            continue
+        who = "%s's cars on %s's game" % (auth.name, recv.name)
+        print("  %s:" % who)
+        if len(trh) >= 2:
+            (t0, x), (t1, y) = trh[0], trh[-1]
+            secs = max(t1 - t0, 1e-6)
+            cars = [num(f.get("cars"), 0) for _, f in trh]
+            print("    authority: %.0f own traffic cars near other players on average (max %d), %.1f KB/s sent, %d spawn / "
+                  "%d state / %d despawn messages, bumps reported to it %d" % (
+                      statistics.fmean(cars), max(cars), (num(y.get("bytes"), 0) - num(x.get("bytes"), 0)) / 1024 / secs,
+                      num(y.get("spawnMsgs"), 0), num(y.get("stateMsgs"), 0), num(y.get("despawnMsgs"), 0),
+                      num(y.get("bumps"), 0)))
+            trp = [f for _, f in auth.records["TRP"] if num(f.get("id"), -1) == recv.local]
+            if trp:
+                print("    authority -> %s: relevant mean %.1f, admitted mean %.1f, states skipped as unchanged %d of "
+                      "%d, deferred by the budget (max) %d" % (
+                          recv.name, statistics.fmean(num(f.get("relevant"), 0) for f in trp),
+                          statistics.fmean(num(f.get("admitted"), 0) for f in trp), num(trp[-1].get("skipped"), 0),
+                          num(trp[-1].get("skipped"), 0) + num(trp[-1].get("states"), 0),
+                          max(num(f.get("deferred"), 0) for f in trp)))
+        # copy vs its target (what the receiver's controller saw)
+        errs = [e for e in (num(f.get("err"), 0) for f in trc) if e < 1e6]
+        if errs:
+            print("    copy vs its target (per sample): %s" % stats_line(errs))
+            far = Counter(f.get("net") for f in trc if 3 < num(f.get("err"), 0) < 1e6)
+            if far:
+                print("    copies most often more than 3 m off: %s" % ", ".join(
+                    "net %s (%d)" % kv for kv in far.most_common(5)))
+        # the true error: the copy against the authority's car at the same moment (the clocks lined up by the RX
+        # offsets), and against the authority's car at the time its target stood for (rT: the playout part left out)
+        truth = _truth(auth) if trs else {}
+        if trc and truth:
+            rel, _, _ = clock_relation(recv, auth, auth.local)
+            same, at_rt = [], []
+            for t, f in recv.records["TRC"]:
+                if num(f.get("a"), 0) != auth.local:
+                    continue
+                tt, cp = truth.get(f.get("net")), vec(f.get("cp"))
+                if not tt or not cp:
+                    continue
+                if rel is not None:
+                    p = tt.at(t - rel)
+                    if p:
+                        same.append(dist2(cp, p))
+                rt = num(f.get("rT"), -1)
+                if rt and rt > 0:
+                    p = tt.at(rt / 1000.0)
+                    if p:
+                        at_rt.append(dist2(cp, p))
+            if same:
+                print("    copy vs the authority's car at the same moment (true error): %s" % stats_line(same))
+                record("traffic.true_p95", pct(same, 95), who)
+            elif at_rt:
+                print("    (no clock relation: the true error at the target's time rT instead)")
+                record("traffic.true_p95", pct(at_rt, 95), who + " (at rT)")
+            if at_rt:
+                print("    copy vs the authority's car at its target's time rT: %s" % stats_line(at_rt))
+            if not same and not at_rt:
+                print("    no TRC lined up with a TRS (the copies' cars were not written as truth)")
+        elif trc:
+            print("    no truth records (TRS) on %s's game: the true error cannot be computed" % auth.name)
+    # what each receiver showed, its region and its own leftovers
+    for recv in (a, b):
+        trg = [f for _, f in recv.records["TRG"]]
+        if not trg:
+            continue
+        print("  on %s's game:" % recv.name)
+        due = [num(f.get("due"), -1) for f in trg]
+        if any(d >= 0 for d in due):
+            sd = sum(d for d in due if d > 0)
+            ss = sum(num(f.get("shown"), 0) for f in trg if num(f.get("due"), 0) > 0)
+            near = sum(1 for d in due if d > 0)
+            if sd:
+                share = 100.0 * ss / sd
+                print("    shown: %.1f%% of the other games' cars within 150 m had a copy that drove (%d samples with "
+                      "cars near)" % (share, near))
+                record("traffic.shown", share, "on %s's game" % recv.name)
+            own = [f for f in trg if num(f.get("mode"), 0) == 0]
+            print("    region: our own %.0f%% of the time, another player's %.0f%%" % (
+                100.0 * len(own) / len(trg), 100.0 - 100.0 * len(own) / len(trg)))
+        else:  # a 0.15 trace: the share of the time the host's traffic showed
+            on = [f for f in trg if num(f.get("mode"), 0) == 1]
+            print("    host traffic shown %.0f%% of the time (0.15 trace)" % (100.0 * len(on) / len(trg)))
+            record("traffic.shown", 100.0 * len(on) / len(trg), "host traffic on %s (0.15 trace)" % recv.name)
+        print("    copies mean %.1f (max %d) of %.1f cars of others; pins %d, snaps %d, bumps %d, states %d (old %d)" % (
+            statistics.fmean(num(f.get("copies"), 0) for f in trg), max(num(f.get("copies"), 0) for f in trg),
+            statistics.fmean(num(f.get("live"), 0) for f in trg), num(trg[-1].get("pins"), 0),
+            num(trg[-1].get("snaps"), 0), num(trg[-1].get("bumps"), 0), num(trg[-1].get("states"), 0),
+            num(trg[-1].get("old"), 0)))
+        for a_id in sorted({f.get("a") for _, f in recv.records["TRA"]}):
+            tra = [f for _, f in recv.records["TRA"] if f.get("a") == a_id]
+            d = [num(f.get("due"), 0) for f in tra]
+            s = [num(f.get("shown"), 0) for f in tra]
+            print("    player %s's cars: live mean %.1f, copies mean %.1f, shown %s, playout %.0f ms median" % (
+                a_id, statistics.fmean(num(f.get("live"), 0) for f in tra),
+                statistics.fmean(num(f.get("copies"), 0) for f in tra),
+                ("%.1f%%" % (100.0 * sum(s) / sum(d))) if sum(d) else "-",
+                pct([num(f.get("pd"), 0) for f in tra], 50)))
+        trr = recv.records["TRR"]
+        if trr:
+            print("    region changes: %s" % ", ".join(
+                "%s at %s (%s m)" % ("own" if f.get("own") == "1" else "player " + f.get("auth", "?"), recv.wall(t),
+                                    f.get("d", "?")) for t, f in trr[:8]))
+        trl = [f for _, f in recv.records["TRL"]]
+        if trl:
+            late = [num(f.get("near"), 0) for f in trl if num(f.get("since"), 99) >= 10]
+            if "since" in trl[0]:
+                print("    own cars within 70 m not shared with a player near them (10 s after a region change): max "
+                      "%d; own cars hidden max %d, near us mean %.1f" % (
+                          max(late) if late else 0, max(num(f.get("hidden"), 0) for f in trl),
+                          statistics.fmean(num(f.get("mine"), 0) for f in trl)))
+                if late:
+                    record("traffic.unshared_near", max(late), "%s's own cars" % recv.name)
+            else:  # a 0.15 trace: the guest's own cars still driving near him while the host's showed
+                print("    our own traffic while the host's showed: hidden max %d, still driving near us max %d "
+                      "(0.15 trace)" % (max(num(f.get("hidden"), 0) for f in trl),
+                                        max(num(f.get("near"), 0) for f in trl)))
+                record("traffic.unshared_near", max(num(f.get("near"), 0) for f in trl), "%s's own cars (0.15)" % recv.name)
+    # drivers and crews (TRO): an authority's driver reads that failed and came back, a receiver's crews out / in / put
+    # back
+    for tr in (a, b):
+        tro = [f for _, f in tr.records["TRO"]]
         misses = [f for f in tro if f.get("ev") == "miss"]
-        backs = [num(f.get("after"), 0) for f in tro if f.get("ev") == "back"]
-        print("  host: no driver read %d times (%s); read again %d times (after %s s); moving when missed %d" % (
-            len(misses), ", ".join("%s %d" % kv for kv in Counter(
-                "seat 0 holds another human" if "holds" in f.get("why", "") else f.get("why", "?").replace("_", " ")
-                for f in misses).most_common(4)),
-            len(backs), stats_line(backs, "s") if backs else "-", sum(1 for f in misses if num(f.get("spd"), 0) > 2)))
-        dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
-        if dist:
-            print("  host: distance from the host when a driver was not read: %s" % stats_line(dist))
-        last = trh[-1][1] if trh else {}
-        print("  host: driverless (confirmed, 1 s slow) %d, driven again %d" % (
-            num(last.get("orphaned"), 0), num(last.get("driven"), 0)))
-    if guest and guest.records["TRO"]:
-        ev = Counter(f.get("ev") for _, f in guest.records["TRO"])
-        print("  guest: crews got out %d, back in %d, crew members put back in their seats %d" % (
-            ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
-    notes = [s for _, s in guest.logs if "traffic: " in s and ("failed" in s or "knocked" in s)] if guest else []
-    for s in notes[:6]:
-        print("  note: %s" % s.split("traffic: ", 1)[-1][:160])
+        if misses or any(f.get("ev") == "back" for f in tro):
+            backs = [num(f.get("after"), 0) for f in tro if f.get("ev") == "back"]
+            print("  %s (authority): no driver read %d times (%s); read again %d times (after %s s); moving when "
+                  "missed %d" % (
+                      tr.name, len(misses), ", ".join("%s %d" % kv for kv in Counter(
+                          "seat 0 holds another human" if "holds" in f.get("why", "") else
+                          f.get("why", "?").replace("_", " ") for f in misses).most_common(4)),
+                      len(backs), stats_line(backs, "s") if backs else "-",
+                      sum(1 for f in misses if num(f.get("spd"), 0) > 2)))
+            dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
+            if dist:
+                print("  %s: distance from its player when a driver was not read: %s" % (tr.name, stats_line(dist)))
+            trh = tr.records["TRH"]
+            last = trh[-1][1] if trh else {}
+            print("  %s: driverless (confirmed, 1 s slow) %d, driven again %d" % (
+                tr.name, num(last.get("orphaned"), 0), num(last.get("driven"), 0)))
+        ev = Counter(f.get("ev") for f in tro)
+        if ev.get("out") or ev.get("in") or ev.get("reseat"):
+            print("  %s (receiver): crews got out %d, back in %d, crew members put back in their seats %d" % (
+                tr.name, ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
+        notes = [s for _, s in tr.logs if "traffic: " in s and ("failed" in s or "knocked" in s)]
+        for s in notes[:6]:
+            print("  note (%s): %s" % (tr.name, s.split("traffic: ", 1)[-1][:160]))
+
+
+def peds(auth, recv):
+    """Pedestrians (docs/sync-trace.md PDT / PDR / PDC / PDS): `auth`'s pedestrians as replicas on `recv`'s game.
+    The true error lines up each replica record (PDR rT = the authority clock time its target stands for) with the
+    authority's truth records (PDT sT, the same clock) of that pedestrian."""
+    pdr = [f for _, f in recv.records["PDR"] if int(num(f.get("from"), -1)) == auth.local]
+    pdc = [f for _, f in recv.records["PDC"]]
+    if not pdr and not pdc and not auth.records["PDS"]:
+        return
+    section("Pedestrians (%s's on %s's game)" % (auth.name, recv.name))
+    truth = defaultdict(list)
+    for _, f in auth.records["PDT"]:
+        p, st = vec(f.get("p")), num(f.get("sT"))
+        if p is not None and st is not None:
+            truth[f.get("net")].append((st / 1000.0, p))
+    series = {net: Series(pts, gap=1.0) for net, pts in truth.items()}
+    errs, by_how, missing = [], defaultdict(list), 0
+    worst = Counter()
+    for f in pdr:
+        ser = series.get(f.get("net"))
+        cp, rt = vec(f.get("cp")), num(f.get("rT"))
+        if ser is None or cp is None or rt is None:
+            missing += 1
+            continue
+        tp = ser.at(rt / 1000.0)
+        if tp is None:
+            missing += 1
+            continue
+        e = dist2(cp, tp)
+        errs.append(e)
+        by_how[f.get("how", "?")].append(e)
+        if e > 3:
+            worst[f.get("net")] += 1
+    if errs:
+        print("  replica vs the authority's pedestrian at the same moment: %s" % stats_line(errs))
+        for how, v in sorted(by_how.items()):
+            print("    %-8s %s" % (how, stats_line(v)))
+        record("ped.p95", pct(errs, 95), "%s's on %s" % (auth.name, recv.name))
+        if worst:
+            print("  pedestrians most often more than 3 m off: %s" % ", ".join(
+                "net %s (%d)" % kv for kv in worst.most_common(5)))
+    if pdr:
+        print("  replica records %d, %d without a truth record at that moment (PDT is 1 in 2 states)" % (
+            len(pdr), missing))
+    if pdc:
+        near = sum(num(f.get("near"), 0) for f in pdc)
+        rep_n = sum(num(f.get("rep"), 0) for f in pdc)
+        if near > 0:
+            cov = 100.0 * rep_n / near
+            print("  coverage: %.1f%% of the authorities' pedestrians within 40 m had a replica (%d samples); "
+                  "hidden max %d, adopted mean %.1f, spawned mean %.1f, spawn failures %d" % (
+                      cov, len(pdc), max(num(f.get("hidden"), 0) for f in pdc),
+                      statistics.fmean(num(f.get("adopted"), 0) for f in pdc),
+                      statistics.fmean(num(f.get("spawned"), 0) for f in pdc), num(pdc[-1].get("fails"), 0)))
+            record("ped.coverage", cov, "on %s" % recv.name)
+    pds = auth.records["PDS"]
+    if len(pds) >= 2:
+        (t0, a), (t1, b) = pds[0], pds[-1]
+        secs = max(t1 - t0, 1e-6)
+        print("  %s as the authority: %.0f ambient humans near players (mean), %.0f his to send, %.2f KB/s sent, "
+              "%d states, %d spawns, %d gone, %d deaths, %d kill requests" % (
+                  auth.name, statistics.fmean(num(f.get("peds"), 0) for _, f in pds),
+                  statistics.fmean(num(f.get("owned"), 0) for _, f in pds),
+                  (num(b.get("bytes"), 0) - num(a.get("bytes"), 0)) / 1024 / secs, num(b.get("states"), 0),
+                  num(b.get("spawns"), 0), num(b.get("gones"), 0), num(b.get("deaths"), 0),
+                  num(b.get("killreq"), 0)))
 
 
 def car_damage(a, b):
@@ -686,6 +1042,128 @@ def reconnects(tr):
         print("  %s %s %s%s" % (tr.wall(t), kind, extra, gap))
     if lost is not None:
         print("  (not back by the end of the trace)")
+
+
+def hour_diff(a, b):
+    """a - b in hours, the short way round the clock: (-12, 12]."""
+    d = (a - b) % 24.0
+    return d - 24.0 if d > 12.0 else d
+
+
+def world(host, guest):
+    """Time of day and weather on the guest against the host's at the same moment (WEH on the host, WEG on the guest,
+    both stamped with the session clock sT; docs/sync-trace.md, docs/protocol.md "WorldEnv")."""
+    weg = guest.records["WEG"] if guest else []
+    weh = host.records["WEH"] if host else []
+    if not weg and not weh:
+        return
+    section("World: time of day on %s's game against the host's" % (guest.name if guest else "the guest"))
+    if not weg:
+        print("  host readings (WEH): %d, no guest records (WEG)" % len(weh))
+        return
+    hs = []
+    for _, f in weh:
+        st, t = num(f.get("sT")), num(f.get("t"))
+        if st is not None and t is not None:
+            hs.append((st, t, f.get("weather")))
+    hs.sort()
+    hst = [h[0] for h in hs]
+
+    def host_at(st):
+        """The host's time (hours) and weather at session ms st, from the two WEH around it (at most 2.5 s apart)."""
+        i = bisect.bisect_left(hst, st)
+        if 0 < i < len(hs) and hs[i][0] - hs[i - 1][0] <= 2500:
+            a, b = hs[i - 1], hs[i]
+            k = (st - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0.0
+            return (a[1] + hour_diff(b[1], a[1]) * k) % 24.0, a[2]
+        if i < len(hs) and abs(hs[i][0] - st) <= 600:
+            return hs[i][1], hs[i][2]
+        if i > 0 and abs(st - hs[i - 1][0]) <= 600:
+            return hs[i - 1][1], hs[i - 1][2]
+        return None, None
+
+    # stretches: a gap of over 5 s between guest readings is a new world or a rejoin; the first 10 s of each are the
+    # first sync and left out of the target
+    errs, own, acts, measured = [], [], Counter(), []
+    wmatch = wtotal = from_truth = 0
+    seg_start = last_t = None
+    for t, f in weg:
+        if last_t is None or t - last_t > 5.0:
+            seg_start = t
+        last_t = t
+        acts[f.get("act", "?")] += 1
+        e_own = num(f.get("err"))
+        gt, st = num(f.get("t")), num(f.get("sT"))
+        ht, hw = host_at(st) if (st is not None and hs) else (None, None)
+        if ht is not None and gt is not None:
+            e = hour_diff(ht, gt) * 60.0
+            from_truth += 1
+            if hw is not None:
+                wtotal += 1
+                wmatch += 1 if hw == f.get("weather") else 0
+        else:
+            e = e_own  # no host trace (or no stamp): the guest's own estimate
+        if e is None:
+            continue
+        if e_own is not None and ht is not None:
+            own.append(abs(e_own - e))
+        if t - seg_start >= 10.0:
+            errs.append(abs(e))
+            measured.append((e, t, f))
+    print("  guest readings (WEG): %d, host readings (WEH): %d; compared with the host's own reading at the same "
+          "session time: %d" % (len(weg), len(weh), from_truth))
+    print("  what the guest did: %s" % ", ".join("%s %d" % (k, v) for k, v in sorted(acts.items())))
+    sets = [(t, f) for t, f in weg if f.get("act") == "set"]
+    for t, f in sets[:10]:
+        print("    %s SetTime: ours %s h, host %s h (%s game minutes)" % (guest.wall(t), f.get("t"), f.get("host"),
+                                                                       f.get("err")))
+    if errs:
+        print("  |host - guest| after the first 10 s of each stretch: %s" % stats_line(errs, "game minutes"))
+        worst = max(measured, key=lambda m: abs(m[0]))
+        print("  worst: %.2f game minutes at %s (act=%s)" % (worst[0], guest.wall(worst[1]), worst[2].get("act")))
+        record("world.time_err", max(errs), guest.name)
+    else:
+        print("  no readings after the first 10 s")
+    if own:
+        print("  the guest's own estimate against the truth: %s" % stats_line(own, "game minutes"))
+    if wtotal:
+        print("  weather the same as the host's: %.1f %% of %d readings" % (100.0 * wmatch / wtotal, wtotal))
+    rates = [num(f.get("rate")) for _, f in weg if f.get("measured") == "1"]
+    rates = [r for r in rates if r]
+    if rates:
+        print("  the game's rate as the guest measured it: %.5f game hours per second per flow unit (median)" %
+              pct(rates, 50))
+
+
+def joins(guest, host):
+    """How long a guest waited for his world after a join or a reconnect (JN, docs/sync-trace.md)."""
+    jn = guest.records["JN"] if guest else []
+    reports = [(t, f) for t, f in (host.records["JN"] if host else []) if f.get("ev") == "report"]
+    if not jn and not reports:
+        return
+    section("Join and reconnect: %s's world complete" % (guest.name if guest else "the guest"))
+    for t, f in jn:
+        ev = f.get("ev")
+        if ev == "begin":
+            print("  %s %s (%s other player(s))" % (guest.wall(t), "back after a reconnect" if f.get("reconnect") == "1"
+                                                    else "joined", f.get("others", "?")))
+        elif ev == "complete":
+            missing = f.get("missing", "-")
+            after = num(f.get("after"))
+            what = "complete" if missing == "-" else "STILL MISSING " + missing
+            none = f.get("none", "-")
+            print("  %s %s after %s s%s%s" % (guest.wall(t), what, f.get("after"),
+                                             " (late)" if f.get("late") == "1" else "",
+                                             "; nothing came for " + none if none != "-" else ""))
+            if after is not None and f.get("late") != "1":
+                who = "reconnect" if f.get("reconnect") == "1" else "join"
+                record("join.complete_s", after, "%s %s" % (guest.name, who))
+        else:
+            print("    %-10s %-8s after %s s" % (ev, f.get("key", "-"), f.get("after")))
+    for t, f in reports:
+        print("  host %s: player %s reported complete=%s after %s s, missing %s (%s)" % (
+            host.wall(t), f.get("from"), f.get("complete"), f.get("after"), f.get("missing"),
+            (f.get("times") or "").replace(",", ", ").replace(":", " ")))
 
 
 def doors(tr, other):
@@ -790,11 +1268,11 @@ def msg_system(name):
         return "player"
     if n in ("WorldEnv", "MissionState", "HostSave", "Cutscene", "MissionFail", "FailVerdict"):
         return "world"
-    if n in ("NpcStates", "GuestNpcStates"):
+    if n in ("NpcStates", "GuestNpcStates", "NpcStates2", "GuestNpcStates2"):
         return "npc"
     if n.startswith("Npc") or n in ("GuestNpcEnd", "HostNpcHit"):
         return "npc-event"
-    if n == "TrafficStates":
+    if n in ("TrafficStates", "TrafficStates2"):
         return "traffic"
     if n.startswith("Traffic"):
         return "traffic-event"
@@ -812,6 +1290,10 @@ def msg_system(name):
         return "item-event"
     if n == "Hit":
         return "hit"
+    if n == "PedStates":
+        return "ped"
+    if n.startswith("Ped"):
+        return "ped-event"
     return n
 
 
@@ -898,10 +1380,15 @@ def main():
     worst = []
     compare(a, b, args, worst)
     compare(b, a, args, worst)
+    players(a, b)
+    players(b, a)
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
         own_npcs(guest, b if guest is a else a)
+        other = b if guest is a else a
+        npc_replicas(other, guest, worst)  # the host's NPCs on the guest
+        npc_replicas(guest, other, worst)  # the guest's own NPCs on the host
     for tr in (a, b):
         swapped_cars(tr)
     for tr in (a, b):
@@ -909,7 +1396,12 @@ def main():
     for x, y in ((a, b), (b, a)):
         doors(x, y)
     host = a if a.role == "host" else b if b.role == "host" else None
-    traffic(host, guest)
+    world(host, guest)
+    joins(guest, host)
+    traffic(a, b)
+    for x, y in ((a, b), (b, a)):
+        peds(x, y)
+    npc_bandwidth(host)
     car_damage(a, b)
     car_looks(a, b)
     bandwidth((a, b))

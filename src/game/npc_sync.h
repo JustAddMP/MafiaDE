@@ -1,16 +1,18 @@
 #pragma once
-// Phase 4 (B3): mission NPCs in co-op. Every game runs the chapter's mission scripts at the host's checkpoint, so
-// the mission NPCs exist on every game; the host is authoritative for them (docs/protocol.md "NPCs",
-// docs/game-api.md 15, the game side in npc_sync.lua):
-//   - Host: the state of the NPCs near any player (position, heading, health, dead, AI type, archetype tag, weapon),
-//     10 Hz (NpcStates), and every NPC death at once (NpcDeath).
-//   - Guest: pairs each host NPC with its own copy (same spot; else the nearest of the same kind within 40 m), keeps
-//     its health at most the host's, kills it when the host's dies, puts it back when it wandered off; the guest's hits
-//     on copies hurt them and go to the host (NpcHit), where they are replayed as real shots from the guest's puppet
-//     (the NPC turns on the puppet); a hit that killed the guest's copy is lethal on the host too.
-//   - Guest-owned NPCs (npc_owner.h): NPCs only a guest's game has (no host NPC pairs with them) go guest -> host and
-//     are shown there as copies driven by the guest's states; the host's hits on them go back to the guest; when the
-//     host's own game spawns that NPC, it is paired again and the host is authoritative for it.
+// Phase 4 (B3): mission NPCs in co-op, one authority per NPC (docs/protocol.md "NPCs", "Guest-owned NPCs",
+// docs/game-api.md 15, the pure logic in npc_replica.h / npc_owner.h, the game side in npc_sync.lua):
+//   - Host: the authority for its NPCs. Each round (15 Hz) of the Lua glue lists the shared NPCs near any guest (not
+//     ambient pedestrians, those are ped_sync's); the publisher (npc_replica.h) sends each guest the ones near him, as
+//     often as their distance says, as compact time-stamped states (NpcStates2, slow fields in NpcInfo, NpcLeave), and
+//     every NPC death at once (NpcDeath).
+//   - Guest: pairs each host NPC with its own NPC (same spot; else the nearest of the same kind within 40 m), stops that
+//     NPC's own AI and DRIVES it from the host's states (interpolated, a locomotion controller + correction per replica,
+//     a command per tick to the Lua glue, its position reported back); a host NPC without a partner gets a spawned copy,
+//     driven the same way. Health and death follow the host's; the guest's hits go to the host (NpcHit), where they are
+//     replayed as real shots from the guest's puppet; the guest's damage from host NPCs comes from the host.
+//   - Guest-owned NPCs (npc_owner.h): NPCs only a guest's game has go guest -> host the same compact way and are
+//     shown there as copies driven the same way; the host's hits on them go back to the guest; when the host's own game
+//     spawns that NPC, it is paired again and the host is authoritative for it.
 // Threads: messages on the render thread; Lua on GameMainThread (tick callback); a mutex for the hand-over.
 #include "net/session.h"
 #include "render/overlay.h"
