@@ -392,6 +392,10 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
      known issue, a player's car with another variant, colour and plate on the other screen: CarLook (0x0253)
      gives copies of player and traffic cars the car's tuning items (body variant), colours, plate, tint,
      interior and painting (game-api.md 24 "Car look", re-notes 13; unit test car_look_test).
+     Unreleased (4500b98, fixed in code, in-game check pending): a copy's tuning (which rebuilds the car) waits
+     while a player sits in it, a new copy holds the puppet back until its look is on, car damage asks for the
+     whole state after a rebuild; puppet script control (melee) waits for the friend brain switch, is given back
+     before a seat, door walk or ragdoll, is cleared on respawn, and late answers are ignored.
    - Police (protocol.md "Police"): wanted states shared, the host's police chase a wanted guest's puppet near the
      host. The offence fix (968d300) is checked in game; the guest's level still runs down during a chase.
      Unreleased (merge 2026-10-19, fixed in code, in-game check pending): the guest's zone decay is held
