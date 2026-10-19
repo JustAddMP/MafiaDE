@@ -1,6 +1,6 @@
 # Sync architecture: how close to "100 % synced" we can get, and how
 
-Status: plan (2026-10-19), written from the first real two-PC test (0.15.0, two sessions, 906 s and 345 s, Steam
+Status: plan (2026-10-19), built 2026-10-20 (section 8 "Status"), written from the first real two-PC test (0.15.0, two sessions, 906 s and 345 s, Steam
 P2P, rtt ~28 ms, loss ~0 %) and the code on main after the Round 4 merge. **Nothing in this document is verified in
 game yet**; the numbers under "now" are measured (`python tools/sync_compare.py <host trace> <guest trace> --check` on
 the 0.15.0 traces: session 1 = `-204809` / `-204821`, session 2 = `-210320` / `-210331`), the targets are what the next
@@ -166,6 +166,24 @@ agent-rules.md. Message ids are fixed here so nothing clashes. Only `players` ch
 Shared files every package may touch only in the lines for its own ids: `src/game/latency.cpp` (lanes, priorities,
 system names), `src/game/module.cpp` (wiring), `build.cmd`, `docs/protocol.md` / `docs/sync-trace.md` (own sections),
 `tools/sync_compare.py` (own section + its metrics through `record()`).
+
+### Status (2026-10-20): built, not verified in game
+
+All six packages are merged on main (core v0.12.0). What each delivered and its simulated numbers (unit tests with
+modelled copies; the game's real AI walk, car physics and civilians may differ):
+
+| Package | Branch | Wire | Simulated |
+|---|---|---|---|
+| sync-core | core `feat/sync-core` (v0.12.0) | NetRef form only | walker: gait 95-98 %, p95 0.34-0.41 m moving, 0.07-0.09 m standing |
+| players | `feat/players` | ParkedCars 0x0104 (PlayerState unchanged) | foot p95 0.65-0.75 m, standing 0.25-0.27 m, gait 99.8 %; car p95 0.88-0.98 m, pinned 0-0.1 % |
+| npc-authority | `feat/npc-authority` | 0x0212-0x0214, 0x0424-0x0426; 0x0210 / 0x0420 retired | two session-1 cops: p95 0.97 m, max 2.15 m; 6.3 KB/s at 48 NPCs |
+| traffic-regions | `feat/traffic-regions` | 0x0224-0x0227 | true p95 0.91 m at 30 m, 1.27 m at 150 m; unshared 0; shown 99.7 % |
+| ambient-peds | `feat/ambient-peds` | 0x0280-0x0284 (lane 5) | p95 0.78-0.86 m; coverage 100 % |
+| world-join | `feat/world-join` | JoinReport 0x0207; WorldEnv + u32 sample time | convergence without overshoot |
+
+Two more `--check` metrics came with the packages: `npc.bw` (<= 8 KB/s per guest) and `join.complete_s` (<= 10 s).
+The biggest open questions for the game: whether a mission NPC's and a civilian's AI really stops while it is a
+replica, how close the game's AI walk is to the simulated walker, and the semantics of BlockSpawnersInSphere.
 
 ## 9. What stays out of reach (said plainly)
 
