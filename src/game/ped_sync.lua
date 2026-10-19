@@ -132,6 +132,11 @@ local function ambientKind(h)
   local okO, o = pcall(h.GetOwner, h)
   if okO and o then return false end  -- in a vehicle
   local okN, name = pcall(h.GetName, h)
+  -- one rule with npc_sync: src/game/npc_replica.h ClassOfName / IsAmbientHuman through mc_npc_class
+  if mc_npc_class then
+    local amb = mc_npc_class(okN and tostring(name or "") or "", 0, 0, 0)
+    return amb == 1
+  end
   if okN and type(name) == "string" then
     local suffix = name:match("^behavior_object_prime%-%x+%-(.*)$")
     if suffix and suffix ~= "" then return false end  -- a mission spawner's (or a factory's) human
