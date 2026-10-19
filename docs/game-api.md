@@ -630,6 +630,17 @@ begin with a drive or a walk the tests cannot follow).
   Taxi mission does not let the player out). In chapters that start with each player in his own mission car (Lost
   Heaven chase, Taxi cp_020) the guest sits in his own car where the host's would be: the host's puppet waits hidden
   until the cars have parted, as before.
+- Both players in their own copy of one mission car at one spot (0.15.0 test, after the guest's reload at Taxi
+  cp_020: the guest's taxi 2 cm from the host's, the host in his): the guest's puppet stayed `veh-hidden` for minutes
+  on the host (trace `VEH ... have=0`, the log said "another car stands where it is" once). Since this fix the copy
+  waits 2 s, then is spawned beside his car (src/game/seats.h `PlaceCopy` / `AsideSpot`: 6 m to his right or left,
+  7.5 m behind or ahead, 9 m out, no car within 5.6 m, ground and wall checked with `mc_raycast`) and his puppet is
+  seated in it; it is held there (not driven onto his car) until his car is 4.5 m clear of every car here, then the
+  vehicle controller takes it to his car. A parked copy of his earlier car standing on his spot (his car's id changed
+  with a reload or a rejoin) is dropped first, and on a new world every car record except copies and hidden real cars
+  is looked up again (a guest whose taxi had stood for the host's car went on reporting the host's car key after a
+  reload when the new car compared equal to the old entity; UNVERIFIED that it does). All of it UNVERIFIED in game:
+  the ray checks, that SpawnCar takes the spot, that the snap onto his car looks right.
 
 **Mission car back (0.15; built from the code paths above, NOT checked in game).** The swap keeps the real car
 (`c.orig` in player_sync.lua): this game's mission scripts reference that entity, not the copy. Since 0.15 every

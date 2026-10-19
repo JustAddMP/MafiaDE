@@ -1,7 +1,10 @@
 // seats_test: unit tests for the seat rules of a car that three or four players share (src/game/seats.h): the
 // ride-along seat (free here and claimed by no other player's state), the yield when two players took the same
 // passenger seat (the lower id keeps it), the claim list the Lua side passes. Simulates the four games of a session
-// (host + 3 guests) seeing one car. Prints PASS/FAIL per check; exits non-zero on any failure.
+// (host + 3 guests) seeing one car. Also where a remote car's copy stands when his spot is taken here (PlaceCopy,
+// AsideSpot: the guest's reload in the 0.15.0 test, both mission taxis on one spot). Prints PASS/FAIL per check;
+// exits non-zero on any failure.
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -145,6 +148,89 @@ void TestSimultaneousRide() {
           "simultaneous: two-seater, the higher id has no seat to go to");
 }
 
+// Where a remote player's car copy stands (PlaceCopy): wait briefly while his spot is taken, then beside his car,
+// held there while ours stands within kReleaseDist of his car, released once his car is clear.
+void TestPlaceCopy() {
+    Check(PlaceCopy(false, false, -1, 0, false) == Place::AtCar, "place: no car near his: the copy goes onto his car");
+    Check(PlaceCopy(false, false, 8.0f, 0, false) == Place::AtCar, "place: the nearest car is not in the way: at car");
+    Check(PlaceCopy(false, false, 0.02f, 0.5, true) == Place::Wait, "place: blocked a moment: wait");
+    Check(PlaceCopy(false, false, 0.02f, kBlockWait, true) == Place::Aside, "place: blocked 2 s: beside his car");
+    Check(PlaceCopy(false, false, 0.02f, 60, false) == Place::Wait, "place: blocked, no free spot: keep waiting");
+    Check(PlaceCopy(true, false, 0.02f, 60, true) == Place::AtCar, "place: a copy at his car stays a normal copy");
+    Check(PlaceCopy(true, true, 0.02f, 0, false) == Place::Hold, "place: aside, ours still on his spot: held");
+    Check(PlaceCopy(true, true, kReleaseDist - 0.1f, 0, false) == Place::Hold, "place: aside, ours too close: held");
+    Check(PlaceCopy(true, true, kReleaseDist, 0, false) == Place::Release, "place: aside, his car clear: released");
+    Check(PlaceCopy(true, true, -1, 0, false) == Place::Release, "place: aside, no car near his: released");
+    Check(std::string(PlaceName(Place::Release)) == "release" && std::string(PlaceName(Place::AtCar)) == "at_car",
+          "place: names for the log");
+}
+
+float Dist(Pt a, float x, float y) { return std::sqrt((a.x - x) * (a.x - x) + (a.y - y) * (a.y - y)); }
+
+void TestAsideSpot() {
+    // his car at 1294,140 heading +x; ours on the same spot (the reload case): the first spot, 6 m to his right
+    const std::vector<Pt> twin = {{1294.0f, 140.0f}};
+    const Spot a = AsideSpot(1294.0f, 140.0f, 1, 0, twin);
+    Check(a.ok && a.index == 0 && std::fabs(a.x - 1294.0f) < 0.01f && std::fabs(a.y - 134.0f) < 0.01f,
+          "aside: the first spot is to his right", std::to_string(a.x) + "," + std::to_string(a.y));
+    Check(Dist({a.x, a.y}, 1294.0f, 140.0f) >= kAsideClear, "aside: the spot is clear of ours");
+    // a car parked on his right: the left one
+    const Spot b = AsideSpot(1294.0f, 140.0f, 1, 0, {{1294.0f, 140.0f}, {1294.5f, 134.5f}});
+    Check(b.ok && b.index == 1 && std::fabs(b.y - 146.0f) < 0.01f, "aside: right taken: left");
+    // the caller found the right one unusable (a wall): the left one; both sides: behind
+    Check(AsideSpot(1294.0f, 140.0f, 1, 0, twin, 1u).index == 1, "aside: right rejected (wall): left");
+    const Spot c = AsideSpot(1294.0f, 140.0f, 1, 0, twin, 3u);
+    Check(c.ok && c.index == 2 && std::fabs(c.x - 1286.5f) < 0.01f, "aside: both sides rejected: behind him");
+    // the heading turns the spots with it (heading +y: right = +x); an unnormalised or zero heading works
+    const Spot d = AsideSpot(0, 0, 0, 5, {});
+    Check(d.ok && d.index == 0 && std::fabs(d.x - 6.0f) < 0.01f && std::fabs(d.y) < 0.01f,
+          "aside: heading +y: his right is +x");
+    Check(AsideSpot(0, 0, 0, 0, {}).ok, "aside: no heading: +x taken");
+    // a car park: every spot taken -> none
+    std::vector<Pt> full;
+    for (int i = 0; i < kAsideCandidates; ++i) full.push_back(AsideCandidate(0, 0, 1, 0, i));
+    Check(!AsideSpot(0, 0, 1, 0, full).ok, "aside: every spot has a car: none");
+    Check(!AsideSpot(0, 0, 1, 0, {}, (1u << kAsideCandidates) - 1).ok, "aside: every spot rejected: none");
+    const auto pts = ParsePoints("1.5,2 x 3,4.25 5, 7,8");
+    Check(pts.size() == 3 && pts[0].x == 1.5f && pts[1].y == 4.25f && pts[2].x == 7.0f,
+          "aside: car list parsed, garbage skipped");
+}
+
+// The 0.15.0 in-game case: after the guest's reload both games stood in their own mission taxi at cp_020, 2 cm
+// apart. On the host the guest's car was blocked by the host's taxi for minutes (puppet veh-hidden). Now, ticked
+// every 0.5 s as player_sync.lua does: 2 s of waiting, a copy beside it (the puppet sits in it), held while the
+// guest stays there, released once he has driven kReleaseDist off our taxi.
+void TestTwinAfterReload() {
+    const float hostX = 1294.013f, hostY = 139.842f;
+    float gx = 1294.015f, gy = 139.841f;
+    bool haveCopy = false, aside = false;
+    double since = -1;
+    int waits = 0, holds = 0;
+    double asideAt = -1, releasedAt = -1;
+    for (double t = 0; t < 120; t += 0.5) {
+        if (t >= 60) gx += 0.5f;  // the guest drives off after a minute (1 m/s)
+        const float d = std::sqrt((gx - hostX) * (gx - hostX) + (gy - hostY) * (gy - hostY));
+        if (!haveCopy) {
+            const bool blocked = d <= kBlockDist;
+            if (blocked && since < 0) since = t;
+            const Spot sp = AsideSpot(gx, gy, 1, 0, {{hostX, hostY}});
+            const Place p = PlaceCopy(false, false, d, blocked ? t - since : 0, sp.ok);
+            if (p == Place::Wait) ++waits;
+            if (p == Place::Aside) haveCopy = aside = true, asideAt = t;
+            if (p == Place::AtCar) haveCopy = true;
+        } else if (aside) {
+            const Place p = PlaceCopy(true, true, d, 0, false);
+            if (p == Place::Hold) ++holds;
+            if (p == Place::Release) aside = false, releasedAt = t;
+        }
+    }
+    Check(asideAt >= kBlockWait && asideAt <= kBlockWait + 0.5, "twin: a copy beside his car after 2 s",
+          std::to_string(asideAt));
+    Check(waits == 4, "twin: waited 4 looks (2 s), not minutes", std::to_string(waits));
+    Check(holds > 100 && releasedAt > 60 && releasedAt < 75, "twin: held while he stands there, released after he left",
+          std::to_string(releasedAt));
+}
+
 }  // namespace
 
 int main() {
@@ -153,6 +239,9 @@ int main() {
     TestParse();
     TestThreePlayersOneCar();
     TestSimultaneousRide();
+    TestPlaceCopy();
+    TestAsideSpot();
+    TestTwinAfterReload();
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }
