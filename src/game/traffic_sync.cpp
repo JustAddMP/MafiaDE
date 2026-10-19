@@ -169,7 +169,8 @@ bool LoadModule(lua_State* L) {
     return true;
 }
 
-// "TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags"
+// "TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags" (flag 4: no living driver read
+// at the wheel this round; HostTraffic's DriverWatch turns it into the confirmed kNoDriver)
 bool ParseCar(const std::string& line, HostCar& c) {
     unsigned long key = 0;
     unsigned kind = 0, flags = 0;
@@ -406,8 +407,22 @@ void HostSend(double now) {
     {
         std::lock_guard lock(sh.mu);
         if (sh.carsFresh) {
-            _host->SetCars(sh.cars);
+            const uint64_t o0 = _host->Orphaned(), d0 = _host->DrivenAgain();
+            _host->SetCars(sh.cars, now);
             sh.carsFresh = false;
+            // a car whose driver is gone for good (DriverWatch: none read for 1 s while slow): its copies' crews may
+            // get out; one found driven again: they get back in
+            if (_host->Orphaned() != o0 || _host->DrivenAgain() != d0) {
+                static uint32_t logged = 0;
+                if (++logged <= 60 || logged % 100 == 0)
+                    MC_LOG_INFO("traffic: driverless cars (no driver read for %.1f s while slower than %.0f m/s): "
+                                "+%llu now, +%llu driven again (so far %llu / %llu; %zu without a driver read now)",
+                                kOrphanConfirm, kOrphanSlow,
+                                static_cast<unsigned long long>(_host->Orphaned() - o0),
+                                static_cast<unsigned long long>(_host->DrivenAgain() - d0),
+                                static_cast<unsigned long long>(_host->Orphaned()),
+                                static_cast<unsigned long long>(_host->DrivenAgain()), _host->MissingNow());
+            }
         }
         for (const auto& [id, v] : sh.views)
             if (_session->FindPlayer(static_cast<net::PlayerId>(id)) && id != net::kHostPlayer)
@@ -450,10 +465,14 @@ void HostSend(double now) {
     _hostStatus = s;
     if (core::trace::IsOpen() && now - _hostTraceAt >= kTraceInterval) {
         _hostTraceAt = now;
-        core::trace::Line("TRH", "cars=%zu spawnMsgs=%llu stateMsgs=%llu despawnMsgs=%llu bytes=%llu bumps=%llu",
+        core::trace::Line("TRH",
+                          "cars=%zu spawnMsgs=%llu stateMsgs=%llu despawnMsgs=%llu bytes=%llu bumps=%llu nodrv=%zu "
+                          "orphan=%zu orphaned=%llu driven=%llu",
                           _host->CarCount(), static_cast<unsigned long long>(_spawnMsgs),
                           static_cast<unsigned long long>(_stateMsgs), static_cast<unsigned long long>(_despawnMsgs),
-                          static_cast<unsigned long long>(_bytesSent), static_cast<unsigned long long>(_bumpsRecv));
+                          static_cast<unsigned long long>(_bytesSent), static_cast<unsigned long long>(_bumpsRecv),
+                          _host->MissingNow(), _host->DeclaredNow(), static_cast<unsigned long long>(_host->Orphaned()),
+                          static_cast<unsigned long long>(_host->DrivenAgain()));
         for (const auto& p : _session->Players()) {
             const auto* st = _host->Stats(p.id);
             if (!st || p.id == net::kHostPlayer) continue;

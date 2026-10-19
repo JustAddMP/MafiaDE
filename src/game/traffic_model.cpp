@@ -290,7 +290,47 @@ uint16_t HostTraffic::NewNet() {
     return 0;
 }
 
-void HostTraffic::SetCars(const std::vector<HostCar>& cars) {
+bool DriverWatch::Update(double now, bool driverSeen, float speed) {
+    if (driverSeen || !std::isfinite(speed)) {
+        missSince_ = slowSince_ = -1;
+        declared_ = false;
+        return false;
+    }
+    if (missSince_ < 0) missSince_ = now;
+    if (speed <= kOrphanSlow) {
+        if (slowSince_ < 0) slowSince_ = now;
+    } else {
+        slowSince_ = -1;
+    }
+    if (!declared_) {
+        declared_ = slowSince_ >= 0 && now - missSince_ >= kOrphanConfirm && now - slowSince_ >= kOrphanConfirm;
+    } else if (speed > kOrphanDriven) {  // nobody read at the wheel, yet it speeds up: someone drives it
+        declared_ = false;
+        missSince_ = now;
+        slowSince_ = -1;
+    }
+    return declared_;
+}
+
+bool CrewGetsOut(uint8_t targetFlags, float targetSpeed, float copySpeed) {
+    if (!(targetFlags & kNoDriver)) return false;
+    if (!std::isfinite(targetSpeed) || targetSpeed >= kOrphanSlow) return false;
+    return copySpeed < kOrphanSlow;  // (no report yet: negative)
+}
+
+size_t HostTraffic::MissingNow() const {
+    size_t n = 0;
+    for (const auto& [net, c] : cars_) n += c.drv.Missing() ? 1 : 0;
+    return n;
+}
+
+size_t HostTraffic::DeclaredNow() const {
+    size_t n = 0;
+    for (const auto& [net, c] : cars_) n += c.drv.Declared() ? 1 : 0;
+    return n;
+}
+
+void HostTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
     for (auto& [net, c] : cars_) c.seen = false;
     for (const HostCar& in : cars) {
         if (!Finite(in.st.pos) || !SafeToken(in.model, 64)) continue;
@@ -312,6 +352,13 @@ void HostTraffic::SetCars(const std::vector<HostCar>& cars) {
         c.c = in;
         c.c.st.net = net;
         c.seen = true;
+        // the Lua's kNoDriver is this round's read; what is sent is the confirmed one
+        const bool was = c.drv.Declared();
+        const float speed = std::sqrt(in.st.vel.x * in.st.vel.x + in.st.vel.y * in.st.vel.y + in.st.vel.z * in.st.vel.z);
+        const bool orphan = c.drv.Update(now, (in.st.flags & kNoDriver) == 0, speed);
+        if (orphan && !was) ++orphaned_;
+        if (was && !orphan) ++drivenAgain_;
+        c.c.st.flags = static_cast<uint8_t>((c.c.st.flags & ~kNoDriver) | (orphan ? kNoDriver : 0));
         im_.UpdateEntity(net, {in.st.pos.x, in.st.pos.y, in.st.pos.z}, {in.st.vel.x, in.st.vel.y, in.st.vel.z});
     }
     for (auto it = cars_.begin(); it != cars_.end();) {
@@ -848,6 +895,14 @@ void GuestTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std::v
         vi.dt = c.accDt;
         c.accDt = 0;
         cmd.vc = c.vc.Update(vi);
+        {
+            const Vec3& tv = cmd.target.vel;
+            const float ts = std::sqrt(tv.x * tv.x + tv.y * tv.y + tv.z * tv.z);
+            const float cs = vi.haveCopy ? std::sqrt(vi.copyVel.x * vi.copyVel.x + vi.copyVel.y * vi.copyVel.y +
+                                                     vi.copyVel.z * vi.copyVel.z)
+                                         : -1.0f;
+            if (CrewGetsOut(cmd.target.flags, ts, cs)) cmd.target.flags |= kCrewOut;
+        }
         if (cmd.vc.justPinned) ++stats_.pins;
         if (cmd.vc.fix == motion::VehicleCommand::Fix::Snap) ++stats_.snaps;
         if (vi.haveCopy) {

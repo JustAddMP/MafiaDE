@@ -3,6 +3,7 @@
 // interpolation, removal, hand-over, bumps). Prints PASS/FAIL per check; exits non-zero on any failure.
 #include "game/traffic_model.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -776,6 +777,133 @@ void TestHostPause() {
           Fmt("bumps %.0f quiet %.0f", lb, l.Stats().quietBumps));
 }
 
+// The host's "no driver" decision: a car only counts as driverless after 1 s without a driver read while slow.
+void TestDriverWatch() {
+    {
+        DriverWatch w;  // a flickering read (the 0.15.0 test: cars flagged while driven on)
+        bool any = false;
+        for (int i = 0; i < 200; ++i) {
+            const double t = i * 0.05;
+            const bool seen = (i % 30) >= 15;  // 0.7 s missing, then read, ...
+            any |= w.Update(t, seen, 0.0f);
+        }
+        Check(!any, "driver: missing 0.7 s at a time (flicker) is never driverless");
+    }
+    {
+        DriverWatch w;  // no driver read, but the car drives on at 10 m/s (someone we cannot read drives it)
+        bool any = false;
+        for (int i = 0; i < 200; ++i) any |= w.Update(i * 0.05, false, 10.0f);
+        Check(!any && w.Missing(), "driver: a moving car without a driver read is not driverless (10 s at 10 m/s)");
+    }
+    {
+        DriverWatch w;  // a stopped car whose driver got out
+        bool at09 = false, at10 = false;
+        for (int i = 0; i <= 20; ++i) {
+            const double t = i * 0.05;
+            const bool d = w.Update(t, false, 0.3f);
+            if (i == 18) at09 = d;
+            if (i == 20) at10 = d;
+        }
+        Check(!at09 && at10, "driver: standing without a driver: driverless after 1.0 s, not at 0.9 s");
+        Check(w.Update(1.05, false, 3.0f), "driver: pushed to 3 m/s (below 'driven again', 4 m/s): still driverless");
+        Check(!w.Update(1.1, false, 6.0f), "driver: driverless car speeding up (6 m/s) is driven again");
+        Check(!w.Update(1.5, false, 0.0f), "driver: ... and needs 1 s slow again");
+        Check(w.Update(2.6, false, 0.0f), "driver: ... after which it is driverless again");
+        Check(!w.Update(2.65, true, 0.0f) && !w.Missing(), "driver: a driver read clears it at once");
+    }
+    {
+        DriverWatch w;  // the driver dies at 12 m/s; the car rolls to a stop over 4 s
+        double declaredAt = -1;
+        for (int i = 0; i <= 120; ++i) {
+            const double t = i * 0.05;
+            const float v = std::max(0.0f, 12.0f - 3.0f * static_cast<float>(t));
+            if (w.Update(t, false, v) && declaredAt < 0) declaredAt = t;
+        }
+        // slow (<= 2 m/s) from t = 3.33: driverless 1 s later
+        Check(declaredAt > 4.3 && declaredAt < 4.45, "driver: a rolling car is driverless 1 s after it got slow",
+              Fmt("at %.2f s", declaredAt));
+    }
+    Check(!CrewGetsOut(kNoDriver, 8.0f, 0.0f), "crew: host car driverless but rolling at 8 m/s: crew stays in");
+    Check(!CrewGetsOut(kNoDriver, 0.5f, 6.0f), "crew: our copy still moving (6 m/s): crew stays in");
+    Check(!CrewGetsOut(kControls, 0.0f, 0.0f), "crew: no driverless flag: crew stays in");
+    Check(CrewGetsOut(kNoDriver, 0.5f, 0.4f), "crew: both stand, host car driverless: the driver gets out");
+    Check(CrewGetsOut(kNoDriver, 0.0f, -1.0f), "crew: no report of the copy yet, host car stands: out");
+}
+
+// End to end: the host's raw read becomes the sent kNoDriver only once confirmed; the guest's Drive command carries
+// kCrewOut only while both cars stand.
+void TestOrphanEndToEnd() {
+    HostTraffic h;
+    GuestTraffic g;
+    std::vector<PeerOut> out;
+    std::vector<GuestCmd> cmds;
+    std::vector<GuestBump> bumps;
+    HostCar car = Car(4242, 20, 0, 0, 10);
+    uint8_t lastSent = 0;
+    bool sentNoDriverMoving = false;
+    double sentAt = -1;
+    const double base = 100.0;
+    for (int i = 0; i <= 120; ++i) {
+        const double t = i * 0.05;
+        // driver read flickers for the first 2 s (moving at 10 m/s), then it is gone and the car brakes to a stop
+        const bool read = t < 2.0 ? (i % 10) < 5 : false;
+        const float v = t < 2.0 ? 10.0f : std::max(0.0f, 10.0f - 5.0f * static_cast<float>(t - 2.0));
+        car.st.vel = {0, v, 0};
+        car.st.pos.y += v * 0.05f;
+        car.st.flags = static_cast<uint8_t>(kControls | (read ? 0 : kNoDriver));
+        h.SetCars({car}, t);
+        h.SetView(1, {0, 0, 5}, t);
+        h.Tick(t, static_cast<uint32_t>(t * 1000), out);
+        for (const auto& po : out) {
+            for (const auto& b : po.spawns) {
+                net::ByteReader r(b.data(), b.size());
+                std::vector<SpawnInfo> s;
+                ReadSpawns(r, s);
+                for (const auto& x : s) g.OnSpawn(x, base + t);
+            }
+            for (const auto& b : po.states) {
+                net::ByteReader r(b.data(), b.size());
+                uint32_t ms = 0;
+                std::vector<CarState> st;
+                ReadStates(r, ms, st);
+                for (const auto& s : st) {
+                    lastSent = s.flags;
+                    if ((s.flags & kNoDriver) && v > kOrphanSlow) sentNoDriverMoving = true;
+                    if ((s.flags & kNoDriver) && sentAt < 0) sentAt = t;
+                }
+                g.OnStates(ms, st, base + t);
+            }
+        }
+        g.SetLocal({0, 0, 0}, true, {0, 0, 0});
+        g.Tick(base + t, 0.05f, cmds, bumps);
+    }
+    Check(!sentNoDriverMoving, "orphan: never sent as driverless while it moves");
+    // slow (<= 2 m/s) from t = 3.6: driverless from 4.6
+    Check(sentAt > 4.5 && sentAt < 4.75 && (lastSent & kNoDriver), "orphan: sent as driverless 1 s after it stopped",
+          Fmt("at %.2f s", sentAt));
+    Check(h.Orphaned() == 1 && h.DeclaredNow() == 1, "orphan: counted once", Fmt("%.0f", h.Orphaned()));
+    // the guest: a copy that stands gets kCrewOut, one that still moves (our report) does not
+    const double now = base + 6.02;
+    CopyReport rep;
+    CarState tgt;
+    g.Target(h.NetOf(4242), now, tgt);
+    rep.pos = tgt.pos;
+    rep.vel = {0, 5, 0};
+    g.SetReport(h.NetOf(4242), rep, now);
+    g.Tick(now + 0.02, 0.016f, cmds, bumps);
+    bool out1 = false, drove = false;
+    for (const auto& c : cmds)
+        if (c.type == GuestCmd::Type::Drive) drove = true, out1 |= (c.target.flags & kCrewOut) != 0;
+    Check(drove && !out1, "orphan: our copy still rolling at 5 m/s: no kCrewOut");
+    rep.vel = {0, 0, 0};
+    g.SetReport(h.NetOf(4242), rep, now + 0.04);
+    g.Tick(now + 0.04, 0.016f, cmds, bumps);
+    bool out2 = false;
+    for (const auto& c : cmds)
+        if (c.type == GuestCmd::Type::Drive) out2 |= (c.target.flags & kCrewOut) != 0;
+    Check(out2, "orphan: both stand: kCrewOut in the Drive command");
+}
+
 }  // namespace
 
 int main() {
@@ -789,6 +917,8 @@ int main() {
     TestEndToEnd();
     TestHostThreeGuests();
     TestHostPause();
+    TestDriverWatch();
+    TestOrphanEndToEnd();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

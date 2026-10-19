@@ -87,6 +87,18 @@ local COPY_SNAP = 10        -- m: farther off its host NPC than this, a copy is 
 local COPY_AFTER_LOAD = 10  -- s after our world loaded before copies are spawned (our own mission spawns its NPCs then)
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
+-- Spawn profiles for a copy of an NPC whose own is not known (profile "0": police and civilians of the generators, and
+-- every NPC no mission spawner made): by its AI type, police (4) a police profile, anyone else a generic civilian.
+-- The spawner component takes a profile as its FNV-1 64 hash (mc_fnv); both names have their hash in
+-- sds_retail/combinables/spawnprofiles.sds (checked statically 2026-10-19, as traffic_sync.lua's crews). 0.15.0 two-PC
+-- test: 12 guest-owned cops (AI type 4, profile 0) were never shown on the host. UNVERIFIED in game.
+local FALLBACK_POLICE = "characters/ai/police_scotch/ai_police_triggerman"
+local FALLBACK_CIVILIAN = "characters/traffic/traffic_base_ambient_combined"
+local FAST_NPC = 11         -- m/s: a host NPC moving this fast (smoothed) is in a vehicle, whatever its car flag says
+local FAST_HOLD = 2         -- s it counts as in a vehicle after that
+local UNPAIR_WAIT = 2       -- s a host NPC in a vehicle stays paired with our NPC on foot more than LOOSE_DIST away
+local STEER_DIST = 3        -- m: our cop paired with a host cop on foot that runs is steered toward it beyond this
+local STEER_EVERY = 0.4     -- s between two steering orders
 
 local function log(s) if mc_log then mc_log("npc: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -133,6 +145,30 @@ N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sy
 -- player id, a value no entity id has, so it never is a host NPC's key, and below 2^24, so our 32-bit float numbers
 -- hold it exactly. They are host NPCs here like any other (paired, copied, hit: the host forwards hits to the owner).
 local RELAY_TYPE, TYPE_HUMAN, BYTE, MAXKEY = 240, 8, 256, 16777216
+
+-- Is the NPC of state `s` in a vehicle on its owner's game? Its car flag (GetOwner there), or it moves faster than a
+-- human runs: the 0.15.0 two-PC test had host cops chasing the guest at 12-25 m/s with the car flag 0 (37 samples, our
+-- paired cop on foot 20-46 m off and put back every 2 s: NPC 7090184). UNVERIFIED why GetOwner reads nil for them.
+function N.InVehicle(s)
+  return s.car == true or (s.fastT ~= nil and M.now - s.fastT < FAST_HOLD)
+end
+
+-- The spawn profile for a copy of the NPC of state `s` (nil: none): its own, else the fallback for its AI type.
+function N.CopyProfile(s)
+  if s.prof and s.prof ~= "0" then return s.prof end
+  if not mc_fnv then return nil end
+  N.fbHash = N.fbHash or {}
+  for _, name in ipairs(s.ai == 4 and { FALLBACK_POLICE, FALLBACK_CIVILIAN } or { FALLBACK_CIVILIAN }) do
+    local h = N.fbHash[name]
+    if not h then
+      h = tostring(mc_fnv(name))
+      N.fbHash[name] = h
+      log("fallback spawn profile " .. name .. " = " .. h)
+    end
+    if not N.badProfiles[h] then return h, name end
+  end
+  return nil
+end
 function N.RelayKey(from, key)
   local f, k = tonumber(from), tonumber(key)
   if not f or not k or k < 0 or k >= MAXKEY or k % BYTE ~= TYPE_HUMAN or f < 1 or f > 15 then return nil end
@@ -645,7 +681,9 @@ function N.PairAll()
   for id, e in pairs(N.ents) do
     if not N.byLocal[id] and valid(e.h) and not e.h:IsDeath() and active(e.h) then
       local q = e.h:GetPos()
-      free[#free + 1] = { id = id, x = q.x, y = q.y, z = q.z, ai = aiOf(e.h), tag = tagOf(e.h) }
+      local okc, car = pcall(e.h.GetOwner, e.h)
+      free[#free + 1] = { id = id, x = q.x, y = q.y, z = q.z, ai = aiOf(e.h), tag = tagOf(e.h),
+        car = okc and car ~= nil or false }
     end
   end
   if #free == 0 then return end
@@ -663,7 +701,9 @@ function N.PairAll()
         local kindOk = (s.tag or 0) == 0 or f.tag == 0 or f.tag == s.tag
         if d <= MATCH_DIST and not s.dead and kindOk then
           cands[#cands + 1] = { d = d, dist = d, s = s, i = i, how = "same spot" }
-        elseif loose and d <= LOOSE_DIST and f.ai ~= 0 and math.abs(f.z - s.z) < 8 then
+        elseif loose and d <= LOOSE_DIST and f.ai ~= 0 and math.abs(f.z - s.z) < 8 and f.car == N.InVehicle(s) then
+          -- (a host NPC in a vehicle is not ours on foot, nor the other way round: 0.15.0 paired a host cop driving
+          -- after the guest with our cop on foot, put back 30-50 m every 2 s)
           local sameTag = (s.tag or 0) ~= 0 and f.tag == s.tag
           local sameAi = f.ai == s.ai
           if sameTag or (sameAi and ((s.tag or 0) == 0 or f.tag == 0) and not s.copy) then
@@ -746,9 +786,48 @@ function N.Enforce(s, e, p)
   end
   -- pulled back when it walked off (not in cars: they drive their own way)
   -- (only NPCs with a job: enemies, allies, police, scripted ones; plain civilians wander their own way here)
-  if s.ai ~= 0 and not s.car and not h:GetOwner() and M.inWorldAt and M.now - M.inWorldAt > 3 then
+  local inVeh, ourCar = N.InVehicle(s), h:GetOwner()
+  -- the host's NPC drives (or rides), ours walks far from it: not the same NPC (a loose pair made while both stood,
+  -- or before the host's got in): unpaired, the pairing finds one of the right kind (or none)
+  if inVeh and not ourCar and s.ai ~= 0 then
     local q = h:GetPos()
     local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2)
+    if d > LOOSE_DIST then
+      s.vehOffSince = s.vehOffSince or M.now
+      if M.now - s.vehOffSince > UNPAIR_WAIT then
+        N.unpairs = (N.unpairs or 0) + 1
+        if N.unpairs <= 40 then
+          log(string.format("%s is in a vehicle (%s), our %d on foot %.0f m off: unpaired (#%d)", N.Who(s.key),
+            s.car and "car flag" or string.format("%.0f m/s", s.spd or 0), e.id, d, N.unpairs))
+        end
+        N.byLocal[e.id] = nil
+        s.loc, s.vehOffSince, s.offSince, s.unpairedSince = nil, nil, nil, M.now
+        return
+      end
+    else
+      s.vehOffSince = nil
+    end
+  else
+    s.vehOffSince = nil
+  end
+  if s.ai ~= 0 and not inVeh and not ourCar and M.inWorldAt and M.now - M.inWorldAt > 3 then
+    local q = h:GetPos()
+    local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2)
+    -- a cop running after someone on the host's game: ours runs the same way (its own AI chases our player or the
+    -- puppet here and drifts off, 0.15.0: p50 6 m, p95 13 m while running). UNVERIFIED that MoveVec steers a police
+    -- AI (spawned copies, civilians, follow it).
+    local spd = s.spd or 0
+    if s.ai == 4 and d > STEER_DIST and spd > 1.8 and M.now - (s.steerT or -10) >= STEER_EVERY then
+      s.steerT = M.now
+      local lead = math.min(0.6, d / math.max(spd, 1))
+      local good = pcall(h.MoveVec, h, V(s.x + (s.vx or 0) * lead, s.y + (s.vy or 0) * lead, s.z),
+        spd >= 4.2 and "SPRINT" or "RUN")
+      N.steers = (N.steers or 0) + 1
+      if N.steers <= 10 or N.steers % 200 == 0 then
+        log(string.format("our cop %d runs after %s (%.1f m off, it runs %.1f m/s)%s (#%d)", e.id, N.Who(s.key), d,
+          spd, good and "" or ": MoveVec failed", N.steers))
+      end
+    end
     -- enemies in a fight run and take cover differently on each game: only one far off (12 m) is put back
     if hostQuiet() then
       if s.offSince then
@@ -940,8 +1019,8 @@ function N.CopyWanted(p)
   local q = p:GetPos()
   local list = {}
   for key, s in pairs(N.host) do
-    if not s.loc and not N.copies[key] and not s.dead and not s.car and s.ai ~= 0 and M.now - s.t <= 1
-        and s.prof and s.prof ~= "0" and not N.badProfiles[s.prof] and s.unpairedSince
+    if not s.loc and not N.copies[key] and not s.dead and not N.InVehicle(s) and s.ai ~= 0 and M.now - s.t <= 1
+        and N.CopyProfile(s) and s.unpairedSince
         and M.now - s.unpairedSince >= LOOSE_WAIT + COPY_WAIT then
       local d = math.sqrt((s.x - q.x) ^ 2 + (s.y - q.y) ^ 2)
       if d <= COPY_RANGE and math.abs(s.z - q.z) < 30 then list[#list + 1] = { s = s, d = d } end
@@ -1008,9 +1087,18 @@ function N.SpawnCopyTick(p)
   local w = N.CopyWanted(p)[1]
   if not w then return end
   local s = w.s
-  local c = { key = s.key, st = "loading", prof = s.prof }
-  local ok = pcall(f.comp.SetSpawnProfile, f.comp, s.prof)
-  if not ok then N.badProfiles[s.prof] = true return end
+  local prof, fallback = N.CopyProfile(s)
+  if not prof then return end
+  if fallback then
+    N.fallbacks = (N.fallbacks or 0) + 1
+    if N.fallbacks <= 40 then
+      log(string.format("%s has no spawn profile (AI type %s): its copy gets %s", N.Who(s.key), tostring(s.ai),
+        fallback))
+    end
+  end
+  local c = { key = s.key, st = "loading", prof = prof }
+  local ok = pcall(f.comp.SetSpawnProfile, f.comp, prof)
+  if not ok then N.badProfiles[prof] = true return end
   N.copies[s.key] = c
   f.load, f.loadT, f.busy = f.comp:GetSpawnProfileLoadSyncObject(), M.now, s.key
 end
@@ -1095,8 +1183,8 @@ function N.CopiesTick(p)
         N.Forget(key, c)
       elseif not s or M.now - s.t > RELEASE then
         N.DropCopy(key, owner() .. " no longer sends it (out of range or gone)")
-      elseif s.car then
-        N.DropCopy(key, "it got into a car on " .. owner() .. "'s game")
+      elseif N.InVehicle(s) then
+        N.DropCopy(key, "it got into a car on " .. owner() .. "'s game" .. (s.car and "" or " (it moves too fast)"))
       elseif s.loc ~= c.id then
         N.DropCopy(key, "paired otherwise")
       else
@@ -1350,6 +1438,19 @@ function N.Update(dt, cmds)
       -- its velocity from the last two states (spawned copies lead by it), smoothed
       if pt and M.now - pt > 0.03 and M.now - pt < 0.6 then
         local vx, vy = (s.x - px) / (M.now - pt), (s.y - py) / (M.now - pt)
+        -- its speed, smoothed (a vehicle's speed too: N.InVehicle; a jump over 80 m/s is a teleport, left out)
+        local raw = math.sqrt(vx * vx + vy * vy)
+        if raw < 80 then s.spd = 0.6 * (s.spd or raw) + 0.4 * raw end
+        if (s.spd or 0) > FAST_NPC then
+          if not s.fastT and not s.car then
+            N.fastSeen = (N.fastSeen or 0) + 1
+            if N.fastSeen <= 20 then
+              log(string.format("%s moves at %.0f m/s without its car flag: taken as in a vehicle", N.Who(s.key),
+                s.spd))
+            end
+          end
+          s.fastT = M.now
+        end
         if vx * vx + vy * vy > 100 then vx, vy = 0, 0 end
         s.vx, s.vy = 0.5 * (s.vx or vx) + 0.5 * vx, 0.5 * (s.vy or vy) + 0.5 * vy
       elseif pt then
@@ -1498,8 +1599,9 @@ function N.Trace(host)
         matched = matched + 1
         sumD, maxD = sumD + d, math.max(maxD, d)
       end
-      mc_trace("NP", string.format("key=%.0f loc=%s copy=%d ai=%s car=%d host=%.2f,%.2f,%.2f our=%s d=%.2f hp=%s/%s "
-        .. "dead=%d/%d age=%.2f", key, tostring(s.loc), s.copy and 1 or 0, tostring(s.ai), s.car and 1 or 0, s.x, s.y,
+      mc_trace("NP", string.format("key=%.0f loc=%s copy=%d ai=%s car=%d spd=%.1f host=%.2f,%.2f,%.2f our=%s d=%.2f "
+        .. "hp=%s/%s dead=%d/%d age=%.2f", key, tostring(s.loc), s.copy and 1 or 0, tostring(s.ai),
+        s.car and 1 or (N.InVehicle(s) and 2 or 0), s.spd or 0, s.x, s.y,
         s.z, q and string.format("%.2f,%.2f,%.2f", q.x, q.y, q.z) or "-", d, tostring(s.hp),
         h and valid(h) and string.format("%.0f", tonumber(h.health) or -1) or "-", s.dead and 1 or 0,
         (h and valid(h) and h:IsDeath()) and 1 or 0, M.now - s.t))
@@ -1507,8 +1609,9 @@ function N.Trace(host)
   end
   local nc = 0
   for _, c in pairs(N.copies) do if c.st == "alive" then nc = nc + 1 end end
-  mc_trace("NGS", string.format("live=%d matched=%d copies=%d avg=%.2f max=%.2f kills=%d pulls=%d own=%d claims=%d",
-    live, matched, nc, matched > 0 and sumD / matched or 0, maxD, N.kills or 0, N.pulls or 0, own, N.claimsDone or 0))
+  mc_trace("NGS", string.format("live=%d matched=%d copies=%d avg=%.2f max=%.2f kills=%d pulls=%d own=%d claims=%d "
+    .. "unpairs=%d steers=%d fallbacks=%d", live, matched, nc, matched > 0 and sumD / matched or 0, maxD, N.kills or 0,
+    N.pulls or 0, own, N.claimsDone or 0, N.unpairs or 0, N.steers or 0, N.fallbacks or 0))
 end
 
 return N.version

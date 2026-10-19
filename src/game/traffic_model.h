@@ -29,10 +29,42 @@ enum Kind : uint8_t { kTraffic = 0, kPolice = 1 };
 enum StateFlags : uint8_t {
     kHandbrake = 1,   // handbrake > 0.5
     kSiren = 2,       // police: siren and beacons on (host heuristic, see traffic_sync.lua)
-    kNoDriver = 4,    // the driver is dead or gone (the car rolls on)
+    kNoDriver = 4,    // the driver is dead or gone, confirmed (DriverWatch: missing for kOrphanConfirm s while slow)
     kControls = 8,    // steer / power / brake are the driver's (else unknown: 0)
     kReverse = 16,    // moving backwards (power then means reverse: not applied on the copy)
 };
+// Never on the wire: the guest's Drive command to its Lua sets it when the copy's crew may get out (CrewGetsOut).
+constexpr uint8_t kCrewOut = 32;
+
+// ---- drivers ------------------------------------------------------------------------------------------------------
+// The host's Lua reports each round whether it read a living traffic driver at the wheel (TC flag 4 = "none read
+// now"). That read flickers: in the 0.15.0 two-PC test 118 of 179 cars flagged on the first miss were still moving
+// at 2-15 m/s and 84 kept their speed 4 s later (someone was driving), mostly 50-100 m from the host's player
+// (docs/game-api.md 19). So a car only counts as driverless (kNoDriver sent) when no driver was read for
+// kOrphanConfirm s while it is slow; it is driven again (flag cleared) when a driver is read or it speeds up.
+constexpr double kOrphanConfirm = 1.0;  // s without a driver read, slow all that time
+constexpr float kOrphanSlow = 2.0f;     // m/s: slow
+constexpr float kOrphanDriven = 4.0f;   // m/s: a declared driverless car this fast is driven again (someone drives it)
+
+class DriverWatch {
+public:
+    // One round: was a living driver read at the wheel now, how fast the car goes (m/s). Returns Declared().
+    bool Update(double now, bool driverSeen, float speed);
+    bool Declared() const { return declared_; }
+    bool Missing() const { return missSince_ >= 0; }
+    double MissingFor(double now) const { return missSince_ >= 0 ? now - missSince_ : 0; }
+
+private:
+    double missSince_ = -1;  // first round without a driver read (-1: one was read last round)
+    double slowSince_ = -1;  // first round slow while missing (-1: not slow)
+    bool declared_ = false;
+};
+
+// Guest: may the crew of a copy get out now? Only for a host car confirmed driverless (kNoDriver) that stands or
+// rolls slower than kOrphanSlow, and whose copy here is that slow too (copySpeed < 0: no report of the copy yet).
+// A moving copy always keeps its crew seated (0.15.0: 249 "lost its driver" get-outs left empty copies driving on
+// and their drivers standing in the road).
+bool CrewGetsOut(uint8_t targetFlags, float targetSpeed, float copySpeed);
 
 using Vec3 = net::motion::Vec3;
 
@@ -90,7 +122,7 @@ struct HostCar {
     std::string model;
     int16_t color[2] = {-1, -1};
     std::string plate;
-    CarState st;  // net is filled in by HostTraffic
+    CarState st;  // net is filled in by HostTraffic; kNoDriver here = no driver read this round (DriverWatch decides)
 };
 
 struct HostConfig {
@@ -120,7 +152,13 @@ class HostTraffic {
 public:
     explicit HostTraffic(const HostConfig& cfg = {});
     // This round's traffic cars near any guest (a car missing from the list is gone: despawned on every guest).
-    void SetCars(const std::vector<HostCar>& cars);
+    // `now` (s) times each car's DriverWatch: its kNoDriver read becomes the confirmed flag that is sent.
+    void SetCars(const std::vector<HostCar>& cars, double now = 0);
+    // Cars that went driverless (confirmed) / were found driven again since the start (logs and traces).
+    uint64_t Orphaned() const { return orphaned_; }
+    uint64_t DrivenAgain() const { return drivenAgain_; }
+    size_t MissingNow() const;   // cars without a driver read now
+    size_t DeclaredNow() const;  // of those, confirmed driverless
     // A guest's position (his player, or his car); a guest seen for the first time is added.
     void SetView(uint32_t peer, const Vec3& pos, double now);
     void RemovePeer(uint32_t peer);  // left the session: nothing is sent to him any more
@@ -135,6 +173,7 @@ private:
     struct Car {
         HostCar c;
         bool seen = false;
+        DriverWatch drv;
     };
     struct Sent {
         CarState q;  // quantised, as last sent
@@ -157,6 +196,7 @@ private:
     std::map<uint32_t, uint16_t> byKey_;  // host entity id -> net id
     std::map<uint32_t, Peer> peers_;
     uint16_t nextNet_ = 1;
+    uint64_t orphaned_ = 0, drivenAgain_ = 0;
 };
 
 // ---- guest ------------------------------------------------------------------------------------------------------

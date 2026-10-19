@@ -384,6 +384,17 @@ def npcs(guest):
             far[f.get("key")] += 1
     if far:
         print("  NPCs most often more than 3 m off: %s" % ", ".join("%s (%d)" % kv for kv in far.most_common(5)))
+    veh = [num(f.get("d"), -1) for _, f in guest.records["NP"] if f.get("car") in ("1", "2") and num(f.get("d"), -1) >= 0]
+    foot = [num(f.get("d"), -1) for _, f in guest.records["NP"] if f.get("car") == "0" and num(f.get("d"), -1) >= 0]
+    if veh:
+        print("  paired host NPCs in a vehicle (car flag or faster than 11 m/s): distance %s" % stats_line(veh))
+    if foot:
+        print("  paired host NPCs on foot: distance %s" % stats_line(foot))
+    last = ngs[-1]
+    if "unpairs" in last:
+        print("  pulls %d, unpaired (in a vehicle, ours on foot) %d, cops steered %d, copies with a fallback profile %d"
+              % (num(last.get("pulls"), 0), num(last.get("unpairs"), 0), num(last.get("steers"), 0),
+                 num(last.get("fallbacks"), 0)))
 
 
 def swapped_cars(tr):
@@ -476,6 +487,26 @@ def traffic(host, guest):
     if trl:
         print("  our own traffic while the host's showed: hidden max %d, still driving near us max %d" % (
             max(num(f.get("hidden"), 0) for f in trl), max(num(f.get("near"), 0) for f in trl)))
+    # drivers and crews (TRO): the host's driver reads that failed and came back, the guest's crews out / in / put back
+    if host and host.records["TRO"]:
+        tro = [f for _, f in host.records["TRO"]]
+        misses = [f for f in tro if f.get("ev") == "miss"]
+        backs = [num(f.get("after"), 0) for f in tro if f.get("ev") == "back"]
+        print("  host: no driver read %d times (%s); read again %d times (after %s s); moving when missed %d" % (
+            len(misses), ", ".join("%s %d" % kv for kv in Counter(
+                "seat 0 holds another human" if "holds" in f.get("why", "") else f.get("why", "?").replace("_", " ")
+                for f in misses).most_common(4)),
+            len(backs), stats_line(backs, "s") if backs else "-", sum(1 for f in misses if num(f.get("spd"), 0) > 2)))
+        dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
+        if dist:
+            print("  host: distance from the host when a driver was not read: %s" % stats_line(dist))
+        last = trh[-1][1] if trh else {}
+        print("  host: driverless (confirmed, 1 s slow) %d, driven again %d" % (
+            num(last.get("orphaned"), 0), num(last.get("driven"), 0)))
+    if guest and guest.records["TRO"]:
+        ev = Counter(f.get("ev") for _, f in guest.records["TRO"])
+        print("  guest: crews got out %d, back in %d, crew members put back in their seats %d" % (
+            ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
     notes = [s for _, s in guest.logs if "traffic: " in s and ("failed" in s or "knocked" in s)] if guest else []
     for s in notes[:6]:
         print("  note: %s" % s.split("traffic: ", 1)[-1][:160])

@@ -237,19 +237,40 @@ function B.OnGrenade(m)
   if B.grenadeMsgs <= 20 then log("PLAYER_GRENADE_EXPLOSION for us (sender " .. tostring(m:GetSenderGUID()) .. ")") end
 end
 
--- A car problem (C_* message with GetCarProblem(), common_vehicle_events.lua OnCarProblem): EXPLODE = 1.
+-- A car problem (CAR_HAVE_PROBLEM, enums.CarProblem: EXPLODE 1, MOTOR_CRASH 2, POSITION 3, FUEL, TYRE_CRASH, AI_LOST).
+-- The message our blanket subscription gets has no GetCarProblem (0.15.0 two-PC test: "attempt to call a nil value",
+-- once on each game): the getter is the car's own, C_WrapperCar:GetCarProblem (docs/re-notes.md appendix); the
+-- game's common_vehicle_events.lua OnCarProblem reads the problem next to the event's entity. So: the message's
+-- getter when it has one, else the car's (the message's receiver). UNVERIFIED: that the car's getter returns the
+-- problem of this message (it is read at once, in the event).
+local function problemOf(m, car)
+  local okf, f = pcall(function() return m.GetCarProblem end)
+  if okf and type(f) == "function" then
+    local good, prob = pcall(f, m)
+    if good and tonumber(prob) then return tonumber(prob), "message" end
+  end
+  if valid(car) then
+    local good, prob = pcall(car.GetCarProblem, car)
+    if good and tonumber(prob) then return tonumber(prob), "car" end
+  end
+  return nil, "none"
+end
+
 function B.OnCarProblem(m)
-  local good, prob = pcall(m.GetCarProblem, m)
-  if not good then
-    if not B.noProblem then B.noProblem = true; log("CAR_HAVE_PROBLEM without GetCarProblem: " .. tostring(prob)) end
-    return
+  local okr, rg = pcall(m.GetReceiverGUID, m)
+  local id = okr and idOf(tostring(rg)) or 0
+  local car = id ~= 0 and mc_entity and mc_entity(id) or nil
+  local prob, from = problemOf(m, car)
+  B.stats.problems = (B.stats.problems or 0) + 1
+  B.problemFrom = B.problemFrom or {}
+  if not B.problemFrom[from] then  -- once per way (quiet: no error, no traceback)
+    B.problemFrom[from] = true
+    log(string.format("CAR_HAVE_PROBLEM: problem read from the %s (car %d: %s)", from, id, tostring(prob)))
   end
   local explode = (enums.CarProblem and enums.CarProblem.EXPLODE) or 1
-  if tonumber(prob) ~= explode then return end
-  local id = idOf(tostring(m:GetReceiverGUID()))
+  if prob ~= explode then return end
   if id == 0 or B.exploded[id] then return end
   B.exploded[id] = true
-  local car = mc_entity and mc_entity(id)
   if not valid(car) then return end
   local p = car:GetPos()
   local key, c = nil, nil
