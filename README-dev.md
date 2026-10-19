@@ -366,6 +366,35 @@ Unreleased fixes (merged 2026-10-19, code only, none checked in game yet):
   not asked ... friend brain switch is not over yet`; punch then get in a car / fall down: `script control given
   back (car seat|it goes down, ...)`; trace `SC late=1` only for answers after an action ended.
 
+Unreleased fixes from the first two-PC test (merged 2026-10-19, code only, none checked in game yet; two PCs where
+possible):
+- [ ] Car copy speed: the log `SetSpeed(km/h) accepted` (once); `sync_compare.py` copy / driver speed ratio about 1.0
+  (was 0.28) and a pinned share far below 56 %.
+- [ ] One wheel: ride along, then the driver's puppet leaves the seat on the passenger's game: `sliding to seat 1 to
+  give the wheel back` (trace `WHL ev=yield` / `ev=slide` / `ev=done`), never `drives it too; we keep it` on both
+  games. Both on one motorbike: `bike ...: player N rides it too and keeps it` (`WHL ev=bike`).
+- [ ] A paused game: the host pauses 10 s: the guest's log `player 0 paused his game`, trace `PAU ev=freeze` /
+  `ev=thaw`, `TRZ ev=freeze` / `ev=thaw`; no burst of `knocked ... reported to the host` after the resume
+  (`TRG quiet=` counts them instead), no `lost its driver` burst.
+- [ ] Traffic crews: the guest drives 100-200 m through the host's traffic: few `ours gets out`, no empty copies driving
+  on; crews are not Tommy (`crew profile ... works`); trace `TRO`, `TRH nodrv= orphan=`.
+- [ ] NPC fallbacks: the guest gets wanted: the host's log `has no spawn profile (AI type 4): its copy gets
+  characters/ai/police_scotch/...`; in a car chase the NPC distances (`sync_compare.py`) far below 60 m p95
+  (`NGS unpairs= steers=`).
+- [ ] CAR_HAVE_PROBLEM: a car explodes: `problem read from the car`, no `Attempt to call a nil value`.
+- [ ] Character change: step CHARACTER 5 times fast: the host sends one `sent PlayerModel (... stable/panel-closed)`;
+  the guest logs one `removed (his character changed)` and `old entity N released`, never `STILL there` (trace `CHM`,
+  `PRT`). Again while seated in the guest's car seat 1: no second, frozen character.
+- [ ] Shooting a player: the host shoots the guest's puppet about 10 times with a pistol at 5-15 m: `our shot ... at
+  puppet 1: ray|bullet|game ... Hit of X sent`, the guest `hit by player 0`; a shot through a wall: `PV v=blocked`;
+  shots at a swimming puppet still land (`PV demi=1 hit=1`). Friendly fire OFF: `v=off`. If the ray is not good
+  enough: the next step is a native hook on the friend check (exe 0x25E0700).
+- [ ] Punch lock-on: punch from 2-2.5 m at about 50 degrees off: `locked on to puppet 1 (SetDir ok)`, trace `PVM`.
+- [ ] Motorbikes: the host rides a bike: `a motorbike (motorcycle_1935 ...)` and the probe line (`BK`); the guest
+  `player 0 rides a motorbike`, `puppet 0 rides bike` or `perched`; no `we did a jump` on getting on or off (`TS`).
+- [ ] Water: the host swims: the guest `its player swims`, `shielded, a demigod` (`PG`, `PW`), no `died here`; a car
+  driven into the sea: `car K is under water here` (`CUW`).
+
 Next in-game checks (fixes from the 2026-10-18 test, not yet checked):
 - [ ] Pad guard: close the lobby with pad X (START), then press Enter on the loading screen / the next menu: the
   game takes it (core 0.11.0 `PadHold`; before, the keyboard stayed blocked until a panel was opened again).

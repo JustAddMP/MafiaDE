@@ -1,6 +1,6 @@
 # Plan — next steps
 
-Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-18 (0.15.0 pre-release after a first in-game test on one PC; most of it not yet verified).
+Living plan for the native co-op rewrite. Update it as items land. Last updated 2026-10-19 (0.15.0 pre-release, first two-PC test; the Round 3 and Round 4 fixes merged, in-game check pending).
 Read with `ARCHITECTURE.md` (game layer + clean-room rule), `protocol.md` (our app messages), `re-notes.md`,
 `game-api.md`, `../README-dev.md`, and core's docs in `../external/core/docs/` (ARCHITECTURE.md, protocol.md,
 interest.md).
@@ -15,6 +15,23 @@ interest.md).
 | 5 Native UI (CO-OP in main/pause menus, banners, lobby, settings, name tags, map markers) | Done: keyboard, gamepad (virtual pad) and mouse; Steam invite between two PCs works (2026-10-17); lobby: Free Ride, Story and chapter select |
 | 4 Shared world | Weather/time, story (chapter, checkpoint, objectives), cutscenes and mission NPCs done (pairing, deaths and hits both ways, copies of host-only enemies; one chapter's fight checked); mission cars partly; 0.15.0 built, needs the in-game test: guest-owned NPCs, traffic and police, mission car back, failed missions in one load |
 | 6 polish | Not started |
+
+2026-10-19, first real two-PC test (0.15.0 release zip, core 0.11.0, over Steam; host the user, guest a friend; Free
+Ride only, two sessions, no crash, no ERR line). Verified there, nothing ticked by it: Steam invite and join over
+Steam P2P (twice), the lobby (characters, ready, FREE RIDE start on both), HOST LEFT on leave and hosting again;
+movement and latency (loss about 0 %, rtt about 28 ms, playout delay about 40 ms, LAT p50 about 16 ms, the `held`
+menu-wait split of the "Latency summary" check); car signals (horn only); ride along in seat 1 both ways; the host's
+traffic on the guest's game (basic, with the problems fixed below); car damage sync (crashes, shot tyres and wheels,
+reports from copies, the exploded flag); police (the host's cops chase a wanted guest's puppet, the host stays clean,
+the guest's level held while chased but still decaying); guest-owned NPCs shown on the host (session 2); Free Ride
+death and respawn on both games; PvP punches landing (through the swing fallback); traversal messages reaching the
+puppet; the physical gamepad in the co-op panels and its prompts (host); a clean exit or leave from either side.
+Seen again: the known issues fixed in the 2026-10-19 merges (melee visuals, minimap marker, car look, repair after
+an explosion, guest police decay, garage.pf). Not tried: JOIN FRIEND, chapters, reconnect, doors, item takes,
+grenades, seats after a reload, the pad guard, three or more players. Its new bugs (car copies at 0.28 of the speed,
+two drivers in one car, bullets never hurting a player, motorbikes and water, the host's pause, driverless traffic
+copies, character-change duplicates, guest cops without a profile) are fixed in code by the Round 4 merge (notes on
+the items below), in-game check pending.
 
 ## Working rules
 
@@ -82,6 +99,14 @@ Tick an item (`- [x]`) in the same commit that lands it.
    Re-verified: ram damage summed over 0.25 s (puppets no longer dodge cars), the >20 m snap (host car teleported 40 m
    through the guest: the copy jumped, no damage). The bullet replay (CreateShots from the attacker's puppet) only
    works in some game instances; the DoDamage fallback covers the rest.
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): gunfire between players (the
+   2026-10-19 two-PC test: about 20 shots, no Hit, the friend brain made the game ignore our bullets on puppets):
+   each shot is resolved from the game's DAMAGE, its ON_BULLET_HIT or a ray test of the aim against each puppet's
+   body (walls by mc_raycast); a shielded puppet is resolved by the ray and ON_BULLET_HIT alone (pvp_hit.h, trace
+   PV). Puppets in water and the puppet shield: a swimming or diving player is sent (pose bits 8 / 16) and his puppet
+   shown at his position with swim strokes; puppets never die from local causes (drowning, falls, fire, explosion
+   pictures, a sinking car: SetDemigod while at risk, puppet_guard.h), only a network death counts (water.h, trace
+   PG / PD / PW / WT).
 - [x] **Player models**: guests choose/see proper character models (Tommy for host, Paulie/Sam for guests);
    Thompson needs a model that accepts it. Done 2026-10-15: default by player id (Tommy, Paulie, Sam, Salieri),
    `model =` / `--model` sent in Hello, the local player switched with the override slot (re-applied after loads,
@@ -111,6 +136,12 @@ Tick an item (`- [x]`) in the same commit that lands it.
    beside his car with his puppet seated in it (seats.h `PlaceCopy` / `AsideSpot`) and moves onto his car once the
    cars have parted; a parked copy of his earlier car is dropped, car records are looked up again after a load
    (trace SCP / DRK).
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): one wheel, one driver (the
+   2026-10-19 two-PC test had both players drive one car for 100 s): a seat-0 reading while the driver's state still
+   names the wheel is the game's slide, simultaneous claims go to the car's holder, else the lower id; the loser
+   slides to a passenger seat or gets out, PlayerShouldRemainPassenger as a passenger, car damage follows the single
+   driver; on a motorbike the loser counts as the rider behind (seats.h `LocalWheel`, trace WHL). Character changes:
+   the old puppet is taken out of its seat, hidden and deactivated before its release, the new one takes the seat.
 - [ ] **Car controls sync** (0.13.0, same): the driver's steering, throttle, brake and handbrake applied to the car
    copies (wheels steer, brake lights), copies carried by their own physics with a blended correction (pinned as
    before when the physics does not follow). Gate: wheels show the driver's steering, no wobble, error as before.
@@ -120,6 +151,11 @@ Tick an item (`- [x]`) in the same commit that lands it.
    real controls, engine, gear and wheel angle in the sync trace.
    0.15.0: the puppet keeps its seat in the copy (seats, see the item above) and the copy shows the driver's lights
    and signals (item below). Built, needs the in-game test.
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): the copies' speed. The 2026-10-19
+   two-PC test measured copies at exactly 0.28 of their driver's speed, pinned 56-74 % of the time: SetSpeed takes
+   km/h (read from the exe) and was given m/s. Every caller now gives km/h (player cars, traffic, negative when
+   reversing) and GetSpeedFloat is read as km/h (car_units.h, mc_car_speed_arg / mc_car_speed_ms); the SetSpeed probe
+   logs once. Motorbike copies are pinned to the rider's transform instead (no SetSpeed).
 - [x] **Car signals** (0.15.0, built 2026-10-18 from static research, docs/game-api.md 7/16, re-notes 9): headlights,
    indicators, horn, siren and beacon read from the driver's car (vehicle part +0xD00 / +0xA88 / +0x119C,
    `mc_car_signals`), one byte at the end of the PlayerState vehicle block, set on the copy on change
@@ -139,6 +175,10 @@ Tick an item (`- [x]`) in the same commit that lands it.
    in turn (PlayAnimation direct, no-transition, DesirePlayAnimation, script control, script control + combat
    mode, AnimPlay), judged by the puppet's hand bones, the first that moves them kept (game/anim_methods.h,
    game-api.md 17, re-notes 12; log `ANIM: ... SHOW with ...`, console `MafiaCoop.TestAction`).
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): punch lock-on (the 2026-10-19
+   two-PC test: every swing had opponent 0, the friend brain makes puppets no melee target): at a swing the nearest
+   puppet within 2.6 m and 70 degrees is locked on, we are turned to it (SetDir) and it is hit within 2.3 m at the
+   impact (pvp_hit.h `PickMelee`, trace PVM).
 
 ### F. Customisable characters
 Builds on A6 (player models). Each player picks how they look; everyone sees the same choice.
@@ -167,6 +207,11 @@ Builds on A6 (player models). Each player picks how they look; everyone sees the
   Done 2026-10-15: `model =` saved by the panel, PlayerModel (0x0102) with the pick and its look, re-sent when a
   player joins; guest switched to Sam / suit mid-session and the host's puppet followed at once; a rejoining guest saw
   the host's sailor outfit straight away.
+  Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): one PlayerModel per settled pick (the
+  2026-10-19 two-PC test respawned the host's puppet five times in 2 s while he stepped through the list, one release
+  seated in the guest's car): the pick goes out once it has stayed for a second or the panel closes (model_change.h);
+  the old puppet is unseated, hidden, deactivated, then released, its id never taken for an NPC, and the police turn
+  to the new one (trace CHM / PRT).
 - [x] **Fallbacks**: an unknown or unsupported choice (e.g. from a newer version) falls back to a default model instead
   of failing; the host's story character can be kept as Tommy for cutscenes if swapping breaks them.
   Done 2026-10-15: unknown alias (`--model zorro`) -> the default for the player id on every game; a profile the game
@@ -339,6 +384,12 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    host. Ownership rules in `src/game/npc_owner.h` (unit test npc_owner_test); traffic copy crews are never
    guest-owned (mission ObtainCarWithCrew crews stay ownable); trace NM / NO / NGO / NGE / NGC / NMC / NMX. Built,
    needs the in-game test (a fight where the guest goes first).
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): guest-owned police and other NPCs
+   without a spawn profile (the 2026-10-19 two-PC test: 12 guest cops, none shown on the host) get a police or
+   civilian fallback profile by AI type; host cops chasing in cars (or faster than 11 m/s) are no longer paired with,
+   and pulled to, cops on foot on the guest's game, a running host cop's partner is steered after it; none of this
+   (and no pull-back) while the host's game is paused or just resumed (trace NP spd / car=2, NGS unpairs / steers /
+   fallbacks).
 - [ ] **Vehicles + traffic** (research: docs/research-world-sync.md): host's mission cars mirrored; ambient traffic either disabled on guests
    (`game.traffic` SwitchGenerators) and mirrored, or left local (cheap, accepted desync). Start local.
    Partly done 2026-10-15 (game-api.md 15): ambient traffic stays local on every game (accepted). A driven car whose
@@ -372,6 +423,17 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    crewed copies driven with core's VehicleController (police with siren and beacon); trace TRH / TRP / TRG / TRC /
    TRL. Both built, need the in-game test: the "mission car coming back" and "traffic and police each player's own"
    points above are built, needs the in-game test. Pedestrians stay local.
+   Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending), from the 2026-10-19 two-PC test:
+   traffic copies kept losing their drivers (249 get-outs for about 430 copies): a host car only counts as
+   driverless after 1 s without a driver read while slow (DriverWatch), a copy's crew only gets out when both cars
+   stand and is seated again when found outside; crews use the civilian and police spawn profiles
+   (traffic_base_ambient_combined, police_scotch) instead of Tommy (trace TRO, TRH nodrv / orphan). A paused game
+   says so (PeerPaused 0x0103, peer_pause.h): the others hold his puppet, his car and (host) his traffic copies, and
+   report no knocks until 1 s after the resume (trace PAU / TRZ). Motorbikes are vehicles (the test sent the host's
+   bike ride as an on-foot sprint at up to 32 m/s and its mount as jumps): found through GetOwner /
+   GetOwnerSceneObject and the motorcycle component, sent with the bike pose bit 32, a copy pinned to the rider's
+   transform with the puppet on it or perched on its saddle; a player reported on foot above 12 m/s has his puppet
+   hidden (T field 68; trace BK / BKS / FF / TS). A car copy under water leaves its engine to the game (CUW).
    In-game 2026-10-18 (0.15.0, one PC): traffic near the host shown on the guest (`the host's traffic shows here`, back to his own beyond 250 m, copies p95 1.1 m off the host's cars, bumps put back and reported). Police: a guest's wanted state reaches the host; the 0.15.0 offence announced from his puppet made the HOST wanted (fixed 968d300: no announce, cops attack a hunted guest's puppet; retested: `our cop ... set on guest 1's puppet: ok`, host stayed clean). Mission car back: the swap and the real car restored at the copy's place when the guest's world went (`our own car 3102474 is back at the copy's place`); the parked case not reached. A player's car copy is another variant/colour of the model (no colours/plate for player cars on the wire).
 - [ ] **World sync added in 0.15.0, not yet verified in game** (built 2026-10-18 from static research, each with
    unit tests; README-dev.md "Test checklist: 0.15.0 features"):
@@ -384,6 +446,9 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
    - Explosions and the grenade arc (game-api.md 23): explosions on every game as harmless pictures, a throw's
      flight drawn on the others. 2026-10-18: the messages and the flight numbers arrived (0.0 m off at the
      explosion), the pictures were not seen on screen.
+     Unreleased (Round 4 merge 2026-10-19, fixed in code, in-game check pending): CAR_HAVE_PROBLEM is read from the
+     car (the message has no getter: the 2026-10-19 test logged `Attempt to call a nil value` on both games), so car
+     explosions are detected.
    - Car damage (protocol.md "Car damage", game-api.md 24): dents, parts, tyres, fire and explosions on every game.
      2026-10-18: crash damage and a blown-up car reached the copy; the copy's wreck damage came back to the host as
      a report and was read as a repair (to fix).

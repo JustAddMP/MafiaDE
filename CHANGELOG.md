@@ -42,6 +42,48 @@ Fixed (unverified in game):
   is given back before a car seat, a walk to a car door or a fall, is cleared when the puppet is re-created or
   respawns, and a late answer for an action that is already over is ignored.
 
+Fixed from the first two-PC test (2026-10-19), all unverified in game:
+- Car copies drive at their real speed: SetSpeed takes km/h (read from the exe); copies got m/s and ran at 0.28 of
+  their driver's speed, pinned most of the time. Every caller is fixed (player cars, traffic), reversing gives a
+  negative speed, and GetSpeedFloat is read as km/h too. The SetSpeed probe logs once instead of a traceback per copy.
+- One wheel, one driver: when the game slides a passenger to the wheel because the driver's puppet left it, that is no
+  longer a takeover; when both claim the wheel, the car's holder keeps it (else the lower id) and the other slides to
+  a passenger seat or gets out. Car damage follows the single driver. On a motorbike the one who gives way counts as
+  the rider behind.
+- Traffic copies no longer lose their drivers while driving: a host car only counts as driverless after 1 s without a
+  driver while standing, a copy's driver only gets out when both cars stand, and crews found outside their copy are
+  seated again.
+- Traffic crews use this game's civilian and police spawn profiles instead of Tommy (traffic_base_ambient_combined,
+  police_scotch).
+- Guest-owned police and other NPCs without a spawn profile are shown on the host with a police or civilian fallback
+  profile.
+- Host cops chasing in cars are no longer paired with, and pulled to, cops on foot on the guest's game.
+- CAR_HAVE_PROBLEM is read from the car (the message has no getter): no more error line, and car explosions are
+  detected.
+- Changing character no longer replaces your character on the other games for every step through the list: your pick
+  goes out once it has stayed for a second or when you close the panel. The old character goes properly (out of its
+  car seat, hidden, deactivated, removed) and the new one takes its seat at once; a left-over old character is never
+  taken for an NPC, and the police turn to the new one at once.
+- Players can shoot each other: the friend brain made the game ignore our bullets on puppets. Each shot is now checked
+  against the game's own damage, its bullet-hit message, and a ray test of the aim against each puppet (walls block);
+  a shielded puppet (swimming, falling, burning) is hit by the ray and bullet-hit checks alone. Punches lock on to a
+  puppet in front of you (you turn to it; reach 2.3 m). Friendly fire OFF turns both off.
+- Motorbikes are vehicles: the rider is seen on his bike (a pinned copy, the puppet on it or on its saddle); no more
+  sprinting puppet or getting on and off as jumps. A player moving faster than 12 m/s while reported on foot has his
+  puppet hidden.
+- Water: swimming and diving are sent (pose bits 8 / 16) and shown (the puppet at his position with swim strokes).
+  Puppets never die from local causes (drowning, falls, fire, explosion pictures, a sinking or exploding car); only a
+  network death counts. A sunk car copy's engine is left to the game.
+
+Added (unverified in game):
+- A paused game says so (new message PeerPaused 0x0103): the others hold that player's puppet, his car and (host) his
+  traffic copies, and report no knocks, pull back no NPCs and start no driverless-car or NPC-pairing decisions until
+  1 s after the resume.
+
+Protocol: PeerPaused (0x0103) is a new message (CarLook 0x0253 above is one too); the pose bits 8 / 16 / 32 use the
+existing PlayerState pose byte (no format change). The next release needs a protocol / version bump (not done here),
+so that players on different builds are told instead of half-syncing.
+
 ## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 
 A big step for the shared world: fights, doors, items, explosions and car details you can see on the other screen,
