@@ -2217,7 +2217,8 @@ local function retireRelease(g, how)
   log(string.format("puppet %s: old entity %s released (%s)%s%s", tostring(g.pid), tostring(g.eid), how,
     released and "" or ": no spawner (it goes with the factory)",
     g.car and string.format(", its seat %d of car %s reads %s now", g.seat, tostring(g.vkey), seatNow) or ""))
-  retireTrace(g, "release", string.format(" how=%s ok=%d seat=%s", how, released and 1 or 0, seatNow))
+  retireTrace(g, "release", string.format(" how=%s ok=%d seat=%s", (how:gsub("[ %.]", "_")), released and 1 or 0,
+    seatNow))
 end
 
 function M.Release(pp, so, why)

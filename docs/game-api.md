@@ -81,6 +81,15 @@ comp:ReleaseObjectRaw(npc)                                         -- deletes it
 game.traffic:DespawnEntityImmediately(id)                          -- deletes the factory car, crew AND everything they spawned
 ```
 
+- **Removing a puppet** (player_sync.lua `M.Release`, since the 0.15.0 two-PC test showed a puppet released per
+  character step, one of them seated in a car): the map marker goes first (section 15), script control is given back,
+  then `h:GetOutCarFast()` (else `GetOffVehicle()`) if it sits in a car, `ShowModel(false)` + `SetPhysState(2)`,
+  `Deactivate()`, and `ReleaseObjectRaw` at once on foot, or once it is out of the seat (at most 1 s, then where it
+  sits). **UNVERIFIED:** what `GetOutCarFast` takes and whether it frees the seat in the same tick (the log says
+  `out at once` / `still in the car`); whether a human released in a seat stayed visible (the suspected duplicate);
+  whether `Deactivate()` on a puppet before its release changes anything for the game-sectors list (the guard,
+  docs/re-notes.md, drops a stale entry either way). The log line `old entity N is STILL there 1.0 s after its
+  release` (trace `PRT ev=check gone=0`) is the evidence to look for.
 - Spawn profile names: `mm_spawn_profiles` (global table) lists the hero outfits, e.g.
   `visuals/hero/game_main_tommy_{casual, gangster_suit_1_hat, gangster_suit_2_hat, gangster_trenchcoat,
   cab_driver_flatcap, racing_outfit, sailor, bank_job, ...}`. An unknown name "loads" instantly and must not be used.
