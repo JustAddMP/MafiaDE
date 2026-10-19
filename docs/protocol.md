@@ -1215,8 +1215,7 @@ Priorities against the per-peer send budget (`net_budget_kbps`, lowered automati
 Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
 NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
 (0x0260-0x0262), MissionFail / FailVerdict. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
-DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, ParkedCars, car damage, the
-rest.
+DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, car damage, the rest.
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
 parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way
