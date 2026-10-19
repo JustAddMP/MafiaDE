@@ -530,6 +530,81 @@ void TestStale() {
     Check(o.reports.empty(), "and its old damage not reported");
 }
 
+// 0.15.0 in-game test: car:Explode() on the host's car; the guest's copy was blown up through the one explode routine,
+// its wreck (wheels off) came back to the host as a CarDamageReport, the host put it on his wreck and read the drop
+// that followed as a repair (a new epoch: every copy repaired itself). Echoes must never come back.
+void TestExplosionEcho() {
+    Net n;
+    Snapshot a = Car(), b = Car();
+    a.parts[0] = 200;
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    a.flags = kExploded;
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);  // A sends it
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);  // B blows its copy up
+    Check(b.flags & kExploded, "copy blown up with the authority's car");
+    // what the game does to the copy's wreck by itself: three wheels off, a part broken off
+    b.wheels[0] = b.wheels[1] = b.wheels[2] = kWheelOff;
+    b.parts[5] = kGone;
+    for (int i = 0; i < 12; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(n.b.GetStats().reports == 0, "the copy's wreck is not reported", std::to_string(n.b.GetStats().reports));
+    Check(n.b.GetStats().echoesAbsorbed >= 1, "it is taken as an echo", std::to_string(n.b.GetStats().echoesAbsorbed));
+    Check(a.wheels[0] == kWheelOk && a.parts[5] == 0, "the authority's car is untouched by it", a.Describe());
+    // the authority's own wreck changes by itself (a part model swapped: less damage read): no repair
+    a.parts[0] = 120;
+    for (int i = 0; i < 4; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    uint16_t ep = 9;
+    n.a.Known(CarRef{CarRef::kPlayer, 0, 5000}, nullptr, &ep);
+    Check(ep == 0 && n.a.GetStats().repairs == 0, "a wreck's drop is no repair", std::to_string(ep));
+    Check(n.b.GetStats().repairs == 0 && (b.flags & kExploded), "the copy stays a wreck (no repair sent)");
+    // an older build's copy still sends its wreck: the holder drops it
+    Update echo;
+    CarRef::Parse("0:5000", echo.ref);
+    echo.layout = a.layout;
+    echo.partCount = static_cast<uint8_t>(a.parts.size());
+    echo.wheels = {kWheelOff, kWheelOff, kWheelOff, kWheelOk};
+    echo.flags = kExploded;
+    n.a.OnReport(echo, 1, n.now);
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(a.wheels[0] == kWheelOk && n.a.GetStats().echoesDropped >= 1, "an old copy's wreck report is dropped",
+          std::to_string(n.a.GetStats().echoesDropped));
+    ep = 9;
+    n.a.Known(CarRef{CarRef::kPlayer, 0, 5000}, nullptr, &ep);
+    Check(ep == 0, "still no repair");
+}
+
+// cascading writes on a copy (a wheel taken off by the authority's damage) and the game's reaction to them: not the
+// copy's own damage; the holder's own drop right after it wrote a report on its car: no repair
+void TestWriteEcho() {
+    Net n;
+    Snapshot a = Car(), b = Car();
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    a.wheels[3] = kWheelOff;
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(b.wheels[3] == kWheelOff, "the copy's wheel is off too");
+    b.wheels[2] = kWheelBurst;  // the game burst the tyre next to it as the wheel came off
+    for (int i = 0; i < 6; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(n.b.GetStats().reports == 0 && a.wheels[2] == kWheelOk, "the reaction to our write is not reported");
+    // later, a real shot at the copy's tyre is reported as before
+    b.wheels[1] = kWheelBurst;
+    for (int i = 0; i < 6; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Check(n.b.GetStats().reports == 1 && a.wheels[1] == kWheelBurst, "a real hit later is still reported",
+          std::to_string(n.b.GetStats().reports));
+    // the authority puts a reported dent on its car; its game shows another part lower right after: no repair
+    a.parts[2] = 150;
+    for (int i = 0; i < 3; ++i) Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    b.parts[7] = 100;
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);  // B reports (settle), A writes it
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    a.parts[2] = 100;  // within repairGrace of that write
+    Step(n, a, 11, Role::Authority, b, 22, Role::Copy);
+    uint16_t ep = 9;
+    n.a.Known(CarRef{CarRef::kPlayer, 0, 5000}, nullptr, &ep);
+    Check(a.parts[7] == 100 && ep == 0, "a drop right after our write is no repair", std::to_string(ep));
+}
+
 }  // namespace
 
 int main() {
@@ -548,6 +623,8 @@ int main() {
     TestBlast();
     TestBookTraffic();
     TestStale();
+    TestExplosionEcho();
+    TestWriteEcho();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -14,6 +14,7 @@
 #include "game/menu.h"
 #include "game/mission_sync.h"
 #include "game/car_damage_sync.h"
+#include "game/car_look_sync.h"
 #include "game/npc_sync.h"
 #include "game/player_sync.h"
 #include "game/save_guard.h"
@@ -216,6 +217,7 @@ public:
             ItemSync::Install();
             DoorSync::Install();
             CarDamageSync::Install();  // after traffic: its Lua reads player_sync's and traffic_sync's cars
+            CarLookSync::Install();    // the same: copies of player and traffic cars get the car's look
             ExplosionSync::Install();  // last: its glue reads the others' tables
             ThrowSync::Install();      // the flights of thrown explosives (its glue is called by the explosions')
         }
@@ -237,6 +239,7 @@ public:
         PoliceSync::Attach(session);
         ExplosionSync::Attach(session);
         CarDamageSync::Attach(session);
+        CarLookSync::Attach(session);
         ThrowSync::Attach(session);
     }
     void OnSessionEnd() override {
@@ -249,6 +252,7 @@ public:
         PoliceSync::Detach();
         ExplosionSync::Detach();
         CarDamageSync::Detach();
+        CarLookSync::Detach();
         ThrowSync::Detach();
         latency::Attach(nullptr);
         _session = nullptr;
@@ -260,6 +264,7 @@ public:
         PoliceSync::OnPlayerLeft(id);
         ExplosionSync::OnPlayerLeft(id);
         CarDamageSync::OnPlayerLeft(id);
+        CarLookSync::OnPlayerLeft(id);
         ThrowSync::OnPlayerLeft(id);
     }
 
@@ -275,6 +280,7 @@ public:
         PoliceSync::OnPlayerLeft(id);   // his wanted state is sent again when back
         ExplosionSync::OnPlayerLeft(id);  // his explosion numbers start anew when back
         CarDamageSync::OnPlayerLeft(id);  // his copies ask for the cars' damage again when back
+        CarLookSync::OnPlayerLeft(id);    // and for their looks
         ThrowSync::OnPlayerLeft(id);      // his flights shown here go, his throw numbers start anew
     }
     // Guest: we lost the host. The game keeps running (no reload, no menu); the puppets go (PlayerSync, when the
@@ -307,6 +313,7 @@ public:
         ExplosionSync::Tick(dt);
         ThrowSync::Tick(dt);
         CarDamageSync::Tick(dt);
+        CarLookSync::Tick(dt);
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
             _latencyLogIn = 10;
@@ -343,6 +350,7 @@ public:
         case 0x0250: return "CarDamage";
         case 0x0251: return "CarDamageReport";
         case 0x0252: return "CarDamageRequest";
+        case 0x0253: return "CarLook";
         case 0x0260: return "PoliceState";
         case 0x0261: return "PoliceEvent";
         case 0x0262: return "PoliceChase";
@@ -371,6 +379,7 @@ public:
         PoliceSync::GetStatus(out);
         ExplosionSync::GetStatus(out);
         CarDamageSync::GetStatus(out);
+        CarLookSync::GetStatus(out);
         ThrowSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }

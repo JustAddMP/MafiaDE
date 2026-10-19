@@ -280,6 +280,9 @@ bool MergeUp(Snapshot& into, const Update& u) {
 
 bool Repaired(const Snapshot& was, const Snapshot& now) {
     if ((was.flags & kExploded) && !(now.flags & kExploded)) return true;
+    // a car that stays exploded is a wreck: its parts and wheels change by themselves (the wreck model, our own
+    // writes on it), none of that is a repair (0.15.0 test: such a drop was sent out as one)
+    if ((was.flags & kExploded) && (now.flags & kExploded)) return false;
     if (was.layout == now.layout && was.parts.size() == now.parts.size()) {
         for (size_t i = 0; i < now.parts.size(); ++i) {
             const uint8_t o = was.parts[i], v = now.parts[i];
@@ -486,7 +489,20 @@ void Book::OnReport(const Update& u, int from, double now) {
         ++stats_.blastDropped;
         return;
     }
-    if (MergeUp(c.raise, u)) c.haveRaise = true;
+    // echoes: our car is a wreck here (whatever a copy shows of it is its own wreck: the explosion came from us), and
+    // a copy never blows up by itself (its exploded flag is ours, sent back). Older builds' copies still send both.
+    const bool wreck = (c.haveSent && (c.sent.flags & kExploded)) || (c.havePrev && (c.prev.flags & kExploded));
+    if (wreck) {
+        ++stats_.echoesDropped;
+        return;
+    }
+    Update v = u;
+    if (v.flags & kExploded) {
+        v.flags &= static_cast<uint8_t>(~kExploded);
+        ++stats_.echoesDropped;
+        if (Empty(v)) return;
+    }
+    if (MergeUp(c.raise, v)) c.haveRaise = true;
     (void)from;
 }
 
@@ -494,6 +510,7 @@ void Book::OnRemoteBlast(const CarRef& ref, double now) {
     auto it = cars_.find(ref);
     if (it == cars_.end() || it->second.role != Role::Authority) return;
     it->second.blastUntil = now + cfg_.blastQuiet;
+    it->second.wroteAt = now;  // the blast's writes on our car: no repair read from what follows
     ++stats_.blasts;
 }
 
@@ -593,6 +610,7 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
                                 " burn=" + (a.burn ? "1" : "0") + " explode=" + (a.explode ? "1" : "0"));
             ++stats_.applied;
             out.applies.push_back(std::move(a));
+            c.wroteAt = now;
         }
         c.havePrev = false;
     }
@@ -613,9 +631,20 @@ void Book::AuthorityRound(const CarInput& in, Car& c, bool rebound, double now, 
                                 " burn=" + (a.burn ? "1" : "0") + " explode=" + (a.explode ? "1" : "0"));
             ++stats_.applied;
             out.applies.push_back(std::move(a));
+            c.wroteAt = now;
         }
     }
-    if (c.havePrev && !rebound && Repaired(c.prev, local)) {
+    // a drop right after our own writes on the car is the game's reaction to them (a part model swapped, a wheel
+    // taken off with its part), not a repair: within repairGrace the read only becomes the new baseline
+    const bool grace = now - c.wroteAt < cfg_.repairGrace;
+    if (c.havePrev && !rebound && grace && Repaired(c.prev, local)) {
+        std::snprintf(buf, sizeof buf, "car %s: its damage dropped right after we wrote some on it (was %s; now %s): "
+                                       "taken as the game's reaction, no repair",
+                      ref.c_str(), c.prev.Describe().c_str(), local.Describe().c_str());
+        out.logs.emplace_back(buf);
+        out.trace.push_back("CDT ref=" + ref + " kind=drop-after-write ep=" + std::to_string(c.epoch));
+    }
+    if (c.havePrev && !rebound && !grace && Repaired(c.prev, local)) {
         ++c.epoch;
         ++stats_.repairs;
         Update u = Full(in.ref, c.epoch, local);
@@ -791,13 +820,41 @@ void Book::CopyRound(const CarInput& in, Car& c, bool rebound, double now, Outbo
                             " burn=" + (a.burn ? "1" : "0") + " explode=" + (a.explode ? "1" : "0"));
         if (a.explode) ++stats_.explosions;
         ++stats_.applied;
+        // writes that make the game change more by itself (an explosion blows wheels and parts off, a fire burns, a
+        // wheel taken off or a part broken off takes others along): what the copy shows new for a moment is theirs
+        bool cascade = a.explode || a.burn || !a.wheels.empty();
+        for (const auto& [i, v] : a.parts) cascade = cascade || v == kGone;
+        if (cascade) c.echoUntil = now + cfg_.echoQuiet;
         out.applies.push_back(std::move(a));
     }
     // our copy's own damage: reported to the authority once it stood for a moment (not while the copy is moved by
-    // SetPos: bumps from that are no real damage; tyres, the fire and the explosion are reported even then)
+    // SetPos: bumps from that are no real damage; tyres and the fire are reported even then). Never the exploded
+    // flag: a copy never blows up by itself, its explosion is the authority's (sent back, it was read as a repair).
     Update rep = excess;
+    rep.flags &= static_cast<uint8_t>(~kExploded);
     if (in.quiet) rep.parts.clear();
     if (in.authPeer < 0 || Empty(rep)) {
+        c.excessAt = -1;
+        return;
+    }
+    // echoes of our own writes are not the copy's own damage: a wreck (ours or the authority's car) shows what the
+    // explosion did to it here, and right after cascading writes the game's reaction shows. Taken as reported, so
+    // only damage beyond it (taken later, really ours) is ever sent.
+    const bool wreck = (local.flags & kExploded) || (c.auth.flags & kExploded);
+    if (wreck || now < c.echoUntil) {
+        Update absorbed = rep;
+        if (absorbed.layout != c.reported.layout) absorbed.parts.clear();
+        if (MergeUp(c.reported, absorbed)) {
+            ++stats_.echoesAbsorbed;
+            std::snprintf(buf, sizeof buf, "car %s: our copy shows damage beyond the authority's right after we %s "
+                                           "(%zu parts, %s): an echo of our own writes, not reported",
+                          ref.c_str(), wreck ? "blew it up (a wreck)" : "wrote damage on it", rep.parts.size(),
+                          local.Describe().c_str());
+            out.logs.emplace_back(buf);
+            out.trace.push_back("CDX ref=" + ref + " to=" + std::to_string(in.authPeer) + " ep=" +
+                                std::to_string(c.epoch) + " echo=" + (wreck ? "wreck" : "write") + " parts=" +
+                                PartsText(rep.parts));
+        }
         c.excessAt = -1;
         return;
     }
