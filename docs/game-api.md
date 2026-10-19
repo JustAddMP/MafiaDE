@@ -211,6 +211,14 @@ traffic states carry m/s; the glue converts at the two game calls only (`mc_car_
   sync object) sets it. `GetTimeFlowSpeed()` / `SetTimeFlowSpeed(n)` (1 arg): 0 in missions (time stands still), the
   game's day cycle runs when it is > 0 (flow 20 = 1 game hour per ~3 s). The game's own node scripts
   (`Game.Weather.SetTime`, `Game.Game.SetMissionWeatherAndTime`) make the same calls.
+- **Time of day in co-op (world-join, unreleased): UNVERIFIED in game.** Assumed: the clock advances by
+  `rate x flow` game hours per real second with one fixed rate (the follower starts from 1/60, read off "flow 20 = 1
+  game hour per ~3 s", and measures the real rate from the host's WorldEnv samples: the WEG trace shows it as `rate`,
+  `measured=1`); `SetTimeFlowSpeed(n)` takes effect at once and smoothly for any n > 0 (the catch-up changes it
+  by up to 25 % for a few seconds); `GetTimeFlowSpeed()` reads back what was set; `SetTime(h, 0)` shows on the next
+  ticks (the follower waits 2 s after one). The 2026-10-19 two-PC test's Free Ride had flow 0 on the host (time stands
+  still), where only SetTime can correct the clock. To check: the WEG `rate` is about the same in every session, and
+  a catch-up does not make the sky, shadows or street lights jump.
 - Globals useful for exploring: `scripts`, `mm_spawn_profiles`, `enums`, `Game.*` / `Human.*` / `Vehicle.*` (viscript
   node tables: their functions show, via `string.dump`, which wrapper methods a node calls).
 - `package.loaded.traffic.GetSpawnProfiles(...)`, `Game.Traffic.SpawnProfileHuman`, `Testscenes.SpawnEnemies`

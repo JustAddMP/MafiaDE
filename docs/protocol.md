@@ -433,12 +433,53 @@ he gets.
 
 | App id | Name | Dir | Channel | Body |
 |---|---|---|---|---|
-| 0x0200 | WorldEnv | host -> guests (`Broadcast`) | R | f32 timeOfDay (hours 0..24), f32 timeFlowSpeed, str weatherSet |
+| 0x0200 | WorldEnv | host -> guests (`Broadcast`; `SendTo` a newcomer) | R | f32 timeOfDay (hours 0..24), f32 timeFlowSpeed, str weatherSet, u32 sampleMs (unreleased, optional) |
+| 0x0207 | JoinReport | guest -> host (`SendToHost`) | R | u8 flags (1 reconnect, 2 complete, 4 late), u32 afterMs, u8 n, n x (u8 system, i32 ms of its first arrival, -1 none), str missing (at most 200 bytes) |
 
-WorldEnv is sent while the host is in the world: every 4 s and at once when the weather set or the time flow speed
-changes. A guest in the world sets the weather set when it differs (`SetWeatherSet(name, 0, 0)`), the flow speed when it
-differs, and its clock when it is more than 0.05 h (3 game minutes) off (`SetTime(t, 0)`). Guests' own weather/time
-scripts may change things in between; the next WorldEnv puts them back.
+WorldEnv (src/game/world_env.h, world_env.cpp, world_env.lua; since the world-join change no longer in PlayerSync) is
+sent while the host is in the world: at once to every newcomer (also a guest back after a lost connection: newcomers
+are keyed by `(id, joinSeq)`; one who arrives before the host has a reading gets it with the first one), at once when
+the weather set or the time flow speed changes, and every 2 s (was 4 s). Priority Critical, lane 1.
+
+- `sampleMs` (new, unreleased): the moment the host's game was read, on the session clock (ms). It is a trailing
+  field: the reader before this change reads the three fields and never checks for the end of the body (verified in
+  the 0.15 code: `OnWorldEnv` read f32, f32, str and `ByteReader` leaves the rest), so an older guest still works; a
+  newer guest that gets no `sampleMs` from an older host takes the message's send stamp (core's, `MessageStampMs`)
+  or, without one, its arrival. No protocol / version bump is needed for it.
+- A guest predicts the host's time now: `timeOfDay + age x rate x timeFlowSpeed` (age = session clock now -
+  `sampleMs`, 0..600 s; rate = game hours per real second per unit of flow speed, measured from the host's samples: the hours
+  between two WorldEnv over the session time between them x his flow speed, two agreeing observations (~4 s) for the
+  first value, one more than 2x off ignored (a jump of his clock); the first guess is 1/60 from docs/game-api.md 8,
+  UNVERIFIED). The error is the host's predicted time
+  minus ours, the short way round 24 h.
+- The first time after a join, a reconnect or a new world of ours: `SetTime(t, 0)` once when 0.5 game minutes or
+  more off. During play: below 0.5 game minutes nothing; up to 15 game minutes the guest's flow speed is the host's
+  x (1 + share), share = error / (2 s x the host's game minutes per second), at most +-25 % in 1 % steps, until the
+  error is under 0.1 game minutes, then exactly the host's flow speed again (no overshoot: the error closes at most at
+  error / 2 s per second); beyond 15 game minutes, when the host's time stands still (flow 0, missions, the Free Ride
+  of the 2026-10-19 test) or when a catch-up would take over 30 s: `SetTime` once (then 2 s for it to show). Until the
+  rate is measured (~4 s), only errors beyond 15 game minutes are corrected. When the session ends during a catch-up,
+  the host's flow speed is put back.
+- The weather set is set at once when it differs (`SetWeatherSet(name, 0, 0)`; asked again every 2 s while the game
+  reports another name).
+- Guests' own weather/time scripts may change things in between; the next WorldEnv (or the guest's own reading of a
+  different flow speed) puts them back.
+- Trace: `WEH` (host), `WEG` (guest), docs/sync-trace.md; `tools/sync_compare.py` "World" and the
+  `world.time_err` target. UNVERIFIED in game: how smoothly the game's clock (sun, shadows, street lights) follows a
+  changed `SetTimeFlowSpeed`, and that `GetTimeFlowSpeed` reads back what was set.
+
+### Join and reconnect: when is a guest's world complete (unreleased, not checked in game)
+
+On a guest, from the moment the session became active (a join, or back after a lost connection; src/game/join_sync.h)
+each system's handler marks the first time it got its part of the world: the first PlayerState of every other player,
+the host's MissionState, WorldEnv, the DoorSnapshot (asked 3 s after we are in the world), the first NpcStates and
+TrafficSpawn (optional: the host may have none for us), the first PoliceState of every other player, and the first
+CarDamage answer for every car copy that asked for one meanwhile. The world is complete when every required part is
+here and we are in the world (log `join: world complete in X s`, trace `JN ev=complete`); when something required has
+not come 15 s after we are in the world, `join: still missing ... after 15 s` (`JN ev=complete missing=...`), and a
+late complete follows if it comes. The guest sends the result in JoinReport 0x0207 (once per verdict); the host logs
+it (`join: player N's world is complete in X s (...)`) and traces it (`JN ev=report`). An older host ignores the
+message. `tools/sync_compare.py` "Join and reconnect" and the `join.complete_s` target (<= 10 s).
 
 ### Story: chapter, checkpoint, objectives, cutscenes (0.6.0)
 
@@ -1074,7 +1115,7 @@ the game layer does with it:
 |---|---|---|
 | host, other guests | a player is dropped (`GameModule::OnPlayerDropped`) | his puppet is removed (`PlayerSync::OnPlayerLeft`, as when he leaves); banner "<NAME> LOST THE CONNECTION - WAITING FOR THE PLAYER TO RECONNECT... 45 S" (`Session::DroppedPlayers`; several at once: "SAM AND PAULIE LOST THE CONNECTION - WAITING FOR THEM ..." with the longest wait) |
 | lost guest | `OnConnectionLost` | the game keeps running (no menu, no load). The session is inactive: PlayerSync removes the puppets and stops sending (the trace stays open: `RCN ev=sync-paused`), MissionSync keeps the host's point and our `_followPoint` (nothing reloads by itself) and forgets the host's cutscene, NpcSync's Lua drops the copies it spawned (it does that whenever the session is inactive); banner "CONNECTION LOST - RECONNECTING... 12 S" |
-| host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
+| host | the player is back in `Players()` with a new `joinSeq` | MissionSync sends him MissionState, his HostSave (the newest checkpoint save) and the Cutscene, as to a newcomer; WorldEnvSync sends him WorldEnv at once; PlayerSync sends our PlayerModel; NpcStates reach him with the next 10 Hz send |
 | lost guest | `OnReconnected(sameSlot)` | PlayerSync is active again: every player is new (`_seenPlayers` cleared), so we send our PlayerModel and the puppets are spawned from the next states. MissionSync: the host's MissionState and HostSave arrive; at the same checkpoint nothing happens (the save is the same `#seq` or our point equals his), at another one the usual follow (quit to the menu and load his point after `follow_grace`). |
 
 | lost guest | the session is inactive / back | DoorSync: nothing is sent or applied meanwhile; when the session is active again the glue reads its doors again and asks the host for a DoorSnapshot (reason reconnect) |
@@ -1082,7 +1123,11 @@ the game layer does with it:
 | host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
 | lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
-- Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`), so a drop and a resume
+- A lost guest that is back: his WorldEnv follower starts with a first sync again (one SetTime when off), a catch-up
+  that ran when the connection was lost has had the host's flow speed put back; JoinSync times his world anew
+  ("Join and reconnect" above).
+- Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`, WorldEnvSync
+  `HostSender`), so a drop and a resume
   between two ticks (a guest's new Hello on the live Steam connection) still re-sends everything.
 - A guest that comes back after the 60 s hold is a new player for the host (maybe another id): the same re-send
   happens; his characters default by the new id unless he picked one (`model =`, re-sent as PlayerModel).
@@ -1157,7 +1202,7 @@ NPC death sent after a mission change can arrive before it (UNVERIFIED that no h
 Priorities against the per-peer send budget (`net_budget_kbps`, lowered automatically on a lossy / backed-up link):
 Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
 NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
-(0x0260-0x0262), MissionFail / FailVerdict. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
+(0x0260-0x0262), MissionFail / FailVerdict, WorldEnv. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
 DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates, GuestNpcStates, car damage, the rest.
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
@@ -1177,6 +1222,7 @@ network delay N. "Before" is 0.15 main (core 0.11).
 | Car damage | rounds 4 Hz -> ~6.7 Hz | 0..250 ms + 16.7 + N | 0..150 ms + N | only changes: < 1 KB/s typical, a few KB in a crash (E) |
 | Explosions, throws | event (detector) | 16.7 + N | N | < 0.2 KB/s (E) |
 | Mission state / fail | on change | 16.7 + N (HostSave held back everything after it) | N; HostSave on its own lane | HostSave up to 256 KB once per checkpoint, Bulk |
+| WorldEnv (time, weather) | every 4 s, on change | a newcomer waited up to 4 s; corrected only beyond 3 game minutes, by a jump | at once to a newcomer, on a change, every 2 s; the sample's age compensated, small errors closed by the flow speed | ~40 B every 2 s (< 0.03 KB/s) |
 
 Everything is also behind one hop more for guest -> guest traffic (via the host's relay, which forwards in the Poll
 that received it). Lua <-> C++: every system's tick hands what arrived to its Lua glue in the same script tick
