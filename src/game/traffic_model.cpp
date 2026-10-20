@@ -1,5 +1,7 @@
 #include "game/traffic_model.h"
 
+#include "game/player_motion.h"  // CarForward: a car's heading as Mafia DE gives its rotation
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -373,13 +375,16 @@ uint16_t AuthorityTraffic::NewNet() {
     return 0;
 }
 
-bool DriverWatch::Update(double now, bool driverSeen, float speed) {
+bool DriverWatch::Update(double now, DriverRead read, float speed) {
     // no rounds for a while (the host's game was paused, game/peer_pause.h, or loading): that time is not time without
     // a driver; a car not yet declared starts its watch again
     const bool gap = lastAt_ >= 0 && now - lastAt_ > kOrphanGap;
     lastAt_ = now;
+    far_ = read == DriverRead::Far;
     if (gap && !declared_) missSince_ = slowSince_ = -1;
-    if (driverSeen || !std::isfinite(speed)) {
+    if (read == DriverRead::Seen || !std::isfinite(speed) || (far_ && !declared_)) {
+        // a driver at the wheel; or none read far from our player, where the game streams drivers out and drives
+        // the car on without one: a driven car (one declared before stays so: its driver got out near us)
         missSince_ = slowSince_ = -1;
         declared_ = false;
         return false;
@@ -418,6 +423,12 @@ size_t AuthorityTraffic::DeclaredNow() const {
     return n;
 }
 
+size_t AuthorityTraffic::FarNow() const {
+    size_t n = 0;
+    for (const auto& [net, c] : cars_) n += c.drv.Far() ? 1 : 0;
+    return n;
+}
+
 void AuthorityTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
     for (auto& [net, c] : cars_) c.seen = false;
     for (const HostCar& in : cars) {
@@ -440,13 +451,17 @@ void AuthorityTraffic::SetCars(const std::vector<HostCar>& cars, double now) {
         c.c = in;
         c.c.st.net = net;
         c.seen = true;
-        // the Lua's kNoDriver is this round's read; what is sent is the confirmed one
+        // the Lua's kNoDriver (+ kDriverFar) is this round's read; what is sent is the confirmed one
         const bool was = c.drv.Declared();
         const float speed = std::sqrt(in.st.vel.x * in.st.vel.x + in.st.vel.y * in.st.vel.y + in.st.vel.z * in.st.vel.z);
-        const bool orphan = c.drv.Update(now, (in.st.flags & kNoDriver) == 0, speed);
+        const DriverRead read = (in.st.flags & kNoDriver) == 0 ? DriverRead::Seen
+                                : (in.st.flags & kDriverFar)  ? DriverRead::Far
+                                                              : DriverRead::Missing;
+        const bool orphan = c.drv.Update(now, read, speed);
         if (orphan && !was) ++orphaned_;
         if (was && !orphan) ++drivenAgain_;
-        c.c.st.flags = static_cast<uint8_t>((c.c.st.flags & ~kNoDriver) | (orphan ? kNoDriver : 0));
+        c.c.st.flags = static_cast<uint8_t>((c.c.st.flags & ~(kNoDriver | kDriverFar | kCrewOut)) |
+                                            (orphan ? kNoDriver : 0));
         im_.UpdateEntity(net, {in.st.pos.x, in.st.pos.y, in.st.pos.z}, {in.st.vel.x, in.st.vel.y, in.st.vel.z});
     }
     for (auto it = cars_.begin(); it != cars_.end();) {
@@ -698,6 +713,14 @@ net::correction::Tuning TrafficCorrection() {
     return t;
 }
 
+float CopySpeed(const Vec3& copy, const Vec3& target, float targetSpeed, const float copyFwd[2], bool reverse,
+                const motion::VehicleTuning& t) {
+    const float along = (target.x - copy.x) * copyFwd[0] + (target.y - copy.y) * copyFwd[1];
+    const float corr = std::clamp((reverse ? -along : along) * t.velGain, -t.maxVelCorr, t.maxVelCorr);
+    const float ts = std::isfinite(targetSpeed) ? targetSpeed : 0.0f;
+    return std::max(0.0f, ts + corr);
+}
+
 motion::VehicleTuning TrafficVehicleTuning(const net::correction::Tuning& corr) {
     motion::VehicleTuning v;
     v.snapDist = corr.snapDist;  // the corrector snaps (far, stuck, teleport); the controller pins
@@ -822,6 +845,7 @@ void ReceiverTraffic::Gone(uint32_t key) {
     it->second.vc.Reset();
     it->second.fix.Reset();
     it->second.repAt = -1e9;
+    it->second.crewOut = false;
 }
 
 void ReceiverTraffic::Clear() {
@@ -1065,6 +1089,7 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             c.haveLast = false;
             c.accDt = 0;
             c.lastErr = 1e9f;  // no bump before the copy was seen on its target once
+            c.crewOut = false;  // a new copy comes with its crew seated
             ++copies;
         }
     }
@@ -1096,7 +1121,8 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             cmd.target.vel = {};
             cmd.target.power = 0;
             cmd.target.brake = 1;
-            cmd.target.flags = static_cast<uint8_t>((cmd.target.flags & ~kReverse) | kControls | kHandbrake);
+            cmd.target.flags = static_cast<uint8_t>((cmd.target.flags & ~kReverse) | kControls | kHandbrake |
+                                                    (c.crewOut ? kCrewOut : 0));  // a crew that is out stays out
             cmd.vc = motion::VehicleCommand{};
             cmd.vc.fix = motion::VehicleCommand::Fix::Pin;
             for (int k = 0; k < 4; ++k) cmd.vc.rot[k] = c.frozenRot[k];
@@ -1147,10 +1173,30 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
         } else if (cmd.vc.fix == motion::VehicleCommand::Fix::Pin || cmd.vc.fix == motion::VehicleCommand::Fix::Snap) {
             c.fix.Reset();  // put on its target: no stuck time, no previous target carried over
         }
+        // The speed the copy is given (SetSpeed takes one number: along the copy's heading): the target's speed plus
+        // the error along that heading (CopySpeed), never backwards against the way the authority's car goes. A
+        // pinned or snapped copy is put on its target and gets the target's speed (vc.vel).
+        cmd.vel = cmd.vc.vel;
+        cmd.reverse = (cmd.target.flags & kReverse) != 0;
+        if (vi.haveCopy && cmd.vc.fix != motion::VehicleCommand::Fix::Pin &&
+            cmd.vc.fix != motion::VehicleCommand::Fix::Snap) {
+            float fwd[2];
+            if (pmotion::CarForward(vi.copyRot, fwd)) {
+                const float sp = CopySpeed(vi.copy, vi.target, Speed(vi.targetVel), fwd, cmd.reverse, vehicleTuning_);
+                const float dir = cmd.reverse ? -1.0f : 1.0f;
+                cmd.vel = {fwd[0] * sp * dir, fwd[1] * sp * dir, 0.0f};
+            }
+        }
+        // The crew of a driverless car gets out once both stand, and stays out until the authority's car is driven
+        // again (no flapping with the copy's speed)
         {
             const float ts = Speed(cmd.target.vel);
             const float cs = vi.haveCopy ? Speed(vi.copyVel) : -1.0f;
-            if (CrewGetsOut(cmd.target.flags, ts, cs)) cmd.target.flags |= kCrewOut;
+            if (!(cmd.target.flags & kNoDriver))
+                c.crewOut = false;
+            else if (!c.crewOut && CrewGetsOut(cmd.target.flags, ts, cs))
+                c.crewOut = true;
+            if (c.crewOut) cmd.target.flags |= kCrewOut;
         }
         if (cmd.vc.justPinned) ++stats_.pins;
         if (cmd.vc.fix == motion::VehicleCommand::Fix::Snap) ++stats_.snaps;

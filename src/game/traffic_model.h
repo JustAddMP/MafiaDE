@@ -46,8 +46,12 @@ enum StateFlags : uint8_t {
     kControls = 8,    // steer / power / brake are the driver's (else unknown: 0)
     kReverse = 16,    // moving backwards (power then means reverse: not applied on the copy)
 };
-// Never on the wire: the receiver's Drive command to its Lua sets it when the copy's crew may get out (CrewGetsOut).
+// Never on the wire: the receiver's Drive command to its Lua sets it while the copy's crew is out (CrewGetsOut, then
+// held until the authority's car is driven again).
 constexpr uint8_t kCrewOut = 32;
+// Never on the wire: the authority's Lua (TC) sets it for a car without a driver read that is farther than
+// kDriverLod from our player - the game streams traffic drivers out there while their cars drive on (DriverWatch).
+constexpr uint8_t kDriverFar = 64;
 
 // A traffic car on every game: {authority, net} as one number (authority << 16 | net). The host's cars (authority 0)
 // keep their net id as key, so everything keyed by the host's net id before (car damage, car look, explosions) is
@@ -69,13 +73,31 @@ constexpr double kOrphanConfirm = 1.0;  // s without a driver read, slow all tha
 constexpr float kOrphanSlow = 2.0f;     // m/s: slow
 constexpr float kOrphanDriven = 4.0f;   // m/s: a declared driverless car this fast is driven again (someone drives it)
 constexpr double kOrphanGap = 0.5;      // s between two rounds (normally 0.05): the game stood, the watch restarts
+// The game's level of detail for traffic drivers (2026-10-20 two-PC test, both authorities): every "seat 0 empty" read
+// of a car was 45-169 m from the authority's player (A: 28 misses 45-76 m but one at 16 m; B: 33 misses 49-169 m), 14 of 28
+// while the car drove on at 10-14 m/s, and the driver was read again when the player came back within 44-51 m: the game
+// streams the human out of a traffic car beyond ~50 m and its traffic system drives the car on without him. Such a car
+// is not driverless: beyond kDriverLod a missing driver is "not streamed" (kDriverFar), not "gone".
+constexpr float kDriverLod = 40.0f;     // m from the authority's player
+
+enum class DriverRead : uint8_t {
+    Seen,     // a living driver at the wheel
+    Missing,  // none, within kDriverLod of our player: he got out, died or was dragged out
+    Far,      // none, beyond kDriverLod: streamed out by the game (its car is still driven)
+};
 
 class DriverWatch {
 public:
     // One round: was a living driver read at the wheel now, how fast the car goes (m/s). Returns Declared().
-    bool Update(double now, bool driverSeen, float speed);
+    // A Far read keeps a car that was declared driverless declared (its driver got out near our player, then we went
+    // away) and is a driven car otherwise.
+    bool Update(double now, DriverRead read, float speed);
+    bool Update(double now, bool driverSeen, float speed) {
+        return Update(now, driverSeen ? DriverRead::Seen : DriverRead::Missing, speed);
+    }
     bool Declared() const { return declared_; }
     bool Missing() const { return missSince_ >= 0; }
+    bool Far() const { return far_; }  // the last read was Far (the game streamed the driver out)
     double MissingFor(double now) const { return missSince_ >= 0 ? now - missSince_ : 0; }
 
 private:
@@ -83,12 +105,15 @@ private:
     double slowSince_ = -1;  // first round slow while missing (-1: not slow)
     double lastAt_ = -1;     // the last round (kOrphanGap)
     bool declared_ = false;
+    bool far_ = false;
 };
 
 // Receiver: may the crew of a copy get out now? Only for a car confirmed driverless (kNoDriver) that stands or rolls
 // slower than kOrphanSlow, and whose copy here is that slow too (copySpeed < 0: no report of the copy yet). A moving
 // copy always keeps its crew seated (0.15.0: 249 "lost its driver" get-outs left empty copies driving on and their
-// drivers standing in the road).
+// drivers standing in the road). Once out, the crew stays out until the authority's car is driven again (kNoDriver
+// gone): ReceiverTraffic holds it (2026-10-20: 19 of 40 get-outs were followed by "back in" within 2 s because the
+// copy's speed went over 2 m/s and back).
 bool CrewGetsOut(uint8_t targetFlags, float targetSpeed, float copySpeed);
 
 using Vec3 = net::motion::Vec3;
@@ -192,7 +217,8 @@ struct HostCar {
     std::string model;
     int16_t color[2] = {-1, -1};
     std::string plate;
-    CarState st;  // net is filled in by AuthorityTraffic; kNoDriver here = no driver read this round (DriverWatch)
+    CarState st;  // net is filled in by AuthorityTraffic; kNoDriver here = no driver read this round (DriverWatch),
+                  // with kDriverFar: beyond kDriverLod of our player (streamed out); neither is sent as such
 };
 
 struct HostConfig {
@@ -228,8 +254,9 @@ public:
     // Cars that went driverless (confirmed) / were found driven again since the start (logs and traces).
     uint64_t Orphaned() const { return orphaned_; }
     uint64_t DrivenAgain() const { return drivenAgain_; }
-    size_t MissingNow() const;   // cars without a driver read now
+    size_t MissingNow() const;   // cars without a driver read now (within kDriverLod of our player)
     size_t DeclaredNow() const;  // of those, confirmed driverless
+    size_t FarNow() const;       // cars whose driver the game streamed out (beyond kDriverLod): driven, not missing
     // Another player's position (his player, or his car); one seen for the first time is added.
     void SetView(uint32_t peer, const Vec3& pos, double now);
     void RemovePeer(uint32_t peer);  // left the session: nothing is sent to him any more
@@ -318,6 +345,10 @@ struct GuestConfig {
 struct CopyReport {
     Vec3 pos, vel;
     float rot[4] = {0, 0, 0, 1};
+    // traces only: where the copy was before this tick's commands (the game's own placement since the last tick; pos
+    // is after our SetPos / nudge)
+    Vec3 pre;
+    bool havePre = false;
 };
 
 struct GuestCmd {
@@ -330,8 +361,21 @@ struct GuestCmd {
     CarState target;
     // Drive
     net::motion::VehicleCommand vc;
+    // Drive: the velocity the copy is given after this command (SetSpeed takes one number: the speed along the copy's
+    // own heading, `reverse` backwards): the target's speed plus the error along the copy's heading (CopySpeed), not
+    // vc.vel's length (a vector toward the target: given as a speed along the heading it drove a copy that was past a
+    // standing target away from it at up to 4 m/s, 2026-10-20 two-PC test).
+    Vec3 vel;
+    bool reverse = false;
     bool grace = false;  // Remove: after despawnGrace (the authority no longer sends it), not at once
 };
+
+// The speed (m/s, >= 0) a traffic copy is given along its heading: the target's speed plus the error along the copy's
+// heading (in the direction it drives: backwards when reversing) x velGain, that part at most maxVelCorr; never
+// negative (a copy past a stopping target stops, the position blend takes the rest). copyFwd: the copy's heading
+// (unit, ground plane); reverse: the authority's car reverses.
+float CopySpeed(const Vec3& copy, const Vec3& target, float targetSpeed, const float copyFwd[2], bool reverse,
+                const net::motion::VehicleTuning& t);
 
 struct GuestBump {
     uint32_t key = 0;
@@ -415,6 +459,7 @@ private:
         double bumpAt = -1e9;
         bool haveLast = false;
         Vec3 lastTarget;
+        bool crewOut = false;  // the copy's crew is out (CrewGetsOut), until the authority's car is driven again
         bool frozen = false;  // held at frozenPos / frozenRot (its authority is paused)
         Vec3 frozenPos;
         float frozenRot[4] = {0, 0, 0, 1};

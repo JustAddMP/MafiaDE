@@ -562,7 +562,10 @@ Play in this order, both players together unless a step says otherwise (about 25
    `car.p95` <= 1.0 m, `car.pinned` <= 10 %, `car.speed_ratio` 0.9-1.1. VEH `gs=1` rare, `pf` short.
 3. **Traffic, 4 min:** together near the host, then the guest drives more than 400 m away and back.
    `traffic.true_p95` <= 1.5 m, `traffic.shown` >= 95 %, `traffic.unshared_near` 0 (both directions). No car pops in
-   view when the guest comes back (`TRR` changes, `TRL near=0` 10 s later).
+   view when the guest comes back (`TRR` changes, `TRL near=0` 10 s later). Stop next to a red light with cars
+   waiting (the host 50+ m away): `traffic.crew_exits_per_min` <= 1, `traffic.reseats_per_min` <= 3, the
+   report's `copies of a standing car driven off it` near 0 %; the waiting copies keep their drivers and stand still
+   (2026-10-20: drivers got out and back in, copies crept away from the stop line at 4 m/s).
 4. **Pedestrians, 3 min:** walk a busy street together, look around; shoot one pedestrian each.
    `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m; the shot pedestrians die on both games (`PDE ev=killreq` / `death`).
 5. **NPCs, 5 min:** get a wanted level and let the host's cops chase the guest on foot; then a mission fight if one is

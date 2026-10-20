@@ -34,6 +34,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | character | 10-guest-new-character | host: `puppet 1 removed (his character changed)` then `spawned` with the new profile within ~1 s |
 | loss | 11-after-loss | guest log: `puppet 0 is gone (removed by the game, #1)`, `... (loaded before) not ready in 4 s: the spawner is stuck`, `factory reset: the spawner is stuck`, `puppet 0 spawned` within ~5 s; never `did not load in 12 s` for a known profile |
 | a minute | 12-a-minute-later | traffic and pedestrians around both; both puppets still there |
+| traffic | (run.log lines `host traffic:` / `guest traffic:`, tools/onepc/traffic_probe.lua) | host: `ours: 0-40 m N (no driver 0), 40-60 m ..., 60- m N (no driver K)`: the cars without a driver are the far ones (the game streams drivers out beyond ~50 m; one within 40 m is a real get-out); guest: `copies N: driver seated N, crew out 0` (unless a host car's driver really got out next to the host) |
 
 ## Expected `compare.ps1` (sync_compare --check)
 
@@ -46,10 +47,14 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | foot.p95 / mean / gait | PASS (one PC: ~0.1-0.5 m) |
 | car.* | PASS for the guest's car on the host |
 | traffic.*, npc.*, ped.*, world.time_err, lat.player.p95, bw.host_up | PASS |
+| traffic.true_p95 | <= 1.5 m (was 2.14 m in session A: copies of standing cars driven off them; the replay of A in tests/traffic_test.cpp: 0.75 m) |
+| traffic.crew_exits_per_min | <= 1 per minute of copies (was 26.5 on the guest in session A, 5.2 in B: drivers the host's game streamed out 45-76 m from him counted as gone) |
+| traffic.reseats_per_min | <= 3 per minute of copies (was 71.6 on the guest in session A: crews leaving copies that were pushed off their standing car, and every get-out put back) |
+| traffic "driven off" line | `copies of a standing car driven off it` near 0 % (was 13 % of the standing rows in session A) |
 | join.complete_s | <= 10 s (now timed from the world's load, not from joining in the menu) |
 | log counts, files | `savesys: written: (garage\|my2k\|profile_data\|.slot)` 0 and `savesys: written: save` 0 on both (only settings are written for real in co-op, the host's too: he hosts a FREE RIDE, not his story); `save write #n kept out` >= 1 and `kept out of the player's profile` >= 1 on the host |
 | run_stop.ps1 | `profile and save files changed by the run: 0` (before anything is put back; was garage.pf and aslot\save1.sav for the host in the 2026-10-20 test) and `saves: 0 file(s) differ`; only settings (gamesettings.pf, videoconfig.cfg, ...) may be listed as `restored` |
-| log counts | `cars error` 0 on both; `did not load in` 0; `rides bike` >= 1 (guest); `sits in car` >= 1 (host) |
+| log counts | `cars error` 0 on both; `did not load in` 0; `rides bike` >= 1 (guest); `sits in car` >= 1 (host); `has no driver (for 1 s` and `is driven again: our crew gets back in` 0 or a handful (guest), `keeps leaving seat` 0; `the game streams drivers out` (host) whenever a host car farther than 40 m from him lost its driver |
 
 One PC cannot show: Steam P2P, real latency / loss, two different machines' timing, the real Free Ride garage
 removing a puppet (simulated by losstest.lua), a bike from the garage (spawned by bike_spawn.lua instead), a car
