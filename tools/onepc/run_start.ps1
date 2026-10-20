@@ -41,7 +41,7 @@ Say "connected"
 Start-Sleep 8
 for ($k = 0; $k -lt 4 -and -not (LogHas "host" "first script tick"); $k++) { Say (Keys 0 @("ENTER")); Start-Sleep 4 }
 for ($k = 0; $k -lt 4 -and -not (LogHas "guest" "lobby panel opened"); $k++) { Say (Keys 1 @("ENTER")); Start-Sleep 4 }
-Set-Content "$Out\dev\guest.input.txt" "pad DOWN`nwait 300`npad A`nwait 300`ndump"
+Set-Content "$Out\dev\guest.input.txt" "pad X`nwait 500`ndump"  # X = Ready (the lobby now has an OUTFIT row: DOWN + A hit it)
 Start-Sleep 3
 Set-Content "$Out\dev\host.input.txt" "open lobby`nwait 800`npad X`nwait 500"
 for ($k = 0; $k -lt 20 -and -not (LogHas "host" "lobby start: FREE RIDE"); $k++) { Start-Sleep 1 }

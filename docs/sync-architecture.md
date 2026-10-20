@@ -1,5 +1,9 @@
 # Sync architecture: how close to "100 % synced" we can get, and how
 
+**Superseded in part (2026-10-20): the host owns the world, docs/host-authority.md.** The region authority below
+(principle 1, traffic-regions, the region parts of ambient-peds, guest-owned NPCs 0x0424-0x0426) is retired; the rest
+(time base, correction, NetRef, measuring, targets) stands.
+
 Status: plan (2026-10-19), built 2026-10-20 (section 8 "Status"), written from the first real two-PC test (0.15.0, two sessions, 906 s and 345 s, Steam
 P2P, rtt ~28 ms, loss ~0 %) and the code on main after the Round 4 merge. **Nothing in this document is verified in
 game yet**; the numbers under "now" are measured (`python tools/sync_compare.py <host trace> <guest trace> --check` on

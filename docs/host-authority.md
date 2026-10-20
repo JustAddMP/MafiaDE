@@ -220,3 +220,51 @@ Expected compare.ps1 additions: `world.guest_own_cars` 0, `world.guest_own_peds`
 
 A 3-4 h, B 3 h, C 4-5 h, D 3-4 h, E 4-5 h in parallel (five agents): ~5 h; merge, integration and docs ~2-3 h; the
 one-PC run ~1 h and the two-PC test ~45 min when game runs are allowed again. F later (6-8 h).
+
+## 9. Status (2026-10-20 evening): built, one-PC check done, two PCs not yet
+
+Branch `feat/host-authority` (from feat/host-authority-plan): A guest-world 649c75c, B host-traffic 332b62a, C host-peds
+03d6b54 (with feat/sync-peds 652cbf9), D host-npcs 4dcecac, E leash c97dfcc, merged in the order A, B, D, E, C (C came
+last), then the integration fixes. core stays at feat/foot-track 3e892eb (no core change, no tag). build.cmd OK, all 33
+`out\*_test.exe` pass. F (NPC-driven mission cars) is not started.
+
+Trace replays on the real 2026-10-20 traces (unit tests):
+
+| Package | Replay | Result |
+|---|---|---|
+| B traffic | session A host cars -> guest copies (tests/data/traffic_replay.h) | true p95 0.75 m (unchanged; the 0.16 copy speed: 1.52 sim / 2.17 game) |
+| C pedestrians | real PDT of A and B through 80/90 m interest, copies-only pool, spawner model | coverage A 82.2 % (recorded 18.2 %), B 91.7 % (82.1 %); p95 0.40 / 0.37 m (3.2 m); copy fails 0.55 / 0 per min (86) |
+| D NPCs | session A guest's NPCs (1 guest-owned cop, made his own 3 times by 0.16; 1350 states sent) | held at 120.4 s, never sent; 3 paired NPCs never held |
+| E leash | both players at 1 Hz, A and B | A: no warning (max 98 m); B: warning at 300 m, countdown at 402 m, one pull 10 s later at 587 m, no false pulls |
+| A guest world | guest traces A and B | his own ambient humans 31 / 24 -> 0 in the tick 0.16 switched spawning off (so one of the calls clears them) |
+
+One PC, two instances, UDP loopback (tools/onepc, 2026-10-20 14:36 and 15:00; games muted and unmuted, saves backed up
+and byte-identical afterwards, "profile and save files changed by the run: 0"):
+- guest world: own moving cars 0 and own ambient humans 0 in every band at 10 s and after a minute, budget read as
+  150 and set to 0, nothing of ours hidden; `world.guest_own_cars` / `world.guest_own_peds` PASS 0.
+- host world extent (the leash question D1): the host's cars and humans were all within ~300 m (humans: 0-50 m 1-6,
+  50-100 m 31-36, 100-150 m 6-7, then a few to 300 m; cars 0-5 per band to 200 m). 400 m is beyond everything the
+  host's game had; 300 m is where it thins out. The defaults stand.
+- pedestrians on the guest: coverage 96.4 / 97.5 %, copy failures 0, six looks loaded, pool reuse 166 / 207;
+  `ped.p95` 2.05 / 1.72 m (FAIL, target 1.5; mostly reused copies, max 59.9 m right after a reuse).
+- traffic on the guest: true p95 1.32 / 1.41 m, shown 99.4-99.9 %, crew exits 0; `traffic.reseats_per_min` 0 in the
+  first run, 6.4 in the second (the second had the leash teleports).
+- NPCs: p95 0.08-0.09 m, `npc.guest_sent` 0.
+- players (first run, no extra teleports): every `foot.*` PASS but `foot.respawn_s` 5.03 s (the simulated loss);
+  `car.p95` 0.02 / 1.58 m (the guest drove into a wall). The second run's foot FAILs (dz p95 1.52, snaps 0.91/min,
+  shown 95.4 %, one respawn) come from the scripted teleports of the leash checks (a 340 m move 30 m up, a fall onto
+  a roof).
+- leash: the first run had no leash at all (this engine's Lua reports a Lua function as type 9: fixed f26144f); then
+  the warning banner at 340 m, the countdown at 426 m and the pull beside the host (1.5 m) after 10 s, "THE HOST
+  PAUSED" and no pull while the host was in his pause menu, the pull after he resumed; `leash.pulls` 2,
+  `leash.false_pulls` 0.
+- bandwidth: host upload median 7.3-9.0 KB/s with one guest.
+- The one-PC check of feat/sync-gaps first (13:55; the "AI walk" question): every foot metric PASS (p95 0.05-0.06 m)
+  with the velocity matching; the game's own walk under the puppets measured 2.94 m/s at RUN x1.8 (guest's puppet on
+  the host, 34 % of the way nudged) and 0.49 m/s (the host's puppet on the guest after the simulated losses, 82 %
+  nudged): the AI walk does not reach ~4 m/s at x1.8 even without a SetPos every frame, the velocity matching covers
+  the rest (with some foot sliding).
+
+Still to confirm on two PCs (section 6), plus: a reload / chapter with held NPCs (D), the car pull (E), whether
+`SetMaxHumanElements(0)` also starves mission spawners in a chapter (A: the probe saw npc copies 0 in Free Ride, no
+mission there), the ped.p95 of reused copies, the traffic put-backs after a teleport.
