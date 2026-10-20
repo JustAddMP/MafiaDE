@@ -47,6 +47,8 @@ public:
 
     // What the HUD shows over the game (render thread): "" or a line like "HOST IS WATCHING A CUTSCENE".
     static std::string HudNotice();
+    // A failed mission's reload is under way here (FailFlow not idle: game/fail_flow.h). Any thread (game/leash.h).
+    static bool FailBusy();
     static void GetStatus(std::vector<render::OverlayLine>& out);
 };
 

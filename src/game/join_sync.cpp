@@ -141,6 +141,12 @@ void JoinSync::Detach() {
     sh.accept = true;
 }
 
+bool JoinSync::Settled() {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    return sh.tracker.Begun() && (sh.tracker.Complete() || sh.tracker.Reported());
+}
+
 void JoinSync::Tick(float) {
     if (!_session) return;
     const bool active = _session->IsActive(), host = _session->IsHost();

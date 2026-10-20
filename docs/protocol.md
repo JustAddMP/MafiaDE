@@ -57,6 +57,10 @@ connection was lost keeps playing while core rejoins the host; the host holds hi
 
 Mission fail: MissionFail (0x0205) and FailVerdict (0x0206), additive (a peer without them ignores them).
 
+Leash (host authority, docs/host-authority.md section 3; not yet checked in game): LeashConfig (0x0208) and LeashEvent
+(0x0209), additive (a peer without them ignores them; a guest without the host's LeashConfig uses the defaults). See
+"The leash" below.
+
 Car damage: CarDamage (0x0250), CarDamageReport (0x0251), CarDamageRequest (0x0252); additive (a peer without them
 ignores them and keeps its own car damage). See "Car damage". Since the car damage echo fix a copy never reports its
 wreck, the exploded flag, the game's reaction to our own writes or the part change of a rebuild by its tuning, and
@@ -448,7 +452,9 @@ report back).
     its resume they are driven again and no knock (TrafficBump) is reported for 1 s (counted as `quiet` in `TRG`);
     logged `traffic: player N paused his game: N copies ... held`, trace `TRZ`;
   - the host's NPCs on a guest are not pulled back while he is paused or within 1 s of his resume (npc_sync.lua,
-    `not put back: the host's game is paused or just resumed`).
+    `not put back: the host's game is paused or just resumed`);
+  - the leash (see "The leash"): while the host is paused a guest's warning or countdown freezes at its value and the
+    banner says `THE HOST PAUSED`; no pull until he runs again.
 - **Our own pause** counts too: after a tick gap of more than 0.5 s (our game stood while the host's cars drove on)
   the guest reports no knocks for 1 s (`traffic: our own game stood for a while`, `TRZ ev=localgap`), and the resume
   of our own detector puts every copy of everybody's things in the 1 s grace.
@@ -509,6 +515,8 @@ he gets.
 |---|---|---|---|---|
 | 0x0200 | WorldEnv | host -> guests (`Broadcast`; `SendTo` a newcomer) | R | f32 timeOfDay (hours 0..24), f32 timeFlowSpeed, str weatherSet, u32 sampleMs (0.16.0, optional) |
 | 0x0207 | JoinReport | guest -> host (`SendToHost`) | R | u8 flags (1 reconnect, 2 complete, 4 late), u32 afterMs, u8 n, n x (u8 system, i32 ms of its first arrival, -1 none), str missing (at most 200 bytes) |
+| 0x0208 | LeashConfig | host -> guests (`SendTo` each guest once per join / return, `Broadcast` on a change) | R | u16 warnM, u16 maxM, u8 countdownS (0 = warning only), u8 flags (bit0 1 = leash on); 6 bytes, trailing bytes ignored |
+| 0x0209 | LeashEvent | guest -> host (`SendToHost`) | R | u8 kind (1 warn, 2 countdown, 3 pulled, 4 back), u16 distM (to the host's puppet on the guest's game); on each change and every 5 s while warn / countdown last |
 
 WorldEnv (src/game/world_env.h, world_env.cpp, world_env.lua; since the world-join change no longer in PlayerSync) is
 sent while the host is in the world: at once to every newcomer (also a guest back after a lost connection: newcomers
@@ -553,7 +561,33 @@ here and we are in the world (log `join: world complete in X s`, trace `JN ev=co
 not come 15 s after we are in the world, `join: still missing ... after 15 s` (`JN ev=complete missing=...`), and a
 late complete follows if it comes. The guest sends the result in JoinReport 0x0207 (once per verdict); the host logs
 it (`join: player N's world is complete in X s (...)`) and traces it (`JN ev=report`). An older host ignores the
-message. `tools/sync_compare.py` "Join and reconnect" and the `join.complete_s` target (<= 10 s).
+message. `tools/sync_compare.py` "Join and reconnect" and the `join.complete_s` target (<= 10 s). The leash waits for
+this verdict (complete or the 15 s report, `JoinSync::Settled`) and 20 s more after every join and reconnect.
+
+### The leash (host authority, not checked in game)
+
+src/game/leash.h (the logic, tests/leash_test.cpp), src/game/leash_sync.h (the session part), player_sync.lua
+`M.Leash` / `M.LeashPull` (the reading and the pull); the spec is docs/host-authority.md section 3. The host reads
+`leash_warn_m` (300), `leash_max_m` (400) and `leash_countdown_s` (10) from MafiaCoop.ini every 2 s and sends them in
+LeashConfig to every guest when he joins or comes back (newcomers keyed by `(id, joinSeq)`) and to everyone when they
+change; `leash_warn_m = 0` turns the leash off, `leash_countdown_s = 0` is warning only. On a guest every script tick:
+the ground-plane distance from us (our car while we sit in one) to the host's puppet's newest target; 300 m and over
+the banner `FAR FROM THE HOST - THE STREETS THIN OUT (340 M)` (in 10 m steps), over 400 m `TOO FAR FROM THE HOST -
+BACK IN 10 S` counting down (under 380 m stops it, under 280 m ends the warning: hysteresis 20 m), at 0 s the pull
+while we are still over 400 m: the screen fades out (`HUD_FaderFadeOut(0.25)`, as the failed-mission flow uses it),
+on foot we are put beside the host (`M.NearHost`, as after being downed), at the wheel our car goes on the road 15 m
+behind the host (`game.traffic:GetClosestPointOnRoad`, its second argument UNVERIFIED; else 4 m to his right),
+facing his heading and stopped, and we stay in it (its copies on the other games jump with it); the screen fades in
+and `PULLED BACK TO THE HOST` shows for 3 s. A pull that does not work is tried again 2 s later. The banner is the
+centre notice (module.cpp `DrawNotice`) after the reconnect and the story notices. Suspended (no banner, no
+countdown): our world not loaded and 5 s after; a fail-flow reload; the join / reconnect not settled (JoinReport
+complete or its 15 s verdict, `JoinSync::Settled`) and 20 s after; no state of the host's here; the host paused
+(PeerPaused: a running countdown or warning freezes, banner `THE HOST PAUSED`); a cutscene and 5 s after; we or the
+host downed / dead; 15 s after the host's puppet jumped more than 50 m in one state; we sit in the car the host is in;
+we are a passenger (the driver's leash moves the car). Each warn / countdown / pulled / back goes to the host in
+LeashEvent; his status panel shows `<NAME> IS FAR AWAY (420 M)` (12 s after the last one) or `<NAME> WAS PULLED BACK
+TO US` (5 s), no banner over his game. Trace `LSH` (docs/sync-trace.md); `tools/sync_compare.py` "Leash" with
+`leash.pulls` (info) and `leash.false_pulls` (0).
 
 ### Story: chapter, checkpoint, objectives, cutscenes (0.6.0)
 
@@ -1358,7 +1392,8 @@ the game layer does with it:
 
 - A lost guest that is back: his WorldEnv follower starts with a first sync again (one SetTime when off), a catch-up
   that ran when the connection was lost has had the host's flow speed put back; JoinSync times his world anew
-  ("Join and reconnect" above).
+  ("Join and reconnect" above), and his leash is suspended until that is settled and 20 s more; the host sends him
+  LeashConfig again (a newcomer by `(id, joinSeq)`; "The leash" above).
 - Newcomer detection keys by `(id, joinSeq)` (PlayerSync `_seenPlayers`, MissionSync `_seen`, WorldEnvSync
   `HostSender`), so a drop and a resume
   between two ticks (a guest's new Hello on the live Steam connection) still re-sends everything.
@@ -1435,8 +1470,8 @@ Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, 
 NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
 (0x0260-0x0262), MissionFail / FailVerdict, WorldEnv. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
 DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates2, NpcInfo, NpcLeave, GuestNpcStates2,
-GuestNpcInfo, GuestNpcLeave (0.16.0; their rates and the per-guest budget are the NPC publisher's), car damage, the
-rest.
+GuestNpcInfo, GuestNpcLeave (0.16.0; their rates and the per-guest budget are the NPC publisher's), LeashConfig /
+LeashEvent (lane 1, a few bytes now and then), car damage, the rest.
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
 parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way

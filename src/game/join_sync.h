@@ -145,6 +145,7 @@ public:
 
     bool Begun() const { return begun_; }
     bool Complete() const { return complete_; }
+    bool Reported() const { return reported_; }  // the 15 s "still missing" verdict is out
     bool Reconnect() const { return reconnect_; }
     // s after Begin of a system's first arrival, -1 none
     double FirstAfter(System s) const {
@@ -243,6 +244,9 @@ public:
     static void Attach(net::Session& session);
     static void Detach();
     static void Tick(float dt);  // render thread
+    // Guest: this join / reconnect is settled: the world is complete or its 15 s verdict is out (game/leash.h waits
+    // 20 s more before it warns). False before the session is active and again after a lost host. Any thread.
+    static bool Settled();
 };
 
 }  // namespace mc::game

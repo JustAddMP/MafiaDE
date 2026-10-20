@@ -5,6 +5,17 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
 ## Unreleased (toward 0.17.0), not yet verified in game
 
+- **The leash** (host authority, docs/host-authority.md section 3; NOT verified in game): a guest who goes far from
+  the host (whose game is the only one with a living world around it) sees `FAR FROM THE HOST - THE STREETS THIN OUT
+  (340 M)` from 300 m, from 400 m `TOO FAR FROM THE HOST - BACK IN 10 S` counting down (coming back under 380 m stops
+  it), and at 0 s the screen fades and he is put back beside the host; driving, his car is put on the road 15 m behind
+  the host facing his way, with him in it; then `PULLED BACK TO THE HOST`. The host's status panel shows `MILES IS FAR
+  AWAY (420 M)`. No warning or pull during loading screens, cutscenes, the host's pause (the countdown freezes: `THE
+  HOST PAUSED`), while anyone is downed, after the host's teleports, the first 20 s after a join / reconnect, in the
+  host's car, as another guest's passenger, or during a failed mission's reload. Host ini `leash_warn_m` (300, 0 =
+  off), `leash_max_m` (400), `leash_countdown_s` (10, 0 = warning only), sent to every guest (LeashConfig 0x0208;
+  LeashEvent 0x0209 back). Replayed against the 2026-10-20 sessions in tests/leash_test.cpp (A: no warning; B: warning
+  at 300 m, countdown at 400 m, one pull). Trace `LSH`, sync_compare `leash.pulls` / `leash.false_pulls`.
 - Update check (core v0.13.0): once per game start the mod asks https://justaddmp.com/api/version/mafia-de for the
   newest MafiaCoop release (the newest GitHub release of this repo, pre-releases included). When it is newer than
   this build, a banner at the main menu says so for 20 s ("UPDATE AVAILABLE: MafiaCoop v0.17.0 is out (you have

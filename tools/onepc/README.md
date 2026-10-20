@@ -34,6 +34,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | character | 10-guest-new-character | host: `puppet 1 removed (his character changed)` then `spawned` with the new profile within ~1 s |
 | loss | 11-after-loss | guest log: `puppet 0 is gone (removed by the game, #1)`, `... (loaded before) not ready in 4 s: the spawner is stuck`, `factory reset: the spawner is stuck`, `puppet 0 spawned` within ~5 s; never `did not load in 12 s` for a known profile |
 | a minute | 12-a-minute-later | traffic and pedestrians around both; both puppets still there |
+| leash (by hand, after the steps above: `Lua 1 tools\onepc\leash_test.lua`, then again in a car, then once with the host in his pause menu) | a guest screenshot at the countdown and after the pull | run.log: `moved to ... (450 m from the host, ...)`; guest: banner `TOO FAR FROM THE HOST - BACK IN 10 S` counting down, log `leash: ... -> countdown`, after ~10 s the screen fades and `leash: pulled back beside the host (foot)` (in the car: `(road)` or `(beside)`, still in the car), `PULLED BACK TO THE HOST` for 3 s; host status panel `<NAME> IS FAR AWAY (450 M)`; host paused: banner `THE HOST PAUSED`, no pull until he resumes, then the rest of the countdown |
 | traffic | (run.log lines `host traffic:` / `guest traffic:`, tools/onepc/traffic_probe.lua) | host: `ours: 0-40 m N (no driver 0), 40-60 m ..., 60- m N (no driver K)`: the cars without a driver are the far ones (the game streams drivers out beyond ~50 m; one within 40 m is a real get-out); guest: `copies N: driver seated N, crew out 0` (unless a host car's driver really got out next to the host) |
 
 ## Expected `compare.ps1` (sync_compare --check)
@@ -51,6 +52,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | traffic.crew_exits_per_min | <= 1 per minute of copies (was 26.5 on the guest in session A, 5.2 in B: drivers the host's game streamed out 45-76 m from him counted as gone) |
 | traffic.reseats_per_min | <= 3 per minute of copies (was 71.6 on the guest in session A: crews leaving copies that were pushed off their standing car, and every get-out put back) |
 | traffic "driven off" line | `copies of a standing car driven off it` near 0 % (was 13 % of the standing rows in session A) |
+| leash.false_pulls / leash.pulls | 0 / 1-3 (one per leash_test.lua move; none while the host was paused) |
 | join.complete_s | <= 10 s (now timed from the world's load, not from joining in the menu) |
 | log counts, files | `savesys: written: (garage\|my2k\|profile_data\|.slot)` 0 and `savesys: written: save` 0 on both (only settings are written for real in co-op, the host's too: he hosts a FREE RIDE, not his story); `save write #n kept out` >= 1 and `kept out of the player's profile` >= 1 on the host |
 | run_stop.ps1 | `profile and save files changed by the run: 0` (before anything is put back; was garage.pf and aslot\save1.sav for the host in the 2026-10-20 test) and `saves: 0 file(s) differ`; only settings (gamesettings.pf, videoconfig.cfg, ...) may be listed as `restored` |

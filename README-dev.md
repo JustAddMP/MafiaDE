@@ -639,6 +639,10 @@ Measuring: every session writes a sync trace; compare the two with tools/sync_co
 - Settings (ini or `--key value`): `net_budget_kbps` (per-peer limit, KiB/s, default 1024), `net_state_hz` (default
   60), `net_interp_ms` (default 50). Host: `enemies_target_guests` (default 1: the host's enemies target the guests' puppets,
   docs/game-api.md 15).
+- The leash (host's ini, sent to the guests; docs/host-authority.md 3, docs/protocol.md "The leash"): `leash_warn_m`
+  (default 300; 0 = off), `leash_max_m` (400), `leash_countdown_s` (10; 0 = warning only). Read every 2 s, so a change
+  applies in the session. Logic tests: `out\leash_test.exe` (the 2026-10-20 sessions replayed: tests/data/leash_1020.h
+  from `python tools\extract_leash.py`); in game: tools/onepc/leash_test.lua on the guest.
 - **Sync trace (0.14.0, always on):** each session writes `out\logs\trace\mafiacoop[-<tag>]-<date>-<time>.trace`:
   every state sent and received, clocks, every controller decision per puppet / car copy, readbacks of what the game
   really did (car controls, engine, gear, wheel angle; puppet seat, physics, sprint), NPC distances (guest) and a copy
