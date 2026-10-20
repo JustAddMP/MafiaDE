@@ -35,6 +35,8 @@ constexpr GameInfo kInfo = {
     .proxyBuiltName = L"mafiacoop_proxy.dll",
     .proxyPointerName = L"mafiacoop_path.txt",
     .proxyMarker = "MafiaCoop-proxy-dll:v1 (version.dll forwarder that loads mafiacoop.dll)",
+    // Update check (core 0.13): https://justaddmp.com/api/version/mafia-de, the newest GitHub release of this repo.
+    .updateId = "mafia-de",
 };
 
 }  // namespace

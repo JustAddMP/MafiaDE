@@ -12,7 +12,7 @@ git rev-parse --verify --quiet "refs/tags/%TAG%^{commit}" >nul || ( popd & echo 
 git -c advice.detachedHead=false checkout --detach "refs/tags/%TAG%" || ( popd & exit /b 1 )
 popd
 call "%ROOT%\external\core\build.cmd" || ( echo Core build failed. & exit /b 1 )
-for %%t in (net_loopback net_password net_kick net_lobby net_interest net_motion net_fuzz proxy_test pending_join crash_dump launcher_args config_set test_input) do (
+for %%t in (net_loopback net_password net_kick net_lobby net_interest net_motion net_fuzz proxy_test pending_join crash_dump launcher_args config_set test_input update_check) do (
   "%ROOT%\external\core\out\%%t.exe" >nul || ( echo Core test %%t failed. & exit /b 1 )
 )
 call "%ROOT%\build.cmd" || ( echo Game build failed. & exit /b 1 )

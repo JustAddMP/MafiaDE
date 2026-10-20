@@ -225,6 +225,8 @@ the launcher arguments still work.
 | `--window left\|right` | Keep the game window on the left/right half of its monitor's work area (full height, title bar kept), for watching two test instances side by side. Unset = the window is left alone. |
 | `--model <alias>` | Your character (see "Characters" below), e.g. `--model sam_hat`; wins over the ini until you pick another in the CO-OP panel. |
 | `--test_pad 1` | Tests: a virtual gamepad the game and our panels read like a real one, pressed with `mc_pad(...)` from the dev console. |
+| `--update-as <version>` | Tests: the update check compares the newest release with this version instead of modVersion, e.g. `--update-as 0.15.0` (see "Update check"). |
+| `--update-url <url>` | Tests: the update check asks this URL instead of https://justaddmp.com/api/version/mafia-de. |
 
 ini equivalents: `host = 1`, `join = ...`, `join_lobby = ...`, `transport = ...`, `name = ...`, `port = ...`,
 `password = ...`, `require_password_for_invites = 0|1`,
@@ -290,6 +292,25 @@ follows through the ResizeBuffers hook). Both windows open; the games sit at the
 Steam account, so both show the same name; that is expected). Before 0.13.0 these commands had `--name Host` /
 `--name Guest`, which is why name tags said HOST / GUEST in tests. Both instances share one SteamID, so they can only connect over UDP; Steam P2P needs
 two accounts on two PCs. Stop with `taskkill /IM mafiadefinitiveedition.exe /F`.
+
+### Update check
+
+Once per game start (core v0.13.0, `external/core/src/core/update_check.h`) the dll asks
+`https://justaddmp.com/api/version/mafia-de` (`GameInfo::updateId` in `src/game/game_info.cpp`), which answers with
+the newest GitHub release of this repo, pre-releases included, e.g.
+`{"mod":"mafia-de","latest":"v0.16.0","prerelease":true,"url":"https://github.com/JustAddMP/MafiaDE/releases/tag/v0.16.0","download":".../MafiaCoop-0.16.0.zip",...}`
+(the website caches it for 5 minutes; source: the justaddmp.com repo, `app/api/version/[mod]/route.ts`). The request
+starts on the overlay's first frame, on its own thread, 5 s per step. If `latest` is newer than `modVersion`, a
+banner "UPDATE AVAILABLE" shows for 20 s once the main menu is up, and CO-OP SETTINGS keeps a gold line
+"UPDATE AVAILABLE: V... AT JUSTADDMP.COM". Nothing waits for it; offline, a timeout or an odd answer only log.
+
+To see the banner without a newer release, pretend to be an older build:
+`out\MafiaCoop.exe --update-as 0.15.0`. The log shows
+`update check: checking as version 0.15.0`, `update check: asking https://justaddmp.com/api/version/mafia-de` and
+`update check: v0.16.0 is available (this is v0.15.0)`; at the main menu the banner appears. Without it:
+`update check: up to date (this is v0.16.0, newest release v0.16.0)`. Check the endpoint itself with
+`curl https://justaddmp.com/api/version/mafia-de`. Core's `update_check` test covers parsing and comparing versions
+and a whole check against a stand-in server; `make_release.cmd` runs it.
 
 ## Lua bridge and dev console
 

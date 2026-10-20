@@ -654,6 +654,11 @@ README-dev.md "Sync architecture checks").
   game: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.16.0. Not ticked until README-dev.md "Test checklist:
   0.16.0" (the "Sync architecture checks" with `sync_compare.py --check`) passes.
 
+- [ ] Update check (core v0.13.0): at every game start the dll asks https://justaddmp.com/api/version/mafia-de for
+  the newest release and shows "UPDATE AVAILABLE ... GET IT AT JUSTADDMP.COM" at the main menu (and a line in CO-OP
+  SETTINGS) when it is newer. Built 2026-10-20 toward 0.17.0; the check ran against the live endpoint from a test
+  harness. Not ticked until the banner is seen in game (`--update-as 0.15.0`, README-dev.md "Update check").
+
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.
   Done 2026-10-15 (core v0.5.0, its docs/protocol.md "Leaving cleanly"): `ExitProcess` / `TerminateProcess(self)`

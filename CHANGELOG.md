@@ -3,6 +3,17 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## Unreleased (toward 0.17.0), not yet verified in game
+
+- Update check (core v0.13.0): once per game start the mod asks https://justaddmp.com/api/version/mafia-de for the
+  newest MafiaCoop release (the newest GitHub release of this repo, pre-releases included). When it is newer than
+  this build, a banner at the main menu says so for 20 s ("UPDATE AVAILABLE: MafiaCoop v0.17.0 is out (you have
+  v0.16.0). Get it at justaddmp.com") and CO-OP SETTINGS shows "UPDATE AVAILABLE: V0.17.0 AT JUSTADDMP.COM". The
+  request runs on its own thread with 5 s timeouts; offline or any other failure only writes a log line
+  (`update check: ...`). Checked against the live endpoint from a test harness (as 0.15.0: v0.16.0 found; as
+  0.16.0: up to date); the banner in game is not yet seen.
+- Core v0.13.0 (from v0.12.0): the update check; no other change, protocol stays 9.
+
 ## 0.16.0 (2026-10-20), pre-release, not yet verified in game
 
 The fixes for the problems found in the 2026-10-18 one-PC test and the 2026-10-19 two-PC test, and a rewrite of how
