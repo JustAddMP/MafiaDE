@@ -2,6 +2,7 @@
 #include "game/sectors_guard.h"
 
 #include "core/config.h"
+#include "core/diag.h"
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
@@ -23,6 +24,7 @@
 #include "game/player_motion.h"
 #include "game/pvp_hit.h"
 #include "game/seats.h"
+#include "game/vis.h"
 #include "mc/core_version.h"
 #include "mc/game_info.h"
 #include "game/latency.h"
@@ -871,6 +873,12 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     rem.lastVeh = vc;
     rem.inCar = inCar;
 
+    // the session summaries' counts (core/diag.h)
+    if (lc.fix == motion::LocomotionCommand::Fix::Snap) core::diag::Add("player.foot_snaps");
+    if (vc.justPinned) core::diag::Add("player.car_pins");
+    if (vc.retried) core::diag::Add("player.car_retries");
+    if (vc.fix == motion::VehicleCommand::Fix::Snap) core::diag::Add("player.car_snaps");
+
     // trace: what the controllers saw and decided (docs/sync-trace.md PUP / VEH)
     const bool event = lc.fix == motion::LocomotionCommand::Fix::Snap || vc.justPinned || vc.retried ||
                        vc.fix == motion::VehicleCommand::Fix::Snap;
@@ -1312,6 +1320,21 @@ int McTrace(lua_State* L) {
     return 0;
 }
 
+// mc_vis(kind, key, ev, extra): a VIS record (game/vis.h) from the Lua glue; kind "player" (key = the player id of
+// the puppet). extra: "k=v ..." or nil. GameMainThread only.
+int McVis(lua_State* L) {
+    const int kt = lua::TypeOf(L, 1), et = lua::TypeOf(L, 3), keyType = lua::TypeOf(L, 2);
+    if (kt != lua::TString || et != lua::TString || (keyType != lua::TNumber && keyType != lua::TString)) return 0;
+    const std::string kind = lua::ToString(L, 1);
+    const std::string ev = lua::ToString(L, 3);
+    const float key = lua::ToNumber(L, 2);
+    const char* extra = lua::TypeOf(L, 4) == lua::TString ? lua::ToString(L, 4) : nullptr;
+    if (kind != "player" || !(key >= 0 && key < 256)) return 0;
+    const auto id = static_cast<uint32_t>(key);
+    vis::Event(vis::Kind::Player, id, ev.c_str(), "rx", static_cast<int>(id), extra && *extra ? "%s" : nullptr, extra);
+    return 0;
+}
+
 // mc_mapmark(icon, target, puppet, changed, failed, hasPos, x, y, z, lx, ly, lz, brainPending) -> want, action: what
 // to do with a remote player's map marker (game/map_markers.h; player_sync.lua M.MarkersTick). icon
 // "none"/"human"/"pos", target "none"/"puppet"/"pos", the flags 1/0 (brainPending may be left out: 0); returns the
@@ -1671,6 +1694,7 @@ bool LoadModule(lua_State* L) {
     MC_LOG_INFO("sync: Lua glue loaded (%s, version %s)", origin, lua::ToDisplay(L, -1).c_str());
     lua::RegisterGlobal(L, "mc_player_profile", &McPlayerProfile);
     lua::RegisterGlobal(L, "mc_trace", &McTrace);
+    lua::RegisterGlobal(L, "mc_vis", &McVis);
     lua::RegisterGlobal(L, "mc_carswap", &McCarSwap);
     lua::RegisterGlobal(L, "mc_mapmark", &McMapMark);
     lua::RegisterGlobal(L, "mc_mapmark_probe", &McMapMarkProbe);
@@ -1695,11 +1719,7 @@ bool LoadModule(lua_State* L) {
     return true;
 }
 
-void LuaError(const std::string& err) {
-    ++_luaErrors;
-    if (_luaErrors <= 20 || _luaErrors % 200 == 0)
-        MC_LOG_WARN("sync: MafiaCoop.Update error #%u: %s", _luaErrors, err.c_str());
-}
+void LuaError(const std::string& err) { _luaErrors = lua::ReportError("sync", "MafiaCoop.Update", err); }
 
 void MainTick(lua_State* L, float dt) {
     // what the render thread received for this system so far is handed to the game now (sync trace LAT)
@@ -1927,6 +1947,8 @@ void PlayerSync::Detach() {
     std::lock_guard lock(sh.mu);
     if (sh.active || !sh.remotes.empty()) {
         MC_LOG_INFO("sync: session ended, removing %zu puppet(s)", sh.remotes.size());
+        for (const auto& [rid, rem] : sh.remotes)
+            vis::Event(vis::Kind::Player, rid, "remove", "rx", static_cast<int>(rid), "why=session_end");
         sh.removeAll = true;
     }
     sh.active = false;
@@ -1963,6 +1985,7 @@ void PlayerSync::OnPlayerLeft(net::PlayerId id) {
     sh.removed.push_back(id);
     peer_pause::RemoveRemote(static_cast<uint8_t>(id));
     MC_LOG_INFO("sync: player %u left, removing their puppet", id);
+    vis::Event(vis::Kind::Player, id, "remove", "rx", static_cast<int>(id), "why=left");
     core::trace::Line("PLX", "id=%u", id);
 }
 
@@ -2064,8 +2087,14 @@ void PlayerSync::Tick(float dt, bool enterDown, bool aimDown) {
         static double clockAt = 0;
         if (active && core::trace::IsOpen() && Now() - clockAt >= 1.0) {
             clockAt = Now();
+            core::diag::Set("player.remotes", static_cast<double>(sh.remotes.size()));
             for (const auto& [id, rem] : sh.remotes) {
                 const net::PlayerInfo* pi = _session->FindPlayer(id);
+                char dn[40];
+                std::snprintf(dn, sizeof dn, "player.p%u.hz", id);
+                core::diag::Set(dn, rem.rateHz);
+                std::snprintf(dn, sizeof dn, "player.p%u.dropped", id);
+                core::diag::Total(dn, rem.dropped);
                 const double ahead = rem.snaps.empty() ? 0 : (rem.snaps.back().t - (clockAt - rem.offset)) * 1000;
                 core::trace::Line("CLK", "id=%u off=%.4f rtt=%.1f hz=%.1f snaps=%zu newest=%.1f recv=%u drop=%u "
                                   "last=%.3f pd=%.1f pdt=%.1f jit=%.1f late=%u sclk=%.1f ow=%.1f",

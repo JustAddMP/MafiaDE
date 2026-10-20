@@ -713,8 +713,7 @@ void MainTick(lua_State* L, float dt) {
     lua::PushString(L, cmds);
     std::string err;
     if (!lua::PCall(L, 2, 1, &err)) {
-        if (++_luaErrors <= 20 || _luaErrors % 200 == 0)
-            MC_LOG_WARN("damage: Update error #%u: %s", _luaErrors, err.c_str());
+        _luaErrors = lua::ReportError("damage", "Update", err);
         lua::SetTop(L, top);
         return;
     }

@@ -100,7 +100,8 @@ KNOWN ISSUES
   car copies driving too slowly, two drivers in one car, shots between players, motorbikes, swimming, a paused
   game, traffic losing its drivers, changing character) and rewrites how the games stay in step: the other
   players, their cars, enemies, pedestrians (now shared), traffic (now shared wherever players are) and the time
-  of day. All of it is built and checked by automated tests only. Please send the logs (both PCs) after playing.
+  of day. All of it is built and checked by automated tests only. After playing, please send the newest zip from
+  the logs\bundles folder (both players).
 - A player sitting in a car cannot be shot by the other players, not even through an open window.
 - After a player gets off a motorbike, its copy may stay on the other screens for up to a second.
 - Car damage and car colours are not shared for traffic that a friend's game spawned.
@@ -145,9 +146,11 @@ UNINSTALL
 PROBLEMS
 --------
 Logs and crash reports are written to the "logs" folder next to mafiacoop.dll. Each co-op session also writes a
-detailed sync record to logs\trace (about 250 MB an hour; only the newest 20 are kept). When something looks wrong
-in co-op, zip the whole "logs" folder on both PCs and send both. Report problems at
-https://github.com/JustAddMP/MafiaDE/issues
+detailed sync record to logs\trace (about 250 MB an hour; only the newest 20 are kept), and when the session ends
+(or you quit the game) one zip with everything about it to logs\bundles (MafiaCoop-<date>-<time>-host.zip or
+-guest.zip; your password is not in it). After playing, send the newest zip from the logs\bundles folder - both
+players. If the game crashed, a "...-recovered.zip" is made the next time you start it: send that one. Report
+problems at https://github.com/JustAddMP/MafiaDE/issues
 
 Unofficial fan-made mod, not affiliated with or endorsed by 2K, Hangar 13 or Valve. You need your own copy of the
 game; the mod contains no game files. MinHook (c) Tsuda Kageyu, BSD 2-clause licence: licenses\MinHook-LICENSE.txt.

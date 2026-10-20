@@ -5,6 +5,22 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
 ## Unreleased (toward 0.17.0), not yet verified in game
 
+- **Session diagnostics** for the two-PC tests (core session-logs; **NOT verified in game**, built and unit-tested,
+  sync_compare checked on the 2026-10-20 one-PC traces): every session writes a header (`SES`: versions, exe CRC,
+  role, Steam, transport, every setting with passwords redacted, window / monitor, OS, fps, paths, each peer, the
+  leash in force on both sides), `SCK` clock samples every 5 s (sync_compare lines the traces up by the session
+  clocks now: 0.3 / 0.8 ms off on one PC against 1.8 - 2.2 ms for the RX method), `SUM` every 10 s (latency, loss,
+  KB/s per peer and lane, fps, warnings, and the game's numbers: traffic / ped / NPC copies, snaps, pins, held NPCs,
+  leash, guest world, Lua errors per module) with a `session: summary` log line a minute, `VIS` for every authority /
+  visibility event with a key that matches on both PCs (traffic, pedestrians and NPCs: the host's admit / leave per
+  guest and the guest's admit / show / hide / reuse / fail; player puppets: spawn / lost / hide / show / respawn /
+  despawn; held NPCs), and `FIN` totals at the end. At the end of a session (and at a game exit with it open) a zip
+  of it goes to `logs\bundles\MafiaCoop-<date>-<time>-<role>.zip` (trace, log, ini redacted, launcher logs, crash
+  dumps, manifest; a `-recovered` one after a crash); players send the newest one. Logs: ten previous runs kept,
+  warnings / errors rate limited per call site; traces: 1 GiB per file, 4 GiB per folder. Lua errors with the Lua
+  stack when the game's Lua allows it (probed once at the first tick, logged). sync_compare: bundles as input, the
+  two headers side by side with mismatches flagged (`session.mismatch`), clocks, SUM, per-entity VIS breakdowns,
+  FIN; and its one-way latency no longer comes out wrong by the 32-bit stamp wrap on a PC up for over 49.7 days.
 - Host authority, the guest's own world off (docs/host-authority.md work package A; **NOT verified in game**, built
   and unit-tested only): on a guest's game (never the host's) his own ambient traffic and police spawning are off and
   his pedestrian budget is 0 for the whole session, switched on the first tick of every world (the loading screen) and
