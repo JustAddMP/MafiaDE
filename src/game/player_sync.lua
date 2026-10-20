@@ -117,6 +117,8 @@ local DEFAULT_PROFILES = { [0] = "tommy", "characters/scotch/game/main/game_main
   "characters/scotch/game/main/game_main_sam", "characters/scotch/game/main/game_main_salieri" }
 local LOAD_TIMEOUT = 12    -- s a spawn profile may take to load (puppet) or to switch (our player) before it is bad
 M.badProfiles = M.badProfiles or {}
+M.loadedProfiles = M.loadedProfiles or {}  -- profiles a puppet spawner loaded on this game (not bad when one hangs)
+local RELOAD_TIMEOUT = 4  -- s: a profile that loaded before and is not ready again: the spawner is stuck
 
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -277,17 +279,29 @@ function M.SpawnTick()
     if not pp then f.busy = nil; return end
     if not f.load:IsDone() then
       -- A profile this game does not know never finishes loading, and the spawner stays stuck on it: mark it bad,
-      -- give the puppet the default character for its player and start a fresh factory.
-      if M.now - (f.loadT or M.now) > LOAD_TIMEOUT then
-        M.badProfiles[pp.profile] = true
-        local fb = M.Fallback(pp.id)
-        log(string.format("puppet %s: profile %s did not load in %d s, using %s instead", pp.id, pp.profile,
-          LOAD_TIMEOUT, fb))
-        if fb == pp.profile then pp.fails = 99 else pp.profile = fb end
-        M.FactoryReset("a profile did not load")
+      -- give the puppet the default character for its player and start a fresh factory. A profile that did load
+      -- before is not bad: the spawner is stuck (2026-10-20 two-PC test: after the game removed a puppet, every
+      -- later load on that spawner hung, the known profile and the fallback alike, and the puppet was given up for
+      -- good). A fresh factory loads it at once; the puppet is never given up.
+      local known = M.loadedProfiles[pp.profile]
+      local limit = known and RELOAD_TIMEOUT or LOAD_TIMEOUT
+      if M.now - (f.loadT or M.now) > limit then
+        if known then
+          log(string.format("puppet %s: profile %s (loaded before) not ready in %d s: the spawner is stuck, a fresh one "
+            .. "spawns it", pp.id, pp.profile, limit))
+        else
+          M.badProfiles[pp.profile] = true
+          local fb = M.Fallback(pp.id)
+          log(string.format("puppet %s: profile %s did not load in %d s, using %s instead", pp.id, pp.profile,
+            limit, fb))
+          if fb ~= pp.profile then pp.profile = fb end
+        end
+        pp.st, pp.retryT = "queued", M.now + 1
+        M.FactoryReset(known and "the spawner is stuck" or "a profile did not load")
       end
       return
     end
+    M.loadedProfiles[pp.profile] = true
     if not pp.tx then  -- preloaded, no position yet: wait, unless another player needs the component now
       pp.st = "preloaded"
       for _, o in pairs(M.pup) do
@@ -297,7 +311,15 @@ function M.SpawnTick()
     end
     f.busy = nil
     local so = try("CreateObject", f.comp.CreateObject, f.comp)
-    if not valid(so) then pp.st = "queued"; pp.fails = (pp.fails or 0) + 1; return end
+    if not valid(so) then
+      pp.st = "queued"; pp.fails = (pp.fails or 0) + 1
+      if pp.fails >= 3 then  -- this spawner makes nothing any more: a fresh one (never given up)
+        log("puppet " .. pp.id .. ": the spawner made no human " .. pp.fails .. " times: a fresh one")
+        pp.fails, pp.retryT = 0, M.now + 2
+        M.FactoryReset("the spawner makes nothing")
+      end
+      return
+    end
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
     so:SetDir(V(pp.hx, pp.hy, 0))
     so:Activate()
@@ -330,7 +352,7 @@ function M.SpawnTick()
   end
   local pick
   for id, pp in pairs(M.pup) do
-    if pp.st == "queued" and (pp.fails or 0) < 5 and (pp.tx or not pick) then
+    if pp.st == "queued" and M.now >= (pp.retryT or -1) and (pp.tx or not pick) then
       pick = pp
       if pp.tx then break end
     end
@@ -350,10 +372,30 @@ end
 -- it) around the moment it is unfixed (docs/game-api.md 7). A dynamic copy moved by SetPos/SetRot every tick
 -- stays put and keeps its occupants.
 -- ---------------------------------------------------------------------------------------------------------------
+-- An entity's number (its GUID). A motorbike's scene object has no GetGUID (in game 2026-10-20: it answers to
+-- GetName, GetPos, GetRot, GetDir, GetComponent, SetPos, SetRot, (De)Activate, IsActive, GetTransform only): it gets
+-- a number of our own, the same one for as long as the object lives (its car key, its copy's key on the others'
+-- games). Calling GetGUID on it was the 0.16.0 "cars error" that stopped every car and bike update for the rest of the
+-- ride (2026-10-20 two-PC test).
+-- The number is a string "16nnnnnn": above the entity ids the game hands out (1-8 million seen) and below 2^24, so the
+-- game's Lua (single-precision numbers: 2146000001 printed as "2.146e+09") keeps it exact through tonumber.
+M.synthIds = M.synthIds or { n = 0, list = {} }
 local function guidNum(o)
-  local s = tostring(o:GetGUID())
-  return s:match("(%d+)%s*$") or "0"
+  local good, g = pcall(function() return o:GetGUID() end)
+  if good and g ~= nil then return tostring(g):match("(%d+)%s*$") or "0" end
+  if not valid(o) then return "0" end
+  local list, keep = M.synthIds.list, {}
+  for _, e in ipairs(list) do
+    if same(e.o, o) then return e.id end
+    if valid(e.o) then keep[#keep + 1] = e end
+  end
+  M.synthIds.n = M.synthIds.n + 1
+  local id = "16" .. string.format("%06d", M.synthIds.n % 700000)
+  keep[#keep + 1] = { o = o, id = id }
+  M.synthIds.list = keep
+  return id
 end
+M.GuidNum = guidNum
 
 function M.KeyOf(ent)
   for k, c in pairs(M.cars) do
@@ -398,7 +440,8 @@ M.bikeProbed = M.bikeProbed or {}
 -- once per bike: which of the car methods its entity and its component answer to (docs/game-api.md 25: to be read
 -- from the log after the first ride)
 function M.BikeProbe(ent, mc, how)
-  local id = valid(ent) and guidNum(ent) or "?"
+  local good0, id0 = pcall(guidNum, ent)
+  local id = (good0 and valid(ent)) and id0 or "?"
   if M.bikeProbed[id] then return end
   M.bikeProbed[id] = true
   local function has(o, name)
@@ -443,9 +486,24 @@ function M.VehicleOf(h)
       memo = { e = oso, mc = motoOf(oso) or false }
       M.vehMemo2 = memo
     end
-    if memo.mc then return oso, memo.mc, "owner scene object" end
+    -- GetOwnerSceneObject can still name a bike after its rider got off (2026-10-20: the "cars error" went on for
+    -- minutes on foot): it is his bike only while the component's seat getter (in game: it has one) says he sits on it
+    if memo.mc and M.RidesBike(memo.mc, h) then return oso, memo.mc, "owner scene object" end
   end
   return nil
+end
+
+-- Does human h sit on the bike with component mc (its GetSeatOwner 0 or 1)? True when the getter does not answer.
+function M.RidesBike(mc, h)
+  local answered = false
+  for s = 0, 1 do
+    local good, o = pcall(function() return mc:GetSeatOwner(s) end)
+    if good then
+      answered = true
+      if valid(o) and same(o, h) then return true end
+    end
+  end
+  return not answered
 end
 
 -- the bike's model name: its component's GetVehicleModelName (what garage.lua / freeride.lua call), else the
@@ -2049,7 +2107,15 @@ end
 function M.GetOut(pp, fast)
   if pp.exitSo then return end
   if fast then
-    local good, r = pcall(pp.so.GetOutCarFast, pp.so)
+    -- GetOutCarFast takes the vehicle (in game 2026-10-20: without it "Missing adaptor arguments"; with the bike's
+    -- scene object the player got off)
+    local c = pp.bikeRec or (pp.vkey and M.cars[pp.vkey])
+    local veh = c and valid(c.ent) and c.ent or nil
+    if not veh then
+      local g2, oso = pcall(function() return pp.so:GetOwnerSceneObject() end)
+      veh = (g2 and valid(oso)) and oso or nil
+    end
+    local good, r = pcall(pp.so.GetOutCarFast, pp.so, veh)
     if good then
       pp.exitSo, pp.exitT = r or true, M.now
       log("puppet " .. pp.id .. " gets off the bike (fast)")
@@ -2673,7 +2739,15 @@ end
 
 function M.Drive(pp)
   local so = pp.so
-  if not valid(so) then M.ScriptForget(pp); pp.so = nil; pp.st = "queued"; return end
+  if not valid(so) then
+    -- the game removed it (2026-10-20 two-PC test: the Free Ride garage clears the humans around its door when a
+    -- player takes a vehicle out): spawned again at once, from a fresh spawner if this one is stuck (M.SpawnTick)
+    M.ScriptForget(pp); pp.so = nil; pp.st = "queued"
+    pp.lost = (pp.lost or 0) + 1
+    log(string.format("puppet %s is gone (removed by the game, #%d): spawned again", pp.id, pp.lost))
+    trace("PRT", string.format("id=%s ev=lost n=%d", pp.id, pp.lost))
+    return
+  end
   if M.PuppetLife(pp) then return end
   local gok, gerr = pcall(M.GuardTick, pp, so)  -- the shield: no local death (game/puppet_guard.h)
   if not gok then logErr("puppet guard", gerr) end
@@ -3049,7 +3123,7 @@ function M.Release(pp, so, why)
   local good, own = pcall(so.GetOwner, so)
   if good and valid(own) then  -- 1. out of its seat
     g.car, g.vkey, g.seat, g.st = own, pp.vkey, pp.seat or 0, "seat"
-    local fast, err = pcall(so.GetOutCarFast, so)
+    local fast, err = pcall(so.GetOutCarFast, so, own)  -- it takes the vehicle (in game 2026-10-20)
     if not fast then pcall(so.GetOffVehicle, so) end
     local g2, ownNow = pcall(so.GetOwner, so)
     g.outNow = not (g2 and valid(ownNow))

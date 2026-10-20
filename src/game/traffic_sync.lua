@@ -133,7 +133,15 @@ local function ourCar(e, mine)
   if M.fac and M.fac.car and same(M.fac.car, e) then return true end
   local N = M.Npc
   if N and N.cfac and N.cfac.car and same(N.cfac.car, e) then return true end
+  -- ped_sync.lua's copy spawner (2026-10-20 two-PC test: it went out as traffic, a crewed copy 40 m under the other
+  -- player whose crew "kept leaving seat 0")
+  local P = M.Peds
+  if P and P.fac and P.fac.car and same(P.fac.car, e) then return true end
   if mine and same(mine, e) then return true end
+  -- every puppet / copy spawner is a crewed car fixed 40 m under its player (FixCarPos); one left over from a reset
+  -- spawner is no traffic either. Ambient traffic is never fixed.
+  local okf, fixed = pcall(e.IsCarPosFixed, e)
+  if okf and fixed then return true end
   for _, c in pairs(T.copies) do
     if c.ent and same(c.ent, e) then return true end
   end

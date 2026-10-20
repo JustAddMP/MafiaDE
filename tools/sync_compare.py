@@ -52,6 +52,9 @@ TARGETS = {
     "foot.stand.p95": ("<=", 0.3, "puppet vs a standing player, p95 (m)"),
     "foot.gait": (">=", 90.0, "puppet gait matches the player's (%)"),
     "foot.snaps_per_min": ("<=", 0.5, "puppet snaps per minute on foot"),
+    "foot.shown": (">=", 98.0, "his puppet (or the car copy he sits in) there while his states arrive (% of the time)"),
+    "foot.respawns": ("<=", 0, "puppet spawned again without a character change or a new world (count)"),
+    "foot.dz_p95": ("<=", 0.5, "puppet height vs the player's on foot, p95 (m; a puppet under the floor)"),
     "car.p95": ("<=", 1.0, "car copy vs the driver's car, p95 (m)"),
     "car.pinned": ("<=", 10.0, "car copy pinned (% of samples)"),
     "car.speed_ratio": ("between", (0.9, 1.1), "copy speed / driver's speed, median"),
@@ -345,6 +348,51 @@ def compare(sender, receiver, args, worst):
         if len(on_foot_s) > 1:
             # PUP is written at 60 Hz while on foot: minutes on foot from the sample count (gaps not counted)
             record("foot.snaps_per_min", snaps / max(len(on_foot_s) / 60.0 / 60.0, 1e-6), who)
+    # ---- there at all (2026-10-20 test: a puppet that is gone counts in none of the numbers above) ----
+    pr = [(t, f) for t, f in receiver.records["PR"] if num(f.get("id"), -1) == sid]
+    if rx:
+        have = set(int(t * 2) for t, f in pr if f.get("hid") != "1" or f.get("veh", "nil") not in ("nil", "-"))
+        # the receiver's own pauses (menus: no script tick, no PR records) are left out
+        paused, since = set(), None
+        for t, f in receiver.records["PAU"]:
+            if num(f.get("id"), -1) != receiver.local:
+                continue
+            ev = f.get("ev")
+            if ev == "local-paused":
+                since = t - num(f.get("ms"), 0) / 1000.0
+            elif ev == "local-resumed" and since is not None:
+                paused.update(range(int(since * 2) - 1, int(t * 2) + 3))
+                since = None
+        if since is not None:
+            paused.update(range(int(since * 2) - 1, int(rx[-1][0] * 2) + 3))
+        bins = sorted(set(int(t * 2) for t, _ in rx) - paused)
+        ok = sum(1 for b in bins if b in have or b - 1 in have or b + 1 in have)
+        share = 100.0 * ok / max(1, len(bins))
+        print("    shown: his puppet (or the car copy he sits in) there in %.1f %% of %.0f s with his states arriving" % (
+            share, len(bins) / 2.0))
+        record("foot.shown", share, who)
+    spawns = [(t, s) for t, s in receiver.logs if ("puppet %d spawned" % sid) in s]
+    reasons = [t for t, s in receiver.logs if ("puppet %d removed" % sid) in s or ("puppet %d queued (" % sid) in s
+               or "local player in world" in s or "a new world" in s]
+    if spawns:
+        extra = 0
+        for i in range(1, len(spawns)):
+            t0, t1 = spawns[i - 1][0], spawns[i][0]
+            if not any(t0 <= tr <= t1 for tr in reasons):
+                extra += 1
+                if extra <= 4:
+                    print("    spawned again without a character change or a new world: %s" % receiver.wall(t1))
+        print("    puppet spawns: %d (%d without such a reason)" % (len(spawns), extra))
+        record("foot.respawns", extra, who)
+    dz = []
+    for t, f in pup:
+        cp = vec(f.get("cp"))
+        tp = truth_p.at(to_sender(t))
+        if cp and tp and len(cp) > 2 and len(tp) > 2 and f.get("have") == "1" and f.get("busy", "0") == "0":
+            dz.append(abs(cp[2] - tp[2]))
+    if dz:
+        print("    height, puppet vs player on foot: %s" % stats_line(dz))
+        record("foot.dz_p95", pct(dz, 95), who)
     if args.csv and rows:
         write_csv(args.csv, "foot-p%d-on-%s.csv" % (sid, receiver.role), [
             "t_receiver", "t_sender", "copy_x", "copy_y", "true_x", "true_y", "true_err", "ctl_err", "gait",
