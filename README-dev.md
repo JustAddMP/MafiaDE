@@ -352,7 +352,7 @@ on 2026-10-18 on one PC (two instances; Free Ride, CHAPTER 2: TAXI, CHAPTER 13: 
 signals, failed missions in one load (host's and guest's failure), the police offence fix (968d300). Everything else
 still needs the checks below. Two instances side by side on one PC (host `--window left`, guest `--window right`,
 `--debug-overlay`, see "Two instances on one PC"), unless a step says two PCs. After each run compare the traces
-(`python tools/sync_compare.py <host trace> <guest trace>`: it lists actions, swapped cars, guest-owned NPCs,
+(`python tools/sync_compare.py <host trace> <guest trace>`: it lists actions, swapped cars, held NPCs,
 traffic, map markers, latency and reconnects per game). Trace records: docs/sync-trace.md. Back up the save folder
 first and compare it afterwards: in the 2026-10-18 test `profiles\temporaryprofile\garage.pf` was written by both
 games during the co-op chapter.
@@ -474,12 +474,13 @@ Car damage and explosions (docs/game-api.md 23 / 24):
 - [ ] Grenade arc: a thrown grenade's flight shows on the other game and ends where it exploded (`... 0.0 m from
   where our simulation had it`: seen 2026-10-18; the drawn arc on screen still to confirm with a real throw).
 
-Guest-owned NPCs (docs/protocol.md "Guest-owned NPCs"):
+Held NPCs (docs/protocol.md "Held NPCs"; the guest-owned NPCs are retired):
 - [ ] A fight where the guest gets there first (Bon Appetit: the guest walks into the kitchen, the host stays
-  outside): the guest's enemies appear on the host (`guest N's own NPC ... : mirror M, AI type ..., profile ...`),
-  move and shoot; the host's hits reach the guest's NPC, the host's kill kills it; their hits on the host's puppet
-  reach the host (`our own NPC ... hit the host's puppet ...: sent to him`). When the host's game spawns that enemy
-  itself it is claimed (`guest N handed his NPC ... back`), no doubles. Trace NM / NO / NGO / NGE / NGC / NMC / NMX.
+  outside): 5 s after they spawn the guest's enemies vanish on his game and do not shoot him (`npc: our NPC ... has no
+  host NPC (unpaired for 5 s): held hidden ...`); nothing of them reaches the host (`npc.guest_sent` 0). When the
+  host walks in, his game spawns them and they appear on the guest as replicas (`our held NPC ... is host NPC ...
+  now: shown, its replica`), no doubles. LEAVE CO-OP with held NPCs: they come back with their own AI (`released
+  (session_end)`). Trace NHD / NHL, NGS held.
 
 Doors and world items (docs/protocol.md "Doors" / "World items"):
 - [ ] A story chapter with doors (Bon Appetit's restaurant, a chapter with a locked door): open, close, kick and
@@ -516,8 +517,7 @@ Reconnect (core docs/protocol.md "Reconnect", protocol.md "Reconnect"):
 
 Several guests (docs/protocol.md "Several guests"):
 - [ ] Three games (three PCs, or three instances): every game shows two puppets, NPC hits on any puppet, three in
-  one car (seat rules), two players going for one car's wheel (one wins, `driver claim` lines), each guest's own
-  NPCs on the other guest (trace NRL / NRH / SEA / DRV).
+  one car (seat rules), two players going for one car's wheel (one wins, `driver claim` lines) (trace SEA / DRV).
 
 Latency (docs/protocol.md "Latency budget"):
 - [ ] Two PCs: `CLK` playout delay and jitter, LAT p50 / p95 per system in `sync_compare.py` (one PC 2026-10-18:
@@ -569,9 +569,9 @@ Play in this order, both players together unless a step says otherwise (about 25
 4. **Pedestrians, 3 min:** walk a busy street together, look around; shoot one pedestrian each.
    `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m; the shot pedestrians die on both games (`PDE ev=killreq` / `death`).
 5. **NPCs, 5 min:** get a wanted level and let the host's cops chase the guest on foot; then a mission fight if one is
-   at hand (Bon Appetit cp_040/050). `npc.p95` <= 1.0 m, `npc.max` <= 4 m, `npc.bw` <= 8 KB/s. Guest log:
-   `freeze ... ok`; any `does not follow ... hidden, a copy shows it` means the AI freeze did not hold (note which).
-   No double damage on the guest (only Hits with source 1).
+   at hand (Bon Appetit cp_040/050). `npc.p95` <= 1.0 m, `npc.max` <= 4 m, `npc.bw` <= 8 KB/s, `npc.guest_sent` 0.
+   Guest log: `freeze ... ok`; any `does not follow ... hidden, a copy shows it` means the AI freeze did not hold
+   (note which). No double damage on the guest (only Hits with source 1).
 6. **World and join, 3 min:** the host sets the time flow fast (`game.gfx:SetTimeFlowSpeed(20)`) for a minute, then
    back; the guest leaves the session and joins again. `world.time_err` <= 0.5, `join.complete_s` <= 10;
    guest log `join: world complete in X s`; the cars parked before the rejoin are there (`PKR`).

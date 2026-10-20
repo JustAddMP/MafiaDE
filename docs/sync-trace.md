@@ -78,22 +78,24 @@ on the other.
 | `SWR` | both | on event | a real car hidden behind a copy: `key ev=swap orig at why`, `key ev=restore how=<copy/here> from p active copy wrecked why`, `key ev=forget orig world` |
 | `MK` | both | 1 Hz | Lua, the other players' map markers (game-api.md 13): `players puppet=<icons on a puppet> pos=<icons at a position> none=<players without an icon> ids=<player>:<nav id>/<human or pos icon>/<puppet or pos>/<check>[/brainwait],...` (`-` no icon; check, for an icon on a puppet: `ok` the game has it there, `unchecked` not yet (1 s after it was put there), `unknown` the check failed, else `-`; `/brainwait`: his puppet's friend brain switch is still to come, so his icon waits at his position) |
 | `MKE` | both | each marker change | Lua: `id nav ev=<create/to_puppet/to_pos/detach/remove/lost/give_up> icon=<human/pos> to=<puppet/pos> p=<position it was put at>` (moves at a position are not traced, see `MK`) |
-| `NHS` | host | 2 Hz | `sending hits kills mirrors=<guests' own NPCs with a state> shown=<with a copy> lateKills=<our NPCs killed as dead mirrors>` |
+| `NHS` | host | 2 Hz | `sending hits kills` (0.16: also `mirrors shown lateKills` of the retired guest-owned NPCs) |
 | `NP` | guest | 2 Hz per host NPC in range | `key loc=<our id; hidden:<id> for a paired NPC that did not follow> copy ai car=<0 on foot, 1 its car flag, 2 faster than 11 m/s: taken as in a vehicle> spd=<its speed, m/s> host=<pos> our=<pos> d=<m> hp=<host>/<ours> dead=<host>/<ours> age` (`spd`, `car=2` unreleased; unreleased: `host` is the replica target, the host's NPC interpolated and led to now, `spd` its velocity: not lined up with the host in time, `NPR` / `NPT` are) |
-| `NGS` | guest | 2 Hz | `live matched copies avg max kills snaps=<replica snaps> own=<our own NPCs> claims=<host claims carried out> unpairs=<pairs released: the host's NPC in a vehicle, ours on foot over 40 m off> refused=<paired NPCs that did not follow: hidden, a copy shown> fallbacks=<copies spawned with a fallback profile> frozen=<paired NPCs whose AI was interrupted> drives=<drive commands applied>` (unreleased: `snaps refused frozen drives` replace `pulls steers`) |
-| `NPT` | the authority (host; a guest for his own NPCs) | per NPC state sent (15 Hz near a receiver to 5 Hz at 120 m) | one authority per NPC, the truth: `key=<its entity id here> sT=<sample time, ms, this game's steady clock as TX's> p=<pos> v=<vx,vy m/s> g=<gait 0-3 from its speed>` (C++, unreleased) |
-| `NPR` | the receiver (guest; the host for guests' own NPCs) | 10 Hz per driven replica | `key=<the authority's key> from=<the authority's player id> kind=<1 a paired NPC, 2 a spawned copy> rT=<the authority time its target stood for, ms (render time + lead)> cp=<the replica where our game shows it> tp=<its target> err=<cp vs tp, m> fix=<0 none 1 nudge 2 snap> why=<-, far, height, stuck, teleport, blocked> g=<commanded gait> sg=<the authority's gait>` (C++, unreleased) |
+| `NGS` | guest | 2 Hz | `live matched copies avg max kills snaps=<replica snaps> held=<our NPCs held now> holds=<held so far> unholds=<shown again so far> unpairs=<pairs released: the host's NPC in a vehicle, ours on foot over 40 m off> refused=<paired NPCs that did not follow: hidden, a copy shown> fallbacks=<copies spawned with a fallback profile> frozen=<paired NPCs whose AI was interrupted> drives=<drive commands applied>` (unreleased: `snaps refused frozen drives` replace `pulls steers`; host authority: `held holds unholds` replace `own claims`) |
+| `NPT` | the authority (the host; 0.16: a guest for his own NPCs, retired) | per NPC state sent (15 Hz near a receiver to 5 Hz at 120 m) | one authority per NPC, the truth: `key=<its entity id here> sT=<sample time, ms, this game's steady clock as TX's> p=<pos> v=<vx,vy m/s> g=<gait 0-3 from its speed>` (C++, unreleased) |
+| `NPR` | the receiver (guest; 0.16: the host for guests' own NPCs, retired) | 10 Hz per driven replica | `key=<the authority's key> from=<the authority's player id> kind=<1 a paired NPC, 2 a spawned copy> rT=<the authority time its target stood for, ms (render time + lead)> cp=<the replica where our game shows it> tp=<its target> err=<cp vs tp, m> fix=<0 none 1 nudge 2 snap> why=<-, far, height, stuck, teleport, blocked> g=<commanded gait> sg=<the authority's gait>` (C++, unreleased) |
 | `NPS` | the receiver | per replica snap | `key from kind err=<m> why=<far, height, stuck, teleport, blocked>` (C++, unreleased) |
 | `NBW` | host | every 10 s per guest | `to=<guest> kbs=<NPC states + infos + leaves sent to him, KB/s> near=<NPCs in his interest>` (C++, unreleased) |
-| `NM` | host | 2 Hz per mirror (a guest's own NPC) | `mid from key=<its id on the guest's game> loc=<our copy> st=<copy state> ai guest=<pos there> our=<copy pos> d=<m> hp=<guest>/<copy> dead=<guest>/<copy> age` |
-| `NO` | guest | 2 Hz per own NPC | `key p hp dead ai` |
-| `NGO` | guest | on change | `key owned=<1 ours now, 0 not any more>` (C++) |
-| `NGE` | both | per GuestNpcEnd | `[from] key why=<0 died 1 handed back 2 gone 3 refused> host=<host NPC> hp byHost` (C++) |
-| `NGC` | guest | per NpcClaim | `key host dead ours` (C++) |
-| `NMC` | host | per claim sent | `mid to key host dead` (C++) |
-| `NMX` | host | mirror end | `mid why host hp` (C++) |
-| `NRL` | host | when the count changes | several guests: `to n=<other guests' own NPCs relayed to him this round> was` (C++; npc_owner.h "relay") |
-| `NRH` | host | per forwarded hit | several guests: a guest hit another guest's own NPC (its relay key): `from owner key=<the owner's id of it> amount type lethal` (C++; sent to the owner as HostNpcHit with `from` as the attacker) |
+| `NM` | host (0.16, retired) | 2 Hz per mirror (a guest's own NPC) | `mid from key=<its id on the guest's game> loc=<our copy> st=<copy state> ai guest=<pos there> our=<copy pos> d=<m> hp=<guest>/<copy> dead=<guest>/<copy> age` |
+| `NO` | guest (0.16, retired) | 2 Hz per own NPC | `key p hp dead ai` |
+| `NHD` | guest | per hold decision | held NPCs (src/game/npc_hold.h, C++): `key ev=<hold/show/kill> host=<the host NPC that paired with it, 0 none> why=<unpaired: no host NPC for 5 s / paired: a host NPC is it, its replica now / host_dead: that host NPC is dead, ours dies with it / session_end: shown with its own AI>` |
+| `NHL` | guest | 2 Hz per held NPC | Lua: `key p hp dead ai for=<s held>` |
+| `NGO` | guest (0.16, retired) | on change | `key owned=<1 ours now, 0 not any more>` (C++) |
+| `NGE` | both (0.16, retired) | per GuestNpcEnd | `[from] key why=<0 died 1 handed back 2 gone 3 refused> host=<host NPC> hp byHost` (C++) |
+| `NGC` | guest (0.16, retired) | per NpcClaim | `key host dead ours` (C++) |
+| `NMC` | host (0.16, retired) | per claim sent | `mid to key host dead` (C++) |
+| `NMX` | host (0.16, retired) | mirror end | `mid why host hp` (C++) |
+| `NRL` | host (0.16, retired) | when the count changes | several guests: `to n=<other guests' own NPCs relayed to him this round> was` (C++; npc_owner.h "relay", deleted) |
+| `NRH` | host (0.16, retired) | per forwarded hit | several guests: a guest hit another guest's own NPC (its relay key): `from owner key=<the owner's id of it> amount type lethal` (C++; sent to the owner as HostNpcHit with `from` as the attacker) |
 | `SEA` | both | per seat yield | several players in one car: `key from=<our seat> to=<seat we slide to> claims=<id:seat of the others' states> ok` (Lua, src/game/seats.h) |
 | `SCP` | both | per change | where a remote player's car copy stands (Lua, seats.h `PlaceCopy`): `key ev=place dec=<wait at_car aside hold release> blk=<m to the nearest other car, -1 none> for=<s his spot has been blocked> spot=<candidate:x,y,z beside his car, - none>`; `key ev=oldcopy drop=<key of the parked copy of his earlier car dropped from his spot> last=<its last driver>`; `ev=world dropped=<records looked up again in a new world>`; `key ev=reseat id seat aside=<1 copy beside his car>` (the puppet is seated anew: the record's car is another entity now); `key ev=lookwait id seat` (the puppet waits for our new copy's look before it is seated, car_look.h holds) |
 | `DRV` | both | once per conflict | two other players claim the wheel of one car: `key keeps=<the driver here> claims=<the other one>` (Lua) |
@@ -203,7 +205,8 @@ Per player as seen on the other game:
   engine lines.
 - **NPCs** (guest): host NPCs in range and paired, the distance of ours from its target, the NPCs most often more
   than 3 m off; drive commands, snaps, frozen and refused paired NPCs (`NGS`).
-- **NPC replicas** (unreleased; both directions: the host's NPCs on the guest, the guest's own NPCs on the host): each
+- **NPC replicas** (unreleased; the host's NPCs on the guest; a 0.16 trace's guest-owned NPCs on the host are no
+  longer listed): each
   replica (`NPR`) against the authority's NPC at the same moment (`NPT`, Hermite through its states with their
   velocities, at the receiver's time mapped to the authority's clock through the player states' clock relation, as
   "on foot"), overall, paired NPCs and spawned copies apart; the controller error; how far the target's time was behind
@@ -211,9 +214,11 @@ Per player as seen on the other game:
   `--check`.
 - **NPC bandwidth** (unreleased): NPC bytes the host sent to each guest per `NBW` (median / max KB/s) and the NPCs in
   his interest; `npc.bw` for `--check` (<= 8 KB/s).
-- **guest-owned NPCs:** how many NPCs became the guest's own (only his game had them), how they ended (died,
-  handed back to the host, gone, claim refused), the host's claims, how often the host showed them with a copy and
-  how far that copy was from the guest's NPC.
+- **held NPCs** (host authority): the guest's NPCs with a job that no host NPC paired with for 5 s, held hidden
+  (`NHD`, `NHL`): how many, how many a host NPC paired with later (shown) or killed, released at the session's end, the
+  longest held; and what the guest sent of his own NPCs: his `NPT` states and the guest-owned NPC messages
+  (0x0421-0x0426, by name or id) going out in his NetMonitor reports, `npc.guest_sent` for `--check` (target 0; a
+  0.16 trace also shows what its guest-owned rule made his own: 1350 states in session A of 2026-10-20).
 - **traffic:** per direction (each game an authority for its own cars): its cars near the other player, bytes per
   second, unchanged states skipped, budget deferrals; the copy-vs-target error and the copies most often off; the
   true error (`TRC cp` against the authority's `TRS` at the same moment, the clocks lined up by the RX offsets;

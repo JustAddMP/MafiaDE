@@ -889,10 +889,11 @@ void TestReceiver() {
 void TestIds() {
     using mc::game::latency::SystemOf;
     namespace lat = mc::game::latency;
-    Check(SystemOf(0x0212) == lat::kNpc && SystemOf(0x0424) == lat::kNpc, "latency: NpcStates2 / GuestNpcStates2 = npc");
-    Check(SystemOf(0x0213) == lat::kNpcEvent && SystemOf(0x0214) == lat::kNpcEvent &&
-              SystemOf(0x0425) == lat::kNpcEvent && SystemOf(0x0426) == lat::kNpcEvent,
-          "latency: NpcInfo / NpcLeave (both ways) = npc-event");
+    Check(SystemOf(0x0212) == lat::kNpc, "latency: NpcStates2 = npc");
+    Check(SystemOf(0x0213) == lat::kNpcEvent && SystemOf(0x0214) == lat::kNpcEvent,
+          "latency: NpcInfo / NpcLeave = npc-event");
+    Check(SystemOf(0x0424) == lat::kCount && SystemOf(0x0425) == lat::kCount && SystemOf(0x0426) == lat::kCount,
+          "latency: the retired GuestNpcStates2 / Info / Leave are no system");
 }
 
 int main() {

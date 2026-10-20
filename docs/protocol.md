@@ -48,6 +48,12 @@ PedStates / PedSpawn / PedGone / PedDeath / PedKill (0x0280-0x0284); retired: Np
 (0x0420); WorldEnv gets an optional trailing u32 sampleMs; the PlayerState pose byte gets bits 3-5 (swimming, under
 water, motorbike) without a format change.
 
+Host authority, NPCs (unreleased, docs/host-authority.md WP-D `host-npcs`; NOT checked in game): NPCs come from the
+host only. Retired, neither sent nor read (ids reserved, never reused): GuestNpcEnd / HostNpcHit / NpcClaim
+(0x0421-0x0423) and GuestNpcStates2 / GuestNpcInfo / GuestNpcLeave (0x0424-0x0426), as GuestNpcStates (0x0420) since
+0.16.0. A guest's NPC that no host NPC is is held hidden on his game (see "Held NPCs"); a 0.16.0 guest's own NPCs are
+not shown on such a host (the integration's `modVersion` bump keeps the builds apart).
+
 Latency (0.15.0; core `kProtocolVersion` 9: lanes, session clock, app message send stamps, core
 docs/protocol.md "Latency"): no message of ours changes; PlayerState's u32 time is now the moment the state was
 sampled (was: sent), which only shifts the receiver's timeline. See "Latency budget" at the end.
@@ -628,14 +634,15 @@ message. `tools/sync_compare.py` "Join and reconnect" and the `join.complete_s` 
 | 0x0410 | NpcHit | guest -> host (`SendToHost`) | R | u32 key, f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (0.11.0: 1 = lethal, the guest's replica died of his hits) |
 
 **One authority per NPC** (0.16.0; `src/game/npc_replica.h`, `tests/npc_replica_test.cpp`; NOT checked in game).
-Every NPC is simulated by exactly one game: the host for its NPCs (mission NPCs, police, anything with a job, mission
-civilians), a guest for the NPCs only his game has ("Guest-owned NPCs" below). Every other game shows a **replica**
+Every NPC is simulated by exactly one game: the host (mission NPCs, police, anything with a job, mission civilians;
+since host authority, docs/host-authority.md, the host only: an NPC only a guest's game has is held there, "Held NPCs"
+below; 0.16.0 made the guest the authority for those, "Guest-owned NPCs (retired)"). Every other game shows a **replica**
 (its own NPC paired with it, or a spawned copy) that is driven from the authority's states every tick and never runs
 its own AI for it. Before, the guest's paired NPC ran its own combat and movement AI and was only pulled back after
 6 m (12 m in a fight) for 1.5 s: host cops chasing the guest were p95 60 m, max 252 m off in the first two-PC test.
 
-- key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`), as in NpcDeath, NpcHit, Hit's npc,
-  NpcClaim and the relay keys. **net** = a u16 the host gives an NPC while it publishes it (one number space for all
+- key = the NPC's entity id on the host's game (the number in its `C_EntityGuid`), as in NpcDeath, NpcHit and Hit's
+  npc. **net** = a u16 the host gives an NPC while it publishes it (one number space for all
   guests; freed when the NPC is gone, reused only after the 65535 others), named by NpcInfo. Ordering: a guest gets
   NpcLeave, then NpcInfo, then NpcStates2 of a round (the two reliable ones on lane 0 in order); states of a net id
   whose info has not arrived yet are kept and shown once it has; an NpcInfo naming a known net id with another key
@@ -643,8 +650,7 @@ its own AI for it. Before, the guest's paired NPC ran its own combat and movemen
 - **What the host sends (interest, per guest):** every round (15 Hz) the host's Lua glue lists the NPCs within 140 m of
   any guest's puppet (128 at most, nearest first) that are not **ambient humans** (not a player / puppet / copy, not in
   a vehicle, AI type 0 and not named after a mission spawner: `npcrep::IsAmbientHuman`, the contract with the
-  `ambient-peds` package, whose humans in `MafiaCoop.PedOwned` are skipped as well), not deactivated and not a copy of
-  a guest's NPC. Core's `InterestManager` (Kind::Npc) decides per guest: viewpoint = his puppet; enter within 120 m,
+  `ambient-peds` package, whose humans in `MafiaCoop.PedOwned` are skipped as well) and not deactivated. Core's `InterestManager` (Kind::Npc) decides per guest: viewpoint = his puppet; enter within 120 m,
   leave beyond 140 m; one state every 1/15 s up to 30 m, linearly down to one every 0.2 s at 120 m (5 Hz; the plan's
   2 Hz left the far target 0.6-0.7 m off at p95 in the unit test), an NPC slower than 0.35 m/s half as often (at most
   1 s apart), a dead one at most once a second; a byte budget of 7000 B/s of records per guest (~8 KB/s with the
@@ -686,7 +692,7 @@ its own AI for it. Before, the guest's paired NPC ran its own combat and movemen
   hits the guest here is given back (player_sync.lua `M.OnLocalDamage`, `N.IsPicture`). The guest's damage from host
   NPCs always comes from the host: their hits on his puppet there go to him as a Hit with source 1 and the NPC's key,
   and are always applied (since 0.16.0: before, a hostile paired NPC that "fought him on his own game" skipped them; now
-  only an NPC his own game is the authority for skips it, `npcrep::SkipRelayedHit`).
+  only an NPC his own game is the authority for skips it, `npcrep::SkipRelayedHit`: none since host authority).
 - **The guest's hits:** a hit on a replica hurts it on his game and goes to the host as NpcHit; the host replays a
   bullet as a real shot from the guest's puppet (`CreateShots`, so the NPC's own hit reaction and damage apply), else
   `DoDamage(amount)`; a replay that does not land within 0.35 s is `DoDamage`. When the guest's replica dies within
@@ -723,85 +729,56 @@ its own AI for it. Before, the guest's paired NPC ran its own combat and movemen
   copy is looked for or spawned during a loading screen and for 4 s after it (a copy spawned before the mission had
   placed its car landed on it).
 
-### Guest-owned NPCs (0.15.0; not yet checked in game)
+### Held NPCs (host authority; unreleased, NOT checked in game)
 
-The reverse of the copies above: NPCs that only a guest's game has. Every game spawns a checkpoint's waves for its
-own player, so a guest who got somewhere first has enemies the host's game has not spawned (yet); the host saw
-nothing of them before.
+NPCs come from the host only (docs/host-authority.md). Every game runs the chapter's mission scripts, so a guest who
+got somewhere first has NPCs the host's game has not spawned (yet). Such an NPC is never sent anywhere and does not
+fight on the guest's game; the rule is C++ (`src/game/npc_hold.h`, unit-tested by `tests/npc_hold_test.cpp`), the
+game side npc_sync.lua (`N.HoldRound`, `N.Hold`, `N.Unhold`):
 
-| App id | Name | Dir | Channel | Body |
-|---|---|---|---|---|
-| 0x0420 | GuestNpcStates | - | - | retired (0.16.0): neither sent nor read (was the full NpcStates body, guest -> host, 10-15 Hz) |
-| 0x0424 | GuestNpcStates2 | guest -> host (`SendToHost`) | U, per NPC 15 Hz near another player to 5 Hz at 120 m | the NpcStates2 body (the guest's sample time on his steady clock, net ids of the guest's own numbering) |
-| 0x0425 | GuestNpcInfo | guest -> host (`SendToHost`) | R | the NpcInfo body; key = the NPC's entity id on the guest's game |
-| 0x0426 | GuestNpcLeave | guest -> host (`SendToHost`) | R | the NpcLeave body |
-| 0x0421 | GuestNpcEnd | guest -> host (`SendToHost`) | R | u32 key, u8 reason (0 died, 1 handed back, 2 gone, 3 claim refused), u32 hostKey (1 and 3: the host NPC), u16 health (its last), u8 flags (1: it died of the host's hit) |
-| 0x0422 | HostNpcHit | host -> that guest (`SendTo`) | R | u32 key (the guest's NPC), f32 amount, u8 damageType, u8 hitZone, u32 weaponId, u8 flags (1 = lethal: the host's copy died of his hits), u8 attacker (0.15 multi-guest, trailing: the player whose hit it was, 0 the host; another guest when he hit the NPC relayed to him; read as 0 when missing, older readers stop before it) |
-| 0x0423 | NpcClaim | host -> that guest (`SendTo`) | R | u32 guestKey, u32 hostKey, u8 flags (1: the guest's NPC is dead) |
+- **Which (guest):** every round (15 Hz) his Lua glue lists his NPCs with a job (AI type not 0; ambient humans are
+  ped_sync's) on foot within 100 m (|dz| < 30 m; the 96 nearest), no puppet, spawned copy, traffic copy crew or
+  pedestrian replica, with the host NPC each is paired with (npc_sync's usual pairing above); and every held one,
+  wherever it is. None in the first 10 s after his world loaded or during a cutscene (a gap of more than 1 s in the
+  rounds restarts the wait). NPCs in a vehicle are not held (the drivers of his own traffic are guest_world's; mission
+  cars driven by NPCs are docs/host-authority.md WP-F).
+- **Held:** one that stays unpaired (alive) for **5 s** is held: hidden where it is (`ShowModel(false)`, physics state
+  2, demigod), its AI interrupted as a paired replica's (`InterruptBattle`, `InterruptCivilWander`, `InterruptPatrol`,
+  `InterruptAvoidingCar`, `SetReactionOnSound(false)`; again every 2 s, and the model hidden again). Its shots on the
+  guest's player are given back like a replica's (`N.IsPicture`). Its mission scripts keep running: it is never
+  despawned.
+- **Paired later:** when a host NPC pairs with it (the host's game spawned it: the same spot within 1.5 m, or the same
+  tag / AI type within 40 m after 2 s, as any pairing), it is shown at once (model, physics state 0, demigod off) and
+  is that NPC's replica, driven like any paired NPC; paired with a dead host NPC it is shown and dies with it. A
+  pairing that is released again (5 s without host states) starts its 5 s again.
+- **Dead:** an NPC that died before it was held is never held; a held one that dies (its own scripts) stays hidden.
+- **Released:** when the session ends (or the game becomes the host), every held NPC is shown with its own AI again
+  (`ResumeBattle`, `SetReactionOnSound(true)`); with a new world nothing is remembered.
+- Log: `npc: our NPC <id> has no host NPC (unpaired for 5 s): held hidden ...`, `our held NPC <id> is host NPC <key>
+  now: shown, its replica`, `... released (session_end)`; trace `NHD` (each decision), `NHL` (2 Hz per held NPC),
+  `NGS held holds unholds`; `tools/sync_compare.py` "NPCs only <guest>'s game had" and `npc.guest_sent` (target 0).
+- Replay of session A of the 2026-10-20 two-PC test (tests/data/npc_guest_1020.h, `tools/extract_npc_guest.py`): the
+  0.16.0 rule made one guest cop (AI type 4) his own three times and sent 1350 states of it (GuestNpcStates2 in 27 of
+  53 NetMonitor reports, ~1340 messages, ~60 KB); his three other NPCs with a job were paired at the same spot. Under
+  this rule the cop is held at the same moment (120.4 s), stays held for 148 s (no host NPC ever paired with it) and
+  is shown at the session's end; the three paired ones are never held; nothing is sent.
 
-The ownership rules are C++ (`src/game/npc_owner.h`, unit-tested by `tests/npc_owner_test.cpp`); the game side is
-npc_sync.lua.
+### Guest-owned NPCs (0.15.0-0.16.0; retired by host authority)
 
-- **Which NPCs (guest):** 10 times a second the guest reports his NPCs with a job (AI type not 0) within 100 m (the
-  64 nearest; none in the first 10 s after his world loaded or during a cutscene) with the host NPC each is paired
-  with. One that stays unpaired for 5 s (alive) becomes **his own**: the 16 nearest at most, their states go to the
-  host as GuestNpcStates2 through the same publisher as the host's (0.16.0): the guest is their authority; the
-  interest viewpoints are the other players (their puppets on his game), so an NPC of his that no other player is
-  within 120 m of is not sent (its mirror on the host ends after 5 s and comes back when someone gets near). Spawned copies (his copies of host NPCs) are never
-  reported, and the C++ side drops any id in the copy list again (no feedback loop). A paired moment restarts the 5 s;
-  an NPC that died before it was his own is never sent.
-- **Mirrors (host):** every guest NPC gets a mirror id (unique on the host; at most 24 per guest). It is shown like a
-  guest's copy of a host NPC (above), the other way round: a human from the copy spawner with the NPC's spawn profile
-  (the guest reads it from the NPC's spawner name like the host does; since 0.16.0: profile 0, e.g. the guest's cops,
-  gets the fallback by AI type as above: the 0.15.0 test showed 0 of 179 samples of 12 such cops), its weapon and
-  health, driven from the
-  guest's states (since 0.16.0: a replica driven like the guest's replicas of host NPCs: the host keeps one
-  replica::Stream per guest and drives the mirror's copy with the same controller and correction; its shots as
-  pictures), a civilian on the host's game (no fight of its own), at most 10 at a time, within 90 m of the host,
-  released 12 s after its death, 5 s after the last state, in a car, in a cutscene, with the session and the world.
-  Mirror copies are never in the host's NpcStates2 (no NPC goes back to the game it came from).
-- **Other guests (several guests, 0.15 multi-guest; not yet checked in game):** the host relays its mirrors of guest
-  A's own NPCs to every other guest in its NpcStates2 (since 0.16.0: through the host's publisher like its own NPCs,
-  stamped with the host's round time, only to the guests whose share it is and within their interest; never to A
-  himself), keyed by a **relay key**: A's entity id for it with its type byte (8, a human: an id is `slot << 8 |
-  type`, docs/game-api.md `mc_entity_ids`) replaced by `0xF0 + A` (`npcown::RelayKey`). No entity id has such a type
-  byte, so it never collides with a host NPC, and it stays below 2^24, so the game's Lua (32-bit float numbers) holds
-  it exactly; an id that does not fit (slot >= 65536) is not relayed. Guest B treats it like any host
-  NPC: his own version of that NPC (his game spawned the same wave) pairs with it, so it never becomes B's own as well,
-  or he shows a spawned copy of it. Live mirrors with a state of the last second and dead ones (so B's copy dies) are
-  relayed; none with a claim under way. B's hits on it come to the host as NpcHit for the relay key; the host forwards
-  them to A as HostNpcHit with B as the attacker, and A replays them from B's puppet (a lethal one kills A's NPC). When
-  A and B both owned the same NPC before either saw the other's (both games spawned it before the host's did; the same
-  spot, or the same tag within 40 m, one-to-one, nearest first), only the lower id's is relayed to the other: B pairs
-  his with A's and hands his back (GuestNpcEnd handed back, hostKey = the relay key), and A never gets B's, so the
-  two cannot hand each other's back in a loop. A guest who leaves or drops takes his relayed NPCs along.
-- **Hits:** the host's hit on a mirror's copy goes to its guest as HostNpcHit; he replays a bullet as a real shot
-  from the host's puppet on his game (`CreateShots`; else, or when it does not land within 0.35 s, `DoDamage`), so
-  the NPC turns on the host's puppet. When the copy dies within 1.5 s of the host's hit, the hit is lethal: 0.8 s
-  later the guest's NPC is killed if it still lives (the same rules as a guest's lethal NpcHit). The guest's own NPCs
-  shoot at every puppet on his game (all puppets get the FRIEND brain where the game-sectors guard is in,
-  player_sync.lua `M.Ally`); their hits go to that puppet's player as a Hit with source 1 (0.15 multi-guest: to any
-  player; before, only hits on the host's puppet were sent and another guest's puppet drew the fire for nothing). The
-  host takes them like any NPC's, and so does another guest (since 0.16.0: his own version of that NPC, paired with its
-  relay key, is a replica driven from the relay and never fights him itself; before, a hostile one skipped them).
-- **Deaths:** the guest's NPC dies -> GuestNpcEnd died -> the mirror's copy dies on the host (health also follows the
-  guest's down, never up). The host kills the copy -> lethal HostNpcHit -> the guest's NPC dies.
-- **Back to the host (no doubles):** when the host's own game spawns that NPC (the host arrives), it is paired again
-  and the host is authoritative for it. Either the guest's usual pairing finds the host NPC (same spot, or same kind
-  within 40 m after 2 s) or the host **claims** it: a host NPC (alive, with a job, sent for 2.5 s, no copy) at the
-  same spot as a mirror (1.5 m, same tag or none) or of the same tag within 40 m (8 m height) is sent to that guest
-  as NpcClaim (pairs taken nearest first, same spot first; one claim per mirror and per host NPC at a time). The
-  guest pairs them (a spawned copy of that host NPC goes), or answers GuestNpcEnd claim refused (his NPC is paired
-  with another host NPC, that host NPC with another of his, or no state of it yet); no answer in 3 s counts as
-  refused, and a refused pair is not tried again for 15 s. On the pairing the guest sends GuestNpcEnd handed back
-  with its health: the host releases the copy and lowers his own NPC's health to it. A late GuestNpcStates2 of an
-  ended NPC (unreliable after reliable) makes no new mirror for 3 s.
-- **Dead mirrors:** a mirror that died is remembered for 60 s: a host NPC that spawns at its place (same rules)
-  in that time is claimed dead: the host kills his NPC (the guest already killed it) and the guest pairs it with his
-  dead one, so it gets no copy there.
-- **Gone:** an NPC of his own out of the guest's rounds for 2 s (out of 100 m, despawned) ends (GuestNpcEnd gone); a
-  mirror without a state for 5 s ends on the host; a guest who leaves takes his mirrors along.
-- Bandwidth: at most 16 NPCs x 15 Hz x 19 bytes = ~4.6 KB/s per guest at most (was ~7 KB/s with GuestNpcStates).
+0.15.0 / 0.16.0 made a guest the authority for NPCs only his game had: sent to the host, shown there as mirrors
+(spawned copies), relayed to the other guests under relay keys, claimed back by the host when its game spawned them
+(`npc_owner.h`, deleted). Retired with host authority (the "Held NPCs" above instead); the ids stay reserved, never
+reused, and are neither sent nor read:
+
+| App id | Name | Was |
+|---|---|---|
+| 0x0420 | GuestNpcStates | (retired in 0.16.0) the full NpcStates body, guest -> host |
+| 0x0421 | GuestNpcEnd | guest -> host: one of his own NPCs died / was handed back / went / a claim refused |
+| 0x0422 | HostNpcHit | host -> that guest: the host (or another guest, relayed) hit his own NPC |
+| 0x0423 | NpcClaim | host -> that guest: the host's game has that NPC now |
+| 0x0424 | GuestNpcStates2 | guest -> host: his own NPCs as NpcStates2 |
+| 0x0425 | GuestNpcInfo | guest -> host: as NpcInfo |
+| 0x0426 | GuestNpcLeave | guest -> host: as NpcLeave |
 
 ### Traffic (0.15.0; by region since 0.16.0; not yet checked in game)
 
@@ -1207,8 +1184,8 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
     (WEAPON_THROWN, the selected explosive) up to 12 s before within 70 m (one throw, one explosion; the oldest
     pending throw first). Kind and weapon from the throw; a molotov also when a BURNING_FIRE sound is within 9 m and
     2 s (flag 1);
-  - on the host one of its NPCs threw it, on a guest one of his own NPCs (guest-owned NPCs above): flag 2 with its
-    key. Receivers show those only where that NPC is shown by a spawned copy (which runs no fight of its own); a game
+  - on the host one of its NPCs threw it (0.16.0 also: on a guest one of his own NPCs; retired with the guest-owned
+    NPCs, a held NPC throws nothing): flag 2 with its key. Receivers show those only where that NPC is shown by a spawned copy (which runs no fight of its own); a game
     that runs its own copy of the NPC (a paired mission NPC) has that NPC's own grenades already;
   - a car: the game whose player drives it (or, parked, whose own explosion blew it up; on the host any shared
     traffic car), seen as CAR_HAVE_PROBLEM with `GetCarProblem() == EXPLODE`.
@@ -1216,9 +1193,9 @@ tests/explosion_test.cpp; the game side in explosion_sync.lua; docs/game-api.md 
   game by its own mission; an explosion of someone else's (an enemy of a guest's own fight) is that game's.
 - **Who is hurt, once.** The sender's own DAMAGE events decide, through the usual paths: a puppet in the blast or the
   fire sends **Hit** (Phase 6; fire summed for 0.5 s into one Hit, like a ram) to its player; on a guest a copy of a
-  host NPC sends **NpcHit** (fire summed per NPC for 0.5 s; a copy that died of it makes the hit lethal); on the host
-  a guest's own NPC's copy sends **HostNpcHit**; the host's own NPCs and a guest's own NPCs on his own game simply
-  take it. An NPC's explosion on the host hurting a guest's puppet goes to him like any NPC hit (Hit, source 1).
+  host NPC sends **NpcHit** (fire summed per NPC for 0.5 s; a copy that died of it makes the hit lethal); the host's
+  own NPCs simply take it (0.16.0: a guest's own NPC's copy on the host sent HostNpcHit, retired; a held NPC is a
+  demigod). An NPC's explosion on the host hurting a guest's puppet goes to him like any NPC hit (Hit, source 1).
   The sender keeps an **own zone** where its explosion went off (blast 14 m / 2.5 s; molotov fire 9 m / 35 s;
   UNVERIFIED reach and duration): explosion or fire damage there whose message names no attacker (or a non-human
   one) counts as its player's, so it is sent on too.
@@ -1353,8 +1330,8 @@ the game layer does with it:
 
 | lost guest | the session is inactive / back | DoorSync: nothing is sent or applied meanwhile; when the session is active again the glue reads its doors again and asks the host for a DoorSnapshot (reason reconnect) |
 | everyone | a player is dropped | CarDamageSync forgets him as the holder of cars and as someone who asked for a state: his cars' copies ask whoever drives them next; when he is back his copies ask for every car's state again |
-| host | a player is dropped | NpcSync drops his mirrors (his own NPCs; `HostMirrors::OnPlayerLeft`, the Lua side drops their copies), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
-| lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our own NPCs (GuestOwner) stay ours and are sent again after the rejoin (the host makes new mirrors). MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
+| host | a player is dropped | NpcSync forgets his interest counters (no mirrors since host authority), TrafficSync forgets him as a peer (`HostTraffic::RemovePeer`: nothing is sent to him; when back he is a new peer and gets every near car spawned again) |
+| lost guest | the session is inactive | TrafficSync's Lua drops the host-traffic copies and brings our own traffic back (spawning on, the cars it hid shown again); the C++ side forgets the host's cars. Our held NPCs are shown with their own AI again (the session is inactive) and held again 5 s after the rejoin when still unpaired. MissionSync gives up its fail role meanwhile (`FailRole::None`): a mission failing in the gap takes the game's own way (FreeRoamRetry, then the usual follow after the rejoin) instead of a report nobody would send |
 
 - A lost guest that is back: his WorldEnv follower starts with a first sync again (one SetTime when off), a catch-up
   that ran when the connection was lost has had the host's flow speed put back; JoinSync times his world anew
@@ -1371,9 +1348,8 @@ the game layer does with it:
   dropped, the story Lua with `active = 0`), that his NPC copies re-pair after the rejoin, and Steam P2P reconnects
   (lobby membership after a drop).
 - Several guests: each held slot is independent (core tests/net_reconnect.cpp section 10: two of three guests lost at
-  once, both back into their own slots, no newcomer meanwhile). A guest who drops takes his own NPCs' relay to the
-  others along; when he is back, his GuestOwner sends them again and the lower-id rule (above) settles any NPC that
-  another guest owned meanwhile.
+  once, both back into their own slots, no newcomer meanwhile). (No guest's NPCs go to the others since host
+  authority: nothing of his to take along.)
 
 ## Several guests (3-4 players; 0.15 multi-guest, not yet checked in game)
 
@@ -1384,9 +1360,9 @@ Sessions take up to 4 players (host + 3 guests, core `kMaxPlayers`). What change
 |---|---|
 | PlayerState, PlayerModel, CarParked | every peer `Broadcast`s, the host relays to the other guests: each game drives one puppet per other player (`Remote` per id) |
 | Hit (player -> player) | `SendTo(victim)`, guest -> guest through the host relay; the victim replays from the attacker's puppet; friendly fire as before |
-| NPC hits on puppets | host NPCs -> any guest's puppet (as before); a guest's own NPC -> any puppet on his game, sent to that puppet's player (was: the host's only) |
+| NPC hits on puppets | host NPCs -> any guest's puppet (as before); 0.15-0.16: a guest's own NPC -> any puppet on his game (retired: his NPCs without a host NPC are held) |
 | NpcStates2 | per guest by interest around his puppet (0.16.0; before: NpcStates broadcast, at most 48 in turns from each player's nearest) |
-| Guest-owned NPCs | relayed by the host to the other guests (relay keys); hits forwarded to the owner with the attacker; one owner per NPC (lower id) |
+| Guest-owned NPCs | retired (host authority): each guest holds his NPCs that no host NPC is; nothing is relayed (0.15-0.16: relay keys, hits forwarded to the owner, one owner per NPC) |
 | Seats | ride along skips seats the other players' states claim; the same passenger seat twice: the lower id keeps it, the other slides; the wheel of one car claimed by two other players: the current one keeps it |
 | Traffic | every game is an authority for its own traffic, with an interest set per other player (24 cars, 40 KB/s budget); a car near two players has one net id; a guest's traffic goes to the other guests through the host's relay (0x0224-0x0226); two guests together far from the host share the lower id's region; a player who drops is a new peer when back and his cars' copies go everywhere (0.16.0) |
 | Failed missions | a guest's failure is his own (MissionFail -> FailVerdict to him only, the others play on); the host's failure is everyone's (HostFailed broadcast); tests/fail_flow_test.cpp "3 guests" |
@@ -1397,15 +1373,13 @@ Sessions take up to 4 players (host + 3 guests, core `kMaxPlayers`). What change
 
 Bandwidth with 4 players (estimates from the per-message sizes above, host upstream): PlayerState ~60-140 B x 60 Hz
 per player, the host sends his own and relays two others' to each guest: ~3 x 3 x 6 KB/s = ~55 KB/s in cars; NpcStates
-~45 B x 48 x 10 Hz = ~22 KB/s per guest (broadcast; since 0.16.0: NpcStates2 by interest, <= 8 KB/s per guest including
-the relayed guests' own NPCs); traffic up to 40 KB/s per guest (its budget). Worst case ~3 x (18 + 22 + 22 + 40) = ~300
+~45 B x 48 x 10 Hz = ~22 KB/s per guest (broadcast; since 0.16.0: NpcStates2 by interest, <= 8 KB/s per guest); traffic up to 40 KB/s per guest (its budget). Worst case ~3 x (18 + 22 + 22 + 40) = ~300
 KB/s up from the host, ~100 KB/s down to each guest; the relay limit per guest (`net_budget_kbps`, 1024 KB/s) is far
 above what one guest sends. Per-guest totals: core's traffic log (`net: <name> (<id>): ... out .. KB/s, in ..`
 every `net_log_interval` s, per peer), the overlay's traffic line on the host ("guest N: cars of relevant (KB)"),
 trace `TRP` per guest.
 
 Known limits (documented, not fixed):
-- A guest's own NPCs reach the other guests only through the host (one more hop: ~1 RTT later than the host's own).
 - Puppets are spawned one at a time (one runtime spawner): with three others the last one may appear a few seconds
   after the first.
 - Two players in one car: their name tags and map markers overlap.
@@ -1431,12 +1405,11 @@ A lane message still comes after the lane-0 messages sent before it; lane 0 does
 NPC death sent after a mission change can arrive before it (UNVERIFIED that no handler minds; none checks for it).
 
 Priorities against the per-peer send budget (`net_budget_kbps`, lowered automatically on a lossy / backed-up link):
-Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, HostNpcHit, NpcClaim,
-NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
+Critical (never thinned or deferred): PlayerState, CarParked, PlayerModel, Hit, NpcHit, NpcDeath, explosions and throws (0x0240-0x024F), DoorEvent / DoorApply, ItemTake / ItemGone / Collectible, police
 (0x0260-0x0262), MissionFail / FailVerdict, WorldEnv. Bulk (first to go): TrafficStates (thinned), ItemStates (thinned),
-DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates2, NpcInfo, NpcLeave, GuestNpcStates2,
-GuestNpcInfo, GuestNpcLeave (0.16.0; their rates and the per-guest budget are the NPC publisher's), car damage, the
-rest.
+DoorSnapshot and HostSave (deferred, in order). Normal: NpcStates2, NpcInfo, NpcLeave (0.16.0; their rates and the
+per-guest budget are the NPC publisher's), car damage, the rest. (The retired 0x0420-0x0426 have no priority any
+more.)
 
 Per system: the delay from the sender's game to the receiver applying it (wire + both games' frames), measured
 parts from core's `net_latency` (loopback) and our tests, the rest estimated (E) for 60 fps games and a one-way

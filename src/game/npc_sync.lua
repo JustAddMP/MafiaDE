@@ -3,9 +3,9 @@
 -- a copy at <dll dir>\npc_sync.lua overrides it.
 --
 -- Every game runs the chapter's own mission scripts at the host's checkpoint, so the mission NPCs exist on every game,
--- spawned by the same scripts at the same places. Each NPC has ONE authority (docs/protocol.md "NPCs",
--- src/game/npc_replica.h): the host for its NPCs, a guest for the NPCs only his game has. Only the authority's AI
--- decides what the NPC does; every other game shows a *replica* driven from the authority's states every tick:
+-- spawned by the same scripts at the same places. Each NPC has ONE authority, the host (docs/protocol.md "NPCs",
+-- docs/host-authority.md, src/game/npc_replica.h). Only the host's AI decides what the NPC does; every guest shows a
+-- *replica* driven from the host's states every tick:
 --   - Host: every round (15 Hz) the NPCs near any guest that are not ambient pedestrians (those are ped_sync.lua's,
 --     the `ambient-peds` package; npc_replica.h IsAmbientHuman, MafiaCoop.PedOwned) go to the C++ side (NS), which
 --     picks per guest what he gets and how often (interest by distance) and sends compact time-stamped states.
@@ -20,11 +20,12 @@
 --     (a local hit by a replica is given back: N.IsPicture). Our hits on a replica hurt it here and go to the host
 --     (NpcHit), where they are replayed as real shots from our puppet; a hit that killed our replica is lethal there.
 --     Mission scripts keep running here: a mission NPC is never despawned, only driven, hidden or killed.
---   - Guest-owned NPCs: an NPC with a job that only the guest's game has (he got somewhere first), unpaired for 5 s,
---     is the guest's own (src/game/npc_owner.h): its states go to the host the same compact way, the host shows each as
---     a spawned copy (a "mirror", keyed by its mirror id) driven like the guest's replicas; the host's hits on it go to
---     the guest, deaths go both ways; when the host's own game spawns that NPC it is paired again (NpcClaim) and the
---     host is its authority. Copies are never reported or sent (no loops).
+--   - Held NPCs (guest): an NPC with a job on foot that only the guest's game has (he got somewhere first), unpaired
+--     for 5 s, is HELD (src/game/npc_hold.h decides): hidden (no model, physics state 2, demigod), its AI interrupted,
+--     never sent anywhere, until a host NPC pairs with it (the usual pairing below): then it is shown and is that NPC's
+--     replica (one paired with a dead host NPC dies with it). Held NPCs are shown with their own AI again when the
+--     session ends. Mission scripts keep running: a held NPC is never despawned. (The guest-owned NPCs of 0.15 / 0.16,
+--     sent to the host and mirrored there, are retired.)
 --
 -- Input (cmds, one line per command):
 --   S active host                                session running, we host
@@ -38,19 +39,14 @@
 --                                                gait 0-3; mult: walk speed multiplier; reissue 1: walk to mx my mz now
 --                                                (gait 0: walk to tx ty tz and stand); fix 1: move by nx ny, 2: put it at
 --                                                tx ty tz facing hx hy; turn 1: face fx fy; refuse 1: it does not follow,
---                                                hide it and show a copy). On the host `key` is a mirror id
+--                                                hide it and show a copy)
 --   D key                                        guest: that host NPC died
 --   H from key amount dtype zone weapon lethal   host: guest `from` hit host NPC `key` on his screen (lethal 1: his
 --                                                replica died of it)
---   GN mid from key x y z hx hy health flags ai tag weapon profile shots
---                                                host: a state of guest `from`'s own NPC `key` (mirror id mid)
---   GD mid                                       host: that mirror died on the guest's game
---   GX mid reason hostKey health                 host: the mirror ends (reason 1 handed back to our NPC hostKey,
---                                                which takes the guest's health; 2 gone): its copy goes
---   GK hostKey mid                               host: our NPC hostKey is the guest's dead mirror mid: it dies
---   O key 1|0                                    guest: our NPC key is (no longer) our own, sent to the host
---   C key hostKey dead                           guest: the host claims our own NPC key as its NPC hostKey
---   X key amount dtype zone weapon lethal        guest: the host hit (his replica of) our own NPC key
+--   HH id                                        guest: hold our NPC id (no host NPC is it: hidden, AI interrupted)
+--   HS id hostKey why                            guest: show our held NPC id again (why 1: host NPC hostKey paired
+--                                                with it, it is its replica now; 3: the session ended, its own AI)
+--   HK id hostKey                                guest: our held NPC id is host NPC hostKey, which is dead: it dies
 -- Output (events, one per line):
 --   NSR, then NS cls key x y z hx hy health flags ai tag weapon profile shots
 --                                                host: a round (15 Hz) of our NPCs near any guest (cls: name class,
@@ -61,18 +57,15 @@
 --   NX key                                       both: that replica is no longer driven (unpaired, copy gone)
 --   VPR, then VP id x y z                        both: where the other players are (puppets), every round
 --   NH key amount dtype zone weapon lethal       guest: we hit (our replica of) host NPC key
---   GH mid amount dtype zone weapon lethal       host: we hit (our replica of) a guest's own NPC (mirror mid)
---   GOR, then GO dist hostKey key x y z hx hy health flags ai tag weapon profile shots
---                                                guest: a round (15 Hz) of our NPCs with a job near us (hostKey:
---                                                the host NPC it is paired with, 0 = none)
---   GCS id id ...                                both: our spawned copies (never reported or sent)
---   GR key hostKey                               guest: a claim we could not carry out
+--   HR, then HL id ai dead hostKey hostDead      guest: a round (15 Hz) of our NPCs with a job on foot near us and
+--                                                every held one (hostKey: the host NPC it is the replica of, 0 =
+--                                                none; hostDead 1: that host NPC is dead), for the hold rule
 --   ST text                                      status for the overlay (once a second)
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
 M.Npc = M.Npc or {}
 local N = M.Npc
-N.version = 4
+N.version = 5
 
 local SCAN_INTERVAL = 1.0   -- s between scans of the entity table (mc_entity_ids)
 local SEND_INTERVAL = 0.066 -- s between host rounds (15 Hz; the C++ side sends each NPC as often as its distance says)
@@ -148,17 +141,11 @@ N.cgrave = N.cgrave or {}  -- guest: burning copies waiting to be released
 N.shots = N.shots or {}    -- host: NPC id -> shots fired (mod 256), from the ON_SHOOT events
 N.spawners = N.spawners or {}  -- host: spawner name -> { {x, y, z, prof}, ... } (mission spawners, entity type 65)
 N.badProfiles = N.badProfiles or {}
-N.owned = N.owned or {}    -- guest: local id -> true while it is our own NPC (sent to the host)
-N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sync.lua): never our own NPCs
+N.held = N.held or {}      -- guest: local id -> { t } while it is held (no host NPC is it: hidden, src/game/npc_hold.h)
+N.tcrew = N.tcrew or {}    -- guest: local ids of traffic copy crews (traffic_sync.lua): never held
 N.cmd = N.cmd or {}        -- both: this tick's drive commands (R lines), key -> fields
 N.hidden = N.hidden or {}  -- guest: local id -> host key: a paired NPC that did not follow, hidden (a copy shows it)
 N.nx = N.nx or {}          -- both: replicas no longer driven since the last update (NX lines)
-
--- Relay keys (several guests, src/game/npc_owner.h "relay"): the host sends a guest the other guests' own NPCs in its
--- NpcStates under a relay key: the owner's entity id with its type byte (8, a human) replaced by 240 + the owner's
--- player id, a value no entity id has, so it never is a host NPC's key, and below 2^24, so our 32-bit float numbers
--- hold it exactly. They are host NPCs here like any other (paired, copied, hit: the host forwards hits to the owner).
-local RELAY_TYPE, TYPE_HUMAN, BYTE, MAXKEY = 240, 8, 256, 16777216
 
 -- Is the NPC of state `s` in a vehicle on its owner's game? Its car flag (GetOwner there), or it moves faster than a
 -- human runs: the 0.15.0 two-PC test had host cops chasing the guest at 12-25 m/s with the car flag 0 (37 samples, our
@@ -183,34 +170,14 @@ function N.CopyProfile(s)
   end
   return nil
 end
-function N.RelayKey(from, key)
-  local f, k = tonumber(from), tonumber(key)
-  if not f or not k or k < 0 or k >= MAXKEY or k % BYTE ~= TYPE_HUMAN or f < 1 or f > 15 then return nil end
-  return k - TYPE_HUMAN + RELAY_TYPE + f
-end
-function N.FromRelay(key)  -- -> owner id (string), his key; nil for a plain host key
-  key = tonumber(key)
-  if not key or key >= MAXKEY or key % BYTE <= RELAY_TYPE then return nil end
-  local t = key % BYTE
-  return tostring(t - RELAY_TYPE), key - t + TYPE_HUMAN
-end
+-- Who a pairing key stands for in the log (guest): a host NPC.
+function N.Who(key) return "host NPC " .. tostring(key) end
+local function owner() return "the host" end
 
--- Who a pairing key stands for in the log: on a guest a host NPC (or another guest's, relayed); on the host a guest's
--- own NPC (its mirror id).
-function N.Who(key)
-  local s = N.host[key]
-  if N.isHost and s then return string.format("guest %s's NPC %s (mirror %s)", tostring(s.from), tostring(s.gkey),
-    tostring(key)) end
-  local of, ok = N.FromRelay(key)
-  if of then return string.format("guest %s's own NPC %.0f (relayed by the host as %.0f)", of, ok, key) end
-  return "host NPC " .. tostring(key)
-end
-local function owner() return N.isHost and "the guest" or "the host" end
-
--- The hit line for the C++ side: on a guest an NpcHit for a host NPC, on the host a HostNpcHit for a mirror.
+-- The hit line for the C++ side (guest): an NpcHit for a host NPC.
 function N.HitLine(key, amount, dtype, zone, weapon, lethal)
-  return string.format("%s %.0f %.2f %d %d %.0f %d", N.isHost and "GH" or "NH", key, amount or 0, dtype or 0, zone or 0,
-    weapon or 0, lethal and 1 or 0)
+  return string.format("NH %.0f %.2f %d %d %.0f %d", key, amount or 0, dtype or 0, zone or 0, weapon or 0,
+    lethal and 1 or 0)
 end
 
 -- Humans that are ours, not mission NPCs: the puppets and the puppet factory's driver.
@@ -219,7 +186,7 @@ local function ours(id)
     if pp.so and valid(pp.so) and idOf(pp.so) == id then return true end
   end
   -- an old puppet entity on its way out or left over after its release (player_sync.lua M.Release): never paired,
-  -- sent or owned as an NPC (a friend-brain human would otherwise become a guest-owned NPC on the host)
+  -- sent or held as an NPC
   if M.IsRetired and M.IsRetired(id) then return true end
   local f = M.fac
   if f and f.drv and valid(f.drv) and idOf(f.drv) == id then return true end
@@ -230,7 +197,7 @@ local function ours(id)
 end
 
 -- The crews of another game's traffic copies here (traffic_sync.lua, every game shows the others' traffic): that
--- game's NPCs, never ours to send or own. Ids collected at most twice a second.
+-- game's NPCs, never ours to send or hold. Ids collected at most twice a second.
 local crewIds, crewT = {}, -10
 local function copyCrew(id)
   if M.now - crewT >= 0.5 then
@@ -274,11 +241,12 @@ function N.Ambient(e)
   return e.amb
 end
 
--- A replica of another game's NPC (a paired NPC driven here, a hidden one, a spawned copy): its shots on our player
--- are only pictures (player_sync.lua M.OnLocalDamage gives them back); its authority's real hits come as Hits.
+-- A replica of another game's NPC (a paired NPC driven here, a hidden one, a spawned copy) or a held NPC: its shots
+-- on our player are only pictures (player_sync.lua M.OnLocalDamage gives them back); its authority's real hits come as
+-- Hits (a held NPC has no authority: nobody's hit).
 function N.IsPicture(id)
   if not id then return false end
-  if N.copyIds[id] or N.hidden[id] then return true end
+  if N.copyIds[id] or N.hidden[id] or N.held[id] then return true end
   return not N.isHost and N.byLocal[id] ~= nil
 end
 
@@ -304,7 +272,7 @@ function N.Scan()
       local s = key and N.host[key]
       if s and s.loc == id then N.Unlink(s, "gone from our world") end
       if s and s.hid == id then s.hid = nil end
-      N.byLocal[id], N.hidden[id] = nil, nil
+      N.byLocal[id], N.hidden[id], N.held[id] = nil, nil, nil
     end
   end
 end
@@ -449,8 +417,7 @@ function N.UnwatchShots()
   N.shotWatch = nil
 end
 
--- Where the other players are (their puppets on our game): the C++ side's interest (host: per guest; guest: what the
--- host and the other guests are near, for our own NPCs). Every round.
+-- Where the guests are (their puppets on our game): the C++ side's interest per guest (host). Every round.
 function N.Views(ev)
   ev[#ev + 1] = "VPR"
   for id, pp in pairs(M.pup or {}) do
@@ -571,37 +538,11 @@ function N.Engage(h, pp)
   try("Attack", h.Attack, h, pp.so)
 end
 
--- DAMAGE events (player_sync.lua forwards every human's): a replayed bullet that landed, and on guests our hits on
--- copies of host NPCs.
+-- DAMAGE events (player_sync.lua forwards every human's): on the host a replayed bullet that landed and our NPCs' hits
+-- on guests' puppets; on guests our hits on replicas of host NPCs.
 function N.OnDamage(m, receiverId)
   local enemyId = tonumber(tostring(m:GetEnemyGUID()):match("(%d+)%s*$"))
-  if not M.isHost and enemyId and N.owned[enemyId] then
-    -- our own NPC (the host's game has none of it) hit a player's puppet, the host's or another guest's (every puppet
-    -- has the friend brain, so our NPCs fire at all of them): that player takes it (M.HurtByNpc on his game; another
-    -- guest skips it when his own version of this NPC, paired with the host's relay of ours, fights him there)
-    for id, pp in pairs(M.pup or {}) do
-      if pp.so and valid(pp.so) and idOf(pp.so) == receiverId then
-        N.ownHits = (N.ownHits or 0) + 1
-        local amount = tonumber(m:GetDamageAmount()) or 0
-        if N.ownHits <= 20 or N.ownHits % 50 == 0 then
-          log(string.format("our own NPC %d hit player %s's puppet (%.1f, type %s; #%d): sent to him", enemyId, id,
-            amount, tostring(m:GetDamageType()), N.ownHits))
-        end
-        if pp.st == "alive" and M.SendNpcHit then
-          M.SendNpcHit(pp, amount, tonumber(m:GetDamageType()) or 0, tonumber(m:GetHitZone()) or 0,
-            tonumber(m:GetWeaponID()) or 0, enemyId)
-        end
-        return true
-      end
-    end
-  end
-  if not M.isHost then
-    -- the host's hit on our own NPC, replayed from his puppet here, landed
-    for _, r in ipairs(N.replays) do
-      if not r.landed and r.key == receiverId and r.shooter == enemyId then r.landed = true return true end
-    end
-  end
-  if M.isHost and not N.copyIds[receiverId] then
+  if M.isHost then
     local enemy = enemyId
     if enemy and N.ents[enemy] then  -- one of our NPCs hit a guest's puppet: the guest takes the hit on his game
       for id, pp in pairs(M.pup or {}) do
@@ -625,9 +566,8 @@ function N.OnDamage(m, receiverId)
     end
     return false
   end
-  -- a copy of an NPC of the other game (on a guest: of a host NPC; on the host: a mirror's copy), hit
+  -- guest: our replica of a host NPC (paired or a copy), hit
   local key = N.byLocal[receiverId]
-  if M.isHost then key = N.copyIds[receiverId] end
   if not key then return false end
   local cc = N.copyIds[receiverId] and N.copies[N.copyIds[receiverId]]
   if cc and tonumber(m:GetDamageType()) == 8 then cc.burnT = M.now end  -- FIRE: see N.ReleaseCopy
@@ -656,18 +596,16 @@ function N.OnDamage(m, receiverId)
   return true
 end
 
--- Guest: NPC `key` of player `from`'s game hit our puppet there (the host's NPC, or another guest's own NPC, known here
--- by its relay key). True when its hit already happened on our game, so the relayed one is skipped (player_sync.lua
--- M.ApplyHit). The rule is src/game/npc_replica.h SkipRelayedHit (mc_npc_skip_hit): only where our game really runs that
--- NPC (our own NPC, alive and hostile). A replica (a paired NPC driven here, a hidden one, a copy) never fights here:
--- its authority's hits always count (before the one-authority rule a hostile paired copy skipped them).
+-- Guest: NPC `key` of the host's game hit our puppet there. True when its hit already happened on our game, so the
+-- relayed one is skipped (player_sync.lua M.ApplyHit). The rule is src/game/npc_replica.h SkipRelayedHit
+-- (mc_npc_skip_hit): only where our game really runs that NPC, which since NPCs come from the host only is never: a
+-- replica (a paired NPC driven here, a hidden one, a copy) never fights here, its authority's hits always count.
 function N.FightsUs(key, from)
-  if N.isHost then return false end  -- (the host's N.host holds mirrors: a guest's NPC that hit us never fights here)
-  if from and tostring(from) ~= "0" then key = N.RelayKey(from, key) end
+  if N.isHost then return false end
+  if from and tostring(from) ~= "0" then return false end  -- (NPCs come from the host only)
   local s = key and N.host[key]
   local id = s and (s.loc or s.hid)
-  local role = 0
-  if id then role = N.owned[id] and 2 or 1 end
+  local role = id and 1 or 0
   local e = id and N.ents[id]
   local alive = e ~= nil and valid(e.h) and not e.h:IsDeath()
   local hostile = alive and aiOf(e.h) == 2
@@ -1429,17 +1367,19 @@ function N.DriveAll(p, ev)
   N.nx = {}
 end
 
--- ---- guest-owned NPCs ----------------------------------------------------------------------------------------------
--- Guest: every round (10 Hz) our NPCs with a job near us go to the C++ side (GO lines), which decides which are our
--- own (unpaired for 5 s: no host NPC is them) and sends those to the host. None in the first COPY_AFTER_LOAD s after
--- our world loaded (the host's states and our pairing need that long).
-local OWN_RANGE = 100       -- m from our player
-local MAX_OWN_REPORT = 64   -- NPCs per round, nearest first
+-- ---- held NPCs (guest) -----------------------------------------------------------------------------------------------
+-- NPCs come from the host only (docs/host-authority.md). Every round (15 Hz) our NPCs with a job on foot near us, and
+-- every held one wherever it is, go to the C++ side (HL lines) with the host NPC each is the replica of; it decides
+-- (src/game/npc_hold.h): unpaired for 5 s -> held (HH), paired later -> shown (HS, its replica now; HK when that host
+-- NPC is dead), the session over -> shown with its own AI (HS ... 3). None in the first COPY_AFTER_LOAD s after our world
+-- loaded (the host's states and our pairing need that long) or during a cutscene. NPCs in a vehicle are not held (the
+-- drivers of our own traffic are guest_world's; mission cars driven by NPCs are a later package).
+local HOLD_RANGE = 100      -- m from our player
+local MAX_HOLD_REPORT = 96  -- NPCs per round, nearest first (held ones always)
 
--- The crews of traffic_sync.lua's copies of the host's traffic and police cars are copies of host NPCs, never our
--- own: reported (police crews have a job, AI type 4) they were mirrored onto the host next to his own drivers, and a
--- dead one could kill a host cop of the same archetype nearby through a claim. Every human seen in a copy's seat is
--- remembered for this world (N.tcrew), so one that got out (its host car lost its driver) stays excluded.
+-- The crews of traffic_sync.lua's copies of the host's traffic and police cars are copies of host NPCs, never held
+-- (police crews have a job, AI type 4). Every human seen in a copy's seat is remembered for this world (N.tcrew), so
+-- one that got out (its host car lost its driver) stays excluded.
 function N.TrafficCrews()
   local T = M.Traffic
   for _, c in pairs(T and T.copies or {}) do
@@ -1451,7 +1391,7 @@ function N.TrafficCrews()
           if id and not N.tcrew[id] then
             N.tcrew[id] = true
             N.tcrewN = (N.tcrewN or 0) + 1
-            if N.tcrewN <= 20 then log("human " .. id .. " is a traffic copy's crew: never one of our own NPCs") end
+            if N.tcrewN <= 20 then log("human " .. id .. " is a traffic copy's crew: never held") end
           end
         end
       end
@@ -1459,148 +1399,110 @@ function N.TrafficCrews()
   end
 end
 
-function N.OwnRound(p, ev)
+function N.HoldRound(p, ev)
   if M.now - (M.inWorldAt or M.now) <= COPY_AFTER_LOAD or M.cutscene then return end
   local q0 = p:GetPos()
   local list = {}
   pcall(N.TrafficCrews)
   for id, e in pairs(N.ents) do
     local h = e.h
-    if not N.copyIds[id] and not N.tcrew[id] and not N.hidden[id] and not pedOwned(id) and valid(h) and active(h) then
+    if N.held[id] then
+      list[#list + 1] = { e = e, d = -1 }
+    elseif not N.copyIds[id] and not N.tcrew[id] and not N.hidden[id] and not pedOwned(id) and valid(h) and active(h)
+        then
       local q = h:GetPos()
       local d2 = (q.x - q0.x) ^ 2 + (q.y - q0.y) ^ 2
-      if d2 <= OWN_RANGE * OWN_RANGE and math.abs(q.z - q0.z) < 30 then
+      if d2 <= HOLD_RANGE * HOLD_RANGE and math.abs(q.z - q0.z) < 30 then
         if not e.aiT or M.now - e.aiT > 2 then e.ai, e.aiT = aiOf(h), M.now end
-        if e.ai ~= 0 then list[#list + 1] = { e = e, d = math.sqrt(d2), q = q } end
+        if e.ai ~= 0 and not h:GetOwner() then list[#list + 1] = { e = e, d = math.sqrt(d2) } end
       end
     end
   end
   table.sort(list, function(a, b) return a.d < b.d end)
-  ev[#ev + 1] = "GOR"
-  for i = 1, math.min(#list, MAX_OWN_REPORT) do
-    local e, q, h = list[i].e, list[i].q, list[i].e.h
-    local d = h:GetDir()
-    local dead = h:IsDeath()
-    if not e.tagT or M.now - e.tagT > 2 then e.tag, e.tagT = tagOf(h), M.now end
-    local prof = "0"
-    if not dead then
-      local good, pr = pcall(N.ProfileOf, e)
-      prof = good and pr or "0"
-    end
-    ev[#ev + 1] = string.format("GO %.1f %.0f %d %.2f %.2f %.2f %.3f %.3f %d %d %d %.0f %s %s %d", list[i].d,
-      N.byLocal[e.id] or 0, e.id, q.x, q.y, q.z, d.x, d.y, dead and 0 or healthOf(h),
-      (dead and 1 or 0) + (h:GetOwner() and 2 or 0), e.ai, e.tag or 0, weaponOf(h), prof, N.shots[e.id] or 0)
-  end
-end
-
--- Guest: the host claims our own NPC `key` as its NPC `hostKey` (its game spawned it: the host got there): paired
--- (any spawned copy of that host NPC goes); the C++ side sees the pairing in the next round and hands it back.
-function N.Claimed(key, hostKey, dead)
-  local e, s = N.ents[key], N.host[hostKey]
-  local why
-  if not (e and valid(e.h)) then
-    why = "our NPC is gone"
-  elseif N.byLocal[key] and N.byLocal[key] ~= hostKey then
-    why = "ours is paired with host NPC " .. tostring(N.byLocal[key])
-  elseif not s then
-    why = "no state of that host NPC here yet"
-  elseif s.loc and not s.copy and s.loc ~= key then
-    why = "that host NPC is paired with our " .. tostring(s.loc)
-  end
-  if why then
-    log(string.format("the host claims our own NPC %d as its NPC %d: refused (%s)", key, hostKey, why))
-    if not dead then N.hitq[#N.hitq + 1] = "GR " .. key .. " " .. hostKey end
-    return
-  end
-  N.owned[key] = nil
-  if s.loc == key then return end
-  if s.copy then N.DropCopy(hostKey, "the host claimed our own NPC " .. key .. " for it") end
-  local q = e.h:GetPos()
-  local d = math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2 + (q.z - s.z) ^ 2)
-  link(hostKey, s, key, d, dead and "claimed by the host, ours is dead" or "claimed by the host")
-  N.claimsDone = (N.claimsDone or 0) + 1
-end
-
--- Host: a state of a guest's own NPC (GN): kept like a guest keeps host NPC states (N.host, keyed by its mirror id),
--- so the spawned-copy machinery above shows it.
-function N.MirrorState(mid, from, f)
-  local s = N.host[mid]
-  if not s then
-    s = { key = mid, from = from, gkey = tonumber(f[4]), unpairedSince = M.now - 100 }  -- the guest waited already
-    N.host[mid] = s
-    N.mirrorsSeen = (N.mirrorsSeen or 0) + 1
-    if N.mirrorsSeen <= 60 then
-      log(string.format("guest %s's own NPC %s (no NPC of ours is it): mirror %d, AI type %s, profile %s", from,
-        tostring(f[4]), mid, tostring(f[12]), tostring(f[15])))
-    end
-  end
-  return s
-end
-
--- Host: a mirror ends (GX): its copy goes; handed back (reason 1): our own NPC hostKey is it now and takes the
--- guest's health (never more than ours).
-function N.MirrorEnd(mid, reason, hostKey, hp)
-  local s = N.host[mid]
-  if N.copies[mid] then
-    N.DropCopy(mid, reason == 1 and ("our own NPC " .. hostKey .. " is it now") or (owner() .. "'s NPC went"))
-  end
-  N.host[mid] = nil
-  if reason == 1 and hostKey and hostKey > 0 then
-    local e = N.ents[hostKey]
-    if e and valid(e.h) and not e.h:IsDeath() and hp and hp > 0 then
-      local here = tonumber(e.h.health) or 0
-      if here > hp + 0.5 then pcall(function() e.h.health = hp end) end
-      log(string.format("guest %s handed his NPC %s back: our NPC %d (health %.0f -> %d)", s and tostring(s.from) or "?",
-        s and tostring(s.gkey) or "?", hostKey, here, hp))
+  ev[#ev + 1] = "HR"
+  for i = 1, math.min(#list, MAX_HOLD_REPORT) do
+    local e = list[i].e
+    local h = e.h
+    if valid(h) then
+      local key = N.byLocal[e.id]
+      local s = key and N.host[key]
+      ev[#ev + 1] = string.format("HL %d %d %d %.0f %d", e.id, e.ai or aiOf(h), h:IsDeath() and 1 or 0, key or 0,
+        (s and s.dead) and 1 or 0)
     end
   end
 end
 
-function N.KillNative(hostKey, mid)
-  local e = N.ents[hostKey]
+-- Hold our NPC `id` (HH): out of sight where it is (no model, no collision, no damage), its AI interrupted as a
+-- replica's (N.Freeze); its mission scripts keep running. Kept so (N.HeldTick) until a host NPC pairs with it.
+function N.Hold(id)
+  local e = N.ents[id]
+  if not (e and valid(e.h)) or N.held[id] then return end
+  local h = e.h
+  pcall(h.ShowModel, h, false)
+  pcall(h.SetPhysState, h, 2)
+  pcall(h.SetDemigod, h, true)
+  if not N.byLocal[id] then N.Freeze(h, id) end
+  N.held[id] = { t = M.now, frzT = M.now }
+  N.holds = (N.holds or 0) + 1
+  if N.holds <= 60 then
+    local q = h:GetPos()
+    log(string.format("our NPC %d (AI type %d) has no host NPC: held hidden at %.1f,%.1f,%.1f until the host's game has "
+      .. "it (#%d)", id, aiOf(h), q.x, q.y, q.z, N.holds))
+  end
+end
+
+-- Show our held NPC `id` again (HS): why 1 a host NPC paired with it (its replica now: its AI stays stopped, the drive
+-- moves it), 3 the session ended (its own AI again).
+function N.Unhold(id, why)
+  local rec = N.held[id]
+  N.held[id] = nil
+  local e = N.ents[id]
+  if not (rec and e and valid(e.h)) then return end
+  local h = e.h
+  pcall(h.ShowModel, h, true)
+  pcall(h.SetPhysState, h, 0)
+  pcall(h.SetDemigod, h, false)
+  if why ~= 1 or not N.byLocal[id] then N.Unfreeze(h, id) end
+  N.unholds = (N.unholds or 0) + 1
+  if N.unholds <= 60 then
+    log(string.format("our held NPC %d shown again (%s, held %.0f s)", id,
+      why == 1 and ("the replica of " .. N.Who(N.byLocal[id] or "?")) or "the session ended", M.now - rec.t))
+  end
+end
+
+-- HK: our held NPC is a host NPC that is dead: shown, it dies with it.
+function N.HoldKill(id)
+  N.Unhold(id, 1)
+  local e = N.ents[id]
   if e and valid(e.h) and not e.h:IsDeath() then
     N.Kill(e.h)
-    N.lateKills = (N.lateKills or 0) + 1
-    log(string.format("our NPC %d spawned where a guest had killed his (mirror %d): it dies (#%d)", hostKey, mid,
-      N.lateKills))
+    N.holdKills = (N.holdKills or 0) + 1
   end
 end
 
--- Host: keep the mirrors' copies in line (health down, deaths) and spawn/drive them (N.CopiesTick).
-function N.MirrorTick(p)
-  local live, shown = 0, 0
-  for mid, s in pairs(N.host) do
-    if s.dead then
-      s.deadT = s.deadT or M.now
-      if M.now - s.deadT < COPY_DEAD_KEEP then s.t = M.now end  -- its copy lies there (no states come any more)
-    end
-    if M.now - s.t > 30 then
-      N.host[mid] = nil
-    elseif M.now - s.t <= STALE then
-      live = live + 1
-      local c = N.copies[mid]
-      local e = s.loc and c and c.ent
-      if s.loc and not (e and valid(e.h)) then
-        N.byLocal[s.loc] = nil
-        s.loc, e = nil, nil
-      end
-      if e then
-        shown = shown + 1
-        local good, err = pcall(N.Enforce, s, e, p)
-        if not good then log("mirror enforce error: " .. tostring(err)) end
-      end
+-- Held NPCs stay out of sight with their AI interrupted (their mission may show them or order them into a fight again).
+function N.HeldTick()
+  for id, rec in pairs(N.held) do
+    local e = N.ents[id]
+    if not (e and valid(e.h)) then
+      N.held[id] = nil
+    elseif M.now - rec.frzT >= REFREEZE and not e.h:IsDeath() then
+      rec.frzT = M.now
+      pcall(e.h.ShowModel, e.h, false)
+      if not N.byLocal[id] then pcall(e.h.InterruptBattle, e.h) end
     end
   end
-  N.mirrorLive, N.mirrorShown = live, shown
-  local good, err = pcall(N.CopiesTick, p)
-  if not good then log("mirror copies error: " .. tostring(err)) end
 end
 
--- Both: our spawned copies for the C++ side (never reported, never sent: no feedback loops).
-function N.CopyList(ev)
-  local ids = {}
-  for id, _ in pairs(N.copyIds) do ids[#ids + 1] = tostring(id) end
-  ev[#ev + 1] = "GCS " .. table.concat(ids, " ")
+-- Every held NPC shown with its own AI (the session ended, a new world, we host now). The C++ side says so too (HS
+-- ... 3); this is the Lua side's own guard.
+function N.ReleaseHeld(why)
+  local n = 0
+  for id, _ in pairs(N.held) do
+    N.Unhold(id, 3)
+    n = n + 1
+  end
+  if n > 0 then log(n .. " held NPCs shown again (" .. why .. ")") end
 end
 
 -- ---- update -----------------------------------------------------------------------------------------------------------
@@ -1634,22 +1536,13 @@ function N.Update(dt, cmds)
     elseif f[1] == "R" then
       local key = tonumber(f[2])
       if key then N.cmd[key] = N.ParseDrive(f) end
-    elseif f[1] == "N" or f[1] == "GN" then
-      local s
-      local vxIn, vyIn, gaitIn, ageIn
-      if f[1] == "N" then
-        local key = tonumber(f[2])
-        s = N.host[key] or { key = key }
-        N.host[key] = s
-        -- "N key ... shots vx vy gait age": the velocity of its replica target (the C++ side's interpolation)
-        vxIn, vyIn, gaitIn, ageIn = tonumber(f[15]), tonumber(f[16]), tonumber(f[17]), tonumber(f[18])
-      else
-        -- "GN mid from key ...": the same fields as N from f[4] on (shifted by two)
-        s = N.MirrorState(tonumber(f[2]), f[3], f)
-        table.remove(f, 2)
-        table.remove(f, 2)
-      end
-      local px, py, pt = s.x, s.y, s.t
+    elseif f[1] == "N" then
+      local key = tonumber(f[2])
+      local s = N.host[key] or { key = key }
+      N.host[key] = s
+      -- "N key ... shots vx vy gait age": the velocity of its replica target (the C++ side's interpolation)
+      local vxIn, vyIn, gaitIn, ageIn = tonumber(f[15]), tonumber(f[16]), tonumber(f[17]), tonumber(f[18])
+      local pt = s.t
       s.x, s.y, s.z, s.hx, s.hy = tonumber(f[3]), tonumber(f[4]), tonumber(f[5]), tonumber(f[6]), tonumber(f[7])
       if vxIn and vyIn then
         s.vx, s.vy, s.gait = vxIn, vyIn, gaitIn
@@ -1664,24 +1557,6 @@ function N.Update(dt, cmds)
           end
           s.fastT = M.now
         end
-      elseif pt and M.now - pt > 0.03 and M.now - pt < 0.6 then
-        -- a mirror (GN, raw states): its velocity from the last two states, smoothed
-        local vx, vy = (s.x - px) / (M.now - pt), (s.y - py) / (M.now - pt)
-        -- its speed, smoothed (a vehicle's speed too: N.InVehicle; a jump over 80 m/s is a teleport, left out)
-        local raw = math.sqrt(vx * vx + vy * vy)
-        if raw < 80 then s.spd = 0.6 * (s.spd or raw) + 0.4 * raw end
-        if (s.spd or 0) > FAST_NPC then
-          if not s.fastT and not s.car then
-            N.fastSeen = (N.fastSeen or 0) + 1
-            if N.fastSeen <= 20 then
-              log(string.format("%s moves at %.0f m/s without its car flag: taken as in a vehicle", N.Who(s.key),
-                s.spd))
-            end
-          end
-          s.fastT = M.now
-        end
-        if vx * vx + vy * vy > 100 then vx, vy = 0, 0 end
-        s.vx, s.vy = 0.5 * (s.vx or vx) + 0.5 * vx, 0.5 * (s.vy or vy) + 0.5 * vy
       elseif pt then
         s.vx, s.vy = 0, 0
       end
@@ -1691,27 +1566,18 @@ function N.Update(dt, cmds)
       s.dead = s.dead or (flags % 2) == 1
       s.car = math.floor(flags / 2) % 2 == 1
       s.t = M.now - math.min(ageIn or 0, 2)
-    elseif f[1] == "D" or f[1] == "GD" then
+    elseif f[1] == "D" then
       local s = N.host[tonumber(f[2])]
       if s then s.dead = true end
-    elseif f[1] == "GX" then
-      local good, err = pcall(N.MirrorEnd, tonumber(f[2]), tonumber(f[3]), tonumber(f[4]), tonumber(f[5]))
-      if not good then log("mirror end error: " .. tostring(err)) end
-    elseif f[1] == "GK" then
-      local good, err = pcall(N.KillNative, tonumber(f[2]), tonumber(f[3]))
-      if not good then log("late kill error: " .. tostring(err)) end
-    elseif f[1] == "O" then
-      N.owned[tonumber(f[2])] = f[3] == "1" or nil
-    elseif f[1] == "C" then
-      local good, err = pcall(N.Claimed, tonumber(f[2]), tonumber(f[3]), f[4] == "1")
-      if not good then log("claim error: " .. tostring(err)) end
-    elseif f[1] == "X" then
-      -- the host hit his copy of our own NPC, or another guest hit his copy of it (the host relays it to him): replayed
-      -- from that player's puppet here (N.HostHit; f[8] the attacker, "0" = the host)
-      local by = (f[8] and f[8] ~= "0" and M.pup and M.pup[f[8]]) and f[8] or "0"
-      local good, err = pcall(N.HostHit, by, tonumber(f[2]), tonumber(f[3]) or 0, tonumber(f[4]) or 0,
-        tonumber(f[5]) or 0, tonumber(f[6]) or 0, f[7] == "1")
-      if not good then log("host hit error: " .. tostring(err)) end
+    elseif f[1] == "HH" then
+      local good, err = pcall(N.Hold, tonumber(f[2]))
+      if not good then log("hold error: " .. tostring(err)) end
+    elseif f[1] == "HS" then
+      local good, err = pcall(N.Unhold, tonumber(f[2]), tonumber(f[4]))
+      if not good then log("show error: " .. tostring(err)) end
+    elseif f[1] == "HK" then
+      local good, err = pcall(N.HoldKill, tonumber(f[2]))
+      if not good then log("held kill error: " .. tostring(err)) end
     elseif f[1] == "H" then
       local good, err = pcall(N.HostHit, f[2], tonumber(f[3]), tonumber(f[4]) or 0, tonumber(f[5]) or 0,
         tonumber(f[6]) or 0, tonumber(f[7]) or 0, f[8] == "1")
@@ -1725,9 +1591,10 @@ function N.Update(dt, cmds)
     local n = 0
     for _, _ in pairs(N.copies) do n = n + 1 end
     if n > 0 then log(n .. " spawned copies went with the old world") end
+    pcall(N.ReleaseHeld, "a new world")
     N.ents, N.host, N.byLocal, N.sent, N.replays, N.lethal = {}, {}, {}, {}, {}, {}
     N.copies, N.copyIds, N.cgrave, N.shots, N.spawners = {}, {}, {}, {}, {}
-    N.owned, N.tcrew, N.fireq, N.cmd, N.hidden, N.nx, N.rec = {}, {}, {}, {}, {}, {}, {}
+    N.held, N.tcrew, N.fireq, N.cmd, N.hidden, N.nx, N.rec = {}, {}, {}, {}, {}, {}, {}
     N.cfac = { st = "none", t = 0 }  -- its car went with the world
     N.shotWatch, N.spT = nil, nil
     N.scanT = -10
@@ -1737,13 +1604,14 @@ function N.Update(dt, cmds)
     N.DropAllCopies("the session ended")
     N.FacReset("session ended", true)
   end
+  if (not active or host) and next(N.held) then pcall(N.ReleaseHeld, host and "we host now" or "the session ended") end
   if not (active and p) then return table.concat(ev, "\n") end
   if M.now - (N.scanT or -10) >= SCAN_INTERVAL then
     N.scanT = M.now
     local good, err = pcall(N.Scan)
     if not good then log("scan error: " .. tostring(err)) end
   end
-  pcall(N.WatchShots)  -- (on guests too: the shots of our own NPCs go to the host's copies of them)
+  if host then pcall(N.WatchShots) end  -- (the guests' copies fire as many)
   if M.now - (N.viewT or -10) >= SEND_INTERVAL then
     N.viewT = M.now
     pcall(N.Views, ev)
@@ -1755,30 +1623,22 @@ function N.Update(dt, cmds)
       if not good then log("send error: " .. tostring(err)) end
     end
     pcall(N.ReplayTick)
-    local good, err = pcall(N.MirrorTick, p)
-    if not good then log("mirror error: " .. tostring(err)) end
-    good, err = pcall(N.DriveAll, p, ev)
-    if not good then log("drive error: " .. tostring(err)) end
-    N.status = string.format("NPCs: sending %d, guest hits %d, guest kills %d; guests' own %d (copies %d)",
-      N.hostCount or 0, N.hitsIn or 0, N.guestKills or 0, N.mirrorLive or 0, N.mirrorShown or 0)
+    N.status = string.format("NPCs: sending %d, guest hits %d, guest kills %d", N.hostCount or 0, N.hitsIn or 0,
+      N.guestKills or 0)
   else
     local good, err = pcall(N.GuestTick, p)
     if not good then log("guest error: " .. tostring(err)) end
     good, err = pcall(N.DriveAll, p, ev)
     if not good then log("drive error: " .. tostring(err)) end
-    pcall(N.ReplayTick)  -- the host's hits on our own NPCs
-    if M.now - (N.ownT or -10) >= SEND_INTERVAL then
-      N.ownT = M.now
-      good, err = pcall(N.OwnRound, p, ev)
-      if not good then log("own round error: " .. tostring(err)) end
+    pcall(N.HeldTick)
+    if M.now - (N.holdT or -10) >= SEND_INTERVAL then
+      N.holdT = M.now
+      good, err = pcall(N.HoldRound, p, ev)
+      if not good then log("hold round error: " .. tostring(err)) end
     end
-    local no = 0
-    for _, _ in pairs(N.owned) do no = no + 1 end
-    N.status = (N.status or "") .. string.format(", our own %d", no)
-  end
-  if M.now - (N.cpT or -10) >= 0.5 then
-    N.cpT = M.now
-    N.CopyList(ev)
+    local nh = 0
+    for _, _ in pairs(N.held) do nh = nh + 1 end
+    N.status = (N.status or "") .. string.format(", held %d", nh)
   end
   if M.now - (N.stT or -10) >= 1 then
     N.stT = M.now
@@ -1792,36 +1652,21 @@ function N.Update(dt, cmds)
 end
 
 -- Sync trace (docs/sync-trace.md), twice a second: host "NHS" (how many NPCs it sends); guest "NP" for every host
--- NPC it has a state of (where the host's is, where ours is, how far apart) and "NGS" (totals).
+-- NPC it has a state of (where the host's is, where ours is, how far apart), "NHL" per held NPC and "NGS" (totals).
 function N.Trace(host)
   if host then
-    mc_trace("NHS", string.format("sending=%d hits=%d kills=%d mirrors=%d shown=%d lateKills=%d", N.hostCount or 0,
-      N.hitsIn or 0, N.guestKills or 0, N.mirrorLive or 0, N.mirrorShown or 0, N.lateKills or 0))
-    for mid, s in pairs(N.host) do
-      if M.now - s.t <= STALE then
-        local c = N.copies[mid]
-        local h = c and c.so
-        local q = h and valid(h) and h:GetPos()
-        mc_trace("NM", string.format("mid=%d from=%s key=%s loc=%s st=%s ai=%s guest=%.2f,%.2f,%.2f our=%s d=%.2f "
-          .. "hp=%s/%s dead=%d/%d age=%.2f", mid, tostring(s.from), tostring(s.gkey), tostring(s.loc),
-          c and tostring(c.st) or "-", tostring(s.ai), s.x, s.y, s.z,
-          q and string.format("%.2f,%.2f,%.2f", q.x, q.y, q.z) or "-",
-          q and math.sqrt((q.x - s.x) ^ 2 + (q.y - s.y) ^ 2) or -1, tostring(s.hp),
-          q and string.format("%.0f", tonumber(h.health) or -1) or "-", s.dead and 1 or 0,
-          (q and h:IsDeath()) and 1 or 0, M.now - s.t))
-      end
-    end
+    mc_trace("NHS", string.format("sending=%d hits=%d kills=%d", N.hostCount or 0, N.hitsIn or 0, N.guestKills or 0))
     return
   end
-  local own = 0
-  for id, _ in pairs(N.owned) do
-    own = own + 1
+  local held = 0
+  for id, rec in pairs(N.held) do
+    held = held + 1
     local e = N.ents[id]
     local h = e and e.h
     if h and valid(h) then
       local q = h:GetPos()
-      mc_trace("NO", string.format("key=%d p=%.2f,%.2f,%.2f hp=%.0f dead=%d ai=%d", id, q.x, q.y, q.z,
-        tonumber(h.health) or -1, h:IsDeath() and 1 or 0, aiOf(h)))
+      mc_trace("NHL", string.format("key=%d p=%.2f,%.2f,%.2f hp=%.0f dead=%d ai=%d for=%.1f", id, q.x, q.y, q.z,
+        tonumber(h.health) or -1, h:IsDeath() and 1 or 0, aiOf(h), M.now - rec.t))
     end
   end
   local matched, live, sumD, maxD = 0, 0, 0, 0
@@ -1847,10 +1692,10 @@ function N.Trace(host)
   end
   local nc = 0
   for _, c in pairs(N.copies) do if c.st == "alive" then nc = nc + 1 end end
-  mc_trace("NGS", string.format("live=%d matched=%d copies=%d avg=%.2f max=%.2f kills=%d snaps=%d own=%d claims=%d "
-    .. "unpairs=%d refused=%d fallbacks=%d frozen=%d drives=%d", live, matched, nc, matched > 0 and sumD / matched or 0,
-    maxD, N.kills or 0, N.snaps or 0, own, N.claimsDone or 0, N.unpairs or 0, N.refused or 0, N.fallbacks or 0,
-    N.frozen or 0, N.drives or 0))
+  mc_trace("NGS", string.format("live=%d matched=%d copies=%d avg=%.2f max=%.2f kills=%d snaps=%d held=%d holds=%d "
+    .. "unholds=%d unpairs=%d refused=%d fallbacks=%d frozen=%d drives=%d", live, matched, nc,
+    matched > 0 and sumD / matched or 0, maxD, N.kills or 0, N.snaps or 0, held, N.holds or 0, N.unholds or 0,
+    N.unpairs or 0, N.refused or 0, N.fallbacks or 0, N.frozen or 0, N.drives or 0))
 end
 
 return N.version

@@ -67,6 +67,7 @@ TARGETS = {
     "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
     "npc.max": ("<=", 4.0, "NPC replica vs the authority's NPC, max (m)"),
     "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
+    "npc.guest_sent": ("<=", 0, "a guest's own NPCs sent (his NPT states or GuestNpc* 0x0421-0x0426 messages, more)"),
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
@@ -620,6 +621,9 @@ def npcs(guest):
     if foot:
         print("  paired host NPCs on foot: distance %s" % stats_line(foot))
     last = ngs[-1]
+    if "held" in last:
+        print("  held now %d (held so far %d, shown again %d)" % (
+            num(last.get("held"), 0), num(last.get("holds"), 0), num(last.get("unholds"), 0)))
     if "refused" in last:
         print("  driven: %d commands, snaps %d, paired NPCs frozen %d, refused (hidden, a copy shown) %d, unpaired (in a "
               "vehicle, ours on foot) %d, copies with a fallback profile %d" % (
@@ -769,24 +773,65 @@ def swapped_cars(tr):
             print("    %s %s machine: %s, %s (%s)" % (tr.wall(t), f.get("key"), f.get("phase"), f.get("act"), why(f)))
 
 
-def own_npcs(guest, host):
-    """Guest-owned NPCs: the ones only the guest's game had, as the host showed them (NO / NM / NGO / NGE / NMC)."""
+GUEST_NPC_MSG = re.compile(r"(GuestNpc\w+|HostNpcHit|NpcClaim|0x042[0-6]) out ([\d.]+) KB/s ([\d.]+)/s")
+
+
+def guest_npcs_sent(guest):
+    """What a guest sent of his own NPCs (docs/host-authority.md: nothing; NPCs come from the host only): his NPT
+    records (one per NPC state he sent, 0.16 guest-owned NPCs) and the guest-owned NPC messages (GuestNpcEnd, HostNpcHit,
+    NpcClaim, GuestNpcStates2 / Info / Leave, 0x0421-0x0426) going out in his NetMonitor reports. npc.guest_sent."""
+    npt = len(guest.records["NPT"])
+    reports, last_t, msgs, kb = 0, None, 0.0, 0.0
+    for t, text in guest.logs:
+        if "net: messages: " not in text:
+            continue
+        rate_m = rate_k = 0.0
+        for m in GUEST_NPC_MSG.finditer(text):
+            rate_k += float(m.group(2))
+            rate_m += float(m.group(3))
+        if rate_m > 0 or rate_k > 0:
+            reports += 1
+            span = t - last_t if last_t is not None and 0 < t - last_t < 60 else 5.0
+            msgs += rate_m * span
+            kb += rate_k * span
+        last_t = t
+    return npt, reports, msgs, kb
+
+
+def held_npcs(guest):
+    """Held NPCs (guest; docs/protocol.md "Held NPCs"): his NPCs with a job that no host NPC paired with for 5 s, hidden
+    until one does (NHD events, NHL samples, NGS held); and what he sent of his own NPCs (npc.guest_sent, target 0). A
+    0.16 trace (guest-owned NPCs: NGO / NGE) shows what the old rule made his own and sent instead."""
+    nhd = [f for _, f in guest.records["NHD"]]
     ngo = [f for _, f in guest.records["NGO"]]
-    nm = [f for _, f in host.records["NM"]] if host else []
-    if not ngo and not nm:
+    npt, reports, msgs, kb = guest_npcs_sent(guest)
+    if not nhd and not ngo and not npt and not reports and not guest.records["NGS"]:
         return
-    section("NPCs only %s's game had (guest-owned)" % guest.name)
-    owned = sum(1 for f in ngo if f.get("owned") == "1")
-    ends = Counter(f.get("why") for _, f in guest.records["NGE"])
-    names = {"0": "died", "1": "handed back", "2": "gone", "3": "claim refused"}
-    print("  became the guest's own: %d; ends: %s" % (owned, ", ".join(
-        "%s %d" % (names.get(k, k), v) for k, v in sorted(ends.items())) or "none"))
-    if host:
-        print("  host claims sent: %d; mirrors shown with a copy (samples): %d of %d" % (
-            len(host.records["NMC"]), sum(1 for f in nm if f.get("loc") not in (None, "nil")), len(nm)))
-        d = [num(f.get("d"), -1) for f in nm if num(f.get("d"), -1) >= 0]
-        if d:
-            print("  distance of the host's copy from the guest's NPC: %s" % stats_line(d))
+    section("NPCs only %s's game had (held; NPCs come from the host only)" % guest.name)
+    if nhd:
+        ev = Counter((f.get("ev"), f.get("why")) for f in nhd)
+        held_keys = {f.get("key") for f in nhd if f.get("ev") == "hold"}
+        print("  held %d (NPCs %d); shown again: paired with a host NPC %d (of them killed with a dead one %d), at the "
+              "session's end %d" % (ev.get(("hold", "unpaired"), 0), len(held_keys), ev.get(("show", "paired"), 0),
+                                     ev.get(("kill", "host_dead"), 0), ev.get(("show", "session_end"), 0)))
+        held_for = defaultdict(float)
+        for _, f in guest.records["NHL"]:
+            held_for[f.get("key")] = max(held_for[f.get("key")], num(f.get("for"), 0))
+        if held_for:
+            print("  longest held: %s" % ", ".join("%s %.0f s" % kv for kv in sorted(held_for.items(),
+                                                                                    key=lambda kv: -kv[1])[:5]))
+    elif guest.records["NGS"] and "held" in guest.records["NGS"][-1][1]:
+        print("  none held")
+    if ngo:
+        owned = sum(1 for f in ngo if f.get("owned") == "1")
+        ends = Counter(f.get("why") for _, f in guest.records["NGE"])
+        names = {"0": "died", "1": "handed back", "2": "gone", "3": "claim refused"}
+        print("  (a 0.16 trace: the old rule made %d of his NPCs his own and sent them, %d times; ends: %s)" % (
+            len({f.get("key") for f in ngo if f.get("owned") == "1"}), owned,
+            ", ".join("%s %d" % (names.get(k, k), v) for k, v in sorted(ends.items())) or "none"))
+    print("  sent of his own NPCs: %d states (NPT); guest-owned NPC messages out in %d NetMonitor reports (~%.0f "
+          "messages, %.1f KB)" % (npt, reports, msgs, kb))
+    record("npc.guest_sent", max(npt, round(msgs)), guest.name)
 
 
 def _hermite(p0, v0, p1, v1, dt, u):
@@ -1576,10 +1621,9 @@ def main():
     guest = a if a.role == "guest" else b if b.role == "guest" else None
     if guest:
         npcs(guest)
-        own_npcs(guest, b if guest is a else a)
+        held_npcs(guest)
         other = b if guest is a else a
-        npc_replicas(other, guest, worst)  # the host's NPCs on the guest
-        npc_replicas(guest, other, worst)  # the guest's own NPCs on the host
+        npc_replicas(other, guest, worst)  # the host's NPCs on the guest (the only NPC authority)
     for tr in (a, b):
         swapped_cars(tr)
     for tr in (a, b):

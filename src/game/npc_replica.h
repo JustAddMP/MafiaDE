@@ -2,15 +2,15 @@
 // One authority per NPC (docs/protocol.md "NPCs", docs/sync-architecture.md section 8 `npc-authority`). Pure logic, no
 // game or Lua calls: unit-tested by tests/npc_replica_test.cpp; npc_sync.cpp feeds it and carries out what it decides.
 //
-// Every NPC is simulated by exactly one game, its authority: the host for its NPCs (mission NPCs, police, anything
-// with a job), a guest for the NPCs only his game has (npc_owner.h GuestOwner). Every other game shows a *replica*: a
-// local NPC paired with it, or a spawned copy, DRIVEN from the authority's states every tick - never its own AI.
+// Every NPC is simulated by exactly one game, its authority: the host (docs/host-authority.md: NPCs come from the host
+// only; a guest's NPC that no host NPC is is held hidden, npc_hold.h). Every other game shows a *replica*: a local NPC
+// paired with it, or a spawned copy, DRIVEN from the authority's states every tick - never its own AI.
 //
-//   wire        NpcStates2 (0x0212 host -> guest, 0x0424 guest -> host): the authority's sample time (ms, its own
-//               steady clock, as PlayerState), an origin, then ~19 bytes per NPC (u16 net id, position from the origin
-//               in cm, heading, ground velocity in cm/s, health, flags, shots, gait). The slow fields (entity key, AI
-//               type, archetype tag, weapon, spawn profile, name class) go once per receiver and on change in the
-//               reliable NpcInfo (0x0213 / 0x0425); NpcLeave (0x0214 / 0x0426) says a net id is no longer sent to him.
+//   wire        NpcStates2 (0x0212 host -> guest; the guest -> host 0x0424-0x0426 are retired): the authority's
+//               sample time (ms, its own steady clock, as PlayerState), an origin, then ~19 bytes per NPC (u16 net id,
+//               position from the origin in cm, heading, ground velocity in cm/s, health, flags, shots, gait). The slow
+//               fields (entity key, AI type, archetype tag, weapon, spawn profile, name class) go once per receiver and
+//               on change in the reliable NpcInfo (0x0213); NpcLeave (0x0214) says a net id is no longer sent to him.
 //   Publisher   the authority's side: velocity and gait from its rounds, net ids, core's InterestManager per receiving
 //               player (viewpoints = his player; enter 120 m / leave 140 m; 15 Hz within 30 m down to 5 Hz at 120 m,
 //               idle NPCs half as often; a byte budget per receiver), infos on enter / change, leaves; truth records.
@@ -30,7 +30,6 @@
 #include <string>
 #include <vector>
 
-#include "game/npc_owner.h"
 #include "net/correction.h"
 #include "net/interest.h"
 #include "net/remote_motion.h"
@@ -43,9 +42,27 @@ class ByteReader;
 
 namespace mc::game::npcrep {
 
-using npcown::NpcState;
-using npcown::PlayerId;
+using PlayerId = uint8_t;
 using net::motion::Vec3;
+
+// ---- one NPC as the Lua glue lists it ---------------------------------------------------------------------------------
+struct NpcState {
+    uint32_t key = 0;  // its entity id on the sender's game
+    float x = 0, y = 0, z = 0, hx = 0, hy = 0;
+    uint16_t hp = 0;
+    uint8_t flags = 0;  // 1 dead, 2 in a car
+    uint8_t ai = 0;     // AI type (0 civilian, 2 enemy, ...)
+    uint32_t tag = 0;   // battle archetype hash (0 = none)
+    std::string weapon = "-";
+    uint64_t profile = 0;  // spawn profile hash (0 = unknown)
+    uint8_t shots = 0;     // shots fired, mod 256
+    bool Dead() const { return (flags & 1u) != 0; }
+};
+
+bool SafeWeapon(const std::string& s);  // a weapon name we pass on (letters, digits, _ and -, at most 48)
+// Lua line fields (after the tag): "key x y z hx hy health flags ai tag weapon profile shots"
+bool ParseState(const std::string& fields, NpcState& s);
+std::string FormatState(const NpcState& s);  // the same fields, for a Lua command line
 
 // ---- wire ----------------------------------------------------------------------------------------------------------------
 enum Flag : uint8_t { kDead = 1, kInCar = 2 };
@@ -76,7 +93,7 @@ bool ReadStates(net::ByteReader& r, StatesMsg& out);  // false on a short or bad
 enum class NameClass : uint8_t { Unknown = 0, Spawner = 1, Generator = 2 };
 struct Info {  // NpcInfo: the slow fields of one net id
     uint16_t net = 0;
-    uint32_t key = 0;   // its entity id on the authority's game (the key of NpcDeath, NpcHit, claims, relays)
+    uint32_t key = 0;   // its entity id on the authority's game (the key of NpcDeath, NpcHit)
     uint8_t ai = 0;     // AI type
     uint32_t tag = 0;   // battle archetype hash
     std::string weapon = "-";

@@ -32,6 +32,12 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
     there on the guest's game 19.5-20.6 % of the time.
   - tools/onepc: a scripted one-PC run (two instances) with screenshots and the expected `--check` results; not run
     yet.
+- NPCs come from the host only (docs/host-authority.md, not run in game): a guest's NPC with a job that no host NPC
+  pairs with for 5 s (he got somewhere first) is no longer sent to the host and mirrored there; it is held hidden on
+  his game with its AI stopped until the host's game has that NPC (then it is shown as its replica, dead if the
+  host's is dead) and shown again when the session ends. The guest-owned NPC messages (0x0421-0x0426) are retired.
+  In the 2026-10-20 session A the guest's game sent 1350 states of one such cop; the replay of it (tests/npc_hold_test)
+  holds it instead and sends nothing. sync_compare: `npc.guest_sent` (target 0) and a "held NPCs" section.
 
 ## 0.16.0 (2026-10-20), pre-release, not yet verified in game
 
