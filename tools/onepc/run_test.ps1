@@ -31,7 +31,7 @@ Say ("host garage.pf: kept out {0}, written for real {1}" -f @(Select-String -Pa
 # a car: the guest gets into one and drives 4 s
 Say "guest car: $(Lua 1 "$PSScriptRoot\car_spawn.lua")"; Start-Sleep 10
 Say (Keys 1 @("W") 4000); Start-Sleep 1; Both "08-guest-in-car"
-Say (Keys 1 @("F") 300); Start-Sleep 5; Both "09-guest-out-of-car"
+Say (Keys 1 @("E") 300); Start-Sleep 5; Both "09-guest-out-of-car"  # E: Exit Vehicle (F did nothing)
 
 # a character change in the world (pause CO-OP panel, CHARACTER one step right), then close the panel
 Set-Content "$Out\dev\guest.input.txt" "open pause`nwait 800`ndump`npad RIGHT`nwait 1500`npad B`nwait 500"

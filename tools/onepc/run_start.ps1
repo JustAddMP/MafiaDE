@@ -13,7 +13,7 @@ Get-ChildItem -Recurse -File $bak | ForEach-Object { "{0} {1}" -f (Get-FileHash 
 Say "saves backed up: $((Get-Content "$Work\save-hashes.txt").Count) files"
 
 # 2. the keeper first, so a window is moved / shrunk the moment it appears
-Start-Process powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\keeper.ps1", "-X", $AreaX -WindowStyle Hidden | Out-Null
+Start-Process powershell -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "$PSScriptRoot\keeper.ps1", "-X", $AreaX, "-StopFile", "$Work\keeper.stop" -WindowStyle Hidden | Out-Null
 Start-Sleep 1
 
 function Launch([string]$role) {
