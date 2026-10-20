@@ -37,6 +37,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | a minute | 12-a-minute-later | traffic and pedestrians around both; both puppets still there |
 | leash (by hand, after the steps above: `Lua 1 tools\onepc\leash_test.lua`, then again in a car, then once with the host in his pause menu) | a guest screenshot at the countdown and after the pull | run.log: `moved to ... (450 m from the host, ...)`; guest: banner `TOO FAR FROM THE HOST - BACK IN 10 S` counting down, log `leash: ... -> countdown`, after ~10 s the screen fades and `leash: pulled back beside the host (foot)` (in the car: `(road)` or `(beside)`, still in the car), `PULLED BACK TO THE HOST` for 3 s; host status panel `<NAME> IS FAR AWAY (450 M)`; host paused: banner `THE HOST PAUSED`, no pull until he resumes, then the rest of the countdown |
 | traffic | (run.log lines `host traffic:` / `guest traffic:`, tools/onepc/traffic_probe.lua) | host: `ours: 0-40 m N (no driver 0), 40-60 m ..., 60- m N (no driver K)`: the cars without a driver are the far ones (the game streams drivers out beyond ~50 m; one within 40 m is a real get-out); guest: `copies N: driver seated N, crew out 0` (unless a host car's driver really got out next to the host) |
+| peds | (guest log / trace; walk a busy street together for a minute, look around) | guest log: `peds: copy spawner ready`, `copy profile <name> loaded` for several of the six looks, `spawned a copy for the host's pedestrian N`, later `pool copy N is the copy of the host's pedestrian M now`; never `copy profile ... not used again` for all six; no `ev=adopt` / `ev=show` in the guest's PDE (0.16 rules gone); host log: no pedestrians received (a guest sends none) |
 
 ## Expected `compare.ps1` (sync_compare --check)
 
@@ -51,6 +52,9 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | car.* | PASS for the guest's car on the host |
 | traffic.*, npc.*, ped.*, world.time_err, lat.player.p95, bw.host_up | PASS |
 | npc.guest_sent | 0 (no state or message of the guest's own NPCs; his NPCs without a host NPC are held: `NHD` in his trace) |
+| ped.coverage | >= 80 % on the guest (the host's pedestrians within 40 m with a copy; the replays in tests/ped_test.cpp: 82 % for session A with its hidden spawner, 92 % for B; recorded on 2026-10-20: 18.2 / 82.1 %) |
+| ped.p95 | <= 1.5 m (replays: 0.40 / 0.37 m; recorded 3.2 m) |
+| ped.copy_fail_per_min | <= 2 (replays: 0.55 / 0; recorded in session A: 86 a minute, the hidden spawner) |
 | traffic.true_p95 | <= 1.5 m (was 2.14 m in session A: copies of standing cars driven off them; the replay of A in tests/traffic_test.cpp: 0.75 m) |
 | traffic.crew_exits_per_min | <= 1 per minute of copies (was 26.5 on the guest in session A, 5.2 in B: drivers the host's game streamed out 45-76 m from him counted as gone) |
 | traffic.reseats_per_min | <= 3 per minute of copies (was 71.6 on the guest in session A: crews leaving copies that were pushed off their standing car, and every get-out put back) |

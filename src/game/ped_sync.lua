@@ -2,68 +2,73 @@
 -- player_sync.lua, npc_sync.lua and traffic_sync.lua, called once per script tick by src/game/ped_sync.cpp
 -- (MafiaCoop.Peds.Update). Embedded into the dll; a copy at <dll dir>\ped_sync.lua overrides it.
 --
--- Every game is the authority for the ambient pedestrians where it simulates the ambient world (core RegionAuthority:
--- the host within 250 m of him, elsewhere the nearest player, with hysteresis; decided in C++, game/ped_model.h).
--- This glue reads this game's ambient humans (MafiaCoop.IsAmbientHuman) near any player 20 times a second for the C++
--- side, which sends the ones near each other player. As a receiver it carries out what the C++ side decides: a local
--- ambient human is adopted as the replica of another game's pedestrian (its own wandering interrupted, walked like a
--- puppet: MoveVec with the sender's gait, speed multiplier, nudges and snaps of core's LocomotionController), a
--- shortfall gets a spawned copy (a spawner of our own, the recipe of player_sync.lua's puppet factory, one civilian
--- profile), a surplus local human is hidden while nobody looks (ShowModel false, Deactivate) and shown again later.
--- Deaths follow the authority (a replica is killed); a replica that dies here by our hand is reported (PedKill).
+-- Host authority (docs/host-authority.md WP-C): the host's game owns every ambient pedestrian. On the host this glue
+-- reads its ambient humans (MafiaCoop.IsAmbientHuman) near any player 20 times a second for the C++ side, which sends
+-- each guest the ones within 80 m of him. On a guest it carries out what the C++ side (game/ped_model.h PedReceiver)
+-- decides: every one of the host's pedestrians is shown by a copy from a pool - a new copy is made by a spawner of
+-- our own (the recipe of player_sync.lua's puppet factory) with one of six civilian profiles (one profile load at a
+-- time; requests for the loaded profile first, a request that waited 2 s gets the loaded look), a copy whose
+-- pedestrian went is hidden (ShowModel false, Deactivate)
+-- and kept, and a kept copy is put at the next new pedestrian's spot and shown again. A copy is walked like a puppet
+-- (MoveVec with the host's gait, speed multiplier, nudges and snaps of core's LocomotionController). Deaths follow
+-- the host (a copy is killed); a copy that dies here by our hand is reported (PedKill). The guest's own pedestrians
+-- are not this glue's business any more: guest_world (WP-A) switches their spawning off and hides leftovers; nothing
+-- here adopts, hides or blocks the guest's own humans.
 --
--- Contract with npc_sync.lua (package npc-authority): an ambient human is not a player / puppet / any copy, not in a
--- vehicle, AI type 0, and not named after a mission spawner (`behavior_object_prime-NN-<suffix>` with a non-empty
--- suffix, docs/game-api.md 15). Those are ours on every game: npc_sync skips them (MafiaCoop.IsAmbientHuman(h)), and
--- never pairs or steers a human in MafiaCoop.PedOwned (entity id -> true): every local human this glue controls
--- (adopted and spawned replicas, hidden humans, its spawner's driver).
+-- Contract with npc_sync.lua and guest_world: an ambient human is not a player / puppet / any copy, not in a vehicle,
+-- AI type 0, and not named after a mission spawner (`behavior_object_prime-NN-<suffix>` with a non-empty suffix,
+-- docs/game-api.md 15). npc_sync skips them (MafiaCoop.IsAmbientHuman(h)). MafiaCoop.PedOwned (entity id -> true)
+-- holds every human this glue controls - every copy of the pool, shown or hidden, and the copy spawner's driver -
+-- and is kept complete at every change: npc_sync never pairs or steers one, guest_world never hides one.
+-- MafiaCoop.Peds.fac.car is the copy spawner's car (traffic_sync and guest_world must leave it alone).
 --
 -- Input (cmds, one line per command):
 --   S active host localId                  session running, we host, our player id
---   A key id x y z hx hy                   local human `id` is the replica of pedestrian `key` (authority << 16 | net)
---   N key x y z hx hy                      spawn a copy for `key` there
---   R key how local                        release `key`'s replica (how: adopted / spawned / none)
---   H id                                   hide local human `id`
---   W id                                   show local human `id` again
+--   N key x y z hx hy prof name            spawn a copy for pedestrian `key` (host << 16 | net) there, with profile
+--                                          `name` (index `prof` of game/ped_model.h kCopyProfiles)
+--   U key id x y z hx hy                   pool copy `id` is `key`'s copy from now on: put there, shown
+--   H id                                   copy `id` has no pedestrian now: hidden, kept in the pool
+--   R key id                               copy `id` goes for good (ReleaseObjectRaw); id 0: `key`'s request dropped
 --   D key gait mult reissue mx my mz fix nx ny turn fx fy tx ty tz hx hy flags
---                                          drive `key`'s replica (core LocomotionCommand; t = the target, flags as
+--                                          drive `key`'s copy (core LocomotionCommand; t = the target, flags as
 --                                          PedStates: 1 dead 2 panic 4 crouch 8 running)
---   K key local                            `key`'s replica dies (the authority's died)
---   KL id                                  our own pedestrian `id` dies (a receiver killed his replica of it)
---   B 1|0                                  keep our pedestrian spawners around us blocked (another's pedestrians show)
+--   K key id                               `key`'s copy dies (the host's died)
+--   KL id                                  (host) our own pedestrian `id` dies (a guest killed his copy of it)
+--   FR why                                 the copy spawner is broken (C++: CreateObject failing / every copy gone
+--                                          at once): a new one now
 -- Output (events, one per line):
 --   PP id x y z inWorld                    every player (us too): where he is (his car while he drives)
 --   PC x y z dx dy dz                      our camera
---   PH id x y z hx hy flags look           an ambient human of ours near a player (flags: 1 dead, 2 panic, 4 crouch)
---   PE                                     end of a round of PH lines
---   PR key x y z hx hy dead                where a replica is, after this tick's commands
---   PSR key id / PSF key why               a spawned copy is in the world (its id) / failed
---   PGL id                                 a local human we controlled (replica / hidden) is gone (the game)
+--   PH id x y z hx hy flags look           (host) an ambient human of ours near a player (flags: 1 dead, 2 panic,
+--                                          4 crouch)
+--   PE                                     (host) end of a round of PH lines
+--   PR key x y z hx hy dead                where a pedestrian's copy is, after this tick's commands
+--   PSR key id prof / PSF key why          a spawned copy is in the world (its id, the look it got) / failed (why:
+--                                          create_failed, no_profile, spawner_reset)
+--   PGL id                                 a copy of ours (bound or in the pool) is gone (the game, or the spawner)
+--   PFR                                    our copy spawner was reset (its copies went with it: the PGLs before)
 --   PW                                     a new world: everything of the old one is gone
 --   ST text                                status for the overlay (once a second)
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
 M.Peds = M.Peds or {}
 local P = M.Peds
-P.version = 1
+P.version = 2
 M.PedOwned = M.PedOwned or {}
 
-local SCAN_INTERVAL = 0.25   -- s between scans of the human table
+local SCAN_INTERVAL = 0.25   -- s between scans of the human table (host)
 local ROUND_INTERVAL = 0.05  -- s between rounds of positions for the C++ side
-local REPORT_RANGE = 75      -- m from any player: our ambient humans reported (the C++ side sends within 50 m)
+local REPORT_RANGE = 100     -- m from any player: our ambient humans reported (the C++ side sends within 80 / 90 m)
 local MAX_REPORT = 200       -- humans per round
 local RECHECK = 5            -- s: a human found not ambient is checked again after this long
 local FACTORY_CAR = "shubert_e_six"
 local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
--- The copies' spawn profile: the game's own ambient civilian profile (its hash is in spawnprofiles.sds, docs/game-api.md
--- 19; npc_sync.lua uses it as the civilian fallback). The authority's pedestrian's own look is not readable: every
--- spawned copy looks like this. UNVERIFIED in game that it loads through a runtime spawner.
-local COPY_PROFILE = "characters/traffic/traffic_base_ambient_combined"
-local LOAD_TIMEOUT = 12      -- s a profile may take to load
-local FACTORY_IDLE = 30      -- s without a spawned copy or request: the spawner goes
-local BLOCK_RADIUS = 60      -- m: spawners blocked around us (BlockSpawnersInSphere, UNVERIFIED for pedestrians)
-local BLOCK_STEP = 20        -- m: blocked again when we moved this far from every blocked spot
-local BLOCK_MAX = 40         -- spots remembered (to unblock them later)
+local LOOK_WAIT = 2         -- s: a request that waited this long is made with the look loaded now (a crowd that comes
+                             -- at once is not kept waiting for six loads; tests/ped_test.cpp SpawnerSim)
+local LOAD_TIMEOUT = 8       -- s a copy profile may take to load (a look that does not load stops the spawner that
+                             -- long; npc_sync's mission profiles get 12 s. UNVERIFIED how long a civilian look takes)
+local FACTORY_IDLE = 30      -- s without a copy (pool included) or request: the spawner goes
+local FACTORY_FOLLOW = 50    -- m: the spawner car is put under us again when we are this far from it (ground)
 local GAITS = { "WALK", "RUN", "SPRINT" }
 
 local function log(s) if mc_log then mc_log("peds: " .. s) end end
@@ -91,13 +96,12 @@ local function active(h)
 end
 local function trace(t, s) if mc_trace then mc_trace(t, s) end end
 
-P.amb = P.amb or {}      -- our ambient humans: id -> { h, id, look, flags }
+P.amb = P.amb or {}        -- (host) our ambient humans: id -> { h, id, look, flags }
 P.notAmb = P.notAmb or {}  -- id -> time it was found not ambient (checked again after RECHECK)
-P.reps = P.reps or {}    -- key -> { key, how = "adopted" | "spawning" | "spawned", h, id, ... }
-P.hidden = P.hidden or {}  -- id -> { h, phys }
-P.queue = P.queue or {}  -- spawn requests: { key, x, y, z, hx, hy }
+P.copies = P.copies or {}  -- (guest) the pool: id -> { h, id, key (nil: free), shown, prof, phys }
+P.reps = P.reps or {}      -- key -> its copy (an entry of P.copies), or { key, how = "spawning" } while asked for
+P.queue = P.queue or {}    -- spawn requests: { key, x, y, z, hx, hy, prof, name }
 P.fac = P.fac or { st = "none", t = 0 }
-P.blocks = P.blocks or {}  -- spots our spawners were blocked around
 
 -- Humans that are not ambient on this game: the puppets, player_sync's factory driver, npc_sync's copies and their
 -- spawner's driver, traffic copy crews, our own (M.PedOwned).
@@ -215,7 +219,7 @@ local function myPos(p)
   return q
 end
 
-function P.Round(p, ev)
+function P.Round(p, ev, host)
   local me = myPos(p)
   local vps = { { x = me.x, y = me.y } }
   ev[#ev + 1] = string.format("PP %s %.2f %.2f %.2f 1", tostring(P.localId or M.localId), me.x, me.y, me.z)
@@ -239,6 +243,7 @@ function P.Round(p, ev)
       ev[#ev + 1] = string.format("PC %.2f %.2f %.2f %.4f %.4f %.4f", cp.x, cp.y, cp.z, cd.x, cd.y, cd.z)
     end
   end
+  if not host then return end  -- a guest shares no pedestrians
   local n = 0
   for id, e in pairs(P.amb) do
     local h = e.h
@@ -268,9 +273,9 @@ local function kill(h)
   pcall(h.DoDamage, h, 100000)
 end
 
--- ---- replicas ---------------------------------------------------------------------------------------------------------
--- A local human under our control: its own wandering and reactions are interrupted (UNVERIFIED which of these the
--- game's civilian AI honours; MoveVec orders are given every few tenths of a second anyway).
+-- ---- copies -----------------------------------------------------------------------------------------------------------
+-- A copy under our control: its own wandering and reactions are interrupted (UNVERIFIED which of these the game's
+-- civilian AI honours; MoveVec orders are given every few tenths of a second anyway).
 local function control(h)
   pcall(h.InterruptCivilWander, h)
   pcall(h.InterruptAvoidingCar, h)
@@ -278,80 +283,93 @@ local function control(h)
   pcall(h.DespawnImmunity, h, true)
 end
 
-local function giveBack(h)
+local function unbind(c)
+  if c.key and P.reps[c.key] == c then P.reps[c.key] = nil end
+  c.key = nil
+end
+
+-- Pool copy `id` stands for pedestrian `key` from now on: put at its spot, shown (UNVERIFIED that Activate +
+-- ShowModel(true) bring back a copy hidden with Deactivate + ShowModel(false), as 0.16.0 did with hidden ambient
+-- humans).
+function P.Reuse(key, id, f)
+  local c = P.copies[id]
+  if not (c and valid(c.h)) then
+    if c then P.copies[id] = nil end
+    M.PedOwned[id] = nil
+    P.ev[#P.ev + 1] = "PGL " .. id
+    return
+  end
+  local n = tonumber
+  local old = P.reps[key]
+  if old and old ~= c then
+    if old.how == "spawning" then P.reps[key] = nil else unbind(old) end
+  end
+  unbind(c)
+  c.key = key
+  c.mult, c.noMult, c.crouchT = nil, nil, nil
+  P.reps[key] = c
+  local h = c.h
+  if not c.shown then
+    pcall(h.Activate, h)
+    pcall(h.ShowModel, h, true)
+    if c.phys ~= nil then pcall(h.SetPhysState, h, c.phys) end
+    c.shown = true
+  end
+  local x, y, z = n(f[4]), n(f[5]), n(f[6])
+  if x and y and z then
+    h:SetPos(V(x, y, z))
+    h:SetDir(V(n(f[7]) or 0, n(f[8]) or 1, 0))
+  end
   pcall(h.SetMovementSpeedMult, h, 1)
-  pcall(h.SetReactionOnSound, h, true)
-  pcall(h.ResumeAvoidingCar, h)
-  pcall(h.ResumeCivilWander, h)
-  pcall(h.DespawnImmunity, h, false)
-end
-
-function P.Adopt(key, id, f)
-  local e = P.amb[id]
-  local h = (e and valid(e.h)) and e.h or mc_entity(id)
-  if not valid(h) then
-    P.ev[#P.ev + 1] = "PGL " .. id
-    return
-  end
-  M.PedOwned[id] = true
-  P.amb[id] = nil
   control(h)
-  P.reps[key] = { key = key, how = "adopted", h = h, id = id }
-  P.adopted = (P.adopted or 0) + 1
-  if P.adopted <= 30 or P.adopted % 100 == 0 then
-    local q = h:GetPos()
-    log(string.format("our human %d is the replica of pedestrian %s of player %d now (%.1f m from it, #%d)", id,
-      tostring(key % 65536), math.floor(key / 65536), math.sqrt((q.x - (tonumber(f[4]) or q.x)) ^ 2 +
-      (q.y - (tonumber(f[5]) or q.y)) ^ 2), P.adopted))
+  P.reused = (P.reused or 0) + 1
+  if P.reused <= 30 or P.reused % 100 == 0 then
+    log(string.format("pool copy %d is the copy of the host's pedestrian %d now (#%d)", id, key % 65536, P.reused))
   end
 end
 
-function P.Release(key, how)
-  local r = P.reps[key]
-  P.reps[key] = nil
-  for i = #P.queue, 1, -1 do
-    if P.queue[i].key == key then table.remove(P.queue, i) end
-  end
-  if not r then return end
-  if r.how == "adopted" and r.h then
-    if valid(r.h) then giveBack(r.h) end
-    if r.id then M.PedOwned[r.id] = nil end
-  elseif r.how == "spawned" and r.h then
-    if valid(r.h) and P.fac.comp then pcall(P.fac.comp.ReleaseObjectRaw, P.fac.comp, r.h) end
-    if r.id then M.PedOwned[r.id] = nil end
-  end
-  P.released = (P.released or 0) + 1
-  if P.released <= 30 or P.released % 100 == 0 then
-    log(string.format("replica of pedestrian %d of player %d released (%s, #%d)", key % 65536, math.floor(key / 65536),
-      tostring(how or r.how), P.released))
-  end
-end
-
-function P.Hide(id)
-  local e = P.amb[id]
-  local h = (e and valid(e.h)) and e.h or mc_entity(id)
-  if not valid(h) then
+-- Copy `id` has no pedestrian now: hidden and kept for the next one.
+function P.HideCopy(id)
+  local c = P.copies[id]
+  if not c then return end
+  unbind(c)
+  if not valid(c.h) then
+    P.copies[id] = nil
+    M.PedOwned[id] = nil
     P.ev[#P.ev + 1] = "PGL " .. id
     return
   end
-  local okp, phys = pcall(h.GetPhysState, h)
-  pcall(h.ShowModel, h, false)
-  pcall(h.Deactivate, h)
-  P.hidden[id] = { h = h, phys = okp and phys or nil }
-  M.PedOwned[id] = true
-  P.amb[id] = nil
+  if c.shown then
+    local h = c.h
+    pcall(h.SetMovementSpeedMult, h, 1)
+    local okp, phys = pcall(h.GetPhysState, h)
+    c.phys = okp and phys or nil
+    pcall(h.ShowModel, h, false)
+    pcall(h.Deactivate, h)
+    c.shown = false
+  end
   P.hides = (P.hides or 0) + 1
 end
 
-function P.Show(id)
-  local x = P.hidden[id]
-  P.hidden[id] = nil
+-- Copy `id` goes for good; id 0: pedestrian `key`'s spawn request is dropped (a copy already made for it stays: the
+-- C++ side got its PSR and keeps it in the pool).
+function P.Remove(key, id)
+  for i = #P.queue, 1, -1 do
+    if P.queue[i].key == key then table.remove(P.queue, i) end
+  end
+  local r = key and P.reps[key]
+  if r and r.how == "spawning" then P.reps[key] = nil end
+  if not id or id == 0 then return end
+  local c = P.copies[id]
+  P.copies[id] = nil
   M.PedOwned[id] = nil
-  if not (x and valid(x.h)) then return end
-  pcall(x.h.Activate, x.h)
-  pcall(x.h.ShowModel, x.h, true)
-  if x.phys ~= nil then pcall(x.h.SetPhysState, x.h, x.phys) end
-  P.shows = (P.shows or 0) + 1
+  if not c then return end
+  unbind(c)
+  if valid(c.h) and P.fac.comp then pcall(P.fac.comp.ReleaseObjectRaw, P.fac.comp, c.h) end
+  P.removed = (P.removed or 0) + 1
+  if P.removed <= 30 or P.removed % 100 == 0 then
+    log(string.format("copy %d removed (#%d)", id, P.removed))
+  end
 end
 
 local function speedMult(r, h, m)
@@ -361,7 +379,7 @@ local function speedMult(r, h, m)
   r.mult = m
 end
 
--- Walk a replica as the C++ side's LocomotionController says (player_sync.lua M.Walk does the same for puppets).
+-- Walk a copy as the C++ side's LocomotionController says (player_sync.lua M.Walk does the same for puppets).
 function P.Drive(r, f)
   local h = r.h
   if not valid(h) or h:IsDeath() then return end
@@ -391,7 +409,7 @@ function P.Drive(r, f)
     end
   end
   if turn then h:SetDir(V(fx, fy, 0)) end
-  -- the authority's pedestrian crouches in panic: ours too, while it stands (UNVERIFIED read and picture)
+  -- the host's pedestrian crouches in panic: ours too, while it stands (UNVERIFIED read and picture)
   if bit(flags, 4) and gait == 0 and M.now - (r.crouchT or -10) > 1.2 then
     r.crouchT = M.now
     pcall(h.PanicCrouch, h, 1.5)
@@ -399,20 +417,41 @@ function P.Drive(r, f)
 end
 
 -- ---- the copies' spawner (player_sync.lua's puppet factory recipe, docs/game-api.md 3) --------------------------------
+local function anyCopy()
+  for _, _ in pairs(P.copies) do return true end
+  return false
+end
+
 function P.FacReset(why)
   local f = P.fac
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end  -- its copies go with it
   if f.drvId then M.PedOwned[f.drvId] = nil end
+  for id, c in pairs(P.copies) do
+    M.PedOwned[id] = nil
+    P.ev[#P.ev + 1] = "PGL " .. id
+  end
   for key, r in pairs(P.reps) do
-    if r.how == "spawned" or r.how == "spawning" then
-      if r.id then M.PedOwned[r.id] = nil end
-      P.reps[key] = nil
-      P.ev[#P.ev + 1] = (r.how == "spawned" and r.id) and ("PGL " .. r.id) or ("PSF " .. key .. " spawner_reset")
+    if r.how == "spawning" then P.ev[#P.ev + 1] = "PSF " .. key .. " spawner_reset" end
+  end
+  P.copies, P.reps, P.queue = {}, {}, {}
+  P.fac = { st = "none", t = -3 }
+  P.ev[#P.ev + 1] = "PFR"  -- after the PGLs: the C++ side does not take them for a spawner that took its copies along
+  if why then log("copy spawner reset: " .. why) end
+end
+
+-- A profile did not load (or was refused): every request for it fails (the C++ side counts it once and may drop it
+-- from the rotation); the spawner itself is fine.
+local function profileFailed(f, name, why)
+  log("copy profile " .. tostring(name) .. " " .. why)
+  for i = #P.queue, 1, -1 do
+    local rq = P.queue[i]
+    if rq.name == name then
+      P.ev[#P.ev + 1] = "PSF " .. rq.key .. " no_profile"
+      if P.reps[rq.key] and P.reps[rq.key].how == "spawning" then P.reps[rq.key] = nil end
+      table.remove(P.queue, i)
     end
   end
-  P.queue = {}
-  P.fac = { st = "none", t = -3 }
-  if why then log("copy spawner reset: " .. why) end
+  f.load, f.loadName, f.loadedName = nil, nil, nil
 end
 
 function P.FacTick(dt, p)
@@ -447,7 +486,7 @@ function P.FacTick(dt, p)
       pcall(drv.SetReactionOnSound, drv, false)
       pcall(drv.InterruptCivilWander, drv)
       pcall(drv.LockControls, drv, true)
-      f.car, f.drv, f.drvId, f.comp, f.st, f.t = car, drv, idOf(drv), comp, "ready", 0
+      f.car, f.drv, f.drvId, f.comp, f.st, f.t, f.readyT = car, drv, idOf(drv), comp, "ready", 0, M.now
       if f.drvId then M.PedOwned[f.drvId] = true end
       log("copy spawner ready")
     elseif f.t > 8 then
@@ -455,111 +494,115 @@ function P.FacTick(dt, p)
     end
   elseif f.st == "ready" then
     if not valid(f.drv) or not valid(f.car) or f.drv:IsDeath() then P.FacReset("copy spawner lost") return end
-    if not f.loaded then
-      if not f.load then
-        local prof = mc_fnv and tostring(mc_fnv(COPY_PROFILE)) or COPY_PROFILE
-        if not pcall(f.comp.SetSpawnProfile, f.comp, prof) then
-          P.FacReset("profile refused")
-          P.fac.t = -30
-          return
+    -- deactivated (2026-10-20 two-PC test: the guest's traffic sync hid it as one of its own traffic cars - its copies
+    -- went with it and every CreateObject failed for 30 s): a new one
+    if not active(f.car) or not active(f.drv) then
+      P.FacReset("copy spawner deactivated")
+      P.fac.t = 0
+      return
+    end
+    if M.now - (f.followT or 0) >= 1 then
+      f.followT = M.now
+      local q, cp = p:GetPos(), f.car:GetPos()
+      if (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 > FACTORY_FOLLOW * FACTORY_FOLLOW then
+        f.car:SetPos(V(q.x - 3, q.y, q.z - 40))
+      end
+    end
+    -- a profile load under way: nothing is made until it is done (the component has one profile at a time)
+    if f.load then
+      if f.load:IsDone() then
+        f.loadedName, f.loadedProf, f.load = f.loadName, f.loadProf, nil
+        P.loadedOnce = P.loadedOnce or {}
+        if not P.loadedOnce[f.loadedName] then
+          P.loadedOnce[f.loadedName] = true
+          log("copy profile " .. f.loadedName .. " loaded (" .. string.format("%.1f", M.now - f.loadT) .. " s)")
         end
-        f.load, f.loadT = f.comp:GetSpawnProfileLoadSyncObject(), M.now
-      elseif f.load:IsDone() then
-        f.loaded = true
-        log("copy profile " .. COPY_PROFILE .. " loaded")
       elseif M.now - f.loadT > LOAD_TIMEOUT then
-        log("copy profile " .. COPY_PROFILE .. " did not load in " .. LOAD_TIMEOUT .. " s")
-        for _, rq in ipairs(P.queue) do P.ev[#P.ev + 1] = "PSF " .. rq.key .. " no_profile" end
-        P.FacReset("the profile did not load")
-        P.fac.t = -30
+        profileFailed(f, f.loadName, "did not load in " .. LOAD_TIMEOUT .. " s")
       end
       return
     end
-    local rq = table.remove(P.queue, 1)
-    if rq then
-      local so = try("copy CreateObject", f.comp.CreateObject, f.comp)
-      if not valid(so) then
-        P.ev[#P.ev + 1] = "PSF " .. rq.key .. " create_failed"
-        P.reps[rq.key] = nil
+    if #P.queue == 0 then
+      -- idle: the spawner goes when it has no copy left for a while, the pool's included (its despawn would take
+      -- its copies along)
+      if anyCopy() then f.t = 0 end
+      if f.t > FACTORY_IDLE then P.FacReset("idle") P.fac.t = 0 end
+      return
+    end
+    -- a request for the loaded profile first (or the oldest one with it, once it waited LOOK_WAIT); else the look
+    -- most requests wait for is loaded (ties: the oldest request's): one load per look, not one per copy
+    local pick
+    for i, rq in ipairs(P.queue) do
+      if rq.name == f.loadedName then pick = i break end
+    end
+    if not pick and f.loadedName and M.now - (P.queue[1].t or M.now) >= LOOK_WAIT then pick = 1 end
+    if not pick then
+      local count, name = {}, P.queue[1].name
+      for _, rq in ipairs(P.queue) do count[rq.name] = (count[rq.name] or 0) + 1 end
+      for _, rq in ipairs(P.queue) do
+        if count[rq.name] > count[name] then name = rq.name end
+      end
+      local prof = mc_fnv and tostring(mc_fnv(name)) or name
+      if not pcall(f.comp.SetSpawnProfile, f.comp, prof) then
+        profileFailed(f, name, "refused by SetSpawnProfile")
         return
       end
-      so:SetPos(V(rq.x, rq.y, rq.z))
-      so:SetDir(V(rq.hx, rq.hy, 0))
-      so:Activate()
-      pcall(so.SetDemigod, so, false)
-      pcall(function() so.invulnerability = false end)
-      control(so)
-      local id = idOf(so)
-      if id then M.PedOwned[id] = true end
-      P.reps[rq.key] = { key = rq.key, how = "spawned", h = so, id = id }
-      P.ev[#P.ev + 1] = "PSR " .. rq.key .. " " .. tostring(id or 0)
-      P.made = (P.made or 0) + 1
-      if P.made <= 30 or P.made % 100 == 0 then
-        log(string.format("spawned a copy for pedestrian %d of player %d (our %s, #%d)", rq.key % 65536,
-          math.floor(rq.key / 65536), tostring(id), P.made))
+      local okL, so = pcall(f.comp.GetSpawnProfileLoadSyncObject, f.comp)
+      if not okL or not so then
+        profileFailed(f, name, "gave no load sync object")
+        return
       end
-      f.t = 0
+      local idx = 0
+      for _, rq in ipairs(P.queue) do
+        if rq.name == name then idx = rq.prof break end
+      end
+      f.load, f.loadName, f.loadProf, f.loadedName, f.loadT = so, name, idx, nil, M.now
+      return
+    end
+    local rq = table.remove(P.queue, pick)
+    local so = try("copy CreateObject", f.comp.CreateObject, f.comp)
+    if not valid(so) then
+      P.ev[#P.ev + 1] = "PSF " .. rq.key .. " create_failed"
+      P.reps[rq.key] = nil
+      return
+    end
+    so:SetPos(V(rq.x, rq.y, rq.z))
+    so:SetDir(V(rq.hx, rq.hy, 0))
+    so:Activate()
+    pcall(so.SetDemigod, so, false)
+    pcall(function() so.invulnerability = false end)
+    control(so)
+    local id = idOf(so)
+    if id then
+      M.PedOwned[id] = true
+      local c = { h = so, id = id, key = rq.key, shown = true, prof = f.loadedProf or rq.prof }
+      P.copies[id] = c
+      P.reps[rq.key] = c
     else
-      -- idle: the spawner goes when it has no copy left for a while (its despawn would take its copies along)
-      local any = false
-      for _, r in pairs(P.reps) do
-        if r.how == "spawned" then any = true break end
-      end
-      if any then f.t = 0 end
-      if f.t > FACTORY_IDLE then P.FacReset("idle") P.fac.t = 0 return end
-      if f.t % 3 < dt then
-        local q, cp = p:GetPos(), f.car:GetPos()
-        if (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 > 120 * 120 then f.car:SetPos(V(q.x - 3, q.y, q.z - 40)) end
-      end
+      P.reps[rq.key] = nil
     end
-  end
-end
-
--- ---- our spawners near another's pedestrians --------------------------------------------------------------------------
--- BlockSpawnersInSphere(pos, r, bool) (static, docs/game-api.md 26: the spawners inside the sphere at that moment get
--- the flag; not a lasting zone) around us while another game's pedestrians show here, so fewer of ours appear only to
--- be hidden. UNVERIFIED that `true` blocks and that it reaches the pedestrian spawners.
-function P.Block(on, p)
-  if on then
-    if M.now - (P.blockT or -10) < 1 then return end
-    P.blockT = M.now
-    local q = p:GetPos()
-    for _, b in ipairs(P.blocks) do
-      if (q.x - b.x) ^ 2 + (q.y - b.y) ^ 2 < BLOCK_STEP * BLOCK_STEP then return end
+    P.ev[#P.ev + 1] = "PSR " .. rq.key .. " " .. tostring(id or 0) .. " " .. tostring(f.loadedProf or rq.prof)
+    P.made = (P.made or 0) + 1
+    if P.made <= 30 or P.made % 100 == 0 then
+      log(string.format("spawned a copy for the host's pedestrian %d (our %s, look %s, #%d)", rq.key % 65536,
+        tostring(id), tostring(f.loadedName), P.made))
     end
-    local ok = pcall(game.traffic.BlockSpawnersInSphere, game.traffic, V(q.x, q.y, q.z), BLOCK_RADIUS, true)
-    table.insert(P.blocks, { x = q.x, y = q.y, z = q.z })
-    if #P.blocks > BLOCK_MAX then
-      local b = table.remove(P.blocks, 1)
-      pcall(game.traffic.BlockSpawnersInSphere, game.traffic, V(b.x, b.y, b.z), BLOCK_RADIUS, false)
-    end
-    if #P.blocks == 1 then log("our pedestrian spawners blocked around us: " .. (ok and "ok" or "FAILED")) end
-  elseif #P.blocks > 0 then
-    for _, b in ipairs(P.blocks) do
-      pcall(game.traffic.BlockSpawnersInSphere, game.traffic, V(b.x, b.y, b.z), BLOCK_RADIUS, false)
-    end
-    log(#P.blocks .. " blocked spots of our pedestrian spawners unblocked")
-    P.blocks = {}
+    f.t = 0
   end
 end
 
 -- Everything we hold goes back to the game (session end, a new world: `gone` = the entities went with it).
 function P.DropAll(why, gone)
-  local n, hn = 0, 0
-  for key, r in pairs(P.reps) do
-    if not gone then P.Release(key, r.how) end
+  local n = 0
+  for id, c in pairs(P.copies) do
+    if not gone and valid(c.h) and P.fac.comp then pcall(P.fac.comp.ReleaseObjectRaw, P.fac.comp, c.h) end
     n = n + 1
   end
-  for id, _ in pairs(P.hidden) do
-    if not gone then P.Show(id) end
-    hn = hn + 1
-  end
   if not gone and P.fac.st ~= "none" then P.FacReset(nil) end
-  if not gone then P.Block(false) end
-  P.reps, P.hidden, P.queue, P.blocks = {}, {}, {}, {}
+  P.copies, P.reps, P.queue = {}, {}, {}
   P.fac = { st = "none", t = 0 }
   M.PedOwned = {}
-  if n + hn > 0 then log(string.format("%d replicas and %d hidden humans let go: %s", n, hn, why)) end
+  if n > 0 then log(string.format("%d copies let go: %s", n, why)) end
 end
 
 -- ---- update -----------------------------------------------------------------------------------------------------------
@@ -575,13 +618,14 @@ function P.Update(dt, cmds)
     P.amb, P.notAmb = {}, {}
     P.scanT, P.roundT = -10, -10
   end
-  local isActive = false
+  local isActive, isHost = false, false
   local list = {}
   for line in string.gmatch(cmds, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
     if f[1] == "S" then
       isActive = f[2] == "1"
+      isHost = f[3] == "1"
       P.localId = f[4] or P.localId
     else
       list[#list + 1] = f
@@ -593,27 +637,26 @@ function P.Update(dt, cmds)
     return table.concat(ev, "\n")
   end
   P.wasActive = true
+  P.isHost = isHost
   for _, f in ipairs(list) do
     local op, n = f[1], tonumber
     local good, err = true, nil
     if op == "D" then
       local r = P.reps[n(f[2]) or -1]
-      if r and (r.how == "adopted" or r.how == "spawned") then good, err = pcall(P.Drive, r, f) end
-    elseif op == "A" then
-      good, err = pcall(P.Adopt, n(f[2]), n(f[3]), f)
+      if r and r.h then good, err = pcall(P.Drive, r, f) end
     elseif op == "N" then
       local key = n(f[2])
-      if key and not P.reps[key] then
+      if key and not P.reps[key] and f[9] then
         P.reps[key] = { key = key, how = "spawning" }
         P.queue[#P.queue + 1] = { key = key, x = n(f[3]) or 0, y = n(f[4]) or 0, z = n(f[5]) or 0, hx = n(f[6]) or 0,
-          hy = n(f[7]) or 1 }
+          hy = n(f[7]) or 1, prof = n(f[8]) or 0, name = f[9], t = M.now }
       end
-    elseif op == "R" then
-      good, err = pcall(P.Release, n(f[2]), f[3])
+    elseif op == "U" then
+      good, err = pcall(P.Reuse, n(f[2]), n(f[3]), f)
     elseif op == "H" then
-      good, err = pcall(P.Hide, n(f[2]))
-    elseif op == "W" then
-      good, err = pcall(P.Show, n(f[2]))
+      good, err = pcall(P.HideCopy, n(f[2]))
+    elseif op == "R" then
+      good, err = pcall(P.Remove, n(f[2]), n(f[3]))
     elseif op == "K" then
       local r = P.reps[n(f[2]) or -1]
       if r and r.h and valid(r.h) then kill(r.h) end
@@ -623,69 +666,80 @@ function P.Update(dt, cmds)
       local h = (e and valid(e.h)) and e.h or (id and mc_entity(id))
       if h and valid(h) then
         kill(h)
-        log("our pedestrian " .. tostring(id) .. " dies: a player killed his replica of it")
+        log("our pedestrian " .. tostring(id) .. " dies: a guest killed his copy of it")
       end
-    elseif op == "B" then
-      good, err = pcall(P.Block, f[2] == "1", p)
+    elseif op == "FR" then
+      -- only a spawner that has been ready a while (one being made, or made just now after our own reset, is new)
+      if P.fac.st == "ready" and M.now - (P.fac.readyT or M.now) >= 1 then
+        good, err = pcall(P.FacReset, "asked (" .. tostring(f[2]) .. ")")
+        P.fac.t = 0
+      end
     end
     if not good then
       P.errs = (P.errs or 0) + 1
       if P.errs <= 20 then log(op .. " error: " .. tostring(err)) end
     end
   end
-  -- the spawner works through the spawn requests (one profile, copies one per tick)
+  -- the spawner works through the spawn requests (one profile load at a time, copies one per tick)
   if #P.queue > 0 or P.fac.st ~= "none" then
     local good, err = pcall(P.FacTick, dt, p)
     if not good then log("spawner error: " .. tostring(err)) P.FacReset("error") end
   end
-  -- replica reports (and gone ones)
-  for key, r in pairs(P.reps) do
-    if r.how == "adopted" or r.how == "spawned" then
-      if not valid(r.h) then
-        ev[#ev + 1] = "PGL " .. tostring(r.id or 0)
-        if r.id then M.PedOwned[r.id] = nil end
+  -- copy reports (and gone ones)
+  for key, c in pairs(P.reps) do
+    if c.h then
+      if not valid(c.h) then
+        ev[#ev + 1] = "PGL " .. tostring(c.id or 0)
+        if c.id then
+          M.PedOwned[c.id] = nil
+          P.copies[c.id] = nil
+        end
         P.reps[key] = nil
       else
-        local q, d = r.h:GetPos(), r.h:GetDir()
-        local okD, dead = pcall(r.h.IsDeath, r.h)
+        local q, d = c.h:GetPos(), c.h:GetDir()
+        local okD, dead = pcall(c.h.IsDeath, c.h)
         ev[#ev + 1] = string.format("PR %d %.3f %.3f %.3f %.4f %.4f %d", key, q.x, q.y, q.z, d.x, d.y,
           (okD and dead) and 1 or 0)
       end
     end
   end
-  if M.now - (P.hiddenT or -10) >= 1 then
-    P.hiddenT = M.now
-    for id, x in pairs(P.hidden) do
-      if not valid(x.h) then
-        P.hidden[id] = nil
+  if M.now - (P.poolT or -10) >= 1 then
+    P.poolT = M.now
+    for id, c in pairs(P.copies) do
+      if not c.key and not valid(c.h) then
+        P.copies[id] = nil
         M.PedOwned[id] = nil
         ev[#ev + 1] = "PGL " .. id
       end
     end
   end
-  -- our ambient humans
-  if M.now - (P.scanT or -10) >= SCAN_INTERVAL then
+  -- our ambient humans (the host only)
+  if isHost and M.now - (P.scanT or -10) >= SCAN_INTERVAL then
     P.scanT = M.now
     local good, err = pcall(P.Scan)
     if not good then log("scan error: " .. tostring(err)) end
   end
   if M.now - (P.roundT or -10) >= ROUND_INTERVAL then
     P.roundT = M.now
-    local good, err = pcall(P.Round, p, ev)
+    local good, err = pcall(P.Round, p, ev, isHost)
     if not good then log("round error: " .. tostring(err)) end
   end
   if M.now - (P.stT or -10) >= 1 then
     P.stT = M.now
-    local a, s, hid = 0, 0, 0
-    for _, r in pairs(P.reps) do
-      if r.how == "adopted" then a = a + 1 elseif r.how == "spawned" then s = s + 1 end
+    local bound, free, hidden = 0, 0, 0
+    for _, c in pairs(P.copies) do
+      if c.key then bound = bound + 1 else free = free + 1 end
+      if not c.shown then hidden = hidden + 1 end
     end
-    for _, _ in pairs(P.hidden) do hid = hid + 1 end
-    ev[#ev + 1] = string.format("ST ambient %d (%d near players), replicas %d adopted / %d spawned (+%d queued), "
-      .. "hidden %d, spawner %s, blocked spots %d", P.ambCount or 0, P.reported or 0, a, s, #P.queue, hid,
-      P.fac.st, #P.blocks)
-    trace("PDL", string.format("amb=%d near=%d adopted=%d spawned=%d queued=%d hidden=%d fac=%s blocks=%d",
-      P.ambCount or 0, P.reported or 0, a, s, #P.queue, hid, P.fac.st, #P.blocks))
+    if isHost then
+      ev[#ev + 1] = string.format("ST ambient %d (%d near players)", P.ambCount or 0, P.reported or 0)
+    else
+      ev[#ev + 1] = string.format("ST copies %d + %d in the pool (%d hidden, +%d queued), spawner %s, look %s",
+        bound, free, hidden, #P.queue, P.fac.st, tostring(P.fac.loadedName or "-"))
+    end
+    trace("PDL", string.format("amb=%d near=%d copies=%d pool=%d hidden=%d queued=%d fac=%s prof=%s",
+      P.ambCount or 0, P.reported or 0, bound, free, hidden, #P.queue, P.fac.st,
+      tostring(P.fac.loadedName or "-")))
   end
   return table.concat(ev, "\n")
 end
