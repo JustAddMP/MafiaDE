@@ -131,10 +131,14 @@ bool CallGlue(lua_State* L, const char* cmd, std::string& reading) {
         return false;
     }
     lua::GetField(L, -1, "Leash");
-    if (lua::TypeOf(L, -1) != lua::TFunction) {
+    // a Lua function is TIFunction (9) in this engine's Lua (Havok Script), TFunction / TCFunction for others: any of
+    // them (the 2026-10-20 14:36 one-PC run: the Lua function read as "no MafiaCoop.Leash" every tick, no leash at all)
+    const int type = lua::TypeOf(L, -1);
+    if (type != lua::TFunction && type != lua::TIFunction && type != lua::TCFunction) {
         if (!_noGlueLogged) {
             _noGlueLogged = true;
-            MC_LOG_WARN("leash: player_sync.lua has no MafiaCoop.Leash (an older override next to the dll?): no leash");
+            MC_LOG_WARN("leash: player_sync.lua has no MafiaCoop.Leash yet (type %d; an older override next to the dll?): "
+                        "tried again every tick", type);
         }
         lua::SetTop(L, top);
         return false;

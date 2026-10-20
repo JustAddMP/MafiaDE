@@ -72,7 +72,7 @@ end
 local P = M.Peds
 local pedCopies = 0
 for _, r in pairs(P and P.reps or {}) do
-  if r.how == "spawned" and r.h and valid(r.h) then pedCopies = pedCopies + 1 end
+  if r.how ~= "spawning" and r.h and valid(r.h) then pedCopies = pedCopies + 1 end  -- pool copies bound to a pedestrian
 end
 local N = M.Npc
 local npcCopies = 0

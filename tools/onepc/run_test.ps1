@@ -57,4 +57,8 @@ Say "host world extent (a minute later): $(Lua 0 "$PSScriptRoot\world_extent.lua
 # crews out / put back so far: no in / out loops)
 Say "host traffic: $(Lua 0 "$PSScriptRoot\traffic_probe.lua")"
 Say "guest traffic: $(Lua 1 "$PSScriptRoot\traffic_probe.lua")"
+# the leash (docs/host-authority.md 3): the guest is put 450 m from the host; within ~1 s the countdown banner, after ~10 s
+# he is pulled back beside the host ("leash: pulled back beside the host", LSH ev=pulled ok=1); the host's panel names him
+Say "guest leash: $(Lua 1 "$PSScriptRoot\leash_test.lua")"; Start-Sleep 3; Both "13-leash-countdown"
+Start-Sleep 13; Both "14-leash-pulled-back"
 Say "done: now run_stop.ps1, then compare.ps1"
