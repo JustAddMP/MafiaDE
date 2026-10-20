@@ -54,6 +54,9 @@ int main() {
               guest.PriorityOf(0x0202) == Priority::Bulk && guest.PriorityOf(0x0210) == Priority::Normal &&
               guest.PriorityOf(0x0250) == Priority::Normal,
           "priorities: player state and events critical, bulk thinned first");
+    Check(guest.LaneOf(0x0208) == 1 && guest.LaneOf(0x0209) == 1 && guest.PriorityOf(0x0208) == Priority::Normal &&
+              guest.PriorityOf(0x0209) == Priority::Normal && latency::SystemOf(0x0209) == latency::kWorld,
+          "the leash (LeashConfig / LeashEvent): world lane, normal priority");
 
     // loopback: the host's handler side sees the guest's door event with its age, Applied writes it into the summary
     latency::Attach(&host);

@@ -73,6 +73,8 @@ TARGETS = {
     "world.guest_own_peds": ("<=", 0, "guest's own ambient humans within 80 m still shown, max 10 s after a world load"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
     "join.complete_s": ("<=", 10.0, "a guest's world complete after a join / reconnect (s)"),
+    "leash.pulls": (">=", 0, "pulls back to the host (info: how often the leash pulled)"),
+    "leash.false_pulls": ("<=", 0, "pulls while a suspension rule held or under the max distance"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
     "bw.host_up": ("<=", 160.0, "host upload, all systems, median (KB/s)"),
 }
@@ -1414,6 +1416,47 @@ def joins(guest, host):
             (f.get("times") or "").replace(",", ", ").replace(":", " ")))
 
 
+def leash(tr):
+    """The distance leash (LSH, docs/sync-trace.md; docs/host-authority.md section 3): a guest's state changes and
+    pulls, the host's received events."""
+    ev = tr.records["LSH"] if tr else []
+    if not ev:
+        return
+    section("Leash on %s's game (%s)" % (tr.name, tr.role))
+    pulls = false_pulls = shown = 0
+    max_m = None
+    for t, f in ev:
+        kind = f.get("ev")
+        if kind in ("config", "send"):
+            max_m = num(f.get("max"), max_m)
+            print("  %s %s warn %s m, max %s m, countdown %s s%s" % (
+                tr.wall(t), "config" if kind == "config" else "sent", f.get("warn"), f.get("max"), f.get("cd"),
+                " (%s)" % f.get("from") if f.get("from") else ""))
+        elif kind == "pull":
+            pulls += 1
+            dist = num(f.get("dist"))
+            mx = num(f.get("max"), max_m)
+            bad = f.get("why", "-") != "-" or (dist is not None and mx is not None and dist < mx)
+            false_pulls += 1 if bad else 0
+            print("  %s PULL at %s m%s" % (tr.wall(t), f.get("dist"), " (FALSE: %s)" % f.get("why") if bad else ""))
+        elif kind == "pulled":
+            print("  %s pulled: ok=%s how=%s" % (tr.wall(t), f.get("ok"), f.get("how")))
+        elif kind == "rx":
+            if f.get("repeat") != "1":
+                print("  %s from player %s: %s (%s m)" % (tr.wall(t), f.get("from"), f.get("kind"), f.get("dist")))
+        elif kind == "state":
+            shown += 1
+            if shown <= 60:
+                print("  %s %s%s %s m" % (tr.wall(t), f.get("st"), "/" + f.get("why") if f.get("why", "-") != "-"
+                                         else "", f.get("dist")))
+    if shown > 60:
+        print("  (%d state changes, the first 60 shown)" % shown)
+    if tr.role == "guest":
+        print("  pulls %d, false pulls %d" % (pulls, false_pulls))
+        record("leash.pulls", pulls, tr.name)
+        record("leash.false_pulls", false_pulls, tr.name)
+
+
 def doors(tr, other):
     """Door changes on this game and what the other game made of them (DR / DL / DA, docs/sync-trace.md)."""
     dr, dl, da = tr.records["DR"], tr.records["DL"], tr.records["DA"]
@@ -1646,6 +1689,8 @@ def main():
     world(host, guest)
     joins(guest, host)
     guest_world(guest)
+    for tr in (a, b):
+        leash(tr)
     traffic(a, b)
     for x, y in ((a, b), (b, a)):
         peds(x, y)

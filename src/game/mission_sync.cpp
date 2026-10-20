@@ -1809,6 +1809,11 @@ std::string MissionSync::HudNotice() {
     return sh.notice;
 }
 
+bool MissionSync::FailBusy() {
+    std::lock_guard lock(_failMu);
+    return _fail.GetState() != FailFlow::State::Idle;
+}
+
 void MissionSync::GetStatus(std::vector<render::OverlayLine>& out) {
     if (!_session || !_session->IsActive()) return;
     Shared& sh = S();

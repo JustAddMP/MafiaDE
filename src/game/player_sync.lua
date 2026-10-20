@@ -4885,6 +4885,104 @@ function M.DownTick(p)
   log("respawned " .. (near and "next to the host" or "in place"))
 end
 
+-- ---------------------------------------------------------------------------------------------------------------
+-- The leash (src/game/leash.h, docs/host-authority.md 3), guest only: the decisions are in C++; this reads what they
+-- need and carries out the pull. src/game/leash_sync.cpp calls MafiaCoop.Leash(cmd) once per script tick after
+-- M.Update. cmd "PULL": the screen fades out (HUD_FaderFadeOut, as mission_sync.lua uses it), we are put back near the
+-- host (M.LeashPull), it fades in again. Returns "" outside a session and on the host, else
+--   "R inWorld x y host hx hy cut selfDown hostDown hostCar passenger drive" [.. " P ok how"]
+-- x y: us (our car while we sit in one); host 1: the host's puppet's spot is known (a state of his came in the last
+-- second), hx hy: that spot; cut: a cutscene plays or the host's holds us (M.cutscene, mission_sync.lua); selfDown:
+-- we are downed / dead / respawning (M.DownTick); hostDown: his health is 0 (downed or dead); hostCar: we sit in the
+-- car the host is in; passenger: we sit in another car, not at the wheel (its driver's leash moves it); drive: we
+-- are at the wheel; P: the answer to the pull (ok 1/0; how: foot, road, beside, or why not).
+-- ---------------------------------------------------------------------------------------------------------------
+local LEASH_BEHIND = 15    -- m behind the host: where a driver's car is put (on the road there if there is one)
+local LEASH_BESIDE = 4     -- m to the host's right: the car's spot without a road point
+local LEASH_FADE = 0.35    -- s of fade-out before the move (none when the fader is not there)
+
+-- Puts us back near the host. On foot: M.NearHost (as after being downed). At the wheel: our car on the road 15 m
+-- behind the host (game.traffic:GetClosestPointOnRoad; UNVERIFIED: its second argument, 0 here), else beside him,
+-- facing his heading, stopped; we stay in it, and the copies of it on the other games jump with it (their teleport
+-- rule). Returns ok, how.
+function M.LeashPull(p)
+  local host = M.pup["0"]
+  if not (host and host.tx) then return false, "nohost" end
+  local my = M.my
+  if not (my and my.c and valid(my.c.ent)) then
+    if M.NearHost(p) then return true, "foot" end
+    return false, "nearhost"
+  end
+  if my.seat ~= 0 then return false, "passenger" end
+  local hx, hy = host.hx or 0, host.hy or 1
+  local l = math.sqrt(hx * hx + hy * hy)
+  if l < 1e-3 then hx, hy, l = 0, 1, 1 end
+  hx, hy = hx / l, hy / l
+  local sx, sy, sz = host.tx - hx * LEASH_BEHIND, host.ty - hy * LEASH_BEHIND, host.tz
+  local x, y, z, how = host.tx + hy * LEASH_BESIDE, host.ty - hx * LEASH_BESIDE, host.tz, "beside"
+  local good, pt = pcall(function() return game.traffic:GetClosestPointOnRoad(V(sx, sy, sz), 0) end)
+  if good and pt then
+    local g2, px, py, pz = pcall(function() return pt.x, pt.y, pt.z end)
+    if g2 and type(px) == "number" and type(py) == "number" and type(pz) == "number"
+        and (px - sx) ^ 2 + (py - sy) ^ 2 < 30 * 30 and math.abs(pz - sz) < 8 then
+      x, y, z, how = px, py, pz, "road"
+    end
+  end
+  if how ~= "road" and not M.leashRoadLogged then
+    M.leashRoadLogged = true
+    log("leash: GetClosestPointOnRoad gave no usable point (" .. tostring(good) .. ", " .. tostring(pt) ..
+      "): the car goes beside the host")
+  end
+  local car = my.c.ent
+  car:SetPos(V(x, y, z + 0.3))
+  -- the car's yaw from the heading (the game's quaternions: forward (sin a, cos a) for a rotation a about z)
+  local a = math.atan2(hx, hy)
+  local q = Math:newQuat()
+  q.v = V(0, 0, math.sin(a / 2))
+  q.s = math.cos(a / 2)
+  pcall(car.SetRot, car, q)
+  pcall(car.SetSpeed, car, 0)
+  return true, how
+end
+
+function M.Leash(cmd)
+  if not M.inSession or M.isHost then M.leashPullAt = nil; return "" end
+  local p = M.Player()
+  local answer = ""
+  if cmd == "PULL" and not M.leashPullAt then
+    local faded = pcall(HUD_FaderFadeOut, 0.25)
+    M.leashPullAt, M.leashFaded = faded and M.now or (M.now - LEASH_FADE), faded
+    log("leash: too far from the host: pulling back" .. (faded and "" or " (no fader: at once)"))
+  end
+  if M.leashPullAt and M.now - M.leashPullAt >= LEASH_FADE then
+    M.leashPullAt = nil
+    local ok, how = false, "notinworld"
+    if p then
+      local good, a, b = pcall(M.LeashPull, p)
+      if good then ok, how = a, b else how = "error"; logErr("leash pull", a) end
+    end
+    if M.leashFaded then pcall(HUD_FaderFadeIn, 0.5) end
+    log(ok and ("leash: pulled back beside the host (" .. tostring(how) .. ")") or
+      ("leash: the pull did not work (" .. tostring(how) .. "), tried again in 2 s"))
+    answer = string.format(" P %d %s", ok and 1 or 0, tostring(how))
+  end
+  if not p then return "R 0 0 0 0 0 0 0 0 0 0 0 0" .. answer end
+  local my = M.my
+  local inCar = my and my.c and valid(my.c.ent)
+  local pos = inCar and my.c.ent:GetPos() or p:GetPos()
+  local host = M.pup["0"]
+  local seen = host and host.tx and host.ty and M.now - (host.tAt or -10) < 1
+  local hostDown = seen and (host.health or 100) <= 0
+  local good, dead = pcall(p.IsDeath, p)
+  local selfDown = M.down or M.died or (good and dead)
+  local hostCar = inCar and seen and host.vkey ~= nil and my.key == host.vkey
+  local passenger = inCar and my.seat ~= 0 and not hostCar
+  local function b(v) return v and 1 or 0 end
+  return string.format("R 1 %.2f %.2f %d %.2f %.2f %d %d %d %d %d %d", pos.x, pos.y, b(seen),
+    seen and host.tx or 0, seen and host.ty or 0, b(M.cutscene), b(selfDown), b(hostDown), b(hostCar), b(passenger),
+    b(inCar and my.seat == 0)) .. answer
+end
+
 -- Our demigod flag: on while shielded or downed (not while a replayed bullet is on its way), off otherwise (only
 -- switched off again if we switched it on).
 -- Health taken by a spawned copy's bullet (M.OnLocalDamage) is given back; our health is kept for that each tick.
@@ -5560,6 +5658,7 @@ function M.Update(dt, cmds)
       if act > 0 then pp.act, pp.actAt = act, M.now end  -- played by M.Drive this tick (or dropped there when stale)
       pp.firstT = pp.firstT or M.now
       pp.fresh = true
+      pp.tAt = M.now  -- the leash: a state of his is here (M.Leash)
     elseif op == "Q" and player then  -- in the session, no position yet: load the model ahead
       if not M.pup[f[2]] then
         M.pup[f[2]] = { id = f[2], st = "queued", model = f[3], profile = M.Profile(f[3], f[2]) }

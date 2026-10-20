@@ -11,6 +11,7 @@
 #include "game/explosion_sync.h"
 #include "game/item_sync.h"
 #include "game/join_sync.h"
+#include "game/leash_sync.h"
 #include "game/lua.h"
 #include "game/menu.h"
 #include "game/mission_sync.h"
@@ -198,10 +199,11 @@ std::string ReconnectNotice() {
 }
 
 // A line over the game while the story sync needs a moment (guest: held during the host's cutscene, loading his
-// checkpoint), or while a connection is being re-established.
+// checkpoint), or while a connection is being re-established; last the leash (guest far from the host, game/leash.h).
 void DrawNotice(render::DrawList& d, float w, float h) {
     std::string text = ReconnectNotice();
     if (text.empty()) text = MissionSync::HudNotice();
+    if (text.empty()) text = LeashSync::HudNotice();
     if (text.empty()) return;
     const float s = h / 1080.0f, px = 26.0f * s;
     const float tw = render::DrawList::TextWidth(text, px);
@@ -230,6 +232,7 @@ public:
             ExplosionSync::Install();  // last: its glue reads the others' tables
             ThrowSync::Install();      // the flights of thrown explosives (its glue is called by the explosions')
             GuestWorldSync::Install(); // after every other glue: its Lua reads their tables (what is ours)
+            LeashSync::Install();      // after PlayerSync: player_sync.lua holds M.Leash (game/leash_sync.h)
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -246,6 +249,7 @@ public:
         PlayerSync::Attach(session);
         WorldEnvSync::Attach(session);
         JoinSync::Attach(session);
+        LeashSync::Attach(session);
         MissionSync::Attach(session);
         NpcSync::Attach(session);
         TrafficSync::Attach(session);
@@ -263,6 +267,7 @@ public:
         PlayerSync::Detach();
         WorldEnvSync::Detach();
         JoinSync::Detach();
+        LeashSync::Detach();
         MissionSync::Detach();
         NpcSync::Detach();
         TrafficSync::Detach();
@@ -340,6 +345,7 @@ public:
         CarDamageSync::Tick(dt);
         CarLookSync::Tick(dt);
         GuestWorldSync::Tick(dt);
+        LeashSync::Tick(dt);
         JoinSync::Tick(dt);  // last: after every system's handlers and ticks of this frame
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
@@ -363,6 +369,8 @@ public:
         case 0x0205: return "MissionFail";
         case 0x0206: return "FailVerdict";
         case 0x0207: return "JoinReport";
+        case 0x0208: return "LeashConfig";
+        case 0x0209: return "LeashEvent";
         case 0x0210: return "NpcStates";
         case 0x0211: return "NpcDeath";
         case 0x0212: return "NpcStates2";
@@ -416,6 +424,7 @@ public:
         CarLookSync::GetStatus(out);
         ThrowSync::GetStatus(out);
         GuestWorldSync::GetStatus(out);
+        LeashSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }
