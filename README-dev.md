@@ -361,6 +361,15 @@ Unreleased fixes (merged 2026-10-19, code only, none checked in game yet):
 - [ ] Garage (save_paths.h): back up the save folder, play a CHAPTER session: `profiles\temporaryprofile\garage.pf`
   byte-identical afterwards; log `kept out of the player's profile` and `held until the game restarts`. (Single player
   garage changes after a co-op session in the same process are lost until the game restarts.)
+- [ ] Host profile (save_paths.h `Guard`, after the 2026-10-20 test): back up the save folder, HOST a lobby FREE RIDE,
+  take a car from the Free Ride garage (next to the start) and put it back, STOP HOSTING in the world, quit to the
+  main menu: `garage.pf`, `aslot.pf` and `gamesaves\default\aslot\save1.sav` byte-identical afterwards (one PC:
+  tools\onepc run_stop.ps1 `profile and save files changed by the run: 0`); host log `savesys: hosting: saves, slot
+  profiles and progress profiles ... now go to`, `profile write #n kept out of the player's profile (progress: the
+  cars in the player's garage)` at each garage visit, never `savesys: written: garage.pf`; `out of the co-op world
+  (main menu)` only once the main menu is up. Then a STORY session as host: his story saves change as in single
+  player (`written: save0.sav (... the STORY host's own story ...)`), `garage.pf` does not. Then single player
+  without a session after a restart: `written: garage.pf` again.
 - [ ] Police decay: the guest makes himself wanted (ZoneCreate HUNT) with the host's cops near his puppet:
   `POD hold=1`, his zone stays more than 60 s; drive away: `POD hold=0` within 4 s; the host's `POL w=0`
   throughout. Watch for a mission that holds the decay itself being released by ours.
@@ -776,9 +785,18 @@ The host is authoritative; guests play his chapter and checkpoint (docs/game-api
   the player's own and left alone. Table: src/game/save_paths.h; log `savesys: profile write #n kept out of the
   player's profile (progress: the cars in the player's garage)`.
   The host of a lobby CHAPTER session is redirected the same way from START on (the game would otherwise save that chapter into his Free
-  Ride slot); his checkpoint scan reads the scratch tree too, so his new checkpoints still reach the guests. The host
-  of a STORY session continues his own story and keeps saving it (that is his campaign, as in single player); in Free
-  Ride the host's game saves his Free Ride as usual.
+  Ride slot); his checkpoint scan reads the scratch tree too, so his new checkpoints still reach the guests. Since the
+  2026-10-20 test (the host's `garage.pf` written for real at each garage visit of a co-op Free Ride, his
+  `aslot\save1.sav` and `aslot.pf` with it) every other host is covered too: in a FREE RIDE (or any world not loaded
+  from his story slot, also his own Free Ride he started hosting from) saves, slot profiles and progress profiles go
+  to the scratch tree like a guest's; the host of a STORY session (his world loaded from `aslot`: CONTINUE, his
+  checkpoints) continues his own story and keeps saving it (his campaign, as in single player), only his progress
+  profiles (garage, stats, persistent data) are kept out. Log: `savesys: hosting: ... now go to <scratch> (the host,
+  in a world that is not his own story)` / `(the host of his own story: his story saves stay his own)`. All of it
+  ends only once the main menu is up after the session (`savesys: out of the co-op world (main menu)`), so the quit
+  save of the co-op world is kept out too; a single-player game after that writes the real files again (held
+  progress files excepted). Decision table: src/game/save_paths.h (`Guard`), replayed from that test's logs by
+  save_paths_test.
 - Dying in a co-op chapter (or failing its mission) reloads the checkpoint: a guest the host's, the host his own. The
   game itself answers a failed mission in these loads with a load of `freeroam_before_quest_activated`, a save of the
   player's own story; save_guard keeps that load inside the session (the slot lookup gets the chapter loader's entry,
