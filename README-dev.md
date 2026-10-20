@@ -564,6 +564,14 @@ Play in this order, both players together unless a step says otherwise (about 25
    back; the guest leaves the session and joins again. `world.time_err` <= 0.5, `join.complete_s` <= 10;
    guest log `join: world complete in X s`; the cars parked before the rejoin are there (`PKR`).
 7. **Always:** `lat.player.p95` <= 40 ms, `bw.host_up` <= 160 KB/s (with 3-4 players if available).
+8. **Motorbike and garage (2026-10-20 findings, docs/test-2026-10-20.md), 3 min:** each player takes a vehicle out of
+   the Free Ride garage (a motorbike once, a car once) while the other stands next to the garage door, then rides
+   past him. `foot.shown` >= 98 %, `foot.respawns` 0, `foot.respawn_s` <= 5 s, `foot.dz_p95` <= 0.5 m (both
+   directions). Logs: no `cars error`; the rider's game `car ...: a motorbike (...)`, the other's `bike copy ready` and
+   `puppet N rides bike`; if the garage removes a puppet, `puppet N is gone (removed by the game ...)` and `puppet N
+   spawned` within 5 s, never `did not load in 12 s` for a profile that loaded before.
+
+Before the two-PC test, the scripted one-PC run (tools/onepc/README.md) checks the same on one PC.
 
 ## Test checklist: animation and car controls (0.13.0; 0.14.0 fixes not yet tested in game)
 

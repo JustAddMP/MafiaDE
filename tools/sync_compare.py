@@ -53,7 +53,8 @@ TARGETS = {
     "foot.gait": (">=", 90.0, "puppet gait matches the player's (%)"),
     "foot.snaps_per_min": ("<=", 0.5, "puppet snaps per minute on foot"),
     "foot.shown": (">=", 98.0, "his puppet (or the car copy he sits in) there while his states arrive (% of the time)"),
-    "foot.respawns": ("<=", 0, "puppet spawned again without a character change or a new world (count)"),
+    "foot.respawns": ("<=", 0, "puppet spawned again with no reason logged (not a character change, a new world or the game removing it)"),
+    "foot.respawn_s": ("<=", 5.0, "puppet the game removed: back after (s, max)"),
     "foot.dz_p95": ("<=", 0.5, "puppet height vs the player's on foot, p95 (m; a puppet under the floor)"),
     "car.p95": ("<=", 1.0, "car copy vs the driver's car, p95 (m)"),
     "car.pinned": ("<=", 10.0, "car copy pinned (% of samples)"),
@@ -372,8 +373,16 @@ def compare(sender, receiver, args, worst):
             share, len(bins) / 2.0))
         record("foot.shown", share, who)
     spawns = [(t, s) for t, s in receiver.logs if ("puppet %d spawned" % sid) in s]
+    gone = [t for t, s in receiver.logs if ("puppet %d is gone" % sid) in s]
     reasons = [t for t, s in receiver.logs if ("puppet %d removed" % sid) in s or ("puppet %d queued (" % sid) in s
-               or "local player in world" in s or "a new world" in s]
+               or "local player in world" in s or "a new world" in s] + gone
+    if gone:
+        backs = []
+        for tg in gone:
+            nxt = [t for t, _ in spawns if t >= tg]
+            backs.append((nxt[0] - tg) if nxt else (receiver.span()[1] - tg))
+        print("    removed by the game %d time(s): back after %s s" % (len(gone), ", ".join("%.1f" % b for b in backs)))
+        record("foot.respawn_s", max(backs), who)
     if spawns:
         extra = 0
         for i in range(1, len(spawns)):

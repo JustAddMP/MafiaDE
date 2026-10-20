@@ -58,7 +58,7 @@ void TestComplete() {
     t.Mark(System::Doors, {}, 15.2);
     ev = t.Poll(15.3);
     const Ev* c = Find(ev, Ev::Complete);
-    Check(c && std::fabs(c->after - 5.2) < 1e-9 && !c->late, "complete when the last required part came (doors)",
+    Check(c && std::fabs(c->after - 3.2) < 1e-9 && !c->late, "complete when the last required part came (doors), timed from the world's load",
           c ? std::to_string(c->after) : "none");
     Check(c && c->none == "traffic", "complete: optional systems that sent nothing are named", c ? c->none : "");
     Check(t.Complete() && t.Poll(40).empty(), "complete: no missing report afterwards");
@@ -76,14 +76,14 @@ void TestMissing() {
     Check(!Find(ev, Ev::Missing) && !Find(ev, Ev::Complete), "missing: not before 15 s in the world");
     ev = t.Poll(35.0);
     const Ev* m = Find(ev, Ev::Missing);
-    Check(m && m->missing == "player:2,police:2" && std::fabs(m->after - 35.0) < 1e-9,
+    Check(m && m->missing == "player:2,police:2" && std::fabs(m->after - 15.0) < 1e-9,
           "missing: after 15 s in the world, names what is missing", m ? m->missing : "none");
     Check(t.Poll(36.0).empty(), "missing: reported once");
     t.Mark(System::Player, "2", 40.0);
     t.Mark(System::Police, "2", 41.0);
     ev = t.Poll(41.5);
     const Ev* c = Find(ev, Ev::Complete);
-    Check(c && c->late && std::fabs(c->after - 41.0) < 1e-9, "missing: a late complete follows",
+    Check(c && c->late && std::fabs(c->after - 21.0) < 1e-9, "missing: a late complete follows",
           c ? std::to_string(c->after) : "none");
 }
 
@@ -98,7 +98,7 @@ void TestNotInWorld() {
     const Ev* c = nullptr;
     auto ev = t.Poll(100.1);
     c = Find(ev, Ev::Complete);
-    Check(c && std::fabs(c->after - 0.6) < 1e-9, "menu: complete as soon as we are in the world (time of the last part)",
+    Check(c && c->after == 0.0, "menu: complete as soon as we are in the world (0 s: everything came in the menu)",
           c ? std::to_string(c->after) : "none");
 }
 

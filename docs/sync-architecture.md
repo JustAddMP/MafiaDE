@@ -90,6 +90,9 @@ Numbers: S1 / S2 = the two sessions of the 2026-10-19 test; "host->guest" = the 
 | | `foot.mean` | 0.71-1.04 m | <= 0.35 m |
 | | `foot.gait` gait match | 63-76 % | >= 90 % |
 | | `foot.snaps_per_min` | 8.2-17.3 (S1), 0.3-6.9 (S2) | <= 0.5 |
+| | `foot.shown` his puppet (or his car copy) there while his states arrive (added after the 2026-10-20 test) | 19.5-20.6 % (host on the guest, 0.16.0) | >= 98 % |
+| | `foot.respawns` / `foot.respawn_s` puppet spawned again with no reason / back after the game removed it | 1 / never (0.16.0) | 0 / <= 5 s |
+| | `foot.dz_p95` height puppet vs player on foot | 0.76-0.79 m (0.16.0, bike riders) | <= 0.5 m |
 | Player car copy | `car.p95` copy vs car | 0.80-1.93 m | **<= 1.0 m** |
 | | `car.pinned` share of samples | 56-74 % | <= 10 % |
 | | `car.speed_ratio` median | 0.28 | 0.9-1.1 |

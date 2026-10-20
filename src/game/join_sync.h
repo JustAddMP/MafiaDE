@@ -123,7 +123,9 @@ public:
             complete_ = true;
             Event e;
             e.kind = Event::Complete;
-            e.after = LastRequired() - begin_;
+            // timed from the later of the join and our world's load: a guest who joins in the menu waits in the
+            // lobby and the loading screen first (2026-10-20 test: 50.9 s, nearly all of it the lobby)
+            e.after = std::max(0.0, LastRequired() - Start());
             e.late = reported_;
             e.none = NoneSeen();
             out.push_back(e);
@@ -133,7 +135,7 @@ public:
             reported_ = true;
             Event e;
             e.kind = Event::Missing;
-            e.after = now - begin_;
+            e.after = now - Start();
             e.missing = Missing();
             e.none = NoneSeen();
             out.push_back(e);
@@ -165,6 +167,7 @@ private:
     void Need(System s, const std::string& key) {
         if (!Optional(s)) need_.insert({s, PerKey(s) ? key : std::string()});
     }
+    double Start() const { return std::max(begin_, inWorldAt_); }
     double LastRequired() const {
         double last = begin_;
         for (const auto& [s, k] : need_) {

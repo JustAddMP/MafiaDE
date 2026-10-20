@@ -13,6 +13,25 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
   (`update check: ...`). Checked against the live endpoint from a test harness (as 0.15.0: v0.16.0 found; as
   0.16.0: up to date); the banner in game is not yet seen.
 - Core v0.13.0 (from v0.12.0): the update check; no other change, protocol stays 9.
+- Fixes from the 2026-10-20 two-PC test of 0.16.0 (docs/test-2026-10-20.md: "the guest is invisible to the host"):
+  - **Motorbikes stopped all car and bike sync** ("cars error" a hundred times a second, every car of that player
+    unshared for the rest of the session, the rider shown as a man running 0.7 m under him and snapped up again and
+    again): a bike has no GetGUID; it now gets a number of its own, and only counts while its seat names the rider.
+    Seen working on one PC with the fix loaded into the running games (the other game showed the bike with the
+    rider's puppet on it, off and on again); not yet on two PCs or with a garage bike.
+  - **The other player vanished and never came back**: when the game removed a puppet (the Free Ride garage clears
+    its door when a player takes a vehicle out), the guest's spawner hung and, after the fallback timed out too, the
+    puppet was given up for good. Now it is spawned again at once, a spawner that hangs on a profile it loaded before
+    is replaced after 4 s, and a puppet is never given up. Tried on one PC with a simulated loss; not yet on two PCs.
+  - The pedestrian copy spawner (and any fixed car) is no longer shared as traffic (a crewed car 40 m under the
+    other player). Not run in game.
+  - A guest's "world complete" time starts when his world has loaded, not when he joined in the menu. Not run in
+    game.
+  - sync_compare: `foot.shown` (the other player's puppet or car copy there while his states arrive),
+    `foot.respawns`, `foot.respawn_s`, `foot.dz_p95` (a puppet under the floor). On the 2026-10-20 traces the host was
+    there on the guest's game 19.5-20.6 % of the time.
+  - tools/onepc: a scripted one-PC run (two instances) with screenshots and the expected `--check` results; not run
+    yet.
 
 ## 0.16.0 (2026-10-20), pre-release, not yet verified in game
 

@@ -1661,6 +1661,8 @@ wheelie are in the bike's rotation, which goes out like a car's. The entity type
 PLAYER 9, CAR 10, BOAT 27); the native car readers (`mc_car_controls`, `mc_car_signals`) only read entities of type
 10, so a bike is never read as a car.
 
+**Checked in game 2026-10-20 (one PC, a `motorcycle_1935` from ObtainSpecificCar / SpawnCar):** `GetSpawnedEntity` gives nil for a bike; `GetSpawnedSceneObject` gives `<SceneObject: motorcycle_1935>`. That scene object answers only to GetName, GetPos, GetRot, GetDir, GetComponent, SetPos, SetRot, Activate, Deactivate, IsActive, GetTransform: **no GetGUID**, no GetSeatOwner, GetSpeed, GetType or SetDespawnImmunity. Its `C_RuntimeMotorcycleComponent` has GetSeatOwner, GetSeatCount, GetPassengers, GetVehicleModelName, GetSpeedFloat, SetSpeed, SetEngineOn, Lock/UnlockPlayerEntryPoints (IsObjectValid on the component is false). `player:GetOnVehicle(<scene object>, 1, false, "WALK")` puts the player (and a puppet) on it; on it the player's `GetOwner()` is nil, `GetOwnerSceneObject()` is the bike, the component's `GetSeatOwner(0)` is the player and the player's GetPos is 0.76 m above the bike's (the +0.7 m height of every bike rider in the 2026-10-20 two-PC traces). `E` gets off; `GetOffVehicle()` returned a sync object but left him on; `GetOutCarFast()` without an argument fails ("Missing adaptor arguments"), with the bike's scene object it is accepted. The mod gives a bike a number of its own (`16nnnnnn`, player_sync.lua guidNum) because GetGUID is missing: calling it was the 0.16.0 "cars error".
+
 **How the mod uses it (UNVERIFIED):**
 
 | what | how |

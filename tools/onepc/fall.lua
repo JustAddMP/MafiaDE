@@ -1,0 +1,5 @@
+-- puts our player 4 m up: he falls (the others' puppet of him must follow the fall, not snap again and again)
+local p = game.game:GetActivePlayer()
+local q = p:GetPos()
+p:SetPos(Math:newVector(q.x, q.y, q.z + 4))
+return string.format("up to %.1f", q.z + 4)
