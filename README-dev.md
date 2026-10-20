@@ -903,9 +903,23 @@ guest_ped_budget = -1      ; the pedestrian budget a guest puts back when his ga
 
 - `out\logs\mafiacoop.log` (or `mafiacoop-<tag>.log` with `--log <tag>`; a second concurrent instance without
   `--log` writes `mafiacoop-<pid>.log`): one line per event (timestamp, thread id, level), written to the file straight away.
-  The previous five runs are kept as `mafiacoop.log.1` (newest) .. `.5`. A heartbeat with FPS is logged every 10 s
-  from the Present hook.
-- `out\logs\trace\*.trace`: the sync trace of each co-op session (docs/sync-trace.md), the newest 20 kept.
+  The previous ten runs are kept as `mafiacoop.log.1` (newest) .. `.10` (per log name). A heartbeat with FPS is
+  logged every 10 s from the Present hook. Warnings and errors are rate limited per call site (10 a minute, then one
+  `repeated N more times in 60 s (rate limited; last: ...)` line). Every co-op session has a `session: ---- session
+  start` block (versions, Steam, transport, window, settings, paths, peers), a `session: summary (60 s)` line every
+  minute and a `session: ---- session end` block (totals, worst latency, the game's counts, the most repeated
+  warnings, the bundle). Lua errors: `<module>: Update error #n: <message> | stack traceback: ...` when the game's Lua
+  gives a stack (the first tick logs `lua: error tracebacks on` or `off`).
+- `out\logs\trace\*.trace`: the sync trace of each co-op session (docs/sync-trace.md), the newest 20 kept, 4 GiB for
+  the folder, 1 GiB per file.
+- `out\logs\bundles\MafiaCoop-<date>-<time>-<role>.zip`: one per session (its trace, the log, the ini with passwords
+  redacted, launcher logs, crash dumps since the session started, manifest.txt), written when the session ends or
+  the game exits with it open; a `-recovered` one at the next start for a session whose game crashed or was killed.
+  The newest 30 are kept. **This is what players send** (both PCs). Read two of them with
+  `python -I tools\sync_compare.py <host bundle.zip> <guest bundle.zip> [--check]` (zip or trace, any order); its first
+  sections are the two session headers side by side (mismatches flagged), the clock alignment, and at the end the 10 s
+  summaries, every entity from the host's admit to the guest's screen (VIS) and the end-of-session totals. The main
+  log is in the zip too (`logs/`), and `grep " SES \| SUM \| FIN "` on the trace gives the headers and totals.
 - `out\logs\launcher.log` (`launcher-<tag>.log`, or `launcher-<pid>.log` when a game was already running): what
   the launcher found and did.
 - `out\logs\crash-<date>-<time>.dmp`: a minidump written on a fatal exception. The log gets the exception code,

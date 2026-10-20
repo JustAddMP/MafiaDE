@@ -1,6 +1,7 @@
 #include "game/leash_sync.h"
 
 #include "core/config.h"
+#include "core/diag.h"
 #include "core/log.h"
 #include "core/trace.h"
 #include "game/join_sync.h"
@@ -14,6 +15,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <string>
@@ -66,6 +68,7 @@ struct Far {
 };
 std::map<net::PlayerId, Far> _far;  // host: what each guest last said
 uint32_t _rxEvents = 0;
+bool _sesHostWritten = false;  // host: his leash in the session header (SES part=leash)
 
 // main thread
 Leash _leash;
@@ -74,6 +77,9 @@ bool _running = false, _pullCmd = false, _holdCmd = false, _noGlueLogged = false
 uint32_t _luaErrors = 0, _logged = 0;
 Config _lastConfig;
 bool _haveLastConfig = false;
+std::atomic<bool> _sesPending{true};  // guest: the leash in force still to go into the session header
+bool _sesFromHost = false;
+double _diagAt = 0;
 
 std::string Upper(std::string s) {
     for (char& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
@@ -147,7 +153,7 @@ bool CallGlue(lua_State* L, const char* cmd, std::string& reading) {
     lua::PushString(L, cmd, std::strlen(cmd));
     std::string err;
     if (!lua::PCall(L, 1, 1, &err)) {
-        if (++_luaErrors <= 20 || _luaErrors % 200 == 0) MC_LOG_WARN("leash: Leash error #%u: %s", _luaErrors, err.c_str());
+        _luaErrors = lua::ReportError("leash", "Leash", err);
         lua::SetTop(L, top);
         return false;
     }
@@ -157,7 +163,22 @@ bool CallGlue(lua_State* L, const char* cmd, std::string& reading) {
     return true;
 }
 
+// The leash in force, for the session header (dll/session_log.h SES; docs/sync-trace.md "SES part=leash"): the host
+// his own (from his settings), a guest the host's LeashConfig once it is here (or the defaults until then).
+void SesLeash(const char* role, const Config& c, const char* from) {
+    if (!core::trace::IsOpen()) return;
+    core::trace::Line("SES", "part=leash role=%s warn=%u max=%u cd=%u on=%d pull=%d from=%s", role, c.warnM, c.maxM,
+                      c.countdownS, c.On() ? 1 : 0, c.PullOn() ? 1 : 0, from);
+    MC_LOG_INFO("session: leash in force (%s, %s): warning at %u m, countdown beyond %u m for %u s%s", role, from,
+                c.warnM, c.maxM, c.countdownS, !c.On() ? " (off)" : c.PullOn() ? "" : " (warning only)");
+}
+
 void Trace(const char* ev, const Output& o, const Config& c) {
+    // the session summaries' counts (core/diag.h): every state entered, every pull
+    char name[48];
+    std::snprintf(name, sizeof name, "leash.%s.%s", std::strcmp(ev, "pull") == 0 ? "ev" : "state",
+                  std::strcmp(ev, "pull") == 0 ? "pull" : StateName(o.state));
+    core::diag::Add(name);
     if (!core::trace::IsOpen()) return;
     core::trace::Line("LSH", "ev=%s st=%s why=%s dist=%.1f left=%.1f warn=%u max=%u cd=%u", ev, StateName(o.state),
                       WhyName(o.why), o.dist, o.left, c.warnM, c.maxM, c.countdownS);
@@ -188,6 +209,14 @@ void MainTick(lua_State* L, float) {
         return;
     }
     _running = true;
+    if (!_haveLastConfig || cfg != _lastConfig || _sesFromHost != fromHost) {
+        _sesPending = true;  // SES part=leash once the trace is open
+        _sesFromHost = fromHost;
+    }
+    if (_sesPending && core::trace::IsOpen()) {
+        _sesPending = false;
+        SesLeash("guest", cfg, fromHost ? "host" : "default");
+    }
     if (!_haveLastConfig || cfg != _lastConfig) {
         _haveLastConfig = true;
         _lastConfig = cfg;
@@ -249,6 +278,11 @@ void MainTick(lua_State* L, float) {
     in.failReload = MissionSync::FailBusy();
     const State before = _leash.GetState();
     const Output o = _leash.Update(in);
+    if (now - _diagAt >= 1.0) {  // the session summaries' levels
+        _diagAt = now;
+        core::diag::Set("leash.dist", o.dist);
+        core::diag::Set("leash.state", static_cast<double>(static_cast<int>(o.state)));
+    }
     if (o.pull) {
         _pullCmd = true;  // carried out by the glue on the next tick
         MC_LOG_INFO("leash: %.0f m from the host after the %u s countdown: pulled back (%s)", o.dist, cfg.countdownS,
@@ -283,6 +317,8 @@ void LeashSync::Install() {
 
 void LeashSync::Attach(net::Session& session) {
     _session = &session;
+    _sesHostWritten = false;
+    _sesPending = true;
     _sender.Reset();
     _iniAt = -1e9;
     _far.clear();
@@ -336,12 +372,18 @@ void LeashSync::Tick(float) {
         return;
     }
     const double now = Now();
+    if (!_sesHostWritten && core::trace::IsOpen() && _iniAt > -1e8) {
+        _sesHostWritten = true;
+        SesLeash("host", _hostConfig, "settings");
+    }
     if (now - _iniAt >= kIniEveryS) {
         _iniAt = now;
         const Config c = IniConfig();
-        if (c != _hostConfig)
+        if (c != _hostConfig) {
             MC_LOG_INFO("leash: our leash for the guests: warning at %u m, countdown beyond %u m, %u s%s", c.warnM,
                         c.maxM, c.countdownS, !c.On() ? " (off)" : c.PullOn() ? "" : " (warning only)");
+            _sesHostWritten = false;  // written again with the new values
+        }
         _hostConfig = c;
     }
     std::vector<std::pair<uint32_t, uint32_t>> guests;

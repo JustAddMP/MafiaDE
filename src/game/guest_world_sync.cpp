@@ -1,6 +1,7 @@
 #include "game/guest_world_sync.h"
 
 #include "core/config.h"
+#include "core/diag.h"
 #include "core/log.h"
 #include "core/mem.h"
 #include "core/trace.h"
@@ -352,8 +353,7 @@ void MainTick(lua_State* L, float dt) {
     std::string err;
     const double now = Now();
     if (!lua::PCall(L, 2, 1, &err)) {
-        if (++_luaErrors <= 20 || _luaErrors % 200 == 0)
-            MC_LOG_WARN("guest world: Update error #%u: %s", _luaErrors, err.c_str());
+        _luaErrors = lua::ReportError("guest world", "Update", err);
         lua::SetTop(L, top);
         return;
     }
@@ -370,6 +370,12 @@ void MainTick(lua_State* L, float dt) {
                           PedSwitchName(p.PedMode()), static_cast<int>(_acts.hide), _cars, _peds, _hidC, _hidP,
                           _hidTotal, _cand, p.SavedBudget(), p.BudgetState(), p.BlockedSpots(), p.Reasserts(),
                           p.Restores());
+        // the session summaries' numbers (core/diag.h): the guest's own world, suppressed or not
+        core::diag::Set("world.suppressed", p.Applied() ? 1 : 0);
+        core::diag::Set("world.own_cars_shown", _cars);
+        core::diag::Set("world.own_peds_shown", _peds);
+        core::diag::Total("world.hidden", static_cast<uint64_t>(_hidTotal > 0 ? _hidTotal : 0));
+        core::diag::Total("world.reapplies", p.Reasserts());
     }
 }
 

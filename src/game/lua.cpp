@@ -1,6 +1,7 @@
 #include "game/lua.h"
 
 #include "core/compat.h"
+#include "core/diag.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/mem.h"
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <unordered_set>
@@ -913,6 +915,8 @@ bool EntityIsLive(const void* entity) {
 
 void* EntityByGuid(uint32_t id) { return EntityLookupAvailable() ? EntityById(id) : nullptr; }
 
+void ProbeTraceback(lua_State* L);  // below: does debug.traceback work as the pcall message handler?
+
 // ---- setup ----------------------------------------------------------------------------------------------------
 bool Install(const std::wstring& dllDir, const std::string& tag) {
     _dllDir = dllDir;
@@ -984,6 +988,7 @@ bool Install(const std::wstring& dllDir, const std::string& tag) {
     _available = true;
     // Our helpers for scripts; registered on the first tick.
     Post([](lua_State* L) {
+        ProbeTraceback(L);  // before anything else runs: how errors are reported from now on (logged once)
         RegisterGlobal(L, "mc_log", &McLog);
         RegisterGlobal(L, "mc_u64", &McU64);
         RegisterGlobal(L, "mc_u64str", &McU64Str);
@@ -1187,15 +1192,154 @@ std::string ToDisplay(lua_State* L, int idx) {
     return out;
 }
 
+namespace {
+std::atomic<int> _tbMode{-1};  // TracebackMode()
+
+// Pushes debug.traceback (false: there is none; nothing pushed).
+bool PushTraceback(lua_State* L) {
+    if (!HasRoom(L, 2)) return false;
+    GetGlobal(L, "debug");
+    if (TypeOf(L, -1) != TTable) {
+        Pop(L, 1);
+        return false;
+    }
+    GetField(L, -1, "traceback");
+    const int t = TypeOf(L, -1);
+    if (t != TFunction && t != TIFunction && t != TCFunction) {
+        Pop(L, 2);
+        return false;
+    }
+    uint8_t* tb = TopRef(L) - kTValueSize;  // [.. debug traceback] -> [.. traceback]
+    std::memcpy(tb - kTValueSize, tb, kTValueSize);
+    TopRef(L) -= kTValueSize;
+    return true;
+}
+
+// The pcall with debug.traceback as its message handler, put below the function (stack index *errIdx); PCall takes
+// the handler out again afterwards. useHandler false (or no debug.traceback): the plain call, *errIdx 0.
+int RawPCall(lua_State* L, int nargs, int nresults, bool useHandler, int* errIdx) {
+    *errIdx = 0;
+    const int fn = GetTop(L) - nargs;  // the function's index
+    if (useHandler && fn >= 1 && PushTraceback(L)) {
+        uint8_t* f = Base(L) + static_cast<size_t>(fn - 1) * kTValueSize;
+        uint8_t handler[kTValueSize];
+        std::memcpy(handler, TopRef(L) - kTValueSize, kTValueSize);
+        std::memmove(f + kTValueSize, f, static_cast<size_t>(nargs + 1) * kTValueSize);
+        std::memcpy(f, handler, kTValueSize);
+        *errIdx = fn;
+    }
+    return _api.pcall(L, nargs, nresults, *errIdx);
+}
+
+// SEH around the probe's call only (no C++ objects with destructors here: C2712).
+int ProbeCall(lua_State* L, int* errIdx) {
+    __try {
+        return RawPCall(L, 0, 0, true, errIdx);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                   : EXCEPTION_CONTINUE_SEARCH) {
+        return -1000;
+    }
+}
+}  // namespace
+
+int TracebackMode() { return _tbMode.load(); }
+
 bool PCall(lua_State* L, int nargs, int nresults, std::string* err) {
-    const int status = _api.pcall(L, nargs, nresults, 0);
-    if (status == 0) return true;
+    int errIdx = 0;
+    const int status = RawPCall(L, nargs, nresults, _tbMode.load() == 1, &errIdx);
+    if (status == 0) {
+        if (errIdx > 0) {  // take the handler out from under the results
+            uint8_t* h = Base(L) + static_cast<size_t>(errIdx - 1) * kTValueSize;
+            std::memmove(h, h + kTValueSize, static_cast<size_t>(TopRef(L) - (h + kTValueSize)));
+            TopRef(L) -= kTValueSize;
+        }
+        return true;
+    }
     if (err) {
         const char* s = ToString(L, -1);
         *err = s ? s : ("error object of type " + std::to_string(TypeOf(L, -1)));
     }
-    Pop(L, 1);
+    if (errIdx > 0)
+        SetTop(L, errIdx - 1);  // the message and the handler
+    else
+        Pop(L, 1);
     return false;
+}
+
+// Once, at the first tick: does debug.traceback work as the pcall message handler here? Logged either way.
+void ProbeTraceback(lua_State* L) {
+    const int top = GetTop(L);
+    const bool have = PushTraceback(L);
+    if (have) Pop(L, 1);
+    if (!have) {
+        _tbMode = 0;
+        MC_LOG_INFO("lua: error tracebacks off: this game's Lua has no debug.traceback (errors are logged with their "
+                    "message only)");
+        return;
+    }
+    static const char kProbe[] = "error('mc traceback probe')";
+    if (_api.loadbuffer(L, kProbe, sizeof kProbe - 1, "=mc_traceback_probe") != 0) {
+        SetTop(L, top);
+        _tbMode = 0;
+        MC_LOG_WARN("lua: error tracebacks off: the probe did not compile");
+        return;
+    }
+    int errIdx = 0;
+    const int status = ProbeCall(L, &errIdx);
+    if (status == -1000) {
+        _tbMode = 0;
+        SetTop(L, top);
+        MC_LOG_WARN("lua: error tracebacks off: the probe's pcall with a message handler faulted");
+        return;
+    }
+    const char* s = status != 0 ? ToString(L, -1) : nullptr;
+    std::string msg = s ? s : "";
+    SetTop(L, top);
+    for (char& c : msg)
+        if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+    // debug.traceback(msg) gives "<msg>\nstack traceback:\n..." (the word after the message)
+    const size_t at = msg.find("mc traceback probe");
+    if (status != 0 && at != std::string::npos && msg.find("traceback", at + 18) != std::string::npos) {
+        _tbMode = 1;
+        MC_LOG_INFO("lua: error tracebacks on (debug.traceback as the pcall message handler; probe: %.200s)",
+                    msg.c_str());
+    } else {
+        _tbMode = 0;
+        MC_LOG_INFO("lua: error tracebacks off: the pcall's message handler gave no stack (status %d, probe: %.200s)",
+                    status, msg.c_str());
+    }
+}
+
+uint32_t ReportError(const char* tag, const char* what, const std::string& err) {
+    static std::mutex mu;
+    static auto* counts = new std::map<std::string, std::pair<uint32_t, std::string>>;  // key -> count, format
+    const std::string key = std::string(tag) + "|" + what;
+    uint32_t n = 0;
+    const char* fmt = nullptr;
+    {
+        std::lock_guard lock(mu);
+        auto& e = (*counts)[key];
+        if (e.second.empty()) {  // one log call site per module (core's repeat limit counts each apart)
+            for (const char* c = tag; *c; ++c) e.second += *c == '%' ? '_' : *c;
+            e.second += std::string(": ") + what + " error #%u: %s";
+        }
+        n = ++e.first;
+        fmt = e.second.c_str();  // stable: entries are never removed
+    }
+    char counter[64];
+    std::snprintf(counter, sizeof counter, "lua.err.%s", tag);
+    for (char* c = counter; *c; ++c)
+        if (*c == ' ') *c = '_';
+    core::diag::Add(counter);
+    if (n <= 20 || n % 200 == 0) {
+        std::string text;
+        for (char c : err) {
+            if (c == '\n') text += " | ";
+            else if (c != '\r' && c != '\t') text += c;
+        }
+        core::log::Write(core::log::Level::Warn, fmt, n, text.c_str());
+    }
+    return n;
 }
 
 bool DoString(lua_State* L, const char* src, size_t len, const char* chunkName, int nresults, std::string* err) {

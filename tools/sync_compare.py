@@ -2,6 +2,9 @@
 
     python tools/sync_compare.py <trace of one game> <trace of the other> [--csv DIR] [--worst N]
 
+A session bundle (logs\\bundles\\MafiaCoop-<date>-<time>-<role>.zip, docs/sync-trace.md "Bundles") can be given instead
+of a trace: its trace is read from the zip.
+
 Each game writes one trace per session to logs\\trace\\ next to its log (mafiacoop-<tag>-<date>-<time>.trace). Give
 the two traces of the same session (one from each PC, or both from one PC). The report covers, for each player as
 seen on the other's game:
@@ -20,6 +23,9 @@ seen on the other's game:
 - latency per system (LAT records): how long a message took from the sender's send to this game applying it,
   p50 / p95 / max per system and receiving game (age on arrival + hand-off to the script tick)
 - the worst moments with the wall-clock time of both games, to look them up in a video or the logs
+- session diagnostics (session-logs builds): both games' session headers side by side with the fields that must match
+  flagged (SES), how the two clocks were lined up (SCK; the RX offsets for older traces), the 10 s summaries (SUM),
+  every entity from the host's admit to the guest's screen (VIS) and the end-of-session totals (FIN)
 
 --csv DIR writes the lined-up time series (one file per player and kind) for plotting.
 --check prints every sync target of docs/sync-architecture.md section 4 with PASS / FAIL / no data (exit code 1 when
@@ -78,6 +84,7 @@ TARGETS = {
     "leash.false_pulls": ("<=", 0, "pulls while a suspension rule held or under the max distance"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
     "bw.host_up": ("<=", 160.0, "host upload, all systems, median (KB/s)"),
+    "session.mismatch": ("<=", 0, "session header fields that must match but differ (versions, protocol, exe, leash)"),
 }
 METRICS = []  # (metric, value, who)
 
@@ -144,8 +151,10 @@ class Trace:
         self.qpc0 = None
         self.players = {}
         self.records = defaultdict(list)  # type -> [(t, fields)]
+        self.raw = defaultdict(list)  # RAW_TYPES -> [(t, the rest of the line)]
         self.logs = []  # (t, text)
-        with open(path, encoding="utf-8", errors="replace") as f:
+        src, self.source = open_trace_text(path)
+        with src as f:
             for line in f:
                 line = line.rstrip("\r\n")
                 if not line:
@@ -174,6 +183,8 @@ class Trace:
                     fl = parse_fields(rest.split("name=", 1)[0])
                     self.players[int(num(fl.get("id"), -1))] = name
                     continue
+                if typ in RAW_TYPES:
+                    self.raw[typ].append((t, rest))
                 self.records[typ].append((t, parse_fields(rest)))
         self.role = self.header.get("role", "?")
         self.local = int(num(self.header.get("local"), -1))
@@ -241,8 +252,9 @@ def stats_line(values, unit="m"):
         statistics.fmean(values), pct(values, 50), pct(values, 95), max(values), unit, len(values))
 
 
-def clock_relation(rx_side, tx_side, sender_id):
-    """Local clock of rx_side minus the clock of tx_side (seconds), from RX offsets and the round trip time."""
+def clock_relation_rx(rx_side, tx_side, sender_id):
+    """Local clock of rx_side minus the clock of tx_side (seconds), from RX offsets and the round trip time. (The
+    session clocks are preferred when both traces have them: clock_relation, in "session diagnostics" below.)"""
     offs = [num(f.get("off")) for _, f in rx_side.records["RX"] if num(f.get("from"), -1) == sender_id]
     offs = [o for o in offs if o is not None]
     rtts = [num(f.get("rtt")) for _, f in rx_side.records["CLK"] if num(f.get("id"), -1) == sender_id]
@@ -339,7 +351,7 @@ def compare(sender, receiver, args, worst):
     first, last = (min(got), max(got)) if got else (0, 0)
     sent_in = [s for s in tx if first <= s <= last]
     lost = [s for s in sent_in if s not in got]
-    lat = [(got[s] - diff - tx[s][0]) * 1000 for s in sent_in if s in got]
+    lat = [(got[s] - unwrap_relation(diff) - tx[s][0]) * 1000 for s in sent_in if s in got]  # trace clocks: no wrap
     drops = len([1 for _, f in receiver.records["RXD"] if num(f.get("from"), -1) == sid])
     print("  network: %d states sent in that time, %d received, %d lost (%.2f %%), %d dropped as old/duplicate" % (
         len(sent_in), len(got), len(lost), 100.0 * len(lost) / max(1, len(sent_in)), drops))
@@ -1762,6 +1774,435 @@ def bandwidth(traces):
         print("  no NetMonitor lines in the traces (net_log_interval 0, or the log copy was off)")
 
 
+# ---- session diagnostics (docs/sync-trace.md SES / SCK / SUM / VIS / FIN; core dll/session_log.h) ------------------
+# Read from the records the session-logs build writes; every function is a no-op (or falls back) on older traces.
+RAW_TYPES = ("SES", "FIN")  # records whose last field runs to the end of the line (names, paths, values)
+REST_KEYS = ("name", "value", "path", "target", "fmt")  # those fields
+
+
+def parse_rest(rest):
+    """key=value fields of a SES / FIN line; the REST_KEYS field takes the rest of the line (spaces included)."""
+    out = {}
+    toks = rest.split(" ")
+    for i, tok in enumerate(toks):
+        k, sep, v = tok.partition("=")
+        if not sep:
+            continue
+        if k in REST_KEYS:
+            out[k] = " ".join([v] + toks[i + 1:])
+            break
+        out[k] = v
+    return out
+
+
+def open_trace_text(path):
+    """A trace file, or a session bundle (.zip, core/bundle.h): its trace/*.trace (the biggest). Returns (lines, note)."""
+    import io
+    import zipfile
+    if path.lower().endswith(".zip") or zipfile.is_zipfile(path):
+        z = zipfile.ZipFile(path)
+        names = [i for i in z.infolist() if i.filename.lower().endswith(".trace")]
+        if not names:
+            raise SystemExit("%s: a zip without a .trace in it" % path)
+        best = max(names, key=lambda i: i.file_size)
+        return io.TextIOWrapper(z.open(best), encoding="utf-8", errors="replace"), "bundle %s: %s" % (
+            os.path.basename(path), best.filename)
+    return open(path, encoding="utf-8", errors="replace"), None
+
+
+def same_pc(a, b):
+    """Both traces from one PC (one QueryPerformanceCounter): its zero (wall clock - qpc) is the same to a second."""
+    if a.wall0 is None or b.wall0 is None or a.qpc0 is None or b.qpc0 is None:
+        return False
+    za = a.wall0 - timedelta(seconds=a.qpc0)
+    zb = b.wall0 - timedelta(seconds=b.qpc0)
+    return abs((za - zb).total_seconds()) < 1.5
+
+
+def session_offset(tr):
+    """This game's session clock offset to the host (host - local, s) and where it came from: SCK records, else the
+    CLK sclk field (traces before SCK), else (None, None). The host's is 0."""
+    if tr.role == "host":
+        return 0.0, "host"
+    v = [num(f.get("off")) for _, f in tr.records["SCK"] if num(f.get("synced"), 1) == 1]
+    v = [x for x in v if x is not None]
+    if v:
+        return pct(v, 50) / 1000.0, "SCK"
+    v = [num(f.get("sclk")) for _, f in tr.records["CLK"] if "sclk" in f]
+    v = [x for x in v if x is not None and x != 0]
+    if v:
+        return pct(v, 50) / 1000.0, "CLK sclk"
+    return None, None
+
+
+def session_clock_relation(rx_side, tx_side):
+    """rx_side's clock minus tx_side's (s) from the session clocks (both games' offset to the host), or None."""
+    orx, _ = session_offset(rx_side)
+    otx, _ = session_offset(tx_side)
+    if orx is None or otx is None or (rx_side.role == tx_side.role):
+        return None
+    return otx - orx
+
+
+STAMP_WRAP = 4294967.296  # s: the senders' ms stamps (sT) are 32-bit; a PC up for 49.7 days has wrapped them
+
+
+def unwrap_relation(rel_stamps):
+    """A relation against a sender's sT stamps (clock_relation_rx) as a relation between the two trace clocks: the
+    32-bit wrap of the stamps taken out (the nearest multiple of STAMP_WRAP)."""
+    return rel_stamps - round(rel_stamps / STAMP_WRAP) * STAMP_WRAP
+
+
+def clock_relation(rx_side, tx_side, sender_id):
+    """rx_side's trace clock minus the clock of tx_side's stamps (sT, ms, 32 bits; s) for lining up the sender's
+    TX / TRS / NPT / PDT stamps: the session clocks (SCK, or the CLK sclk field of traces before SCK) when both traces
+    have them, with the stamps' wrap from the RX method; else the RX offsets and the round trip (clock_relation_rx).
+    off_min / rtt always from the RX method."""
+    rel, off_min, rtt = clock_relation_rx(rx_side, tx_side, sender_id)
+    if rel is None:
+        return rel, off_min, rtt
+    s = session_clock_relation(rx_side, tx_side)
+    if s is None:
+        return rel, off_min, rtt
+    return s + round((rel - s) / STAMP_WRAP) * STAMP_WRAP, off_min, rtt
+
+
+def trace_clock_relation(rx_side, tx_side):
+    """rx_side's trace clock minus tx_side's (s), for records both games stamp with their trace time (VIS): the
+    session clocks, else the RX method without the stamps' wrap; None when neither is known."""
+    s = session_clock_relation(rx_side, tx_side)
+    if s is not None:
+        return s
+    rel, _, _ = clock_relation_rx(rx_side, tx_side, tx_side.local)
+    return None if rel is None else unwrap_relation(rel)
+
+
+def clocks(a, b):
+    section("Clocks: lining up the two traces")
+    for tr in (a, b):
+        off, src = session_offset(tr)
+        sck = tr.records["SCK"]
+        line = "  %s (%s): session clock offset to the host %s" % (
+            tr.name, tr.role, "-" if off is None else "%.2f ms (from %s)" % (off * 1000, src))
+        if sck:
+            errs = [num(f.get("err"), 0) for _, f in sck]
+            offs = [num(f.get("off"), 0) for _, f in sck]
+            line += ", %d SCK samples, offset spread %.2f ms, its uncertainty median %.2f ms" % (
+                len(sck), max(offs) - min(offs), pct(errs, 50))
+        print(line)
+    one = same_pc(a, b)
+    if one:
+        print("  both traces come from one PC (one clock): the true relation is 0, so each method's value is its error")
+    for rx, tx in ((a, b), (b, a)):
+        rel_rx, off_min, rtt = clock_relation_rx(rx, tx, tx.local)
+        rel_s = session_clock_relation(rx, tx)
+        if rel_rx is None and rel_s is None:
+            continue
+        parts = []
+        if rel_rx is not None:
+            wrap = rel_rx - unwrap_relation(rel_rx)
+            rel_rx = unwrap_relation(rel_rx)
+            parts.append("RX offsets %.2f ms (min offset - round trip %.1f / 2%s)" % (
+                rel_rx * 1000, rtt * 1000, ", the stamps' 32-bit wrap of %.0f s taken out" % wrap if wrap else ""))
+        if rel_s is not None:
+            parts.append("session clocks %.2f ms" % (rel_s * 1000))
+        if rel_rx is not None and rel_s is not None:
+            parts.append("difference %.2f ms" % ((rel_s - rel_rx) * 1000))
+        print("  %s (%s) - %s (%s): %s; used: %s" % (rx.name, rx.role, tx.name, tx.role, ", ".join(parts),
+                                            "session clocks" if rel_s is not None else "RX offsets"))
+
+
+def ses(tr):
+    """The SES records of a trace as {part: [fields, ...]}."""
+    out = defaultdict(list)
+    for _, rest in tr.raw["SES"]:
+        f = parse_rest(rest)
+        out[f.get("part", "?")].append(f)
+    return out
+
+
+def session_headers(a, b):
+    """Both games' session headers side by side (the trace header H and, from session-logs builds, SES); the fields
+    that must be the same on both games are flagged when they differ (session.mismatch for --check)."""
+    sa, sb = ses(a), ses(b)
+    section("Session headers (H%s)" % (", SES" if sa or sb else "; no SES: a trace from before session-logs"))
+    sa["H"] = [a.header]
+    sb["H"] = [b.header]
+    rows = [("H", "game"), ("H", "mod"), ("H", "core"), ("H", "proto"), ("H", "state"), ("H", "hz"),
+            ("H", "interp"), ("H", "built"), ("H", "role"), ("H", "local"), ("build", "ver"), ("build", "core"), ("build", "build"), ("build", "proto"), ("build", "exe_crc"),
+            ("build", "exe_label"), ("build", "core_built"), ("me", "role"), ("me", "id"), ("me", "steam"),
+            ("net", "mode"), ("net", "transport"), ("net", "port"), ("net", "relay_kbs"), ("net", "password"),
+            ("window", "bb"), ("window", "fullscreen"), ("window", "windowed"), ("window", "monitor"),
+            ("window", "dpi"), ("sys", "win"), ("sys", "cpus"), ("sys", "ram_mb"), ("sys", "fps"),
+            ("leash", "warn"), ("leash", "max"), ("leash", "cd"), ("leash", "on"), ("leash", "from")]
+    must_match = {("H", "mod"), ("H", "core"), ("H", "proto"), ("H", "state"), ("H", "hz"), ("build", "ver"),
+                  ("build", "core"), ("build", "build"), ("build", "proto"), ("build", "exe_crc"),
+                  ("leash", "warn"), ("leash", "max"), ("leash", "cd"), ("leash", "on")}
+    mismatches = 0
+
+    def val(s, part, key):
+        recs = s.get(part) or []
+        if part == "leash":  # the one in force last (a guest's: once the host's LeashConfig came)
+            recs = recs[-1:]
+        return recs[0].get(key, "-") if recs else "-"
+
+    print("  %-22s %-28s %-28s" % ("", a.name + " (" + a.role + ")", b.name + " (" + b.role + ")"))
+    for part, key in rows:
+        x, y = val(sa, part, key), val(sb, part, key)
+        if x == "-" and y == "-":
+            continue
+        bad = (part, key) in must_match and x != y and "-" not in (x, y) and "pending" not in (x, y)
+        mismatches += 1 if bad else 0
+        print("  %-22s %-28s %-28s%s" % (part + "." + key, x, y, "   <-- DIFFERENT" if bad else ""))
+    for tr, s in ((a, sa), (b, sb)):
+        ini = s.get("ini") or []
+        if ini:
+            print("  %s's settings: %s" % (tr.name, ", ".join("%s=%s%s" % (
+                f.get("key"), f.get("value", ""), "" if f.get("src") == "file" else " (" + f.get("src", "?") + ")")
+                for f in ini)))
+        for f in s.get("path") or []:
+            if f.get("what") in ("bundle", "trace"):
+                print("  %s's %s: %s" % (tr.name, f.get("what"), f.get("path")))
+        for f in s.get("peer") or []:
+            if f.get("me") == "1":
+                continue
+            print("  %s saw player %s '%s' (%s, Steam id %s, join #%s%s)" % (
+                tr.name, f.get("id"), f.get("name", "?"), f.get("via"), f.get("steam"), f.get("seq"),
+                ", joined later" if f.get("later") == "1" else ""))
+    print("  %d field(s) that must match differ" % mismatches)
+    if len(sa) > 1 and len(sb) > 1:  # both have SES: the full comparison (H alone is the old warning above)
+        record("session.mismatch", mismatches, "%s / %s" % (a.name, b.name))
+
+
+def summaries(traces):
+    if not any(tr.records["SUM"] for tr in traces):
+        return
+    section("Periodic summaries (SUM, every 10 s)")
+    for tr in traces:
+        recs = tr.records["SUM"]
+        if not recs:
+            continue
+        peers = defaultdict(list)
+        net, game = [], []
+        for t, f in recs:
+            part = f.get("part")
+            if part == "peer":
+                peers[f.get("id")].append(f)
+            elif part == "net":
+                net.append(f)
+            elif part == "game":
+                game.append((t, f))
+        print("  %s (%s): %d summaries" % (tr.name, tr.role, len(net)))
+        for pid, rows in sorted(peers.items()):
+            rtt = [num(r.get("rtt"), 0) for r in rows]
+            loss = [num(r.get("loss"), 0) for r in rows]
+            kbo = [num(r.get("kbo"), 0) for r in rows]
+            kbi = [num(r.get("kbi"), 0) for r in rows]
+            print("    player %s: rtt median %.1f ms (max %.1f), loss median %.2f %% (max %.2f), out %.1f KB/s (max "
+                  "%.1f), in %.1f KB/s (max %.1f), resends %d" % (
+                      pid, pct(rtt, 50), max(rtt), pct(loss, 50), max(loss), pct(kbo, 50), max(kbo), pct(kbi, 50),
+                      max(kbi), sum(num(r.get("rs"), 0) for r in rows)))
+        if net:
+            fps = [num(f.get("fps"), 0) for f in net if num(f.get("fps"), 0) > 0]
+            fmin = [num(f.get("fps_min"), 0) for f in net if num(f.get("fps_min"), 0) > 0]
+            lanes = defaultdict(lambda: [[], []])
+            for f in net:
+                for item in (f.get("lanes") or "-").split(","):
+                    lane, _, v = item.partition(":")
+                    o, _, i = v.partition("/")
+                    if lane != "-" and v:
+                        lanes[lane][0].append(num(o, 0))
+                        lanes[lane][1].append(num(i, 0))
+            last = net[-1]
+            print("    fps median %.1f (lowest window %.1f, lowest frame %.1f fps); warnings %s, errors %s, lines rate "
+                  "limited %s (session totals)" % (
+                      pct(fps, 50) if fps else 0, min(fps) if fps else 0, min(fmin) if fmin else 0,
+                      (last.get("warn") or "0/0").split("/")[-1], (last.get("err") or "0/0").split("/")[-1],
+                      (last.get("supp") or "0/0").split("/")[-1]))
+            if lanes:
+                print("    per lane out/in KB/s (median, max): %s" % ", ".join(
+                    "%s: %.1f/%.1f (%.1f/%.1f)" % (k, pct(v[0], 50), pct(v[1], 50), max(v[0]), max(v[1]))
+                    for k, v in sorted(lanes.items())))
+        if game:
+            levels, counts = defaultdict(list), {}
+            for _, f in game:
+                for k, v in f.items():
+                    if k == "part":
+                        continue
+                    if "/" in v:
+                        d, _, tot = v.partition("/")
+                        counts[k] = num(tot, 0)
+                    else:
+                        levels[k].append(num(v, 0))
+            if levels:
+                print("    levels (median / max): %s" % ", ".join(
+                    "%s %g/%g" % (k, round(pct(v, 50), 2), round(max(v), 2)) for k, v in sorted(levels.items())))
+            if counts:
+                print("    counts (session totals): %s" % ", ".join(
+                    "%s %d" % (k, v) for k, v in sorted(counts.items()) if v))
+
+
+def finals(traces):
+    if not any(tr.raw["FIN"] for tr in traces):
+        return
+    section("End of session (FIN)")
+    for tr in traces:
+        fins = [parse_rest(r) for _, r in tr.raw["FIN"]]
+        if not fins:
+            ends = [f.get("why") for _, f in tr.records["END"]]
+            print("  %s: no FIN (the game did not end the session: crashed or killed?)%s" % (
+                tr.name, (" END " + ", ".join(ends)) if ends else ""))
+            continue
+        for f in fins:
+            part = f.pop("part", "?")
+            if part == "session":
+                print("  %s (%s): %s s, players %s, %s .. %s" % (tr.name, f.get("role"), f.get("dur"), f.get("peers"),
+                                                               f.get("start"), f.get("end")))
+            elif part == "peer":
+                print("    player %s '%s': out %s MB, in %s MB, rtt avg %s ms (worst %s), loss avg %s %% (worst %s), "
+                      "resends %s" % (f.get("id"), f.get("name", "?"), f.get("out_mb"), f.get("in_mb"),
+                                      f.get("rtt_avg"), f.get("rtt_max"), f.get("loss_avg"), f.get("loss_max"),
+                                      f.get("resends")))
+            elif part == "net":
+                print("    messages: %s out (%s MB), %s in (%s MB); lanes MB out/in %s" % (
+                    f.get("msgs_out"), f.get("out_mb"), f.get("msgs_in"), f.get("in_mb"), f.get("lanes")))
+            elif part == "msgs":
+                print("    top messages (count out/in: MB out/in): %s" % f.get("top"))
+            elif part == "game":
+                print("    game: %s" % " ".join("%s=%s" % kv for kv in f.items()))
+            elif part == "log":
+                print("    warnings %s, errors %s, lines rate limited %s" % (f.get("warn"), f.get("err"), f.get("supp")))
+            elif part == "repeat":
+                print("      %sx %s \"%s\"" % (f.get("n"), f.get("level"), f.get("fmt")))
+            elif part == "bundle":
+                print("    bundle: %s" % f.get("path"))
+
+
+def _vis_events(tr):
+    """VIS records as {kind: {key: [(t, ev, dir, peer, fields)]}}; for a trace without VIS, the pedestrian copies'
+    PDE records stand in (spawn / reuse -> show, remove -> hide)."""
+    out = defaultdict(lambda: defaultdict(list))
+    for t, f in tr.records["VIS"]:
+        out[f.get("kind", "?")][f.get("key")].append((t, f.get("ev"), f.get("dir"), f.get("peer"), f))
+    if not tr.records["VIS"]:
+        for t, f in tr.records["PDE"]:
+            ev = f.get("ev")
+            if "key" not in f or ev not in ("spawn", "reuse", "remove", "kill", "spawnfail", "lagsnap"):
+                continue
+            mapped = {"spawn": "spawn", "reuse": "reuse", "remove": "remove"}.get(ev, ev)
+            out["ped"][f.get("key")].append((t, mapped, "rx", "0", f))
+    return out
+
+
+def _entity_errors(tr):
+    """Per entity key the copy-vs-target errors this receiver recorded: traffic TRC, pedestrians PDR, NPCs NPR."""
+    errs = {"traffic": defaultdict(list), "ped": defaultdict(list), "npc": defaultdict(list)}
+    for _, f in tr.records["TRC"]:
+        e = num(f.get("err"), 1e9)
+        if e < 1e6 and ("a" not in f or num(f.get("a"), -1) == 0):
+            errs["traffic"][f.get("net")].append(e)
+    for _, f in tr.records["PDR"]:
+        frm, n = int(num(f.get("from"), 0)), int(num(f.get("net"), 0))
+        errs["ped"][str((frm << 16) | n)].append(num(f.get("err"), 0))
+    for _, f in tr.records["NPR"]:
+        errs["npc"][f.get("key")].append(num(f.get("err"), 0))
+    return errs
+
+
+def visibility(a, b):
+    """Per entity, from the host's decision (VIS dir=tx admit) to the guest's screen (VIS dir=rx show) and back."""
+    host = a if a.role == "host" else b if b.role == "host" else None
+    guest = b if host is a else a if host is b else None
+    va, vb = _vis_events(a), _vis_events(b)
+    if not any(va.values()) and not any(vb.values()):
+        return
+    section("Visibility per entity (VIS)")
+    if not a.records["VIS"] and not b.records["VIS"]:
+        print("  (no VIS records: a trace from before session-logs; pedestrians from their PDE records only)")
+    rel = None
+    if host and guest:
+        rel = trace_clock_relation(guest, host)
+    vh = _vis_events(host) if host else {}
+    vg = _vis_events(guest) if guest else {}
+    errs = _entity_errors(guest) if guest else {}
+    for kind, label in (("traffic", "traffic cars (key = net id)"), ("ped", "pedestrians (key = host << 16 + net)"),
+                        ("npc", "NPCs (key = the host's entity id)")):
+        hk, gk = vh.get(kind, {}), vg.get(kind, {})
+        if not hk and not gk:
+            continue
+        evs_h = Counter(e[1] for evs in hk.values() for e in evs)
+        evs_g = Counter(e[1] for evs in gk.values() for e in evs)
+        print("  %s:" % label)
+        if evs_h:
+            print("    host: %s (%d entities)" % (", ".join("%s %d" % kv for kv in sorted(evs_h.items())), len(hk)))
+        if evs_g:
+            print("    guest: %s (%d entities)" % (", ".join("%s %d" % kv for kv in sorted(evs_g.items())), len(gk)))
+        # admit (host clock) -> shown on the guest (his clock mapped to the host's)
+        delays, never, durations, flaps = [], [], [], 0
+        worst_delay = []
+        for key, hevs in hk.items():
+            gid = guest.local if guest else None
+            admits = [t for t, ev, d, peer, _ in hevs if ev == "admit" and (gid is None or peer == str(gid))]
+            gevs = sorted(gk.get(key, []), key=lambda e: e[0])
+            shows = [t for t, ev, _, _, _ in gevs if ev in ("show", "reuse")]
+            for t0 in admits:
+                if rel is None:
+                    break
+                after = [s - rel for s in shows if s - rel >= t0 - 0.5]
+                if after:
+                    delays.append(after[0] - t0)
+                    worst_delay.append((after[0] - t0, key))
+                else:
+                    never.append(key)
+        for key, gevs in gk.items():
+            gevs = sorted(gevs, key=lambda e: e[0])
+            shown_at = None
+            for t, ev, _, _, _ in gevs:
+                if ev in ("show", "reuse") and shown_at is None:
+                    shown_at = t
+                elif ev in ("hide", "remove", "leave", "forget", "lost", "taken") and shown_at is not None:
+                    durations.append(t - shown_at)
+                    if t - shown_at < 2.0:
+                        flaps += 1
+                    shown_at = None
+        if delays:
+            print("    host admit -> shown on the guest: %s" % stats_line(delays, "s"))
+            slow = sorted(worst_delay, reverse=True)[:5]
+            print("      slowest: %s" % ", ".join("%s %.2f s" % (k, d) for d, k in slow))
+        if never:
+            print("    admitted but never shown on the guest: %d (e.g. %s)" % (len(never), ", ".join(never[:8])))
+        if durations:
+            print("    shown for: median %.1f s, %d shown less than 2 s (flaps)" % (pct(durations, 50), flaps))
+        give = evs_g.get("spawnfail", 0) + evs_g.get("lost", 0)
+        if give or evs_g.get("reuse"):
+            print("    copies that failed / were lost: %d, pool reuses: %d" % (give, evs_g.get("reuse", 0)))
+        e = errs.get(kind) or {}
+        if e:
+            rows = sorted(((pct(v, 95), max(v), len(v), k) for k, v in e.items() if v), reverse=True)[:6]
+            print("    worst entities by copy error (p95 / max m, records): %s" % ", ".join(
+                "%s %.2f/%.2f (%d)" % (k, p95, mx, n) for p95, mx, n, k in rows))
+    for tr, v in ((a, va), (b, vb)):
+        pl = v.get("player") or {}
+        if not pl:
+            continue
+        print("  %s's puppets:" % tr.name)
+        for key, evs in sorted(pl.items()):
+            c = Counter(e[1] for e in evs)
+            print("    player %s: %s" % (key, ", ".join("%s %d" % kv for kv in sorted(c.items()))))
+            for t, ev, _, _, f in evs[:12]:
+                extra = " ".join("%s=%s" % (k, x) for k, x in f.items() if k not in ("kind", "key", "ev", "dir", "peer"))
+                print("      %s %-8s %s" % (tr.wall(t), ev, extra))
+    for tr, v in ((a, va), (b, vb)):
+        held = v.get("held") or {}
+        if held:
+            c = Counter(e[1] for evs in held.values() for e in evs)
+            print("  %s's held NPCs: %d (%s)" % (tr.name, len(held), ", ".join("%s %d" % kv for kv in sorted(c.items()))))
+    for tr in (a, b):
+        dropped = [num(f.get("n"), 0) for _, f in tr.records["VIS"] if f.get("ev") == "dropped"]
+        if dropped:
+            print("  %s: %d VIS records left out by the rate cap" % (tr.name, sum(dropped)))
+
+
 def _secs(hms):
     try:
         h, m, s = hms.split(":")
@@ -1794,6 +2235,8 @@ def main():
     print("Sync comparison")
     print("===============")
     for tr in (a, b):
+        if tr.source:
+            print("(%s)" % tr.source)
         t0, t1 = tr.span()
         h = tr.header
         print("%s: %s, player %d (%s), mod %s, core %s, %s Hz, %s ms interpolation, %.0f s from %s" % (
@@ -1801,6 +2244,8 @@ def main():
             h.get("interp"), t1 - t0, tr.wall(t0)))
     if a.header.get("mod") != b.header.get("mod"):
         print("WARNING: the two games ran different mod versions")
+    session_headers(a, b)
+    clocks(a, b)
     worst = []
     compare(a, b, args, worst)
     compare(b, a, args, worst)
@@ -1832,6 +2277,9 @@ def main():
     car_looks(a, b)
     bandwidth((a, b))
     latency((a, b))
+    summaries((a, b))
+    visibility(a, b)
+    finals((a, b))
     if worst:
         section("Worst moments (at least a second apart)")
         shown = []

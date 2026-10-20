@@ -7,15 +7,21 @@ setting.
 
 - **Where:** `logs\trace\<log name>-<date>-<time>.trace` in the mod's folder (next to `MafiaCoop.exe`), e.g.
   `logs\trace\mafiacoop-20261017-150912.trace`. One file per session (opened when the session becomes active, closed
-  when it ends; a guest's reconnect keeps it open, `RCN` lines mark the gap). The newest 20 are kept; one file stops at 1.5 GiB (about six hours).
+  when it ends; a guest's reconnect keeps it open, `RCN` lines mark the gap). The newest 20 are kept and the folder
+  holds at most 4 GiB (before a new trace opens the oldest go until the rest take 3 GiB); one file stops at 1 GiB
+  (about four hours; a last `END` line says so) (core `core/trace.h` kKeepFiles, kMaxFolderBytes, kMaxBytes).
 - **Size:** about 60-80 KB/s with one other player (~250 MB an hour). It is written twice a second, so a crash loses
   at most the last half second.
-- **Also kept now:** the last five main logs (`mafiacoop.log.1` newest .. `.5`), not just one.
+- **Also kept now:** the last ten main logs per log name (`mafiacoop-host.log.1` newest .. `.10`; core
+  `core/log.h` kKeepRuns).
+- **Bundles:** at the end of every session a zip of everything about it in `logs\bundles\` (see "Bundles" below).
 - **Comparing:** `python tools/sync_compare.py <trace from one PC> <trace from the other> [--csv DIR] [--worst N]
   [--check]` (standard library only). See "What the report says" below. `--check` ends the report with every sync
   target of docs/sync-architecture.md section 4 (PASS / FAIL / no data per direction; exit code 1 when one fails).
 
-To report a test: zip the whole `logs` folder of both PCs (the traces are in `logs\trace`).
+To report a test: send the newest zip from `logs\bundles` of both PCs (one bundle per session and role, e.g.
+`MafiaCoop-20261020-143610-host.zip` and `MafiaCoop-20261020-143622-guest.zip`). `sync_compare.py` reads a bundle as
+it is. The whole `logs` folder is still the complete picture (older sessions, other runs).
 
 ## Line format
 
@@ -28,7 +34,12 @@ one file are in time order (per writing thread). Every line of the main log is c
 that pairs them exactly. The receiver's `off` (its clock minus the sender's, smallest seen, so it includes the
 shortest one-way trip) and the round trip (`CLK rtt`) give the clock difference: `receiver - sender = off - rtt/2`.
 The tool uses that to compare where a puppet stood on one game with where the player really was at the same moment
-on the other.
+on the other. Since session-logs both games also write `SCK` every 5 s (their session clock offset to the host, the
+NTP-like clock of core's session pings); the tool lines the traces up by those when both have them (the `CLK sclk`
+field in older traces; the RX method otherwise) and prints both methods side by side ("Clocks"). On the one-PC runs of
+2026-10-20 (both games on one clock: the truth is 0) the session clocks were 0.3 / 0.8 ms off, the RX method 1.8 -
+2.2 ms. The senders' `sT` stamps are 32-bit milliseconds: on a PC up for more than 49.7 days they wrap, which the tool
+takes out (the "stamps' 32-bit wrap" in its Clocks section).
 
 ## Records
 
@@ -178,11 +189,45 @@ on the other.
 | `GE` | both | each throw over | `dir=out seq weapon why=<measured/model/no_projectile_no_model> sent entity samples after=<s release -> sent> speed pitch model_speed model_pitch g=<gravity measured, 0 not> o` (ours), `dir=boom seq fuse=<s release -> explosion> p measuring` (our explosion for it decided), `dir=in from seq why=explosion age bounces casts settled p=<simulated> boom=<true> off=<m between> named=<1 by seq>` / `why=<fuse/timeout/left> age bounces casts settled p` / `why=explosion_no_flight` (another game's) |
 | `CHM` | both | each character pick / PlayerModel | C++ (game/model_change.h): `id ev=pick model` (our panel step), `id ev=send model steps=<panel steps folded in> why=<stable panel-closed no-world with-join join>` (ours sent), `id ev=recv model wait=<1 held: inside a burst>` and `id ev=apply model held=<s it waited> skipped=<picks never shown>` (a remote player's; his puppet is made of it from now) |
 | `PRT` | both | each puppet entity retired | Lua (player_sync.lua M.Release): `id ent=<entity id> ev=retire why car seat burns`, `ev=release how=<on_foot ...> ok=<1 the spawner released it> seat=<what its old seat reads now: free ours other ->`, `ev=check gone=<0 still there 1 s after the release, 1 gone>`, `ev=gone` (went with the factory or the world first); `id ev=replace from to seated car seat` (a new character takes the old puppet's place); `id ev=lost n=<times>` (the game removed the puppet, e.g. the Free Ride garage clearing its door: spawned again at once; unreleased) |
-| `END` | both | at the end | `why` |
+| `END` | both | at the end | `why=<session-detached session-inactive process-exit>` (`via=<ExitProcess TerminateProcess>` at a game exit with the session open: core writes it, then the summary and the bundle) |
+| `SES` | both | at the start of the session (core: dll/session_log.h), per player, again when the leash in force changes | the session header, one record per part; the last field (`name=`, `value=`, `path=`, `target=`) runs to the end of the line. `part=build mod ver core build=<handshake build number> proto core_built=<dll build date> exe_crc=<CRC32 of the game exe, hex; pending while it is still being read> exe_ts=<its PE timestamp> exe_label=<the GameInfo build it matches, unknown_build>`; `part=me role id steam=<SteamID64, 0 none> steam_ready name=<our player name>`; `part=persona name=<Steam persona>`; `part=net mode=<host, join_(udp), join_(steam_lobby)> transport=<udp+steam, udp, steam> port=<UDP port hosting, 0> lan=<this PC's LAN IPv4> lobby=<Steam lobby id> relay_kbs=<per-peer budget> password=<1 set; never its value> target=<what a guest connects to>`; `part=window x y w h client=<WxH> bb=<backbuffer WxH> fmt=<DXGI format> windowed fullscreen refresh style maximized minimized monitor=<\\.\DISPLAYn> mon=<x,y,WxH> primary dpi`; `part=sys win=<Windows major.minor.build> cpus ram_mb ram_free_mb fps fps_min=<last 10 s>`; `part=ini key src=<file env set> value=<the setting in force; password-like keys (password, passwd, pwd, secret, token) <redacted>>` per setting; `part=path what=<log trace bundle ini exe dumps> path=<...>`; `part=peer id seq=<joinSeq> me host steam via=<udp steam -> addr=<UDP: the peer's IPv4> model later=<1 joined after the start> name=<...>` (every player, also each later join and rejoin); Mafia DE: `part=leash role=<host guest> warn max cd on pull from=<settings: the host's own; host: a guest got the host's LeashConfig; default: not yet>` |
+| `SCK` | both | every 5 s (core) | session clock sample: `sclk=<the session clock now, ms> off=<host - local, ms; 0 on the host> err=<its uncertainty, ms> rtt=<to the host, ms; -1 on the host> synced=<1 the guest's clock has a sample>`; line time t = this machine's trace clock at that moment: host trace time = guest t + off |
+| `SUM` | both | every 10 s (core) | `part=peer id rtt=<ms> loss=<%> kbo kbi=<KB/s out / in to that peer> pko pki=<packets/s> rs=<resends in the 10 s> q=<reliable units queued>` per other player; `part=net dt kbo kbi lanes=<lane:out/in KB/s,...> fps fps_min=<lowest frame of the 10 s as fps> warn err supp=<log warnings / errors / rate-limited lines: in the 10 s / in the session> off off_err=<session clock offset, ms>`; `part=game <name=value ...>`: the game's numbers (core/diag.h; levels as their value, counts as `<added in the 10 s>/<session total>`; several lines when long), Mafia DE: `traffic.*` (guest: known copies due shown err_avg err_max pins snaps fix_snaps blends bumps spawns despawns states_old; host: cars spawn_msgs despawn_msgs bumps_rx orphaned p<id>.admitted p<id>.relevant), `ped.*` (guest: near near_with_copy copies pool_free known snaps spawn_fails spawns_asked reuses hides removes lost lag_snaps spawner_resets; host: peds shared spawns_sent gones_sent deaths_sent), `npc.*` (guest: known tracks driven snaps refusals dropped_states held held_total held_paired_later; host: published states_sent infos_sent leaves_sent hits_rx), `player.*` (remotes p<id>.hz p<id>.dropped foot_snaps car_pins car_retries car_snaps), `leash.*` (dist state state.<name> ev.pull), `world.*` (suppressed own_cars_shown own_peds_shown hidden reapplies), `vis.<kind>.<ev>` (every VIS event), `lua.err.<module>` (Lua errors per module) |
+| `VIS` | both | per event (game/vis.h; at most 60 a second per kind, then one `ev=dropped n=<count>`) | every authority / visibility event with a key that is the same on both PCs: `kind=<player traffic ped npc held> key=<player: player id; traffic: the host car's net id; ped: host << 16 + net id; npc: the host's entity id; held: the guest's own entity id> ev dir=<tx: the host decided it for a guest, rx: from the host / on our screen, -: local> peer=<the other player, -> [extra]`. Host: traffic / ped / npc `ev=admit` (with `p=` or `net= ai=`) and `ev=leave` per guest (`peer`). Guest: the same from the host (`dir=rx`); traffic `show` (`p=`), `hide` (`grace=`), `lost` (the game removed the copy), `taken` (a player took it); ped `spawn` (`prof=`), `show` (the copy is in the world: `local= prof=`), `reuse` (`local= why=`), `remove` (`why=`), `kill`, `lagsnap` (`err=`), `spawnfail` (`why=`), `death`, `diedhere`; npc `show` (driven: `rk=<1 a paired NPC 2 a spawned copy>`), `switch` (`rk` changed), `hide` (not driven any more), `forget` (no states for 3 s); held `hold` / `show` / `kill` (`host= why=`); player (his puppet here): `spawn` (`after= world= lost=`), `lost` (`n=`), `hide` (`why=`), `show` (`was=`), `respawn` (`why=<back died_here>`), `replace` (`to=`), `despawn` (`why=`), `remove` (`why=<left session_end>`) |
+| `FIN` | both | at the end of the session (core) | `part=session dur=<s> role local peers=<ids> start end=<wall clock>`; `part=peer id secs out_mb in_mb kbo kbi pko pki rtt_avg rtt_max loss_avg loss_max resends name=<...>`; `part=net msgs_out msgs_in out_mb in_mb lanes=<lane:MB out/in>`; `part=msgs top=<name:sent/received count:MB out/MB in,...>` (12 busiest messages); `part=game <the SUM game numbers as session totals>`; `part=log warn err supp dropped_names`; `part=repeat n level fmt=<format string>` (the 5 most frequent warning / error call sites of the session); `part=bundle path=<the session bundle being written>` |
 
 `rb` values come from the car's vehicle part (docs/re-notes.md 9); `eng gear spd fixed rpm pwi` from the script
 getters (IsEngineOn, GetGear, GetSpeedFloat, IsCarPosFixed, GetEngineRotations, GetPowerInternal). A `-` means the
 call failed on that car.
+
+## Session header, summaries and bundles
+
+Core writes these for every session (dll/session_log.h), the game layer adds `SES part=leash` and the `VIS` records:
+
+- **Main log:** a block `session: ---- session start: <role>, player <id> '<name>' ----` with the versions, Steam
+  account, transport and addresses, window and monitor, OS and fps, every setting (password-like ones `<redacted>`),
+  the file paths and each peer (`session: peer 1 'Miles': over Steam ...`); every 60 s `session: summary (60 s): ...`
+  (latency, loss, fps, warnings and errors added, the game's numbers with what they added); at the end
+  `session: ---- session end: ...` with the totals, the worst latency, the game's counts, warnings / errors and the
+  five most repeated ones, and the bundle (`session:   bundle: <path> (being written)`, then
+  `bundle: wrote <path> (N files, X MB -> Y MB, T s)`).
+- **Repeated warnings and errors** (core/log.h): each call site writes at most 10 lines a minute; then
+  `repeated N more times in 60 s (rate limited; last: <the last one>)`. The counts are in `SUM` / `FIN`.
+- **Lua errors:** every module's "Update error #n" goes through one helper (game/lua.h ReportError: the first 20 per
+  module, then every 200th, counted as `lua.err.<module>`); with the Lua stack when the game's Lua has
+  `debug.traceback` and its pcall runs a message handler (checked once at the first tick: `lua: error tracebacks on
+  (...)` or `lua: error tracebacks off: ...`); the stack's lines are joined with ` | `.
+- **Bundles** (core/bundle.h): `logs\bundles\MafiaCoop-<yyyymmdd>-<hhmmss>-<role>.zip` (the session's start = the
+  trace's name; role host / guest) written at the end of each session, and at a game exit with a session open (the
+  exit waits for it, at most 20 s). In it: `trace/<the session's trace>`, `logs/<the main log>`, `MafiaCoop.ini`
+  (password-like values `<redacted>`), `logs/launcher*.log` of the last 24 h, `dumps/crash-*.dmp` written since the
+  session started, `manifest.txt` (versions, exe CRC, role, the files and what was cut or left out). Written to
+  `<name>.tmp` on a worker thread and renamed when complete; the newest 30 bundles are kept. At game start, the
+  newest trace of this log name without a bundle (the game crashed or was killed) gets
+  `MafiaCoop-<its start>-<role>-recovered.zip` with the previous run's log (`logs/<name>.log.1`). Zip without zlib:
+  core/zip_writer.h (deflate: LZ77 with hash chains and dynamic Huffman blocks, CRC-32, no zip64: an entry stops at
+  2 GiB, the archive takes no new entries past 3.8 GB). Measured on the 2026-10-20 one-PC traces: 28.9 MB in 0.16 -
+  0.18 s (165 - 180 MB/s), 7.3x smaller; 21.6 MB -> 2.3 MB (9.5x); 20.0 MB -> 2.2 MB (8.9x).
 
 ## What the report says
 
@@ -266,5 +311,21 @@ Per player as seen on the other game:
   on the thrower and `GR`/`GX in`/`GV`/`GE in` on the others pair by `seq`; the explosion that ends a throw names it
   (`XO`/`XR throw=`).
 - **worst moments:** the largest errors at least a second apart, with the wall-clock time on both games.
+- **session headers** (`H`, `SES`): both games side by side; the fields that must be the same (mod, core, protocol,
+  state version, state rate, session build, exe CRC, the leash in force) are flagged `<-- DIFFERENT`
+  (`session.mismatch` for `--check`, target 0; only when both traces have SES); the settings, paths and peers.
+- **clocks** (`SCK`, `CLK sclk`, `RX`): each game's session clock offset, the relation by the session clocks and by the
+  RX offsets and their difference; when both traces come from one PC (the same QueryPerformanceCounter zero) the
+  true relation is 0, so the values are the methods' errors.
+- **periodic summaries** (`SUM`): per game and peer rtt / loss / KB/s (median, max), fps, per lane, the game's levels
+  (median / max) and counts (session totals).
+- **visibility per entity** (`VIS`; a trace without VIS: the pedestrians' `PDE`): per kind the host's admits / leaves
+  and the guest's events, the time from the host's admit to the guest showing it (p50 / p95 / max, the slowest
+  entities), admitted entities never shown, how long shown (and flaps under 2 s), failed / lost copies and pool reuses,
+  the worst entities by copy error (`TRC` / `PDR` / `NPR`); per puppet its events with the wall-clock time; held NPCs.
+- **end of session** (`FIN`): per game the totals; "no FIN" means the game did not end the session (crash or kill: its
+  `-recovered` bundle has the trace).
+
+`sync_compare.py` takes a bundle zip wherever it takes a trace (it reads the biggest `.trace` in it).
 
 `--csv DIR` writes the lined-up series (`foot-p<id>-on-<role>.csv`, `car-p<id>-on-<role>.csv`) for plotting.

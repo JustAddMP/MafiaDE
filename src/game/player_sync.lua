@@ -129,6 +129,8 @@ local function valid(o) return o ~= nil and IsObjectValid(o) end
 local function same(a, b) return valid(a) and valid(b) and a == b end
 local function log(s) if mc_log then mc_log("sync: " .. s) end end
 local function trace(kind, text) if mc_trace then mc_trace(kind, text) end end
+-- VIS (game/vis.h): a puppet's visibility events, keyed by its player id (the same on both games)
+local function vis(id, ev, extra) if mc_vis then mc_vis("player", tonumber(id) or -1, ev, extra) end end
 local TRACE_PERIOD = 0.05  -- s between readback records (LR / PR / CR)
 -- An error from a per-tick step: logged 5 times, then every 500th time (a broken step must not flood the log).
 local errCount = {}
@@ -356,6 +358,8 @@ function M.SpawnTick()
     pp.calm, pp.brain, pp.brainT, pp.seated, pp.leaving = nil, nil, nil, false, nil
     log(string.format("puppet %s spawned: %s profile %s, %.1f s after his first state, %.1f s after our world loaded",
       pp.id, tostring(so), pp.profile, M.now - (pp.firstT or M.now), M.now - (M.inWorldAt or M.now)))
+    vis(pp.id, "spawn", string.format("after=%.1f world=%.1f lost=%d", M.now - (pp.firstT or M.now),
+      M.now - (M.inWorldAt or M.now), pp.lost or 0))
     return
   end
   local pick
@@ -2755,6 +2759,7 @@ function M.Drive(pp)
     pp.lost = (pp.lost or 0) + 1
     log(string.format("puppet %s is gone (removed by the game, #%d): spawned again", pp.id, pp.lost))
     trace("PRT", string.format("id=%s ev=lost n=%d", pp.id, pp.lost))
+    vis(pp.id, "lost", "n=" .. pp.lost)
     return
   end
   if M.PuppetLife(pp) then return end
@@ -2833,6 +2838,7 @@ function M.Drive(pp)
         "he moves %.1f m/s, too fast for one on foot", math.sqrt((pp.vx or 0) ^ 2 + (pp.vy or 0) ^ 2))
         or "it died here again and again"))
       trace("PH", string.format("id=%s why=%s", pp.id, hold))
+      vis(pp.id, "hide", "why=" .. hold)
     end
     if pp.actRun then M.ActionEnd(pp, so, "hidden") end
     M.Hide(pp, true)
@@ -2843,6 +2849,7 @@ function M.Drive(pp)
   elseif pp.holdWhy then
     log("puppet " .. pp.id .. ": shown again (" .. pp.holdWhy .. " is over)")
     trace("PH", string.format("id=%s why=none was=%s", pp.id, pp.holdWhy))
+    vis(pp.id, "show", "was=" .. tostring(pp.holdWhy))
     pp.holdWhy = nil
   end
   -- in the water: put at his position, swim strokes (M.WaterTick); the controller leaves it alone (busy 1)
@@ -3103,6 +3110,7 @@ end
 local function retireTrace(g, ev, extra)
   trace("PRT", string.format("id=%s ent=%s ev=%s why=%s%s", tostring(g.pid), tostring(g.eid), ev,
     (tostring(g.why or "-"):gsub(" ", "_")), extra or ""))
+  if ev == "retire" then vis(g.pid, "despawn", "why=" .. (tostring(g.why or "-"):gsub("[ =]", "_"))) end
 end
 
 -- Release it now (the spawner's ReleaseObjectRaw); a check follows RETIRE_CHECK s later (M.GraveTick).
@@ -3581,6 +3589,7 @@ function M.PuppetLife(pp)
   if dead then  -- its player is back (respawned, checkpoint), or something killed it here: a fresh puppet
     if pp.deadShown then
       log("puppet " .. pp.id .. ": its player is back, respawning it")
+      vis(pp.id, "respawn", "why=back")
     else
       -- Not a network death: the local game killed it (drowned, a fall, fire, an explosion, the car it sat in). Its
       -- player lives: respawned at once (the factory has its profile loaded). In the water its respawn stays hidden
@@ -3595,6 +3604,7 @@ function M.PuppetLife(pp)
       pp.localDeaths = recent
       if #recent >= LOCAL_DEATHS then pp.hideUntil = M.now + LOCAL_HOLD end
       M.localDeathCount = (M.localDeathCount or 0) + 1
+      vis(pp.id, "respawn", string.format("why=died_here n=%d", #recent))
       local d, k = pp.lastDmg, pp.deathInfo
       local cause = k and string.format("death type %s", tostring(k.dtype))
         or (d and M.now - d.t < 3 and string.format("damage type %d (%.0f) %.1f s before", d.dtype, d.amount, M.now - d.t))
@@ -5652,6 +5662,7 @@ function M.Update(dt, cmds)
               tostring(was.vkey), tostring(was.seat)) or ""))
           trace("PRT", string.format("id=%s ev=replace from=%s to=%s seated=%d car=%s seat=%s", id, tostring(was.model),
             f[3], was.seated and 1 or 0, tostring(was.vkey or "-"), tostring(was.seat or "-")))
+          vis(id, "replace", "to=" .. (tostring(f[3]):gsub("[ =]", "_")))
         end
       end
       pp.tx, pp.ty, pp.tz = tonumber(f[4]), tonumber(f[5]), tonumber(f[6])

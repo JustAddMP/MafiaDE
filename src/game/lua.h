@@ -74,8 +74,16 @@ const char* ToString(lua_State* L, int idx);  // number/string only (else nullpt
 std::string ToDisplay(lua_State* L, int idx);   // like Lua tostring(v), never fails
 // Loads a chunk (pushes the function) -> pcall(nargs = 0, nresults). On error leaves nothing and fills *err.
 bool DoString(lua_State* L, const char* src, size_t len, const char* chunkName, int nresults, std::string* err);
-// pcall of the function below nargs arguments; on error pops the message into *err.
+// pcall of the function below nargs arguments; on error pops the message into *err. Once the probe at the first
+// tick found that this game's Lua has debug.traceback and its pcall runs a message handler (TracebackMode() == 1),
+// the message carries the Lua stack ("... stack traceback: ..."); otherwise it is the bare message as before.
 bool PCall(lua_State* L, int nargs, int nresults, std::string* err);
+// -1 not probed yet, 0 bare messages (no debug.traceback, or the pcall does not use it), 1 with the stack.
+int TracebackMode();
+// A failed per-tick call of a module's glue: "<tag>: <what> error #<n>: <message>" (the stack joined with " | ")
+// the first 20 times per tag and what, then every 200th; counted per module in core/diag.h ("lua.err.<tag>") for
+// the session summaries. Any thread. Returns n.
+uint32_t ReportError(const char* tag, const char* what, const std::string& err);
 // Registers a C function as a global.
 using CFunction = int (*)(lua_State*);
 void RegisterGlobal(lua_State* L, const char* name, CFunction fn);
