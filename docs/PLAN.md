@@ -484,6 +484,9 @@ Goal: guests play the host's real campaign: same NPCs, traffic, weather, time, m
 
 ### G. Sync architecture (docs/sync-architecture.md)
 
+**Superseded in part (2026-10-20): the host owns the world (docs/host-authority.md).** Traffic, pedestrians and NPCs
+come from the host only; the region authority below is retired, a distance leash keeps guests near the host.
+
 Planned and built 2026-10-19/20 from the first two-PC test (merge `feat/merge-sync`, core v0.12.0). Fixed in code, in-game
 check pending: nothing here is ticked until the next two-PC test passes its targets (`sync_compare.py --check`,
 README-dev.md "Sync architecture checks").
