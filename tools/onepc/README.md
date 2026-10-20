@@ -35,6 +35,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | loss | 11-after-loss | guest log: `puppet 0 is gone (removed by the game, #1)`, `... (loaded before) not ready in 4 s: the spawner is stuck`, `factory reset: the spawner is stuck`, `puppet 0 spawned` within ~5 s; never `did not load in 12 s` for a known profile |
 | a minute | 12-a-minute-later | traffic and pedestrians around both; both puppets still there |
 | traffic | (run.log lines `host traffic:` / `guest traffic:`, tools/onepc/traffic_probe.lua) | host: `ours: 0-40 m N (no driver 0), 40-60 m ..., 60- m N (no driver K)`: the cars without a driver are the far ones (the game streams drivers out beyond ~50 m; one within 40 m is a real get-out); guest: `copies N: driver seated N, crew out 0` (unless a host car's driver really got out next to the host) |
+| peds | (guest log / trace; walk a busy street together for a minute, look around) | guest log: `peds: copy spawner ready`, `copy profile <name> loaded` for several of the six looks, `spawned a copy for the host's pedestrian N`, later `pool copy N is the copy of the host's pedestrian M now`; never `copy profile ... not used again` for all six; no `ev=adopt` / `ev=show` in the guest's PDE (0.16 rules gone); host log: no pedestrians received (a guest sends none) |
 
 ## Expected `compare.ps1` (sync_compare --check)
 
@@ -47,6 +48,9 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | foot.p95 / mean / gait | PASS (one PC: ~0.1-0.5 m) |
 | car.* | PASS for the guest's car on the host |
 | traffic.*, npc.*, ped.*, world.time_err, lat.player.p95, bw.host_up | PASS |
+| ped.coverage | >= 80 % on the guest (the host's pedestrians within 40 m with a copy; the replays in tests/ped_test.cpp: 82 % for session A with its hidden spawner, 92 % for B; recorded on 2026-10-20: 18.2 / 82.1 %) |
+| ped.p95 | <= 1.5 m (replays: 0.40 / 0.37 m; recorded 3.2 m) |
+| ped.copy_fail_per_min | <= 2 (replays: 0.55 / 0; recorded in session A: 86 a minute, the hidden spawner) |
 | traffic.true_p95 | <= 1.5 m (was 2.14 m in session A: copies of standing cars driven off them; the replay of A in tests/traffic_test.cpp: 0.75 m) |
 | traffic.crew_exits_per_min | <= 1 per minute of copies (was 26.5 on the guest in session A, 5.2 in B: drivers the host's game streamed out 45-76 m from him counted as gone) |
 | traffic.reseats_per_min | <= 3 per minute of copies (was 71.6 on the guest in session A: crews leaving copies that were pushed off their standing car, and every get-out put back) |

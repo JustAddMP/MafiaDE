@@ -273,34 +273,16 @@ net::motion::LocomotionTuning LocomotionForPed() {
     return t;
 }
 
-std::vector<MatchPair> MatchNearest(const std::vector<Vec3>& remotes, const std::vector<bool>& remoteSeen,
-                                    const std::vector<Vec3>& locals, const std::vector<bool>& localSeen, float nearDist,
-                                    float farDist) {
-    std::vector<MatchPair> cand;
-    for (size_t i = 0; i < remotes.size(); ++i) {
-        for (size_t j = 0; j < locals.size(); ++j) {
-            const float d = Ground(remotes[i], locals[j]);
-            if (!std::isfinite(d) || std::fabs(remotes[i].z - locals[j].z) > 4.0f) continue;
-            const bool unseen = !(i < remoteSeen.size() && remoteSeen[i]) && !(j < localSeen.size() && localSeen[j]);
-            if (d <= nearDist || (unseen && d <= farDist)) cand.push_back({i, j, d});
-        }
-    }
-    std::sort(cand.begin(), cand.end(), [](const MatchPair& a, const MatchPair& b) {
-        if (a.dist != b.dist) return a.dist < b.dist;
-        if (a.remote != b.remote) return a.remote < b.remote;
-        return a.local < b.local;
-    });
-    std::vector<bool> rUsed(remotes.size()), lUsed(locals.size());
-    std::vector<MatchPair> out;
-    for (const MatchPair& p : cand) {
-        if (rUsed[p.remote] || lUsed[p.local]) continue;
-        rUsed[p.remote] = lUsed[p.local] = true;
-        out.push_back(p);
-    }
-    return out;
-}
+const char* const kCopyProfiles[kCopyProfileCount] = {
+    "characters/traffic/traffic_base_ambient_combined",  // 0.16.0's one copy profile (and npc_sync's civilian one)
+    "characters/game/game_attractivemen",
+    "characters/game/game_attractivegirls",
+    "characters/game/game_blackmen",
+    "characters/game/game_blackwomen",
+    "characters/traffic/traffic_workers_male",
+};
 
-// ---- authority ---------------------------------------------------------------------------------------------------------
+// ---- the host's sender -------------------------------------------------------------------------------------------------
 namespace {
 net::interest::Config InterestConfig(const AuthorityConfig& cfg) {
     net::interest::Config c;
@@ -319,38 +301,45 @@ net::interest::Config InterestConfig(const AuthorityConfig& cfg) {
 }
 }  // namespace
 
-PedAuthority::PedAuthority(const AuthorityConfig& cfg) : cfg_(cfg), im_(InterestConfig(cfg)), region_(cfg.region) {}
+PedAuthority::PedAuthority(const AuthorityConfig& cfg) : cfg_(cfg), im_(InterestConfig(cfg)) {}
 
 void PedAuthority::SetPlayers(const std::vector<PlayerView>& players, uint8_t host, uint8_t me) {
     me_ = me;
     host_ = host;
-    std::vector<net::authority::PlayerSpot> spots;
     std::set<uint8_t> present;
-    for (const PlayerView& p : players) {
-        if (!Finite(p.pos)) continue;
-        spots.push_back({p.id, p.pos, p.inWorld});
-        if (p.id == me) continue;
-        present.insert(p.id);
-        auto [it, fresh] = peers_.try_emplace(p.id);
-        if (fresh) im_.AddPeer(p.id);
-        Peer& peer = it->second;
-        if (p.inWorld) {
-            peer.view = p.pos;
-            peer.hasView = true;
-            const net::interest::Vec3 v{p.pos.x, p.pos.y, p.pos.z};
-            im_.SetPeerViewpoint(p.id, v);
-        } else if (peer.hasView) {
-            peer.hasView = false;
-            im_.SetPeerViewpoints(p.id, {});
+    if (Shares()) {
+        for (const PlayerView& p : players) {
+            if (!Finite(p.pos) || p.id == me) continue;
+            present.insert(p.id);
+            auto [it, fresh] = peers_.try_emplace(p.id);
+            if (fresh) im_.AddPeer(p.id);
+            Peer& peer = it->second;
+            if (p.inWorld) {
+                peer.view = p.pos;
+                peer.hasView = true;
+                const net::interest::Vec3 v{p.pos.x, p.pos.y, p.pos.z};
+                im_.SetPeerViewpoint(p.id, v);
+            } else if (peer.hasView) {
+                peer.hasView = false;
+                im_.SetPeerViewpoints(p.id, {});
+            }
         }
     }
-    region_.SetPlayers(spots, host);
+    // a guest shares nothing: no receiver, and whatever was registered (we hosted before?) goes
     for (auto it = peers_.begin(); it != peers_.end();) {
         if (!present.count(it->first)) {
             im_.RemovePeer(it->first);
             it = peers_.erase(it);
         } else {
             ++it;
+        }
+    }
+    if (!Shares()) {
+        for (auto& [id, e] : peds_) {
+            if (e.net == 0) continue;
+            im_.RemoveEntity(e.net);
+            byNet_.erase(e.net);
+            e.net = 0;
         }
     }
 }
@@ -410,10 +399,9 @@ void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
         e.p = lp;
         if (lp.flags & kDead) e.vel = {};
         e.gait = (lp.flags & kDead) ? 0 : GaitOf(std::hypot(e.vel.x, e.vel.y), e.gait);
-        e.owner = (fresh || e.owner == net::kNoPlayer) ? region_.AuthorityAt(lp.pos) : region_.Keep(e.owner, lp.pos);
         const net::interest::Vec3 ip{lp.pos.x, lp.pos.y, lp.pos.z}, iv{e.vel.x, e.vel.y, 0};
         const bool riding = now < e.rideUntil;
-        if (e.owner == me_ && !riding) {
+        if (Shares() && !riding) {
             if (e.net == 0) {
                 e.net = NewNet();
                 if (e.net != 0) {
@@ -431,7 +419,7 @@ void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
             } else {
                 im_.UpdateEntity(e.net, ip, iv);
             }
-        } else if (e.net != 0) {  // its region went to another player, or it rides something: not sent any more
+        } else if (e.net != 0) {  // it rides something (or we are no host): not sent any more
             im_.RemoveEntity(e.net);
             byNet_.erase(e.net);
             e.net = 0;
@@ -471,6 +459,7 @@ float PedAuthority::Dist(const Peer& peer, uint16_t net) const {
 
 void PedAuthority::Tick(double now, uint32_t authMs, std::vector<PeerOut>& out, std::vector<Truth>* truths) {
     out.clear();
+    if (!Shares()) return;
     im_.Tick(now);
     for (const auto& e : im_.Events()) {
         auto it = peers_.find(static_cast<uint8_t>(e.peer));
@@ -527,7 +516,7 @@ void PedAuthority::Tick(double now, uint32_t authMs, std::vector<PeerOut>& out, 
             im_.ChargeBytes(key, static_cast<uint32_t>(po.spawns.back().size()));
         }
         po.spawned = static_cast<uint32_t>(spawns.size());
-        // deaths: once per admitted pedestrian that is dead (a receiver admitted later gets the dead flag in its state)
+        // deaths: once per admitted pedestrian that is dead (a guest admitted later gets the dead flag in its state)
         for (auto& [net, sent] : p.admitted) {
             const Ped& e = peds_.at(byNet_.at(net));
             const bool dead = (e.p.flags & kDead) != 0;
@@ -570,19 +559,6 @@ void PedAuthority::Tick(double now, uint32_t authMs, std::vector<PeerOut>& out, 
     }
 }
 
-uint8_t PedAuthority::OwnerOf(uint32_t id) const {
-    auto it = peds_.find(id);
-    return it == peds_.end() ? net::kNoPlayer : it->second.owner;
-}
-
-std::vector<LocalPed> PedAuthority::Foreign() const {
-    std::vector<LocalPed> out;
-    for (const auto& [id, e] : peds_)
-        if (e.owner != me_ && e.owner != net::kNoPlayer && !(e.p.flags & kDead) && now_ >= e.rideUntil)
-            out.push_back(e.p);
-    return out;
-}
-
 size_t PedAuthority::OwnedCount() const {
     return byNet_.size();
 }
@@ -609,7 +585,7 @@ const AuthorityPeerStats* PedAuthority::Stats(uint8_t peer) const {
     return it == peers_.end() ? nullptr : &it->second.stats;
 }
 
-// ---- receiver ----------------------------------------------------------------------------------------------------------
+// ---- a guest's receiver ------------------------------------------------------------------------------------------------
 const char* SpawnFailName(SpawnFail w) {
     switch (w) {
         case SpawnFail::Create: return "create_failed";
@@ -634,11 +610,17 @@ const char* WhyName(RecvCmd::Why w) {
         case RecvCmd::Why::Unresponsive: return "unresponsive";
         case RecvCmd::Why::CreateFailing: return "create_failing";
         case RecvCmd::Why::CopiesLost: return "copies_lost";
+        case RecvCmd::Why::Body: return "body";
+        case RecvCmd::Why::Surplus: return "surplus";
+        case RecvCmd::Why::Handover: return "handover";
+        case RecvCmd::Why::Cancelled: return "cancelled";
         default: return "-";
     }
 }
 
-PedReceiver::PedReceiver(const ReceiverConfig& cfg) : cfg_(cfg) {}
+PedReceiver::PedReceiver(const ReceiverConfig& cfg) : cfg_(cfg) {
+    stats_.profilesLive = static_cast<uint32_t>(kCopyProfileCount);
+}
 
 PedReceiver::Auth& PedReceiver::AuthOf(uint8_t auth) {
     auto it = auths_.find(auth);
@@ -727,7 +709,7 @@ void PedReceiver::ForgetAuthority(uint8_t auth) {
     for (auto& [key, r] : remotes_) {
         if (r.auth != auth) continue;
         r.lastRecv = -1e9;
-        if (r.goneAt < 0) r.goneAt = -1e9;  // released at the next tick
+        if (r.goneAt < 0) r.goneAt = -1e9;  // let go at the next tick
     }
     auto it = auths_.find(auth);
     if (it != auths_.end()) {
@@ -742,72 +724,130 @@ void PedReceiver::SetLocal(const Vec3& me, const Camera& cam) {
     cam_ = cam;
 }
 
-void PedReceiver::SetRegion(const net::authority::RegionAuthority& region, uint8_t me) {
-    region_ = region;
-    haveRegion_ = true;
-    myId_ = me;
-}
-
-void PedReceiver::SetCandidates(const std::vector<LocalPed>& foreign) {
-    cands_.clear();
-    for (const LocalPed& p : foreign)
-        if (!boundLocal_.count(p.id) && !hidden_.count(p.id) && Finite(p.pos)) cands_[p.id] = p;
-}
-
 void PedReceiver::SetReport(uint32_t key, const CopyReport& rep, double now) {
     auto it = remotes_.find(key);
-    if (it == remotes_.end()) return;
+    if (it == remotes_.end() || it->second.local == 0) return;
     Remote& r = it->second;
     r.rep = rep;
     r.repAt = now;
     r.haveRep = true;
-    if (rep.dead && !r.dead && r.how != How::None) r.diedHere = true;
+    if (rep.dead && !r.dead) r.diedHere = true;
+    auto c = copies_.find(r.local);
+    if (c != copies_.end() && Finite(rep.pos)) {
+        c->second.pos = rep.pos;
+        c->second.havePos = true;
+        if (rep.dead) c->second.body = true;
+    }
 }
 
-void PedReceiver::Spawned(uint32_t key, uint32_t local) {
-    auto it = remotes_.find(key);
-    if (it == remotes_.end() || local == 0) return;
-    Remote& r = it->second;
-    r.loading = false;
-    r.how = How::Spawned;
+void PedReceiver::Bind(Remote& r, uint32_t local, How how) {
+    r.how = how;
     r.local = local;
+    r.loading = false;
     r.haveRep = false;
+    r.diedHere = r.diedHereTold = false;
+    r.killed = false;
     r.lagSince = -1;
+    r.fresh = true;
     r.loco.Reset();
-    boundLocal_[local] = key;
+    Copy& c = copies_[local];
+    c.key = Key(r.auth, r.net);
+    c.shown = true;
+    if (r.haveTarget) {
+        c.pos = r.lastTarget.pos;
+        c.havePos = true;
+    }
+}
+
+void PedReceiver::Spawned(uint32_t key, uint32_t local, double now, uint8_t profile) {
+    if (local == 0) return;
+    uint8_t prof = profile;
+    auto a = asked_.find(key);
+    if (a != asked_.end()) {
+        if (prof >= kCopyProfileCount) prof = a->second;
+        asked_.erase(a);
+    }
+    if (prof < kCopyProfileCount)
+        profiles_[prof].worked = true;
+    else
+        prof = 0;
     createFails_ = 0;
+    if (copies_.count(local)) return;  // told twice
+    auto it = remotes_.find(key);
+    if (it != remotes_.end() && it->second.loading && it->second.local == 0 && it->second.goneAt < 0) {
+        Bind(it->second, local, How::Spawned);
+        copies_[local].profile = prof;
+        return;
+    }
+    // its pedestrian went (or got another copy) meanwhile: a free copy for the pool
+    Copy& c = copies_[local];
+    c.profile = prof;
+    c.shown = true;
+    c.freeAt = now;
+    if (it != remotes_.end() && it->second.loading) it->second.loading = false;
+}
+
+void PedReceiver::ProfileFailed(uint8_t profile, double now) {
+    if (profile >= kCopyProfileCount) return;
+    Profile& p = profiles_[profile];
+    if (p.worked || p.dropped) return;
+    if (now - p.lastFailAt <= 1.0) return;  // the same load's other requests
+    p.lastFailAt = now;
+    if (++p.fails < cfg_.profileFails) return;
+    size_t live = 0;
+    for (const Profile& q : profiles_)
+        if (!q.dropped) ++live;
+    if (live <= 1) return;  // the last one stays
+    p.dropped = true;
+    ++stats_.profilesDropped;
 }
 
 void PedReceiver::SpawnFailed(uint32_t key, double now, SpawnFail why) {
     ++stats_.failsBy[static_cast<size_t>(why)];
     ++stats_.spawnFails;
     if (why == SpawnFail::Create) ++createFails_;
+    auto a = asked_.find(key);
+    if (a != asked_.end()) {
+        if (why == SpawnFail::NoProfile) ProfileFailed(a->second, now);
+        asked_.erase(a);
+    }
     auto it = remotes_.find(key);
     if (it == remotes_.end()) return;
     Remote& r = it->second;
-    if (r.how == How::Spawned && r.local != 0) return;
+    if (r.local != 0) return;
     r.loading = false;
     r.how = How::None;
-    r.retryAt = now + (why == SpawnFail::Reset ? cfg_.resetRetry : cfg_.spawnRetry);
+    r.retryAt = now + (why == SpawnFail::Reset       ? cfg_.resetRetry
+                       : why == SpawnFail::NoProfile ? cfg_.profileRetry
+                                                     : cfg_.spawnRetry);
 }
 
 void PedReceiver::LocalGone(uint32_t local, double now) {
-    hidden_.erase(local);
-    cands_.erase(local);
-    auto it = boundLocal_.find(local);
-    if (it == boundLocal_.end()) return;
-    auto rt = remotes_.find(it->second);
-    if (rt != remotes_.end()) {
-        if (rt->second.how == How::Spawned) {
-            ++stats_.lost;
-            lostAt_.push_back(now);
+    auto c = copies_.find(local);
+    if (c == copies_.end()) return;
+    ++stats_.lost;
+    lostAt_.push_back(now);
+    if (c->second.key != 0) {
+        auto rt = remotes_.find(c->second.key);
+        if (rt != remotes_.end() && rt->second.local == local) {
+            Remote& r = rt->second;
+            r.how = How::None;
+            r.local = 0;
+            r.haveRep = false;
+            r.diedHere = r.diedHereTold = false;
+            r.lagSince = -1;
         }
-        rt->second.how = How::None;
-        rt->second.local = 0;
-        rt->second.haveRep = false;
-        rt->second.diedHere = false;
     }
-    boundLocal_.erase(it);
+    copies_.erase(c);
+}
+
+void PedReceiver::SpawnerWasReset(double now) {
+    resetAt_ = now;  // a reset of ours not before spawnerResetGap from now
+    resetWanted_ = false;
+    createFails_ = 0;
+    lostAt_.clear();
+    for (auto& [key, r] : remotes_)
+        if (r.local == 0 && !r.loading && r.retryAt > now + cfg_.resetRetry) r.retryAt = now + cfg_.resetRetry;
 }
 
 bool PedReceiver::DiedHere(uint32_t key) {
@@ -822,23 +862,32 @@ bool PedReceiver::DiedHere(uint32_t key) {
 void PedReceiver::Clear() {
     remotes_.clear();
     auths_.clear();
-    cands_.clear();
-    boundLocal_.clear();
-    hidden_.clear();
+    copies_.clear();
+    asked_.clear();
     createFails_ = 0;
     lostAt_.clear();
     resetWanted_ = false;
+    // the profiles' record stays: whether a profile loads is a fact of this game, not of a world
 }
 
-void PedReceiver::ShowAll(std::vector<RecvCmd>& out) {
-    for (const auto& [local, h] : hidden_) {
-        RecvCmd c;
-        c.type = RecvCmd::Type::Show;
-        c.local = local;
-        out.push_back(c);
-        ++stats_.shows;
+bool PedReceiver::IsFree(uint32_t local) const {
+    auto it = copies_.find(local);
+    return it != copies_.end() && it->second.key == 0;
+}
+
+uint8_t PedReceiver::ProfileFor(uint16_t net) const {
+    // the live looks; one that failed once (never worked) rests a while: each try of a look that does not load
+    // stops the spawner for its whole load timeout
+    uint8_t live[kCopyProfileCount], ready[kCopyProfileCount];
+    size_t n = 0, m = 0;
+    for (size_t i = 0; i < kCopyProfileCount; ++i) {
+        const Profile& p = profiles_[i];
+        if (p.dropped) continue;
+        live[n++] = static_cast<uint8_t>(i);
+        if (p.worked || p.fails == 0 || now_ - p.lastFailAt >= cfg_.profileRest) ready[m++] = static_cast<uint8_t>(i);
     }
-    hidden_.clear();
+    if (m > 0) return ready[net % m];
+    return n == 0 ? 0 : live[net % n];
 }
 
 double PedReceiver::PlayoutDelay(uint8_t auth) const {
@@ -871,48 +920,69 @@ float PedReceiver::DistToMe(const Vec3& p) const {
     return haveMe_ ? Ground(p, me_) : 1e9f;
 }
 
-void PedReceiver::ReleaseReplica(Remote& r, std::vector<RecvCmd>& out) {
-    if (r.how == How::None && !r.loading) return;
-    RecvCmd c;
-    c.type = RecvCmd::Type::Release;
-    c.key = Key(r.auth, r.net);
-    c.local = r.local;
-    c.how = r.loading ? How::Spawned : r.how;
-    out.push_back(c);
-    if (r.local) boundLocal_.erase(r.local);
+void PedReceiver::Unbind(Remote& r, double now, std::vector<RecvCmd>& out, bool remove, RecvCmd::Why why) {
+    const uint32_t key = Key(r.auth, r.net);
+    if (r.loading) {  // asked for, not there yet: the request is dropped (a copy made meanwhile joins the pool)
+        RecvCmd c;
+        c.type = RecvCmd::Type::Remove;
+        c.why = RecvCmd::Why::Cancelled;
+        c.key = key;
+        out.push_back(c);
+        r.loading = false;
+        asked_.erase(key);
+    }
+    if (r.local != 0) {
+        auto it = copies_.find(r.local);
+        if (it != copies_.end()) {
+            Copy& cp = it->second;
+            const bool body = cp.body || r.dead || r.diedHere || (r.haveRep && r.rep.dead);
+            if (r.haveRep && Finite(r.rep.pos)) {
+                cp.pos = r.rep.pos;
+                cp.havePos = true;
+            }
+            if (remove || body) {
+                RecvCmd c;
+                c.type = RecvCmd::Type::Remove;
+                c.why = body && why == RecvCmd::Why::None ? RecvCmd::Why::Body : why;
+                c.key = key;
+                c.local = r.local;
+                out.push_back(c);
+                copies_.erase(it);
+                ++stats_.removes;
+            } else {
+                cp.key = 0;
+                cp.shown = true;
+                cp.freeAt = now;
+            }
+        }
+    }
     r.how = How::None;
     r.local = 0;
-    r.loading = false;
     r.haveRep = false;
     r.diedHere = r.diedHereTold = false;
     r.lagSince = -1;
-    ++stats_.releases;
 }
 
 void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
+    now_ = now;
     for (auto& [id, a] : auths_) a.stream.Update(now);
-    // 1. gone / stale pedestrians: their replicas go (a spawned copy when nobody looks, at the latest after a grace)
+    // 1. gone / stale pedestrians: their copies go to the pool (a body is removed)
     for (auto it = remotes_.begin(); it != remotes_.end();) {
         Remote& r = it->second;
         const bool stale = now - r.lastRecv > cfg_.stale;
         if (stale && r.goneAt < 0) r.goneAt = now;
         if (r.goneAt >= 0 || stale) {
-            if (r.how == How::Adopted || r.loading || (r.how == How::Spawned && r.local == 0)) {
-                ReleaseReplica(r, out);
-            } else if (r.how == How::Spawned) {
-                const bool unseen = !r.haveRep || !Seen(r.rep.pos);
-                if (unseen || now - r.goneAt > cfg_.unspawnGrace) ReleaseReplica(r, out);
-            }
-            if (r.how == How::None && (now - r.lastRecv > cfg_.forget || r.goneAt < -1e8 ||
-                                       (r.goneAt >= 0 && now - r.goneAt > cfg_.forget))) {
+            if (r.local != 0 || r.loading) Unbind(r, now, out);
+            if (now - r.lastRecv > cfg_.forget || r.goneAt < -1e8 || (r.goneAt >= 0 && now - r.goneAt > cfg_.forget)) {
                 it = remotes_.erase(it);
                 continue;
             }
         }
         // a spawn that never came back
-        if (r.loading && now - r.spawnAskedAt > 20.0) {
+        if (r.loading && now - r.spawnAskedAt > cfg_.spawnTimeout) {
             r.loading = false;
             r.retryAt = now + cfg_.spawnRetry;
+            asked_.erase(it->first);
             ++stats_.spawnFails;
             ++stats_.failsBy[static_cast<size_t>(SpawnFail::Timeout)];
         }
@@ -920,15 +990,13 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
     }
     // 1b. the copy spawner's health: CreateObject failing again and again, or every copy gone at once (the spawner
     //     went and took them along): a new spawner, and the pedestrians waiting for a copy are asked for again soon.
-    //     Only while no copy of it is left (a new spawner's despawn of the old one would take living copies along).
+    //     Only while no copy of it is left, free ones included (a new spawner's despawn of the old one would take
+    //     living copies along).
     {
         lostAt_.erase(std::remove_if(lostAt_.begin(), lostAt_.end(),
                                      [&](double t) { return now - t > cfg_.massLossWindow; }),
                       lostAt_.end());
-        size_t spawnedNow = 0;
-        for (const auto& [key, r] : remotes_)
-            if (r.how == How::Spawned && r.local != 0) ++spawnedNow;
-        if (!resetWanted_ && spawnedNow == 0) {
+        if (!resetWanted_ && copies_.empty()) {
             if (static_cast<int>(lostAt_.size()) >= cfg_.massLoss) {
                 resetWanted_ = true;
                 resetWhy_ = RecvCmd::Why::CopiesLost;
@@ -948,170 +1016,172 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
             createFails_ = 0;
             lostAt_.clear();
             for (auto& [key, r] : remotes_)
-                if (r.how == How::None && !r.loading && r.retryAt > now) r.retryAt = now + cfg_.resetRetry;
+                if (r.local == 0 && !r.loading && r.retryAt > now) r.retryAt = now + cfg_.resetRetry;
         }
     }
     // 2. targets of the live ones
-    struct Live {
-        Remote* r;
-        PedState t;
-        double tT;
-        float d;
-    };
-    std::vector<Live> live;
+    std::vector<Remote*> live;
     for (auto& [key, r] : remotes_) {
+        r.dist = 1e9f;
         if (r.goneAt >= 0) continue;
         PedState t;
         double tT = 0;
         if (!Target(r, now, t, &tT)) continue;
         r.lastTarget = t;
         r.lastTargetT = tT;
-        live.push_back({&r, t, tT, DistToMe(t.pos)});
+        r.haveTarget = true;
+        r.dist = DistToMe(t.pos);
+        live.push_back(&r);
     }
-    // 3. adoption: unmatched living authority pedestrians in our zone <-> free local humans there, nearest first
-    std::vector<size_t> unmatched;
-    for (size_t i = 0; i < live.size(); ++i) {
-        Remote& r = *live[i].r;
-        if (r.how != How::None || r.loading || r.dead || live[i].d > cfg_.zoneRadius) {
-            if (r.how != How::None || r.loading) r.unmatchedSince = -1;
+    // 3. every living pedestrian near us without a copy gets one, nearest first: a free pool copy (put there and
+    //    shown), else a new one (while the pool has room and the spawner is not busy), else - every copy in use -
+    //    the copy of a pedestrian much farther away (a handover)
+    size_t loading = 0;
+    for (const auto& [key, r] : remotes_)
+        if (r.loading) ++loading;
+    std::vector<Remote*> want;
+    for (Remote* r : live)
+        if (!r->dead && r->local == 0 && !r->loading && now >= r->retryAt && r->dist <= cfg_.spawnRadius &&
+            now - r->firstSeen >= cfg_.spawnWait)
+            want.push_back(r);
+    std::sort(want.begin(), want.end(), [](const Remote* a, const Remote* b) {
+        if (a->dist != b->dist) return a->dist < b->dist;
+        return Key(a->auth, a->net) < Key(b->auth, b->net);
+    });
+    for (Remote* rp : want) {
+        Remote& r = *rp;
+        const uint32_t key = Key(r.auth, r.net);
+        // a free copy: the one nearest its spot, an out-of-sight one before one in view
+        uint32_t best = 0;
+        float bestScore = 1e30f;
+        if (cfg_.poolKeep > 0) {
+            for (const auto& [local, c] : copies_) {
+                if (c.key != 0 || c.body) continue;
+                float score = c.havePos ? Ground(c.pos, r.lastTarget.pos) : 500.0f;
+                if (c.shown && c.havePos && Seen(c.pos)) score += 1000.0f;
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = local;
+                }
+            }
+        }
+        if (best != 0) {
+            Bind(r, best, How::Reused);
+            RecvCmd c;
+            c.type = RecvCmd::Type::Reuse;
+            c.key = key;
+            c.local = best;
+            c.target = r.lastTarget;
+            out.push_back(c);
+            ++stats_.reuses;
             continue;
         }
-        if (r.unmatchedSince < 0) r.unmatchedSince = now;
-        unmatched.push_back(i);
-    }
-    std::vector<Vec3> rPos, lPos;
-    std::vector<bool> rSeen, lSeen;
-    std::vector<uint32_t> lIds;
-    for (size_t i : unmatched) {
-        rPos.push_back(live[i].t.pos);
-        rSeen.push_back(Seen(live[i].t.pos));
-    }
-    for (const auto& [id, p] : cands_) {
-        if (DistToMe(p.pos) > cfg_.zoneRadius) continue;
-        lIds.push_back(id);
-        lPos.push_back(p.pos);
-        lSeen.push_back(Seen(p.pos));
-    }
-    std::set<size_t> adoptedIdx;
-    for (const MatchPair& m : MatchNearest(rPos, rSeen, lPos, lSeen, cfg_.adoptNear, cfg_.adoptFar)) {
-        Live& l = live[unmatched[m.remote]];
-        Remote& r = *l.r;
-        const uint32_t local = lIds[m.local];
-        r.how = How::Adopted;
-        r.local = local;
-        r.haveRep = false;
-        r.unmatchedSince = -1;
-        r.loco.Reset();
-        boundLocal_[local] = Key(r.auth, r.net);
-        cands_.erase(local);
-        RecvCmd c;
-        c.type = RecvCmd::Type::Adopt;
-        c.key = Key(r.auth, r.net);
-        c.local = local;
-        c.target = l.t;
-        out.push_back(c);
-        ++stats_.adoptions;
-        adoptedIdx.insert(m.remote);
-    }
-    // 4. a shortfall: spawned copies (nearest first, a while unmatched, more patience when its spot is in sight)
-    size_t spawned = 0, loading = 0;
-    for (const auto& [key, r] : remotes_) {
-        if (r.loading) ++loading;
-        if (r.loading || r.how == How::Spawned) ++spawned;
-    }
-    std::vector<std::pair<float, size_t>> want;
-    const bool nothingToAdopt = lIds.size() == adoptedIdx.size();  // every free local human in our zone is used
-    for (size_t k = 0; k < unmatched.size(); ++k) {
-        if (adoptedIdx.count(k)) continue;
-        const Live& l = live[unmatched[k]];
-        const Remote& r = *l.r;
-        if (l.d > cfg_.spawnRadius || now < r.retryAt) continue;
-        const double wait = nothingToAdopt ? cfg_.spawnWaitNone : rSeen[k] ? cfg_.spawnWaitSeen : cfg_.spawnWait;
-        if (now - r.unmatchedSince < wait) continue;
-        want.push_back({l.d, unmatched[k]});
-    }
-    std::sort(want.begin(), want.end());
-    for (const auto& [d, i] : want) {
-        if (spawned >= cfg_.maxSpawned || loading >= cfg_.maxLoading) break;
-        Remote& r = *live[i].r;
-        r.loading = true;
-        r.spawnAskedAt = now;
-        RecvCmd c;
-        c.type = RecvCmd::Type::Spawn;
-        c.key = Key(r.auth, r.net);
-        c.target = live[i].t;
-        out.push_back(c);
-        ++spawned;
-        ++loading;
-        ++stats_.spawnsAsked;
-    }
-    // 5. surplus local humans in our zone (another's region) are hidden while nobody looks - only while that
-    //    authority's pedestrians really arrive here
-    if (!live.empty()) {
-        for (auto it = cands_.begin(); it != cands_.end();) {
-            const LocalPed& p = it->second;
-            if (DistToMe(p.pos) <= cfg_.zoneRadius && !Seen(p.pos)) {
-                RecvCmd c;
-                c.type = RecvCmd::Type::Hide;
-                c.local = p.id;
-                out.push_back(c);
-                hidden_[p.id] = Hidden{p.pos, -1};
-                ++stats_.hides;
-                it = cands_.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    }
-    // 6. hidden humans come back where the region is ours again (a while, out of sight), or far from us
-    for (auto it = hidden_.begin(); it != hidden_.end();) {
-        Hidden& h = it->second;
-        bool show = DistToMe(h.pos) > cfg_.showFar;
-        if (!show && haveRegion_) {
-            if (region_.AuthorityAt(h.pos) == myId_) {
-                if (h.oursSince < 0) h.oursSince = now;
-                show = now - h.oursSince >= cfg_.showAfter && !Seen(h.pos);
-            } else {
-                h.oursSince = -1;
-            }
-        }
-        if (show) {
+        if (copies_.size() + loading < cfg_.maxCopies) {
+            if (loading >= cfg_.maxLoading) continue;
+            r.loading = true;
+            r.spawnAskedAt = now;
             RecvCmd c;
-            c.type = RecvCmd::Type::Show;
-            c.local = it->first;
+            c.type = RecvCmd::Type::Spawn;
+            c.key = key;
+            c.target = r.lastTarget;
+            c.profile = ProfileFor(r.net);
+            asked_[key] = c.profile;
             out.push_back(c);
-            ++stats_.shows;
-            it = hidden_.erase(it);
-        } else {
-            ++it;
+            ++loading;
+            ++stats_.spawnsAsked;
+            continue;
+        }
+        // the pool is full: the farthest copied pedestrian, if it is far enough and out of sight
+        Remote* far = nullptr;
+        for (Remote* o : live) {
+            if (o->local == 0 || o->dead || o->diedHere || o->dist <= cfg_.coverRadius ||
+                o->dist <= r.dist + cfg_.handoverMargin)
+                continue;
+            if (o->haveRep && Seen(o->rep.pos)) continue;
+            if (!far || o->dist > far->dist) far = o;
+        }
+        if (!far) continue;
+        const uint32_t local = far->local;
+        far->how = How::None;
+        far->local = 0;
+        far->haveRep = false;
+        far->lagSince = -1;
+        Bind(r, local, How::Reused);
+        RecvCmd c;
+        c.type = RecvCmd::Type::Reuse;
+        c.why = RecvCmd::Why::Handover;
+        c.key = key;
+        c.local = local;
+        c.target = r.lastTarget;
+        out.push_back(c);
+        ++stats_.reuses;
+        ++stats_.handovers;
+    }
+    // 4. free copies are hidden once nobody looks (at the latest after hideGrace); more free ones than poolKeep: the
+    //    farthest go for good
+    {
+        size_t freeN = 0;
+        for (const auto& [local, c] : copies_)
+            if (c.key == 0) ++freeN;
+        std::vector<std::pair<float, uint32_t>> byFar;
+        for (const auto& [local, c] : copies_)
+            if (c.key == 0) byFar.push_back({c.havePos ? DistToMe(c.pos) : 1e9f, local});
+        std::sort(byFar.rbegin(), byFar.rend());
+        for (const auto& [d, local] : byFar) {
+            Copy& c = copies_.at(local);
+            const bool surplus = freeN > cfg_.poolKeep;
+            const bool unseen = !c.havePos || !Seen(c.pos);
+            if (c.body || surplus) {
+                if (!c.body && c.shown && !unseen && now - c.freeAt < cfg_.hideGrace) continue;
+                RecvCmd cmd;
+                cmd.type = RecvCmd::Type::Remove;
+                cmd.why = c.body ? RecvCmd::Why::Body : RecvCmd::Why::Surplus;
+                cmd.local = local;
+                out.push_back(cmd);
+                copies_.erase(local);
+                --freeN;
+                ++stats_.removes;
+                continue;
+            }
+            if (c.shown && (unseen || now - c.freeAt >= cfg_.hideGrace)) {
+                RecvCmd cmd;
+                cmd.type = RecvCmd::Type::Hide;
+                cmd.local = local;
+                out.push_back(cmd);
+                c.shown = false;
+                ++stats_.hides;
+            }
         }
     }
-    // 7. drive the replicas (and deaths)
-    for (Live& l : live) {
-        Remote& r = *l.r;
-        if (r.how == How::None || r.local == 0) continue;
+    // 5. drive the copies (and deaths)
+    for (Remote* lp : live) {
+        Remote& r = *lp;
+        if (r.local == 0) continue;
         const uint32_t key = Key(r.auth, r.net);
+        const PedState& tgt = r.lastTarget;
         if (r.dead) {
             if (!r.killed && !(r.haveRep && r.rep.dead)) {
                 RecvCmd c;
                 c.type = RecvCmd::Type::Kill;
                 c.key = key;
                 c.local = r.local;
-                c.target = l.t;
+                c.target = tgt;
                 out.push_back(c);
                 ++stats_.kills;
             }
             r.killed = true;
+            auto cp = copies_.find(r.local);
+            if (cp != copies_.end()) cp->second.body = true;
             continue;
         }
-        if (r.diedHere) continue;  // ours died here: the authority is told (PedKill), its death follows
+        if (r.diedHere) continue;  // ours died here: the host is told (PedKill), its death follows
         net::motion::LocomotionInput in;
-        in.target = l.t.pos;
-        in.targetVel = l.t.vel;
-        in.heading[0] = l.t.heading[0];
-        in.heading[1] = l.t.heading[1];
-        in.sprint = l.t.gait >= 3;
-        in.gaitHint = static_cast<int8_t>(l.t.gait);
+        in.target = tgt.pos;
+        in.targetVel = tgt.vel;
+        in.heading[0] = tgt.heading[0];
+        in.heading[1] = tgt.heading[1];
+        in.sprint = tgt.gait >= 3;
+        in.gaitHint = static_cast<int8_t>(tgt.gait);
         in.haveCopy = r.haveRep && now - r.repAt <= cfg_.reportFresh;
         in.copy = r.rep.pos;
         in.copyHeading[0] = r.rep.heading[0];
@@ -1121,12 +1191,27 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
         c.type = RecvCmd::Type::Drive;
         c.key = key;
         c.local = r.local;
-        c.target = l.t;
+        c.target = tgt;
         c.lc = r.loco.Update(in);
-        // a replica that keeps its gap behind a moving target (it walks at the target's pace, the multiplier and the
-        // nudges do not move it): snapped; lagging again soon after: released, the pedestrian gets a new copy
+        // a copy that keeps its gap behind a moving target (it walks at the target's pace, the multiplier and the
+        // nudges do not move it): snapped; lagging again soon after: removed, the pedestrian gets another copy
         using Fix = net::motion::LocomotionCommand::Fix;
-        const float tspeed = std::hypot(l.t.vel.x, l.t.vel.y);
+        // a copy that just came (spawned where its pedestrian was when it was asked for - one profile load and the
+        // queue ago - or a pool copy put there a moment ago) and is more than freshSnap off: put at its target at once
+        // (it only just appeared: nobody sees the jump) instead of walking it in
+        if (r.fresh && in.haveCopy) {
+            r.fresh = false;
+            if (c.lc.fix != Fix::Snap && c.lc.error > cfg_.freshSnap) {
+                const float sx = tgt.pos.x - r.rep.pos.x, sy = tgt.pos.y - r.rep.pos.y;
+                c.lc.fix = Fix::Snap;
+                c.lc.nudge = {};
+                c.lc.reissue = true;
+                c.lc.moveTo.x += sx;
+                c.lc.moveTo.y += sy;
+                r.loco.Reset();
+            }
+        }
+        const float tspeed = std::hypot(tgt.vel.x, tgt.vel.y);
         if (in.haveCopy && c.lc.fix != Fix::Snap && tspeed >= cfg_.lagMinSpeed && c.lc.error > cfg_.lagDist) {
             if (r.lagSince < 0 || c.lc.error < r.lagRef - cfg_.lagClose) {
                 r.lagSince = now;
@@ -1136,14 +1221,12 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
                 if (now - r.lagSnapAt <= cfg_.lagRespawn) {
                     ++stats_.unresponsive;
                     r.retryAt = now;
-                    r.unmatchedSince = -1;
-                    ReleaseReplica(r, out);
-                    out.back().why = RecvCmd::Why::Unresponsive;
+                    Unbind(r, now, out, true, RecvCmd::Why::Unresponsive);
                     continue;
                 }
                 r.lagSnapAt = now;
                 // walk on from the target's spot (the walk point was picked from the old one)
-                const float sx = l.t.pos.x - r.rep.pos.x, sy = l.t.pos.y - r.rep.pos.y;
+                const float sx = tgt.pos.x - r.rep.pos.x, sy = tgt.pos.y - r.rep.pos.y;
                 c.lc.fix = Fix::Snap;
                 c.lc.nudge = {};
                 c.lc.reissue = true;
@@ -1160,29 +1243,33 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
         r.lastErr = c.lc.error;
         out.push_back(c);
     }
-    // 8. stats
+    // 6. stats
     ReceiverStats& st = stats_;
     st.known = static_cast<uint32_t>(live.size());
-    st.nearby = st.nearReplica = st.adopted = st.spawned = st.loading = 0;
-    for (const Live& l : live) {
-        const Remote& r = *l.r;
-        if (!r.dead && l.d <= cfg_.coverRadius) {
+    st.nearby = st.nearReplica = st.copies = st.free = st.loading = 0;
+    for (const Remote* lp : live) {
+        if (!lp->dead && lp->dist <= cfg_.coverRadius) {
             ++st.nearby;
-            if (r.how != How::None && r.local != 0) ++st.nearReplica;
+            if (lp->local != 0) ++st.nearReplica;
         }
     }
-    for (const auto& [key, r] : remotes_) {
-        if (r.how == How::Adopted) ++st.adopted;
-        if (r.how == How::Spawned && r.local != 0) ++st.spawned;
+    for (const auto& [key, r] : remotes_)
         if (r.loading) ++st.loading;
+    for (const auto& [local, c] : copies_) {
+        if (c.key != 0)
+            ++st.copies;
+        else
+            ++st.free;
     }
-    st.hidden = static_cast<uint32_t>(hidden_.size());
+    st.profilesLive = 0;
+    for (const Profile& p : profiles_)
+        if (!p.dropped) ++st.profilesLive;
 }
 
 std::vector<ReplicaInfo> PedReceiver::Replicas(double now) const {
     std::vector<ReplicaInfo> out;
     for (const auto& [key, r] : remotes_) {
-        if (r.how == How::None || r.local == 0 || r.goneAt >= 0) continue;
+        if (r.local == 0 || r.goneAt >= 0) continue;
         ReplicaInfo i;
         i.key = key;
         i.how = r.how;

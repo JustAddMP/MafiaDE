@@ -567,7 +567,9 @@ Play in this order, both players together unless a step says otherwise (about 25
    report's `copies of a standing car driven off it` near 0 %; the waiting copies keep their drivers and stand still
    (2026-10-20: drivers got out and back in, copies crept away from the stop line at 4 m/s).
 4. **Pedestrians, 3 min:** walk a busy street together, look around; shoot one pedestrian each.
-   `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m; the shot pedestrians die on both games (`PDE ev=killreq` / `death`).
+   `ped.coverage` >= 80 %, `ped.p95` <= 1.5 m, `ped.copy_fail_per_min` <= 2 (host-peds: every pedestrian on the
+   guest is a copy of the host's, from a pool, in six looks); the shot pedestrians die on both games
+   (`PDE ev=killreq` / `death`).
 5. **NPCs, 5 min:** get a wanted level and let the host's cops chase the guest on foot; then a mission fight if one is
    at hand (Bon Appetit cp_040/050). `npc.p95` <= 1.0 m, `npc.max` <= 4 m, `npc.bw` <= 8 KB/s. Guest log:
    `freeze ... ok`; any `does not follow ... hidden, a copy shows it` means the AI freeze did not hold (note which).

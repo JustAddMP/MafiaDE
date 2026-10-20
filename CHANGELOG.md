@@ -13,6 +13,23 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
   (`update check: ...`). Checked against the live endpoint from a test harness (as 0.15.0: v0.16.0 found; as
   0.16.0: up to date); the banner in game is not yet seen.
 - Core v0.13.0 (from v0.12.0): the update check; no other change, protocol stays 9.
+- **Pedestrians come from the host only** (docs/host-authority.md WP-C, `host-peds`; NOT verified in game): the
+  host's game owns every ambient pedestrian and sends each guest the ones within 80 m of him (leave 90 m, at most 48,
+  nearest first, 16 KB/s budget; 0.16.0: 50 / 60 m and 40); a guest sends none (no region authority, no guest ->
+  guest relay) and shows every one of them with a spawned copy from a pool of up to 40: a copy whose pedestrian went
+  is hidden and kept, the next new pedestrian gets it (put at its spot, shown) before a new one is spawned, and with
+  every copy in use a near pedestrian takes a far one's copy. Copies get one of six civilian looks by net id
+  (`traffic_base_ambient_combined`, `game_attractivemen` / `girls`, `game_blackmen` / `women`,
+  `traffic_workers_male`); the spawner loads one look at a time, makes every waiting copy of the loaded look first
+  and gives a request that waited 2 s the look it has; a look that fails to load twice before it ever made a copy is
+  dropped. Adopting and hiding the guest's own humans and blocking his spawners are gone (guest_world switches his
+  pedestrians off). Carried over from feat/sync-peds: the copy spawner's health (a new one after two CreateObject
+  failures in a row or every copy gone at once), riders faster than 8 m/s not shared, the lag snap / removal of a
+  copy that does not close its gap. Replays of the 2026-10-20 sessions (tests/ped_test.cpp, a model of the game's
+  spawner: one load at a time, 0.8-2.5 s each, session A's hidden spawner): coverage within 40 m A 82.2 % (recorded
+  18.2 %, 0.16.0 rules 15.2 %, feat/sync-peds 83.8 % with one look), B 91.7 % (recorded 82.1 %); copy p95 0.40 /
+  0.37 m; copy failures 0.55 / 0 per minute. sync_compare: new `ped.copy_fail_per_min` (<= 2); the pedestrian
+  section has no adoption or regions any more.
 - Fixes from the 2026-10-20 two-PC test of 0.16.0 (docs/test-2026-10-20.md: "the guest is invisible to the host"):
   - **Motorbikes stopped all car and bike sync** ("cars error" a hundred times a second, every car of that player
     unshared for the rest of the session, the rider shown as a man running 0.7 m under him and snapped up again and

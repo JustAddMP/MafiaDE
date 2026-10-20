@@ -14,7 +14,7 @@ seen on the other's game:
 - seats: puppets thrown out of cars (from the copied log lines)
 - NPCs: how far the guest's NPCs were from the host's
 - swapped cars: real cars hidden behind a copy and how they came back (SWR / SWP records)
-- pedestrians: each game's pedestrians as replicas on the other (PDT / PDR / PDC): true error, coverage
+- pedestrians: the host's pedestrians as copies on a guest (PDT / PDR / PDC): true error, coverage, copy failures
 - bandwidth per system (from the copied "net: messages:" log lines of core's NetMonitor): typical (median) and
   worst (max) KB/s out and in, plus what the send budget thinned or deferred
 - latency per system (LAT records): how long a message took from the sender's send to this game applying it,
@@ -69,6 +69,7 @@ TARGETS = {
     "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
+    "ped.copy_fail_per_min": ("<=", 2.0, "pedestrian copies that failed to spawn, per minute with the host's pedestrians near"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
     "join.complete_s": ("<=", 10.0, "a guest's world complete after a join / reconnect (s)"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
@@ -1071,13 +1072,16 @@ def traffic(a, b):
 
 
 def peds(auth, recv):
-    """Pedestrians (docs/sync-trace.md PDT / PDR / PDC / PDS): `auth`'s pedestrians as replicas on `recv`'s game.
-    The true error lines up each replica record (PDR rT = the authority clock time its target stands for) with the
-    authority's truth records (PDT sT, the same clock) of that pedestrian."""
+    """Pedestrians (docs/sync-trace.md PDT / PDR / PDC / PDS; docs/protocol.md "Pedestrians"): the host's pedestrians
+    as copies on a guest's game (since host authority, docs/host-authority.md WP-C, a guest shares none: no regions,
+    nothing adopted). The true error lines up each copy record (PDR rT = the host clock time its target stands for)
+    with the host's truth records (PDT sT, the same clock) of that pedestrian."""
     pdr = [f for _, f in recv.records["PDR"] if int(num(f.get("from"), -1)) == auth.local]
     pdc = [f for _, f in recv.records["PDC"]]
     if not pdr and not pdc and not auth.records["PDS"]:
         return
+    if auth.role == "guest" and not auth.records["PDT"] and not pdr:
+        return  # a guest shares no pedestrians: nothing of his to show on the host
     section("Pedestrians (%s's on %s's game)" % (auth.name, recv.name))
     truth = defaultdict(list)
     for _, f in auth.records["PDT"]:
@@ -1103,7 +1107,7 @@ def peds(auth, recv):
         if e > 3:
             worst[f.get("net")] += 1
     if errs:
-        print("  replica vs the authority's pedestrian at the same moment: %s" % stats_line(errs))
+        print("  copy vs the host's pedestrian at the same moment: %s" % stats_line(errs))
         for how, v in sorted(by_how.items()):
             print("    %-8s %s" % (how, stats_line(v)))
         record("ped.p95", pct(errs, 95), "%s's on %s" % (auth.name, recv.name))
@@ -1111,30 +1115,49 @@ def peds(auth, recv):
             print("  pedestrians most often more than 3 m off: %s" % ", ".join(
                 "net %s (%d)" % kv for kv in worst.most_common(5)))
     if pdr:
-        print("  replica records %d, %d without a truth record at that moment (PDT is 1 in 2 states)" % (
+        print("  copy records %d, %d without a truth record at that moment (PDT is 1 in 2 states)" % (
             len(pdr), missing))
     if pdc:
         near = sum(num(f.get("near"), 0) for f in pdc)
         rep_n = sum(num(f.get("rep"), 0) for f in pdc)
         if near > 0:
             cov = 100.0 * rep_n / near
-            print("  coverage: %.1f%% of the authorities' pedestrians within 40 m had a replica (%d samples); "
-                  "hidden max %d, adopted mean %.1f, spawned mean %.1f, spawn failures %d" % (
-                      cov, len(pdc), max(num(f.get("hidden"), 0) for f in pdc),
-                      statistics.fmean(num(f.get("adopted"), 0) for f in pdc),
-                      statistics.fmean(num(f.get("spawned"), 0) for f in pdc), num(pdc[-1].get("fails"), 0)))
+            # host-peds PDC: spawned (bound copies) pool (free ones) reuses handovers; a 0.16 trace still has
+            # adopted / hidden (its own humans), shown when present
+            old = any("adopted" in f for f in pdc)
+            print("  coverage: %.1f%% of the host's pedestrians within 40 m had a copy (%d samples); copies mean %.1f "
+                  "(max %d), pool (free) mean %.1f, reused %d, handed over %d, spawn failures %d%s" % (
+                      cov, len(pdc), statistics.fmean(num(f.get("spawned"), 0) for f in pdc),
+                      max(num(f.get("spawned"), 0) for f in pdc), statistics.fmean(num(f.get("pool"), 0) for f in pdc),
+                      num(pdc[-1].get("reuses"), 0), num(pdc[-1].get("handovers"), 0), num(pdc[-1].get("fails"), 0),
+                      (" (0.16 trace: adopted mean %.1f, own hidden max %d)" % (
+                          statistics.fmean(num(f.get("adopted"), 0) for f in pdc),
+                          max(num(f.get("hidden"), 0) for f in pdc))) if old else ""))
             record("ped.coverage", cov, "on %s" % recv.name)
+        # copy failures per minute while the host's pedestrians were near (PDC is 1 Hz; fails is a running total)
+        busy = [f for f in pdc if num(f.get("known"), 0) > 0 or num(f.get("spawned"), 0) > 0]
+        if len(busy) >= 2:
+            fails = max(0.0, num(pdc[-1].get("fails"), 0) - num(pdc[0].get("fails"), 0))
+            per_min = fails / (len(busy) / 60.0)
+            print("  copy spawn failures: %d in %.1f min with the host's pedestrians near (%.2f/min: create %d, "
+                  "profile %d, reset %d, timeout %d; spawner resets %d, looks left %s)" % (
+                      fails, len(busy) / 60.0, per_min, num(pdc[-1].get("fcreate"), 0),
+                      num(pdc[-1].get("fprofile"), 0), num(pdc[-1].get("freset"), 0), num(pdc[-1].get("ftimeout"), 0),
+                      num(pdc[-1].get("resets"), 0), pdc[-1].get("profiles", "?")))
+            record("ped.copy_fail_per_min", per_min, "on %s" % recv.name)
     pds = auth.records["PDS"]
     if len(pds) >= 2:
         (t0, a), (t1, b) = pds[0], pds[-1]
         secs = max(t1 - t0, 1e-6)
-        print("  %s as the authority: %.0f ambient humans near players (mean), %.0f his to send, %.2f KB/s sent, "
+        print("  %s as the host: %.0f ambient humans near players (mean), %.0f shared, %.2f KB/s sent, "
               "%d states, %d spawns, %d gone, %d deaths, %d kill requests" % (
                   auth.name, statistics.fmean(num(f.get("peds"), 0) for _, f in pds),
                   statistics.fmean(num(f.get("owned"), 0) for _, f in pds),
                   (num(b.get("bytes"), 0) - num(a.get("bytes"), 0)) / 1024 / secs, num(b.get("states"), 0),
                   num(b.get("spawns"), 0), num(b.get("gones"), 0), num(b.get("deaths"), 0),
                   num(b.get("killreq"), 0)))
+        if auth.role == "guest" and statistics.fmean(num(f.get("owned"), 0) for _, f in pds) > 0:
+            print("  NOTE: %s is a guest and shared pedestrians (a 0.16 region-authority build?)" % auth.name)
 
 
 def car_damage(a, b):

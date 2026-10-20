@@ -93,6 +93,7 @@ double _roundAt = 0, _replicaTraceAt = 0, _summaryAt = 0;
 bool _wasActive = false;
 std::map<uint16_t, uint32_t> _truthCount;  // PDT 1 in 2 per pedestrian
 uint64_t _ridesLogged = 0;
+uint32_t _profilesLogged = 0, _profilesWorked = 0;  // bits by kCopyProfiles index (logged once per dll)
 
 void Append(Shared& sh, const std::string& line) {
     if (sh.inCmds.size() + line.size() < kMaxInCmds) sh.inCmds += line;
@@ -103,13 +104,20 @@ void Queue(Shared& sh, net::PlayerId to, uint16_t id, std::vector<uint8_t> body,
     sh.out.push_back({to, id, std::move(body), reliable});
 }
 
-bool FromOther(net::PlayerId from) {
-    return _session && from != _session->LocalId() && from < net::kMaxPlayers;
+// Host authority (docs/host-authority.md): pedestrians come from the host only. A guest takes PedStates / PedSpawn /
+// PedGone / PedDeath from the host and from nobody else (a 0.16 guest that still sends his own is ignored); only the
+// host takes PedKill (from a guest whose copy died by his hand).
+bool FromHost(net::PlayerId from) {
+    return _session && !_session->IsHost() && from == net::kHostPlayer && from != _session->LocalId();
+}
+
+bool ToHostFromGuest(net::PlayerId from) {
+    return _session && _session->IsHost() && from != _session->LocalId() && from < net::kMaxPlayers;
 }
 
 // ---- messages (render thread) ------------------------------------------------------------------------------------------
 void OnSpawn(net::PlayerId from, net::ByteReader& r) {
-    if (!FromOther(from)) return;
+    if (!FromHost(from)) return;
     std::vector<PedSpawnInfo> list;
     if (!ReadSpawns(r, list)) return;
     Shared& sh = S();
@@ -120,7 +128,7 @@ void OnSpawn(net::PlayerId from, net::ByteReader& r) {
 }
 
 void OnGone(net::PlayerId from, net::ByteReader& r) {
-    if (!FromOther(from)) return;
+    if (!FromHost(from)) return;
     std::vector<uint16_t> nets;
     if (!ReadGone(r, nets)) return;
     Shared& sh = S();
@@ -131,7 +139,7 @@ void OnGone(net::PlayerId from, net::ByteReader& r) {
 }
 
 void OnStates(net::PlayerId from, net::ByteReader& r) {
-    if (!FromOther(from)) return;
+    if (!FromHost(from)) return;
     uint32_t ms = 0;
     std::vector<PedState> states;
     if (!ReadStates(r, ms, states)) return;
@@ -143,7 +151,7 @@ void OnStates(net::PlayerId from, net::ByteReader& r) {
 }
 
 void OnDeath(net::PlayerId from, net::ByteReader& r) {
-    if (!FromOther(from)) return;
+    if (!FromHost(from)) return;
     uint16_t net = 0;
     Vec3 pos;
     if (!ReadDeath(r, net, pos)) return;
@@ -155,16 +163,16 @@ void OnDeath(net::PlayerId from, net::ByteReader& r) {
     core::trace::Line("PDE", "ev=death from=%u net=%u p=%.2f,%.2f,%.2f", from, net, pos.x, pos.y, pos.z);
 }
 
-// PedKill: a player's replica of our pedestrian died by his hand: ours dies too (its death then goes to everyone).
+// PedKill: a guest's copy of our pedestrian died by his hand: ours dies too (its death then goes to every guest).
 void OnKill(net::PlayerId from, net::ByteReader& r) {
-    if (!FromOther(from)) return;
+    if (!ToHostFromGuest(from)) return;
     uint16_t net = 0;
     if (!ReadKill(r, net)) return;
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     const uint32_t id = sh.auth->IdOf(net);
     ++sh.killsRecv;
-    MC_LOG_INFO("peds: player %u killed his replica of our pedestrian %u (our human %u)%s", from, net, id,
+    MC_LOG_INFO("peds: player %u killed his copy of our pedestrian %u (our human %u)%s", from, net, id,
                 id ? ": ours dies too" : ": not ours any more, ignored");
     core::trace::Line("PDE", "ev=killreq from=%u net=%u local=%u", from, net, id);
     if (id) Append(sh, "KL " + std::to_string(id) + "\n");
@@ -202,7 +210,7 @@ bool LoadModule(lua_State* L) {
 }
 
 const char* HowName(How h) {
-    return h == How::Adopted ? "adopted" : h == How::Spawned ? "spawned" : "none";
+    return h == How::Spawned ? "spawned" : h == How::Reused ? "reused" : "none";
 }
 
 void AppendCommands(std::string& cmds, const std::vector<RecvCmd>& list) {
@@ -210,39 +218,37 @@ void AppendCommands(std::string& cmds, const std::vector<RecvCmd>& list) {
     for (const RecvCmd& c : list) {
         const PedState& t = c.target;
         switch (c.type) {
-            case RecvCmd::Type::Adopt:
-                std::snprintf(buf, sizeof buf, "A %u %u %.3f %.3f %.3f %.4f %.4f\n", c.key, c.local, t.pos.x, t.pos.y,
+            case RecvCmd::Type::Spawn: {
+                const uint8_t pi = c.profile < kCopyProfileCount ? c.profile : 0;
+                std::snprintf(buf, sizeof buf, "N %u %.3f %.3f %.3f %.4f %.4f %u %s\n", c.key, t.pos.x, t.pos.y, t.pos.z,
+                              t.heading[0], t.heading[1], static_cast<unsigned>(pi), kCopyProfiles[pi]);
+                core::trace::Line("PDE", "ev=spawn key=%u prof=%u p=%.2f,%.2f,%.2f", c.key, static_cast<unsigned>(pi),
+                                  t.pos.x, t.pos.y, t.pos.z);
+                break;
+            }
+            case RecvCmd::Type::Reuse:
+                std::snprintf(buf, sizeof buf, "U %u %u %.3f %.3f %.3f %.4f %.4f\n", c.key, c.local, t.pos.x, t.pos.y,
                               t.pos.z, t.heading[0], t.heading[1]);
-                core::trace::Line("PDE", "ev=adopt key=%u local=%u p=%.2f,%.2f,%.2f", c.key, c.local, t.pos.x, t.pos.y,
-                                  t.pos.z);
+                core::trace::Line("PDE", "ev=reuse key=%u local=%u why=%s p=%.2f,%.2f,%.2f", c.key, c.local,
+                                  WhyName(c.why), t.pos.x, t.pos.y, t.pos.z);
                 break;
-            case RecvCmd::Type::Spawn:
-                std::snprintf(buf, sizeof buf, "N %u %.3f %.3f %.3f %.4f %.4f\n", c.key, t.pos.x, t.pos.y, t.pos.z,
-                              t.heading[0], t.heading[1]);
-                core::trace::Line("PDE", "ev=spawn key=%u p=%.2f,%.2f,%.2f", c.key, t.pos.x, t.pos.y, t.pos.z);
+            case RecvCmd::Type::Hide:
+                std::snprintf(buf, sizeof buf, "H %u\n", c.local);
+                core::trace::Line("PDE", "ev=hide local=%u", c.local);
                 break;
-            case RecvCmd::Type::Release:
-                std::snprintf(buf, sizeof buf, "R %u %s %u\n", c.key, HowName(c.how), c.local);
-                core::trace::Line("PDE", "ev=release key=%u how=%s local=%u why=%s", c.key, HowName(c.how), c.local,
-                                  WhyName(c.why));
+            case RecvCmd::Type::Remove:
+                std::snprintf(buf, sizeof buf, "R %u %u\n", c.key, c.local);
+                core::trace::Line("PDE", "ev=remove key=%u local=%u why=%s", c.key, c.local, WhyName(c.why));
                 if (c.why == RecvCmd::Why::Unresponsive)
-                    MC_LOG_INFO("peds: our copy of player %u's pedestrian %u lagged again right after a snap: released, "
-                                "a new one is spawned",
-                                c.key >> 16, c.key & 0xFFFF);
+                    MC_LOG_INFO("peds: our copy of the host's pedestrian %u lagged again right after a snap: removed, "
+                                "it gets another one",
+                                c.key & 0xFFFF);
                 break;
             case RecvCmd::Type::ResetSpawner:
                 std::snprintf(buf, sizeof buf, "FR %s\n", WhyName(c.why));
                 core::trace::Line("PDE", "ev=spawnerreset why=%s", WhyName(c.why));
                 MC_LOG_INFO("peds: the copy spawner is broken (%s): a new one is made",
                             c.why == RecvCmd::Why::CopiesLost ? "every copy gone at once" : "CreateObject keeps failing");
-                break;
-            case RecvCmd::Type::Hide:
-                std::snprintf(buf, sizeof buf, "H %u\n", c.local);
-                core::trace::Line("PDE", "ev=hide local=%u", c.local);
-                break;
-            case RecvCmd::Type::Show:
-                std::snprintf(buf, sizeof buf, "W %u\n", c.local);
-                core::trace::Line("PDE", "ev=show local=%u", c.local);
                 break;
             case RecvCmd::Type::Kill:
                 std::snprintf(buf, sizeof buf, "K %u %u\n", c.key, c.local);
@@ -327,10 +333,12 @@ void ParseEvents(Shared& sh, const char* events, double now) {
                 r.dead = dead == 1;
                 sh.recv.SetReport(static_cast<uint32_t>(key), r, now);
             }
-        } else if (line.rfind("PSR ", 0) == 0) {  // a spawned copy is in the world: key local
+        } else if (line.rfind("PSR ", 0) == 0) {  // a spawned copy is in the world: key local look
             unsigned long key = 0, id = 0;
-            if (std::sscanf(s + 4, "%lu %lu", &key, &id) == 2)
-                sh.recv.Spawned(static_cast<uint32_t>(key), static_cast<uint32_t>(id));
+            unsigned prof = 255;
+            if (std::sscanf(s + 4, "%lu %lu %u", &key, &id, &prof) >= 2)
+                sh.recv.Spawned(static_cast<uint32_t>(key), static_cast<uint32_t>(id), now,
+                                static_cast<uint8_t>(prof < kCopyProfileCount ? prof : 255));
         } else if (line.rfind("PSF ", 0) == 0) {  // a spawn failed: key why
             unsigned long key = 0;
             char why[32] = {};
@@ -339,16 +347,19 @@ void ParseEvents(Shared& sh, const char* events, double now) {
                 sh.recv.SpawnFailed(static_cast<uint32_t>(key), now, w);
                 core::trace::Line("PDE", "ev=spawnfail key=%lu why=%s", key, SpawnFailName(w));
             }
-        } else if (line.rfind("PGL ", 0) == 0) {  // a local human of ours (replica / hidden) is gone
+        } else if (line.rfind("PGL ", 0) == 0) {  // a copy of ours (bound or in the pool) is gone
             const auto id = static_cast<uint32_t>(std::strtoul(s + 4, nullptr, 10));
             core::trace::Line("PDE", "ev=gone local=%u", id);
             sh.recv.LocalGone(id, now);
+        } else if (line == "PFR") {  // the Lua reset its copy spawner (the copies' PGLs came before)
+            sh.recv.SpawnerWasReset(now);
+            core::trace::Line("PDE", "ev=spawnerwasreset");
         } else if (line == "PW") {  // a new world: the old one's humans are gone
             sh.recv.Clear();
             sh.auth->SetPeds({}, now);
             sh.peds.clear();
             sh.pedsFresh = false;
-            MC_LOG_INFO("peds: a new world here: replicas, hidden humans and our pedestrians forgotten");
+            MC_LOG_INFO("peds: a new world here: the copies and our pedestrians forgotten");
         } else if (line.rfind("ST ", 0) == 0) {
             sh.status = line.substr(3);
         }
@@ -360,9 +371,9 @@ void ParseEvents(Shared& sh, const char* events, double now) {
     }
 }
 
-// The authority's round: who owns which of our pedestrians, and what each other player gets.
+// The host's round: what each guest gets of our pedestrians (a guest shares none: docs/host-authority.md).
 void AuthorityRound(Shared& sh, double now) {
-    if (sh.views.empty()) return;
+    if (sh.views.empty() || !sh.isHost) return;
     sh.auth->SetPlayers(sh.views, net::kHostPlayer, static_cast<uint8_t>(sh.localId));
     if (sh.pedsFresh) {
         sh.auth->SetPeds(sh.peds, now);
@@ -406,7 +417,7 @@ void AuthorityRound(Shared& sh, double now) {
             static uint32_t logged = 0;
             const auto* st = sh.auth->Stats(po.peer);
             if (++logged <= 60 || logged % 100 == 0)
-                MC_LOG_INFO("peds: player %u: %u of our pedestrians come in, %u go, %zu died (now %u of %u near him)",
+                MC_LOG_INFO("peds: guest %u: %u of our pedestrians come in, %u go, %zu died (now %u of %u near him)",
                             po.peer, po.spawned, po.gone, po.deaths.size(), st ? st->admitted : 0,
                             st ? st->relevant : 0);
         }
@@ -436,15 +447,19 @@ void Traces(Shared& sh, double now) {
         const ReceiverStats& st = sh.recv.Stats();
         using U = unsigned long long;
         const auto fb = [&](SpawnFail w) { return static_cast<U>(st.failsBy[static_cast<size_t>(w)]); };
-        core::trace::Line("PDC",
-                          "near=%u rep=%u hidden=%u adopted=%u spawned=%u loading=%u known=%u snaps=%llu "
-                          "fails=%llu asked=%llu fcreate=%llu fprofile=%llu freset=%llu ftimeout=%llu lost=%llu "
-                          "resets=%llu lagsnaps=%llu unresp=%llu",
-                          st.nearby, st.nearReplica, st.hidden, st.adopted, st.spawned, st.loading, st.known,
-                          static_cast<U>(st.snaps), static_cast<U>(st.spawnFails), static_cast<U>(st.spawnsAsked),
-                          fb(SpawnFail::Create), fb(SpawnFail::NoProfile), fb(SpawnFail::Reset),
-                          fb(SpawnFail::Timeout), static_cast<U>(st.lost), static_cast<U>(st.spawnerResets),
-                          static_cast<U>(st.lagSnaps), static_cast<U>(st.unresponsive));
+        if (!sh.isHost)
+            core::trace::Line("PDC",
+                              "near=%u rep=%u spawned=%u pool=%u loading=%u known=%u snaps=%llu fails=%llu asked=%llu "
+                              "reuses=%llu handovers=%llu hides=%llu removes=%llu fcreate=%llu fprofile=%llu "
+                              "freset=%llu ftimeout=%llu lost=%llu resets=%llu lagsnaps=%llu unresp=%llu profiles=%u",
+                              st.nearby, st.nearReplica, st.copies, st.free, st.loading, st.known,
+                              static_cast<U>(st.snaps), static_cast<U>(st.spawnFails), static_cast<U>(st.spawnsAsked),
+                              static_cast<U>(st.reuses), static_cast<U>(st.handovers), static_cast<U>(st.hides),
+                              static_cast<U>(st.removes), fb(SpawnFail::Create), fb(SpawnFail::NoProfile),
+                              fb(SpawnFail::Reset), fb(SpawnFail::Timeout), static_cast<U>(st.lost),
+                              static_cast<U>(st.spawnerResets), static_cast<U>(st.lagSnaps),
+                              static_cast<U>(st.unresponsive), st.profilesLive);
+        if (!sh.isHost) return;  // a guest shares no pedestrians: no PDS / PDP
         core::trace::Line("PDS",
                           "peds=%zu owned=%zu bytes=%llu states=%llu spawns=%llu gones=%llu deaths=%llu "
                           "killreq=%llu riding=%zu rides=%llu",
@@ -479,28 +494,39 @@ void MainTick(lua_State* L, float dt) {
         cmds = head;
         cmds += sh.inCmds;
         sh.inCmds.clear();
-        if (active) {
-            // the receiver's commands from what the last round reported (the replicas, our candidates)
+        if (active && !sh.isHost) {
+            // a guest: the copies' commands from what the last round reported (where they are)
             std::vector<RecvCmd> list;
-            sh.recv.SetRegion(sh.auth->Region(), static_cast<uint8_t>(sh.localId));
             if (sh.haveMe) sh.recv.SetLocal(sh.me, sh.cam);
-            sh.recv.SetCandidates(sh.auth->Foreign());
             sh.recv.Tick(now, dt, list);
             AppendCommands(cmds, list);
-            // our replicas that died by our hand: their authority is told
+            // our copies that died by our hand: the host is told
             for (const ReplicaInfo& i : sh.recv.Replicas(now)) {
                 if (!sh.recv.DiedHere(i.key)) continue;
                 Queue(sh, static_cast<net::PlayerId>(i.key >> 16), kMsgKill, PackKill(static_cast<uint16_t>(i.key)),
                       true);
                 ++sh.kills;
-                MC_LOG_INFO("peds: our replica of player %u's pedestrian %u died here: he is told (PedKill)",
-                            i.key >> 16, i.key & 0xFFFF);
+                MC_LOG_INFO("peds: our copy of the host's pedestrian %u died here: he is told (PedKill)",
+                            i.key & 0xFFFF);
                 core::trace::Line("PDE", "ev=diedhere key=%u", i.key);
             }
-            // keep our own pedestrian spawners quiet around us while another authority's pedestrians show here
+            // a profile that never loaded leaves the rotation; one that made a copy is logged once
             const ReceiverStats& st = sh.recv.Stats();
-            cmds += (st.known > 0 && st.nearby > 0) ? "B 1\n" : "B 0\n";
-        } else if (_wasActive) {
+            for (size_t i = 0; i < kCopyProfileCount; ++i) {
+                const uint32_t bit = 1u << i;
+                if (!sh.recv.ProfileLive(i) && !(_profilesLogged & bit)) {
+                    _profilesLogged |= bit;
+                    MC_LOG_WARN("peds: copy profile %s failed to load twice before it ever made a copy: not used "
+                                "again (%u of %zu left)",
+                                kCopyProfiles[i], st.profilesLive, kCopyProfileCount);
+                    core::trace::Line("PDE", "ev=profiledrop prof=%zu", i);
+                }
+                if (sh.recv.ProfileWorked(i) && !(_profilesWorked & bit)) {
+                    _profilesWorked |= bit;
+                    MC_LOG_INFO("peds: copy profile %s works (it made a copy)", kCopyProfiles[i]);
+                }
+            }
+        } else if (!active && _wasActive) {
             sh.recv.Clear();
             sh.auth = std::make_unique<PedAuthority>();
             sh.views.clear();
@@ -621,13 +647,16 @@ void PedSync::GetStatus(std::vector<render::OverlayLine>& out) {
     std::lock_guard lock(sh.mu);
     const ReceiverStats& st = sh.recv.Stats();
     char buf[320];
-    std::snprintf(buf, sizeof buf,
-                  "Peds: ours %zu (sent %llu KB), others' near %u, replicas %u (%u adopted, %u spawned, %u loading), "
-                  "hidden %u (rx %llu/%llu/%llu)%s%s",
-                  sh.auth->OwnedCount(), static_cast<unsigned long long>(sh.sentBytes / 1024), st.nearby,
-                  st.nearReplica, st.adopted, st.spawned, st.loading, st.hidden,
-                  static_cast<unsigned long long>(_rxSpawns), static_cast<unsigned long long>(_rxStates),
-                  static_cast<unsigned long long>(_rxGones), sh.status.empty() ? "" : " | ", sh.status.c_str());
+    if (sh.isHost)
+        std::snprintf(buf, sizeof buf, "Peds: ours shared %zu (sent %llu KB, %zu riding)%s%s", sh.auth->OwnedCount(),
+                      static_cast<unsigned long long>(sh.sentBytes / 1024), sh.auth->RidingCount(),
+                      sh.status.empty() ? "" : " | ", sh.status.c_str());
+    else
+        std::snprintf(buf, sizeof buf,
+                      "Peds: the host's near %u, copies %u (pool %u free, %u loading, %u looks) (rx %llu/%llu/%llu)%s%s",
+                      st.nearby, st.copies, st.free, st.loading, st.profilesLive,
+                      static_cast<unsigned long long>(_rxSpawns), static_cast<unsigned long long>(_rxStates),
+                      static_cast<unsigned long long>(_rxGones), sh.status.empty() ? "" : " | ", sh.status.c_str());
     out.push_back({buf, 0xFFB0C4DE});
 }
 
