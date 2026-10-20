@@ -9,10 +9,12 @@
 //                (key 1; cleared when he gets into another car or out, so two cars are never blended). Present() =
 //                Hermite between the snapshots around the render time, 250 ms extrapolation, then held, moved forward
 //                by the playout delay (the "now" lead) - what player_sync.cpp's own Interpolate / Present did.
-//   FootDriver   the puppet on foot: core's LocomotionController with the gait his game reports (gaitHint) and the
-//                Mafia DE tuning (the AI's own walk / run / sprint speeds), plus the rest blend: a standing player's
-//                puppet is not walked the last bit, it stands and is slid onto his spot slowly (0.15 m/s at most)
-//                from 0.1 m off.
+//   FootDriver   the puppet on foot: core's LocomotionController for the walk (the gait his game reports, the Mafia
+//                DE speeds, walk point, stop point, snaps), and its own position fix: while he moves, velocity
+//                matching (the puppet as a whole moves with his velocity plus 5 / s of the error; what its AI walk
+//                does not give is nudged, every frame), while he stands the rest blend (slid onto his spot at 0.15
+//                m/s at most from 0.1 m off; a walk running on after his stop is held back). Since the 2026-10-20
+//                two-PC test (tests/data/foot_2pc.h): the AI walked a fraction of the commanded speed there.
 //   CarDriver    the car copy he drives: core's VehicleController (pin policy: pinned only when its physics does not
 //                keep up, retried after 1.5-8 s) with the car correction preset (net/correction.h ForCar: nothing
 //                inside 0.5 m, a blend hidden in the motion beyond, a snap from 4 m) and a speed fix: when the copy's
@@ -85,9 +87,19 @@ struct FootFixTuning {
     float reissueMin = 0.1f;     //    gives it with each walk command only), at most every this many s
     float stopAhead = 0.35f;     // s: a stop walks along the copy's own line of motion at most this long at its
                                  //    velocity (beyond the AI's command lag), never to a point it already passed
-    float brakeMin = 0.5f;       // m/s: a copy this much faster than him while level with him or ahead ...
-    float brakeBehind = 0.2f;    // m: ... (not more than this behind him along its motion) is held back to his speed,
-    float brakeShare = 0.7f;     //    at most this share of its own speed (its legs still run: some foot sliding)
+    float brakeBehind = 0.2f;    // m: standing, a copy whose walk still runs on, level with his spot or past it (not
+    float holdMin = 0.3f;        //    more than this behind it along its motion) and faster than holdMin m/s, is held
+    float holdShare = 1.0f;      //    back by this share of its own speed (+ holdMin): it stops where he stands
+    // Moving: velocity matching (2026-10-20 two-PC traces). The puppet as a whole moves with his velocity plus
+    // trackGain x the error beyond trackDead (at most trackCorr m/s); the part its own walk does not give is the
+    // nudge, at most slideBase + slideShare x the faster of him and its walk (m/s).
+    float trackGain = 5.0f;      // 1/s
+    float trackDead = 0.05f;     // m
+    float trackCorr = 2.0f;      // m/s
+    float slideBase = 1.0f;      // m/s
+    float slideShare = 1.0f;
+    float quietDist = 0.25f;     // m: closer than this, and its walk within quietSpeed m/s of the wanted velocity:
+    float quietSpeed = 0.4f;     //    no nudge (its own feet)
 };
 
 class FootDriver {
@@ -95,9 +107,11 @@ public:
     explicit FootDriver(const motion::LocomotionTuning& t = FootTuning(), const RestTuning& r = {},
                         const FootFixTuning& f = {});
     // in.gaitHint: his reported mode (0 idle, 1 walk, 2 run, 3 sprint). On top of core's LocomotionController:
-    //  - the position fix is capped by the faster of him and the copy (a copy still running after he stopped is
-    //    pulled back within 35 % of its own speed, hidden in its motion; the controller caps by his speed only);
-    //  - standing: the rest blend (dead zone 0.1 m, 0.15 m/s, more while the copy still brakes) instead of a walk;
+    //  - the position fix replaces the controller's: moving, velocity matching (FootFixTuning track*: his velocity +
+    //    the error share, minus the copy's own walking velocity, as this frame's nudge; nothing while it is within
+    //    quietDist and its walk keeps pace); the controller is told the nudge really applied (its calibration);
+    //  - standing: the rest blend (dead zone 0.1 m, 0.15 m/s, more while the copy still brakes; a creeping player is
+    //    followed at his speed) instead of a walk, and a walk that runs on past his spot is held back;
     //  - a stop (gait Stand, reissue) has moveTo = where the copy comes to rest by itself (its position moved on by
     //    its velocity for the response lag): the glue's stop is a walk to that point, never back to his spot;
     //  - a changed speed multiplier re-issues the walk at once (a brake or a speed-up reaches the AI 0.1 s later,
@@ -118,8 +132,10 @@ public:
     uint32_t MultReissues() const { return multReissues_; }
     bool Braking() const { return braking_; }          // the last update held back a copy that ran on
     float BrakeMetres() const { return brakeMetres_; }  // m held back so far
+    float NudgeMetres() const { return nudgeMetres_; }  // m moved by our nudges so far (ground plane; PUP nsum)
 
 private:
+    float nudgeMetres_ = 0;
     motion::LocomotionController loco_;
     motion::LocomotionTuning t_;
     RestTuning r_;

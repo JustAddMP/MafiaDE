@@ -295,8 +295,27 @@ def compare(sender, receiver, args, worst):
     confusion = Counter()
     snaps = nudges = carry_n = 0
     nudge_sum = 0.0
+    # He sat on something his game sent as on foot (0.16.0: a motorbike rider, 0.7 m above his puppet): those
+    # moments (the puppet more than 0.45 m below him, +-1.5 s) are counted apart, not in the on-foot error (their
+    # height shows in foot.dz_p95); 2026-10-20 test: they were 38-77 % of the "on foot" samples of a direction.
+    seated_t = []
+    for t, f in pup:
+        cp, tp = vec(f.get("cp")), truth_p.at(to_sender(t))
+        if f.get("have") == "1" and cp and tp and len(cp) > 2 and len(tp) > 2 and cp[2] - tp[2] < -0.45:
+            seated_t.append(t)
+
+    def seated(t):
+        i = bisect.bisect_left(seated_t, t - 1.5)
+        return i < len(seated_t) and seated_t[i] <= t + 1.5
+
+    errs_seated = []
     for t, f in pup:
         if f.get("have") != "1":
+            continue
+        if seated_t and seated(t):
+            cp, tp = vec(f.get("cp")), truth_p.at(to_sender(t))
+            if cp and tp:
+                errs_seated.append(dist2(cp, tp))
             continue
         cp, err = vec(f.get("cp")), num(f.get("err"), 0)
         g = int(num(f.get("g"), 0))
@@ -324,6 +343,9 @@ def compare(sender, receiver, args, worst):
                          num(f.get("mult"), 1), num(f.get("want"), 0), num(f.get("meas"), -1), num(f.get("carry"), 0)))
     print("  on foot: %d samples" % len(pup))
     who = "%s on %s" % (sender.role, receiver.role)
+    if errs_seated:
+        print("    left out: he sat on something sent as on foot (puppet > 0.45 m below him): %s" % stats_line(
+            errs_seated))
     if errs_true:
         print("    puppet vs the player at the same moment: %s" % stats_line(errs_true))
         record("foot.p95", pct(errs_true, 95), who)
@@ -349,6 +371,33 @@ def compare(sender, receiver, args, worst):
         if len(on_foot_s) > 1:
             # PUP is written at 60 Hz while on foot: minutes on foot from the sample count (gaps not counted)
             record("foot.snaps_per_min", snaps / max(len(on_foot_s) / 60.0 / 60.0, 1e-6), who)
+    # ---- the game's AI walk against our nudges (the open question of the 2026-10-20 test: does a SetPos every
+    # frame keep the AI from walking?). meas = the controller's own measurement of its walk (every frame's nudge
+    # taken out); nsum = metres our nudges moved it so far (PUP field since the velocity matching, not in 0.16.0)
+    walk_meas = defaultdict(list)
+    last_meas = None
+    moved = nudged = 0.0
+    prev = None
+    for t, f in pup:
+        if f.get("have") != "1" or (seated_t and seated(t)):
+            prev = None
+            continue
+        g, m = int(num(f.get("g"), 0)), num(f.get("meas"), -1)
+        if g > 0 and m >= 0 and m != last_meas:
+            walk_meas[g].append((m, num(f.get("mult"), 1)))
+        last_meas = m
+        cp, ns = vec(f.get("cp")), num(f.get("nsum"))
+        if prev and cp and ns is not None and int(num(f.get("sm"), 0)) > 0 and t - prev[0] < 0.1:
+            moved += dist2(cp, prev[1])
+            nudged += max(0.0, ns - prev[2])
+        prev = (t, cp, ns) if cp and ns is not None else None
+    if walk_meas:
+        print("    the AI walk (its own, nudges out): %s" % ", ".join(
+            "%s %.2f m/s at x%.2f (p50 of %d)" % (GAITS.get(g), pct([x[0] for x in v], 50), pct([x[1] for x in v], 50),
+                                                  len(v)) for g, v in sorted(walk_meas.items())))
+    if moved > 1:
+        print("    while he moved our nudges moved the puppet %.1f m against %.1f m in all (%.0f %%: foot sliding)" % (
+            nudged, moved, 100.0 * nudged / moved))
     # ---- there at all (2026-10-20 test: a puppet that is gone counts in none of the numbers above) ----
     pr = [(t, f) for t, f in receiver.records["PR"] if num(f.get("id"), -1) == sid]
     if rx:

@@ -883,7 +883,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                           "id=%u rT=%.0f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f have=%d age=%.3f cp=%.3f,%.3f,%.3f "
                           "ch=%.3f,%.3f err=%.3f g=%u mult=%.3f want=%.3f meas=%.3f carry=%.3f base=%.2f,%.2f,%.2f "
                           "fix=%u nudge=%.4f,%.4f re=%d mv=%.2f,%.2f turn=%d sm=%u sf=%u busy=%d nz=%.4f tm=%d "
-                          "rec=%d pose=%u hint=%d rest=%d brk=%d stp=%d cspd=%.3f lead=%.1f",
+                          "rec=%d pose=%u hint=%d rest=%d brk=%d stp=%d cspd=%.3f lead=%.1f nsum=%.3f",
                           id, rT, li.target.x, li.target.y, li.target.z, li.targetVel.x, li.targetVel.y,
                           li.haveCopy ? 1 : 0, age, li.copy.x, li.copy.y, li.copy.z, li.copyHeading[0],
                           li.copyHeading[1], lc.error, static_cast<unsigned>(lc.gait), lc.speedMult, lc.want,
@@ -893,7 +893,7 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
                           lc.moveTo.y, lc.turn ? 1 : 0, s.mode, s.flags, busy, lc.nudge.z, tc.moving ? 1 : 0,
                           tc.recovering ? 1 : 0, s.pose.bits, static_cast<int>(li.gaitHint), rem.foot.Resting() ? 1 : 0,
                           rem.foot.Braking() ? 1 : 0, lc.stopping ? 1 : 0, rem.foot.CopySpeed(),
-                          rem.track.Lead() * 1000);
+                          rem.track.Lead() * 1000, rem.foot.NudgeMetres());
     } else if (s.seat == 0) {
         core::trace::Line("VEH",
                           "id=%u key=%s rT=%.0f have=%d tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "

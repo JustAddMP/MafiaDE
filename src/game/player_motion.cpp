@@ -99,6 +99,7 @@ void FootDriver::Applied(const motion::LocomotionCommand& c) {
         lastNudge_ = {};
     } else {
         lastNudge_ = c.fix == motion::LocomotionCommand::Fix::Nudge ? c.nudge : Vec3{};
+        loco_.Applied(lastNudge_);
     }
 }
 
@@ -159,54 +160,71 @@ motion::LocomotionCommand FootDriver::Update(const motion::LocomotionInput& in) 
         return c;
     }
 
-    // the position fix: the controller's (net/correction.h rule, capped by his speed) is taken out of its nudge (what
-    // stays is the carried shortfall) and done again here, capped by the faster of him and the copy - or, when he
-    // and the copy stand, as the rest blend
+    // The position fix: velocity matching. The puppet as a whole is to move with his velocity plus a share of the
+    // error; what its own walk does not give (its measured walking velocity, our fixes left out) is added as a nudge
+    // this frame - so it keeps up whether the game's AI walks the commanded speed, a fraction of it or overshoots (the
+    // 2026-10-20 two-PC traces: the AI walked 0.6-2.2 m/s at RUN x1.8 while nudged every frame, the old carry + blend
+    // left it 0.6-0.8 m behind a runner, p95 1.4-1.5 m). Standing: the rest blend (slow, only beyond its dead zone),
+    // and a walk that still runs on after his stop is held back to his spot.
     const float ex = in.target.x - in.copy.x, ey = in.target.y - in.copy.y;
     const float err = Len2(ex, ey);
     const float tspeed = Len2(in.targetVel.x, in.targetVel.y);
     const float own = Len2(vel_[0], vel_[1]);
-    Vec3 carry = c.nudge;
-    if (c.fix == Fix::Nudge && err > 1e-4f) {
-        const float ctl = net::correction::BlendStep(err, t_.nudgeStart, t_.nudgeGain, t_.nudgeSpeedShare,
-                                                     t_.nudgeRestSpeed, tspeed, dt);
-        carry.x -= ex / err * ctl;
-        carry.y -= ey / err * ctl;
-    } else if (c.fix != Fix::Nudge) {
-        carry = {};
-    }
     const bool standing = c.gait == motion::Gait::Stand && tspeed < r_.standSpeed && in.gaitHint <= 0;
-    float step = 0;
+    float ux = 0, uy = 0;  // m/s added by the nudge
+    braking_ = false;
     if (standing) {
-        // while the copy itself still moves (it brakes after his stop) the slide is hidden in its own motion
-        step = net::correction::BlendStep(err, r_.deadZone, r_.gain, r_.share, r_.speed, own, dt);
+        // the rest blend: within its dead zone nothing, beyond at most r_.speed (more while the copy still moves)
+        const float step = net::correction::BlendStep(err, r_.deadZone, r_.gain, r_.share, r_.speed, own, dt);
         resting_ = step > 0;
         restMetres_ += step;
-    } else {
-        step = net::correction::BlendStep(err, t_.nudgeStart, t_.nudgeGain, t_.nudgeSpeedShare, t_.nudgeRestSpeed,
-                                          std::max(tspeed, own), dt);
-    }
-    c.nudge = {carry.x + (err > 1e-4f ? ex / err * step : 0), carry.y + (err > 1e-4f ? ey / err * step : 0),
-               carry.z};
-    // He brakes (or turns away) and the copy still runs on, level with him or ahead: its body is held back to his
-    // speed while its legs still run (at most brakeShare of its speed, for the AI's command lag): the overshoot of a
-    // stop is what the AI's ~0.2 s lag makes, and it is cheaper to slide it away now than to walk it back after.
-    braking_ = false;
-    if (own > tspeed + f_.brakeMin && own > 1e-3f) {
-        const float dx = vel_[0] / own, dy = vel_[1] / own;
-        const float behind = ex * dx + ey * dy;  // > 0: the target is ahead of the copy along its motion
-        if (behind < f_.brakeBehind) {
-            const float slide = std::min(own - tspeed, f_.brakeShare * own) * dt;
-            c.nudge.x -= dx * slide;
-            c.nudge.y -= dy * slide;
-            braking_ = true;
-            brakeMetres_ += slide;
+        if (err > 1e-4f && dt > 1e-5f) {
+            ux = ex / err * step / dt;
+            uy = ey / err * step / dt;
         }
+        // he creeps (slower than a walk, his game says idle): the puppet creeps with him
+        if (err > r_.deadZone) {
+            ux += in.targetVel.x;
+            uy += in.targetVel.y;
+        }
+        // its walk still runs on (the AI's lag after his stop): that part is taken back, so it stops where he stands
+        if (own > f_.holdMin) {
+            const float dx = vel_[0] / own, dy = vel_[1] / own;
+            if (ex * dx + ey * dy < f_.brakeBehind) {  // level with his spot or past it
+                const float hold = std::min(own, f_.holdShare * own + f_.holdMin);
+                ux -= dx * hold;
+                uy -= dy * hold;
+                braking_ = true;
+                brakeMetres_ += hold * dt;
+            }
+        }
+    } else {
+        // moving: his velocity + trackGain x the error beyond trackDead (at most trackCorr m/s), minus its own walk
+        float cx = 0, cy = 0;
+        if (err > f_.trackDead) {
+            const float k = std::min(f_.trackGain * (err - f_.trackDead), f_.trackCorr) / err;
+            cx = ex * k;
+            cy = ey * k;
+        }
+        ux = in.targetVel.x + cx - vel_[0];
+        uy = in.targetVel.y + cy - vel_[1];
+        const float ul = Len2(ux, uy), cap = f_.slideBase + f_.slideShare * std::max(tspeed, own);
+        if (ul > cap) {
+            ux *= cap / ul;
+            uy *= cap / ul;
+        } else if (err < f_.quietDist && ul < f_.quietSpeed) {
+            ux = uy = 0;  // close and its walk keeps pace: left to its own feet
+        }
+        braking_ = ux * vel_[0] + uy * vel_[1] < -0.5f * own * own;  // held back by more than half its own speed
+        if (braking_) brakeMetres_ += Len2(ux, uy) * dt;
     }
+    c.nudge = {ux * dt, uy * dt, c.nudge.z};
     const bool moved = std::fabs(c.nudge.x) + std::fabs(c.nudge.y) + std::fabs(c.nudge.z) > 1e-6f;
     c.fix = moved ? Fix::Nudge : Fix::None;
     if (!moved) c.nudge = {};
     lastNudge_ = c.nudge;
+    nudgeMetres_ += Len2(c.nudge.x, c.nudge.y);
+    loco_.Applied(c.nudge);  // its walk measurement (the calibration) leaves out this nudge, not its own
     return c;
 }
 

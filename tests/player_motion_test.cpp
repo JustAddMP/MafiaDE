@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "data/car_path.h"
+#include "data/foot_2pc.h"
 #include "data/foot_mixed.h"
 #include "data/foot_sprint.h"
 #include "game/player_motion.h"
@@ -195,6 +196,19 @@ struct AiWalker {
     };
     std::deque<Pending> q;
     double clock = 0;
+    // How the game's AI answers our position fixes. The 2026-10-20 two-PC traces: the puppet's own walk (the
+    // controller's measurement, every frame's nudge taken out) was 0.6-2.2 m/s at RUN x1.8 while it was nudged on
+    // nearly every frame, where 0.15.0 (nudged only beyond 0.9 m) ran ~4 m/s there. Which of these the game really
+    // does is not known, so the controller is checked against all three:
+    //   0 as commanded: a SetPos does not touch its walk
+    //   1 hampered: within 50 ms of a SetPos its walk reaches only `hamper` of its speed
+    //   2 erratic: its walk reaches a share of its speed that wanders between 0.3 and 1 (0.4 s time constant)
+    int model = 0;
+    float hamper = 0.3f;
+    double movedAt = -1;
+    float eff = 1;
+    uint32_t rs = 99;
+    double walkMetres = 0, fixMetres = 0;  // what its own walk and our fixes moved it
     static constexpr float kTurn = 360.0f * kPi / 180, kAccel = 10.0f;
     static constexpr float kArrive = 0.15f;  // m: a walk command is done this close to its point (then it stands)
 
@@ -203,9 +217,12 @@ struct AiWalker {
             x = targetX;
             y = targetY;
             speed = 0;
+            movedAt = clock;
         } else if (c.fix == LocomotionCommand::Fix::Nudge) {
             x += c.nudge.x;
             y += c.nudge.y;
+            fixMetres += std::sqrt(c.nudge.x * c.nudge.x + c.nudge.y * c.nudge.y);
+            movedAt = clock;
         }
         if (c.reissue) q.push_back({clock + lag, c.gait, c.speedMult, c.moveTo.x, c.moveTo.y});
         if (c.turn && !walking) {
@@ -239,13 +256,36 @@ struct AiWalker {
             hy = ny;
             want *= std::max(0.3f, std::cos(a));         // slows down while turning hard
             want = std::min(want, std::sqrt(2 * kAccel * d));  // arrives at its walk point
+            if (model == 1 && movedAt >= 0 && clock - movedAt < 0.05) want *= hamper;
+            if (model == 2) {
+                rs = rs * 1664525u + 1013904223u;
+                const float n = static_cast<float>((rs >> 8) & 0xFFFFFF) / static_cast<float>(0x1000000) - 0.5f;
+                eff = std::clamp(eff + (0.65f - eff) * dt / 0.4f + n * 2.0f * std::sqrt(dt), 0.3f, 1.0f);
+                want *= eff;
+            }
         } else if (walking) {
             walking = false;
         }
         speed += std::clamp(want - speed, -kAccel * dt, kAccel * dt);
-        x += hx * speed * dt;
-        y += hy * speed * dt;
+        walkMetres += std::fabs(speed) * dt;
+        if (walkHz <= 0) {
+            x += hx * speed * dt;
+            y += hy * speed * dt;
+            return;
+        }
+        // the game moves its humans at its own rate, not every frame: the walk shows in steps
+        pendX += hx * speed * dt;
+        pendY += hy * speed * dt;
+        if (clock >= nextWalk) {
+            nextWalk = clock + 1.0 / walkHz;
+            x += pendX;
+            y += pendY;
+            pendX = pendY = 0;
+        }
     }
+    float walkHz = 0;  // 0: its walk moves it every frame
+    float pendX = 0, pendY = 0;
+    double nextWalk = 0;
 };
 
 
@@ -342,6 +382,162 @@ void TestFoot() {
               Fmt("%.2f (%d snaps in %.1f min)", r.snaps / minutes, r.snaps, minutes));
         std::printf("      (max %.2f m, p50 %.2f m, rest blend %.2f m in all)\n", Pct(r.all, 100), Pct(r.all, 50),
                     r.restMetres);
+    }
+}
+
+// ---- the real two-PC test (2026-10-20) replayed --------------------------------------------------------------------
+// Every on-foot stretch of tests/data/foot_2pc.h (the motorbike riders left out): the states as the sender sent them,
+// handed to PlayerTrack at the moment the receiver really got them, the receiver's frames at its own frame rate
+// (114-250 fps: the commands, and so the nudges, run every frame), FootDriver against the AI walker in four answers
+// to a SetPos. Error = puppet vs his real position at the same moment, sampled at 60 Hz as sync_compare's PUP.
+// Measured in game on these stretches (0.16.0): p95 1.53 / 1.53 / 1.52 / 1.36 m, mean 0.61 / 0.62 / 0.77 / 0.35 m,
+// 67-94 % of a runner's motion our nudges. The 0.16.0 FootDriver replayed against the hampered walker: p95 1.56 /
+// 1.27 / 1.42 / 1.07 m (all 1.29), mean 0.36 m, 82 % nudged - the walker that reproduces the test; as commanded 0.57
+// m, erratic 0.77 m.
+struct Replay2pc {
+    std::vector<float> all, stand;
+    int samples = 0, gaitMatch = 0, snaps = 0;
+    double walk = 0, fix = 0, seconds = 0;
+    void Add(const Replay2pc& o) {
+        all.insert(all.end(), o.all.begin(), o.all.end());
+        stand.insert(stand.end(), o.stand.begin(), o.stand.end());
+        samples += o.samples;
+        gaitMatch += o.gaitMatch;
+        snaps += o.snaps;
+        walk += o.walk;
+        fix += o.fix;
+        seconds += o.seconds;
+    }
+};
+
+struct AiAnswer {
+    const char* name;
+    int model;
+    float hamper;
+    float walkHz;
+};
+
+void RunFoot2pc(const Foot2pcSeg& sg, const AiAnswer& ai, Replay2pc& r) {
+    const int(*rows)[8] = kFoot2pc + sg.first;
+    const int n = sg.count;
+    int ti = 0;
+    auto truthAt = [&](double t, float& x, float& y) {  // his real position (sender clock), linear between samples
+        while (ti + 1 < n && rows[ti + 1][0] / 1000.0 < t) ++ti;
+        if (ti + 1 >= n) {
+            x = rows[n - 1][2] / 100.0f;
+            y = rows[n - 1][3] / 100.0f;
+            return;
+        }
+        const double t0 = rows[ti][0] / 1000.0, t1 = rows[ti + 1][0] / 1000.0;
+        const float u = static_cast<float>(std::clamp((t - t0) / std::max(1e-6, t1 - t0), 0.0, 1.0));
+        x = (rows[ti][2] + (rows[ti + 1][2] - rows[ti][2]) * u) / 100.0f;
+        y = (rows[ti][3] + (rows[ti + 1][3] - rows[ti][3]) * u) / 100.0f;
+    };
+    Rng rng;
+    rng.s = 1000u + static_cast<uint32_t>(sg.first);
+    PlayerTrack track;
+    track.SetOneWay(0.0125);  // the measured rtt / 2
+    FootDriver drv;
+    AiWalker w;
+    w.model = ai.model;
+    w.hamper = ai.hamper;
+    w.walkHz = ai.walkHz;
+    w.lag = 0.2f;
+    w.x = rows[0][2] / 100.0f;
+    w.y = rows[0][3] / 100.0f;
+    int next = 0;
+    double now = rows[0][1] / 1000.0;
+    double nextSample = sg.leadInMs / 1000.0;
+    bool started = false;
+    const double end = rows[n - 1][0] / 1000.0;
+    const double frameDt = 1.0 / std::max(30, sg.receiverFps);
+    while (now < end) {
+        while (next < n && rows[next][1] / 1000.0 <= now) {
+            const int* p = rows[next++];
+            track.Observe(p[0] / 1000.0, now);
+            track.PushFoot(p[0] / 1000.0, {p[2] / 100.0f, p[3] / 100.0f, 0}, {p[4] / 100.0f, p[5] / 100.0f, 0},
+                           static_cast<uint32_t>(p[6]));
+        }
+        const float frame = static_cast<float>(frameDt) * (0.8f + 0.4f * rng.Next());
+        track.Update(now);
+        const mc::net::replica::Out o = track.Foot(now);
+        if (o.valid) {
+            LocomotionInput in;
+            in.target = o.pos;
+            in.targetVel = {o.vel.x, o.vel.y, 0};
+            const float sp = std::sqrt(o.vel.x * o.vel.x + o.vel.y * o.vel.y);
+            in.heading[0] = sp > 0.1f ? o.vel.x / sp : 1.0f;
+            in.heading[1] = sp > 0.1f ? o.vel.y / sp : 0.0f;
+            in.gaitHint = static_cast<int8_t>(o.bits);
+            in.sprint = o.bits == 3;
+            in.haveCopy = true;
+            in.copy = {w.x, w.y, 0};
+            in.copyHeading[0] = w.hx;
+            in.copyHeading[1] = w.hy;
+            in.dt = started ? frame : 0.0f;
+            started = true;
+            const LocomotionCommand c = drv.Update(in);
+            w.Apply(c, o.pos.x, o.pos.y);
+            if (now >= nextSample) {
+                nextSample += 1.0 / 60;
+                float tx, ty;
+                truthAt(now, tx, ty);
+                const float e = std::sqrt((w.x - tx) * (w.x - tx) + (w.y - ty) * (w.y - ty));
+                r.all.push_back(e);
+                if (o.bits == 0) r.stand.push_back(e);
+                ++r.samples;
+                if (static_cast<uint32_t>(c.gait) == o.bits) ++r.gaitMatch;
+            }
+            if (c.fix == LocomotionCommand::Fix::Snap && now >= sg.leadInMs / 1000.0) ++r.snaps;
+        }
+        w.Step(frame);
+        now += frame;
+    }
+    r.walk += w.walkMetres;
+    r.fix += w.fixMetres;
+    r.seconds += end - sg.leadInMs / 1000.0;
+}
+
+void TestFoot2pc() {
+    static const AiAnswer kAnswers[] = {
+        {"its walk as commanded", 0, 1, 0},
+        {"its walk hampered by a SetPos (x0.15 for 50 ms, reproduces the test)", 1, 0.15f, 0},
+        {"its walk erratic (0.3-1 of its speed)", 2, 1, 0},
+        {"its walk as commanded, moved by the game at 30 Hz only", 0, 1, 30},
+        {"hampered, and moved by the game at 30 Hz only", 1, 0.15f, 30},
+    };
+    for (const AiAnswer& ai : kAnswers) {
+        Replay2pc all, dir;
+        const char* last = "";
+        const std::string n = std::string("two-PC replay (") + ai.name + "): ";
+        auto flush = [&](const char* name) {
+            if (!dir.samples) return;
+            Check(Pct(dir.all, 95) <= 0.8, (n + name + " foot.p95 <= 0.8 m").c_str(),
+                  Fmt("%.2f m (mean %.2f m, stand p95 %.2f m)", Pct(dir.all, 95), Mean(dir.all), Pct(dir.stand, 95)));
+            dir = Replay2pc{};
+        };
+        for (const Foot2pcSeg& sg : kFoot2pcSegs) {
+            if (std::string(sg.name) != last) {
+                flush(last);
+                last = sg.name;
+            }
+            Replay2pc one;
+            RunFoot2pc(sg, ai, one);
+            dir.Add(one);
+            all.Add(one);
+        }
+        flush(last);
+        const double minutes = all.seconds / 60.0;
+        Check(Pct(all.all, 95) <= 0.8, (n + "foot.p95 <= 0.8 m").c_str(), Fmt("%.2f m", Pct(all.all, 95)));
+        Check(Mean(all.all) <= 0.35, (n + "foot.mean <= 0.35 m").c_str(), Fmt("%.2f m", Mean(all.all)));
+        Check(Pct(all.stand, 95) <= 0.3, (n + "foot.stand.p95 <= 0.3 m").c_str(),
+              Fmt("%.2f m (%.0f samples)", Pct(all.stand, 95), static_cast<double>(all.stand.size())));
+        Check(all.gaitMatch >= all.samples * 0.9, (n + "foot.gait >= 90 %").c_str(),
+              Fmt("%.1f %%", 100.0 * all.gaitMatch / std::max(1, all.samples)));
+        Check(all.snaps / minutes <= 0.5, (n + "foot.snaps_per_min <= 0.5").c_str(),
+              Fmt("%.2f (%d snaps in %.1f min)", all.snaps / minutes, all.snaps, minutes));
+        std::printf("      (max %.2f m, p50 %.2f m; moved by our fixes: %.0f %% of %.0f m)\n", Pct(all.all, 100),
+                    Pct(all.all, 50), 100.0 * all.fix / std::max(1e-6, all.fix + all.walk), all.fix + all.walk);
     }
 }
 
@@ -602,10 +798,12 @@ void TestCar() {
 
 }  // namespace
 
+
 int main() {
     TestTrack();
     TestRest();
     TestFoot();
+    TestFoot2pc();
     TestCar();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
