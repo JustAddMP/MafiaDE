@@ -49,6 +49,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | foot.p95 / mean / gait | PASS (one PC: ~0.1-0.5 m) |
 | car.* | PASS for the guest's car on the host |
 | traffic.*, npc.*, ped.*, world.time_err, lat.player.p95, bw.host_up | PASS |
+| npc.guest_sent | 0 (no state or message of the guest's own NPCs; his NPCs without a host NPC are held: `NHD` in his trace) |
 | traffic.true_p95 | <= 1.5 m (was 2.14 m in session A: copies of standing cars driven off them; the replay of A in tests/traffic_test.cpp: 0.75 m) |
 | traffic.crew_exits_per_min | <= 1 per minute of copies (was 26.5 on the guest in session A, 5.2 in B: drivers the host's game streamed out 45-76 m from him counted as gone) |
 | traffic.reseats_per_min | <= 3 per minute of copies (was 71.6 on the guest in session A: crews leaving copies that were pushed off their standing car, and every get-out put back) |

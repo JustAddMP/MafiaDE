@@ -398,13 +398,6 @@ public:
         case 0x0243: return "ThrowFix";
         case 0x0400: return "Hit";
         case 0x0410: return "NpcHit";
-        case 0x0420: return "GuestNpcStates";
-        case 0x0421: return "GuestNpcEnd";
-        case 0x0422: return "HostNpcHit";
-        case 0x0423: return "NpcClaim";
-        case 0x0424: return "GuestNpcStates2";
-        case 0x0425: return "GuestNpcInfo";
-        case 0x0426: return "GuestNpcLeave";
         default: return nullptr;
         }
     }

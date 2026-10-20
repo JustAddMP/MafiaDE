@@ -27,8 +27,8 @@ namespace mc::game::latency {
 enum System : uint8_t {
     kPlayer,     // PlayerState 0x0100 (stream)
     kWorld,      // WorldEnv / mission state / cutscene / save / fail 0x0200-0x020F
-    kNpc,        // NpcStates 0x0210, guest NPC states 0x0420 (stream)
-    kNpcEvent,   // NPC deaths, hits, claims, ends
+    kNpc,        // NpcStates2 0x0212 (stream)
+    kNpcEvent,   // NPC infos, leaves, deaths, hits
     kTraffic,    // traffic car states 0x0222 (stream)
     kTrafficEvent,  // traffic spawn / despawn / bump
     kDoor,       // 0x0230-0x0233

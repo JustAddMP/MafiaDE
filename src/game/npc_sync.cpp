@@ -5,7 +5,7 @@
 #include "core/trace.h"
 #include "game/join_sync.h"
 #include "game/lua.h"
-#include "game/npc_owner.h"
+#include "game/npc_hold.h"
 #include "game/npc_replica.h"
 #include "net/wire.h"
 
@@ -20,7 +20,6 @@
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -29,27 +28,22 @@ namespace mc::game {
 namespace {
 
 // ---- protocol (docs/protocol.md "NPCs") ---------------------------------------------------------------------------------
-// One authority per NPC (npc_replica.h): the host's NPCs go to each guest as compact states (only the ones near him, as
-// often as their distance says), a guest's own NPCs to the host the same way. NpcStates 0x0210 / GuestNpcStates 0x0420
-// (the full records without a time stamp) are retired: neither sent nor read.
+// One authority per NPC (npc_replica.h): the host. Its NPCs go to each guest as compact states (only the ones near him,
+// as often as their distance says). Retired, neither sent nor read (ids reserved): NpcStates 0x0210, the guest-owned
+// NPCs' GuestNpcStates 0x0420, GuestNpcEnd / HostNpcHit / NpcClaim 0x0421-0x0423 and GuestNpcStates2 / Info / Leave
+// 0x0424-0x0426 (docs/host-authority.md: NPCs come from the host only; a guest's NPC that no host NPC is is held,
+// npc_hold.h).
 constexpr uint16_t kMsgNpcDeath = 0x0211;   // host -> guests, reliable: an NPC died
 constexpr uint16_t kMsgNpcStates2 = 0x0212; // host -> each guest, unreliable: NPC states (sample time, compact)
 constexpr uint16_t kMsgNpcInfo = 0x0213;    // host -> each guest, reliable: the slow fields of net ids (before states)
 constexpr uint16_t kMsgNpcLeave = 0x0214;   // host -> each guest, reliable: net ids no longer sent to him
 constexpr uint16_t kMsgNpcHit = 0x0410;     // guest -> host, reliable: the guest hit (his replica of) a host NPC
-// guest-owned NPCs (docs/protocol.md "Guest-owned NPCs", npc_owner.h)
-constexpr uint16_t kMsgGuestNpcEnd = 0x0421;      // guest -> host, reliable: one of them died / was handed back / went
-constexpr uint16_t kMsgHostNpcHit = 0x0422;       // host -> that guest, reliable: the host hit (his replica of) one
-constexpr uint16_t kMsgNpcClaim = 0x0423;         // host -> that guest, reliable: the host's game has that NPC now
-constexpr uint16_t kMsgGuestNpcStates2 = 0x0424;  // guest -> host, unreliable: his own NPCs (as NpcStates2)
-constexpr uint16_t kMsgGuestNpcInfo = 0x0425;     // guest -> host, reliable: as NpcInfo
-constexpr uint16_t kMsgGuestNpcLeave = 0x0426;    // guest -> host, reliable: as NpcLeave
 constexpr size_t kMaxInCmds = 256 * 1024;
 constexpr size_t kMaxRound = 160;     // NPCs per round of the Lua glue
 constexpr double kTargetLines = 0.1;  // s between the "N" lines for the Lua glue (pairing, health, deaths)
 constexpr double kRecordEvery = 0.1;  // s between NPR records of one replica (10 Hz)
 
-using npcown::NpcState;
+using npcrep::NpcState;
 using npcrep::Vec3;
 
 struct Shared {
@@ -59,24 +53,17 @@ struct Shared {
     std::string inCmds;                 // network -> Lua
     std::vector<std::string> outDeaths; // "ND key"
     std::vector<std::string> outHits;   // "NH ..."
-    std::vector<std::string> outMirrorHits;  // host: "GH mid ..."
     std::string status;
-    npcown::GuestOwner guest;    // guest: the NPCs only our game has
-    npcown::HostMirrors mirrors; // host: the guests' NPCs only their games have
+    npchold::HoldSet hold;       // guest: our NPCs that no host NPC is (yet), held hidden (npc_hold.h)
     // one authority per NPC (npc_replica.h)
-    npcrep::Publisher pub;       // host: our NPCs (and the relays) to the guests; guest: our own NPCs to the host
-    npcrep::ReplicaSet hostSet;  // guest: the host's NPCs (and the other guests' own, relayed by the host)
-    std::map<net::PlayerId, npcrep::ReplicaSet> guestSets;  // host: each guest's own NPCs
+    npcrep::Publisher pub;       // host: our NPCs to the guests
+    npcrep::ReplicaSet hostSet;  // guest: the host's NPCs
     // host: the last round of our NPCs from the Lua glue ("NS cls <state>"), sampled at roundMs (our clock)
     std::vector<std::string> roundLines;
     bool roundReady = false;
     uint32_t roundMs = 0;
     double roundAt = 0;
-    // guest: a round of our own NPCs (GOR) happened at ownMs
-    bool ownReady = false;
-    uint32_t ownMs = 0;
-    double ownAt = 0;
-    std::map<net::PlayerId, Vec3> views;  // every other player where our game shows him (VP lines)
+    std::map<net::PlayerId, Vec3> views;  // host: every guest where our game shows him (VP lines)
     double targetsAt = 0, lastMain = 0;
     std::map<uint64_t, double> recordAt;  // (from << 32 | key) -> last NPR record
     uint32_t refusals = 0;
@@ -97,10 +84,6 @@ uint32_t NowMs() { return static_cast<uint32_t>(static_cast<uint64_t>(Now() * 10
 net::Session* _session = nullptr;  // render thread
 uint32_t _statesSent = 0, _statesRecv = 0, _infosSent = 0, _leavesSent = 0, _hitsSent = 0, _hitsRecv = 0,
          _deathsSent = 0;
-uint32_t _gStatesSent = 0, _gStatesRecv = 0, _gEnds = 0, _gHits = 0, _gClaims = 0;
-// relay of the guests' own NPCs to the other guests (npc_owner.h "relay"): hits forwarded / received
-uint32_t _relayFwd = 0, _relayRecv = 0;
-std::map<net::PlayerId, size_t> _relayLast;  // host: NPCs relayed to each guest last round (logged on a change)
 std::map<net::PlayerId, size_t> _sentLast;   // host: NPCs in each guest's interest (logged on a change)
 double _bwAt = 0;
 std::map<net::PlayerId, uint64_t> _bwBytes;
@@ -114,7 +97,7 @@ void Append(const std::string& line) {
 }
 
 // ---- messages ----------------------------------------------------------------------------------------------------------
-// NpcStates2 / NpcInfo / NpcLeave (and the guest's 0x0424-0x0426): npc_replica.h.
+// NpcStates2 / NpcInfo / NpcLeave: npc_replica.h.
 void OnStates2(net::PlayerId from, net::ByteReader& r) {
     if (from != 0 || (_session && _session->IsHost())) return;
     npcrep::StatesMsg m;
@@ -160,39 +143,6 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     const uint32_t weapon = r.U32();
     const uint8_t hitFlags = r.U8();
     if (r.Failed() || !std::isfinite(amount) || amount < 0 || amount > 10000) return;
-    net::PlayerId owner = 0;
-    uint32_t ownerKey = 0;
-    if (npcown::DecodeRelayKey(key, owner, ownerKey)) {
-        // a hit on another guest's own NPC that we relayed to him: it goes to that guest (HostNpcHit, attacker `from`)
-        bool known = false;
-        {
-            Shared& sh = S();
-            std::lock_guard lock(sh.mu);
-            known = sh.mirrors.Has(owner, ownerKey);
-        }
-        if (!known || owner == from || !_session->FindPlayer(owner)) {
-            MC_LOG_INFO("npc: player %u hit relayed NPC %u (guest %u's %u), which is gone: dropped", from, key, owner,
-                        ownerKey);
-            return;
-        }
-        net::ByteWriter w;
-        w.U32(ownerKey);
-        w.F32(amount);
-        w.U8(dtype);
-        w.U8(zone);
-        w.U32(weapon);
-        w.U8(hitFlags & 1u);
-        w.U8(from);  // the attacker: his puppet fires the replayed shot on the owner's game
-        _session->SendTo(owner, kMsgHostNpcHit, w.Span(), net::Reliability::Reliable);
-        ++_relayFwd;
-        if (_relayFwd <= 40 || _relayFwd % 50 == 0)
-            MC_LOG_INFO("npc: player %u hit guest %u's own NPC %u (relayed as %u): %.1f type %u%s, forwarded to him (#%u)",
-                        from, owner, ownerKey, key, amount, dtype, (hitFlags & 1u) ? ", lethal" : "", _relayFwd);
-        if (core::trace::IsOpen())
-            core::trace::Line("NRH", "from=%u owner=%u key=%u amount=%.2f type=%u lethal=%u", from, owner, ownerKey,
-                              amount, dtype, hitFlags & 1u);
-        return;
-    }
     char buf[128];
     std::snprintf(buf, sizeof buf, "H %u %u %.2f %u %u %u %u\n", static_cast<unsigned>(from), key, amount, dtype, zone,
                   weapon, hitFlags & 1u);
@@ -200,145 +150,20 @@ void OnHit(net::PlayerId from, net::ByteReader& r) {
     Append(buf);
 }
 
-// GuestNpcStates2 (host): a guest's own NPCs. Their replicas here are driven from them (guestSets), and the mirrors
-// (HostMirrors: claims, ends, relays) get them as full states (fast fields + the info).
-void OnGuestStates2(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || !_session->IsHost() || from == 0) return;
-    npcrep::StatesMsg m;
-    if (!npcrep::ReadStates(r, m)) return;
-    ++_gStatesRecv;
-    const double now = Now();
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    npcrep::ReplicaSet& set = sh.guestSets[from];
-    set.OnStates(m, now);
-    for (const npcrep::Fast& f : m.npcs) {
-        const npcrep::Info* info = set.InfoOfNet(f.net);
-        if (!info) continue;  // its info is on the way (reliable): the next state goes in
-        NpcState s;
-        s.key = info->key;
-        s.x = f.x;
-        s.y = f.y;
-        s.z = f.z;
-        s.hx = f.hx;
-        s.hy = f.hy;
-        s.hp = f.hp;
-        s.flags = f.flags;
-        s.ai = info->ai;
-        s.tag = info->tag;
-        s.weapon = info->weapon;
-        s.profile = info->profile;
-        s.shots = f.shots;
-        sh.mirrors.OnState(now, from, s);
-    }
-}
-
-void OnGuestInfo(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || !_session->IsHost() || from == 0) return;
-    std::vector<npcrep::Info> infos;
-    if (!npcrep::ReadInfos(r, infos)) return;
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    sh.guestSets[from].OnInfos(infos);
-}
-
-void OnGuestLeave(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || !_session->IsHost() || from == 0) return;
-    std::vector<uint16_t> nets;
-    if (!npcrep::ReadLeaves(r, nets)) return;
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    sh.guestSets[from].OnLeaves(nets);
-}
-
-// GuestNpcEnd (host): u32 key, u8 reason (0 died, 1 handed back, 2 gone, 3 claim refused), u32 hostKey, u16 health,
-// u8 flags (1: it died of the host's hit)
-void OnGuestEnd(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || !_session->IsHost() || from == 0) return;
-    npcown::GuestEnd e;
-    e.key = r.U32();
-    const uint8_t reason = r.U8();
-    e.hostKey = r.U32();
-    e.hp = r.U16();
-    e.byHost = (r.U8() & 1u) != 0;
-    if (r.Failed() || reason > 3) return;
-    e.reason = static_cast<npcown::EndReason>(reason);
-    ++_gEnds;
-    MC_LOG_INFO("npc: guest %u's own NPC %u: %s (host NPC %u, health %u%s)", from, e.key, npcown::EndName(e.reason),
-                e.hostKey, e.hp, e.byHost ? ", our kill" : "");
-    if (core::trace::IsOpen())
-        core::trace::Line("NGE", "from=%u key=%u why=%u host=%u hp=%u byHost=%u", from, e.key, reason, e.hostKey, e.hp,
-                          e.byHost ? 1u : 0u);
-    Shared& sh = S();
-    std::lock_guard lock(sh.mu);
-    sh.mirrors.OnEnd(Now(), from, e);
-}
-
-// HostNpcHit (guest): u32 key (our NPC), f32 amount, u8 dtype, u8 zone, u32 weapon, u8 flags (1 lethal: the host's
-// replica died of it), u8 attacker (several guests: the player whose hit it was, the host or another guest who saw our
-// NPC relayed; missing = the host)
-void OnHostNpcHit(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || _session->IsHost() || from != 0) return;
-    const uint32_t key = r.U32();
-    const float amount = r.F32();
-    const uint8_t dtype = r.U8(), zone = r.U8();
-    const uint32_t weapon = r.U32();
-    const uint8_t hitFlags = r.U8();
-    if (r.Failed() || !std::isfinite(amount) || amount < 0 || amount > 10000) return;
-    uint8_t attacker = r.AtEnd() ? 0 : r.U8();
-    if (r.Failed() || attacker >= net::kMaxPlayers || attacker == _session->LocalId()) attacker = 0;
-    char buf[128];
-    std::snprintf(buf, sizeof buf, "X %u %.2f %u %u %u %u %u\n", key, amount, dtype, zone, weapon, hitFlags & 1u,
-                  static_cast<unsigned>(attacker));
-    ++_gHits;
-    if (attacker != 0 && (++_relayRecv <= 40 || _relayRecv % 50 == 0))
-        MC_LOG_INFO("npc: player %u hit our own NPC %u on his game (the host relayed it to him): %.1f type %u%s (#%u)",
-                    attacker, key, amount, dtype, (hitFlags & 1u) ? ", lethal" : "", _relayRecv);
-    {
-        Shared& sh = S();
-        std::lock_guard lock(sh.mu);
-        sh.guest.HostHit(Now(), key);
-    }
-    Append(buf);
-}
-
-// NpcClaim (guest): u32 guestKey (our NPC), u32 hostKey (the host's NPC that is it), u8 flags (1: ours is dead)
-void OnClaim(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || _session->IsHost() || from != 0) return;
-    const uint32_t key = r.U32(), hostKey = r.U32();
-    const uint8_t flags = r.U8();
-    if (r.Failed()) return;
-    ++_gClaims;
-    const bool dead = (flags & 1u) != 0;
-    bool ours = false;
-    {
-        Shared& sh = S();
-        std::lock_guard lock(sh.mu);
-        ours = sh.guest.Claim(key, hostKey);
-        if (!ours && !dead) sh.guest.Refuse(key, hostKey);
-    }
-    MC_LOG_INFO("npc: the host claims our NPC %u as its NPC %u%s%s", key, hostKey, dead ? " (ours is dead)" : "",
-                ours || dead ? "" : ": not ours (any more), refused");
-    if (core::trace::IsOpen())
-        core::trace::Line("NGC", "key=%u host=%u dead=%u ours=%u", key, hostKey, dead ? 1u : 0u, ours ? 1u : 0u);
-    if (ours || dead) Append("C " + std::to_string(key) + " " + std::to_string(hostKey) + (dead ? " 1\n" : " 0\n"));
-}
-
 // ---- sending -----------------------------------------------------------------------------------------------------------
 // What the publisher decided for each receiver: leaves, then infos (reliable, in order on lane 0), then the states.
-void SendOut(const std::vector<npcrep::PeerOut>& outs, uint16_t statesId, uint16_t infoId, uint16_t leaveId,
-             bool toHost) {
+void SendOut(const std::vector<npcrep::PeerOut>& outs) {
     for (const npcrep::PeerOut& po : outs) {
         auto send = [&](uint16_t id, const std::vector<uint8_t>& b, net::Reliability rel) {
-            return toHost ? _session->SendToHost(id, b, rel) : _session->SendTo(po.peer, id, b, rel);
+            return _session->SendTo(po.peer, id, b, rel);
         };
         for (const auto& b : npcrep::PackLeaves(po.leaves))
-            if (send(leaveId, b, net::Reliability::Reliable)) ++_leavesSent;
+            if (send(kMsgNpcLeave, b, net::Reliability::Reliable)) ++_leavesSent;
         for (const auto& b : npcrep::PackInfos(po.infos))
-            if (send(infoId, b, net::Reliability::Reliable)) ++_infosSent;
+            if (send(kMsgNpcInfo, b, net::Reliability::Reliable)) ++_infosSent;
         for (const auto& g : po.states)
             for (const auto& b : npcrep::PackStates(g.timeMs, g.npcs))
-                if (send(statesId, b, net::Reliability::Unreliable)) toHost ? ++_gStatesSent : ++_statesSent;
+                if (send(kMsgNpcStates2, b, net::Reliability::Unreliable)) ++_statesSent;
     }
 }
 
@@ -351,8 +176,7 @@ void TraceTruth(const std::vector<npcrep::Truth>& truth) {
 
 npcrep::NameClass ClassOf(int c) { return c >= 0 && c <= 2 ? static_cast<npcrep::NameClass>(c) : npcrep::NameClass::Unknown; }
 
-// Host, once per round of the Lua glue (15 Hz): our NPCs near any guest and the relays (several guests: every guest gets
-// the other guests' own NPCs, keyed by their relay keys, npc_owner.h "relay") through the publisher.
+// Host, once per round of the Lua glue (15 Hz): our NPCs near any guest through the publisher.
 void HostRound() {
     Shared& sh = S();
     std::vector<npcrep::PeerOut> outs;
@@ -366,55 +190,21 @@ void HostRound() {
         if (!sh.roundReady) return;
         sh.roundReady = false;
         std::vector<npcrep::Item> items;
-        std::vector<NpcState> natives;
         for (const std::string& l : sh.roundLines) {  // "NS cls <state fields>"
             npcrep::Item it;
             char* end = nullptr;
             const long cls = std::strtol(l.c_str() + 3, &end, 10);
-            if (!end || !npcown::ParseState(end, it.s)) continue;
-            if (sh.mirrors.IsCopy(it.s.key)) continue;  // feedback guard: a copy of a guest's NPC is never sent back
+            if (!end || !npcrep::ParseState(end, it.s)) continue;
             it.cls = ClassOf(static_cast<int>(cls));
             it.owner = net::kHostPlayer;
-            natives.push_back(it.s);
             items.push_back(std::move(it));
         }
-        sh.mirrors.ObserveNatives(now, natives);
         sh.pub.SetPeers(guests);
         for (net::PlayerId g : guests) {
             auto v = sh.views.find(g);
             sh.pub.SetViewpoints(g, v != sh.views.end() ? std::vector<Vec3>{v->second} : std::vector<Vec3>{});
         }
         sh.pub.Round(sh.roundMs, sh.roundAt, items, true, net::kHostPlayer);
-        // relays: one item per relayed NPC, for every guest whose share it is
-        std::map<uint32_t, npcrep::Item> relay;
-        for (net::PlayerId g : guests) {
-            const std::vector<NpcState> states = sh.mirrors.RelayStates(g, now);
-            size_t& last = _relayLast[g];
-            if (states.size() != last) {
-                MC_LOG_INFO("npc: relaying %zu of the other guests' own NPCs to guest %u (was %zu)", states.size(), g,
-                            last);
-                if (core::trace::IsOpen()) core::trace::Line("NRL", "to=%u n=%zu was=%zu", g, states.size(), last);
-                last = states.size();
-            }
-            for (const NpcState& s : states) {
-                npcrep::Item& it = relay[s.key];
-                if (it.peerMask == 0xFFFFFFFFu) {
-                    it.s = s;
-                    it.peerMask = 0;
-                    net::PlayerId owner = 0;
-                    uint32_t k = 0;
-                    npcown::DecodeRelayKey(s.key, owner, k);
-                    it.owner = owner;
-                    it.cls = npcrep::NameClass::Unknown;
-                }
-                it.peerMask |= 1u << (g & 31);
-            }
-        }
-        if (!relay.empty()) {
-            std::vector<npcrep::Item> ri;
-            for (auto& [k, it] : relay) ri.push_back(std::move(it));
-            sh.pub.Round(sh.roundMs, now, ri, false, net::kHostPlayer);
-        }
         outs = sh.pub.Tick(now);
         truth = sh.pub.TakeTruth();
         for (net::PlayerId g : guests) {
@@ -427,7 +217,7 @@ void HostRound() {
             }
         }
     }
-    SendOut(outs, kMsgNpcStates2, kMsgNpcInfo, kMsgNpcLeave, false);
+    SendOut(outs);
     TraceTruth(truth);
     // the NPC bandwidth per guest, every 10 s (docs/sync-trace.md NBW)
     if (now - _bwAt >= 10.0) {
@@ -445,36 +235,6 @@ void HostRound() {
             _bwBytes[g] = b;
         }
     }
-}
-
-// Guest, once per round of our own NPCs (GOR): the ones that are ours (GuestOwner) go to the host through the publisher
-// (interest: the other players).
-void GuestRound(const std::vector<NpcState>& owned) {
-    Shared& sh = S();
-    std::vector<npcrep::PeerOut> outs;
-    std::vector<npcrep::Truth> truth;
-    {
-        std::lock_guard lock(sh.mu);
-        if (!sh.ownReady) return;
-        sh.ownReady = false;
-        std::vector<npcrep::Item> items;
-        for (const NpcState& s : owned) {
-            npcrep::Item it;
-            it.s = s;
-            it.owner = sh.localId;
-            items.push_back(std::move(it));
-        }
-        sh.pub.SetPeers({net::kHostPlayer});
-        std::vector<Vec3> views;
-        for (const auto& [id, v] : sh.views)
-            if (id != sh.localId && views.size() < net::InterestManager::kMaxViewpoints) views.push_back(v);
-        sh.pub.SetViewpoints(net::kHostPlayer, views);
-        sh.pub.Round(sh.ownMs, sh.ownAt, items, true, sh.localId);
-        outs = sh.pub.Tick(Now());
-        truth = sh.pub.TakeTruth();
-    }
-    SendOut(outs, kMsgGuestNpcStates2, kMsgGuestNpcInfo, kMsgGuestNpcLeave, true);
-    TraceTruth(truth);
 }
 
 // ---- Lua ------------------------------------------------------------------------------------------------------------------
@@ -503,7 +263,8 @@ int McNpcClass(lua_State* L) {
 }
 
 // mc_npc_skip_hit(role, alive, hostile) -> 1: a relayed NPC hit on our player is skipped (it happened here already);
-// role 0 nothing here, 1 a replica (paired or a copy), 2 our own NPC (npc_replica.h SkipRelayedHit).
+// role 0 nothing here, 1 a replica (paired, held or a copy), 2 our own NPC (none since NPCs come from the host only;
+// npc_replica.h SkipRelayedHit).
 int McNpcSkipHit(lua_State* L) {
     const int role = static_cast<int>(NumArg(L, 1));
     const npcrep::HitRole r = role == 1 ? npcrep::HitRole::Replica : role == 2 ? npcrep::HitRole::Own : npcrep::HitRole::None;
@@ -532,61 +293,35 @@ bool LoadModule(lua_State* L) {
     return true;
 }
 
-std::vector<uint32_t> ParseIds(const std::string& rest) {
-    std::vector<uint32_t> ids;
-    std::istringstream in(rest);
-    double v = 0;
-    while (in >> v)
-        if (v > 0 && v <= 4294967295.0) ids.push_back(static_cast<uint32_t>(v));
-    return ids;
-}
-
-// Host: the mirror commands for the Lua side. Guest: our ownership changes. (Called with sh.mu held.)
-void MirrorCommands(Shared& sh, std::string& cmds) {
+// Guest: what the hold rule decided (npc_hold.h) for the Lua side: "HH id" hold, "HS id hostKey why" show (why 1
+// paired, 3 the session ended), "HK id hostKey" kill (paired with a dead host NPC). (Called with sh.mu held.)
+void HoldCommands(Shared& sh, std::string& cmds) {
     char buf[96];
-    for (const npcown::MirrorCmd& c : sh.mirrors.TakeCmds()) {
-        net::PlayerId from = 0;
-        uint32_t key = 0;
+    for (const npchold::Cmd& c : sh.hold.TakeCmds()) {
         switch (c.kind) {
-        case npcown::MirrorCmd::Kind::State:
-            sh.mirrors.Lookup(c.mid, from, key);
-            std::snprintf(buf, sizeof buf, "GN %u %u ", c.mid, static_cast<unsigned>(from));
-            cmds += buf + npcown::FormatState(c.s) + "\n";
+        case npchold::Kind::Hold:
+            std::snprintf(buf, sizeof buf, "HH %u\n", c.id);
+            MC_LOG_INFO("npc: our NPC %u has no host NPC (unpaired for %.0f s): held hidden until the host's game has "
+                        "it (%u held so far)",
+                        c.id, npchold::HoldSet::kHoldAfter, sh.hold.TotalHeld());
             break;
-        case npcown::MirrorCmd::Kind::Died:
-            cmds += "GD " + std::to_string(c.mid) + "\n";
-            MC_LOG_INFO("npc: mirror %u (a guest's own NPC) died on his game", c.mid);
+        case npchold::Kind::Show:
+            std::snprintf(buf, sizeof buf, "HS %u %u %u\n", c.id, c.hostKey, static_cast<unsigned>(c.why));
+            if (c.why == npchold::Why::Paired)
+                MC_LOG_INFO("npc: our held NPC %u is host NPC %u now: shown, its replica", c.id, c.hostKey);
+            else
+                MC_LOG_INFO("npc: our held NPC %u released (%s): shown, its own AI again", c.id,
+                            npchold::WhyName(c.why));
             break;
-        case npcown::MirrorCmd::Kind::End:
-            std::snprintf(buf, sizeof buf, "GX %u %u %u %u\n", c.mid, static_cast<unsigned>(c.reason), c.hostKey,
-                          static_cast<unsigned>(c.hp));
-            cmds += buf;
-            {
-                net::PlayerId rf = 0;
-                uint32_t rk = 0;
-                if (npcown::DecodeRelayKey(c.hostKey, rf, rk))  // the guest paired it with another guest's (relayed)
-                    MC_LOG_INFO("npc: mirror %u ends: %s (it is guest %u's own NPC %u, which we relay to him: one "
-                                "owner, not two)",
-                                c.mid, npcown::EndName(c.reason), rf, rk);
-                else
-                    MC_LOG_INFO("npc: mirror %u ends: %s (our NPC %u)", c.mid, npcown::EndName(c.reason), c.hostKey);
-            }
-            if (core::trace::IsOpen())
-                core::trace::Line("NMX", "mid=%u why=%u host=%u hp=%u", c.mid, static_cast<unsigned>(c.reason),
-                                  c.hostKey, static_cast<unsigned>(c.hp));
-            break;
-        case npcown::MirrorCmd::Kind::KillNative:
-            std::snprintf(buf, sizeof buf, "GK %u %u\n", c.hostKey, c.mid);
-            cmds += buf;
-            MC_LOG_INFO("npc: our NPC %u is mirror %u, which the guest killed already: it dies", c.hostKey, c.mid);
+        case npchold::Kind::Kill:
+            std::snprintf(buf, sizeof buf, "HK %u %u\n", c.id, c.hostKey);
+            MC_LOG_INFO("npc: our held NPC %u is host NPC %u, which is dead: it dies with it", c.id, c.hostKey);
             break;
         }
-    }
-    for (const auto& [key, owned] : sh.guest.TakeOwnedChanges()) {
-        cmds += "O " + std::to_string(key) + (owned ? " 1\n" : " 0\n");
-        MC_LOG_INFO("npc: our NPC %u %s", key,
-                    owned ? "has no host NPC: ours now, sent to the host" : "is no longer ours (the host's, or gone)");
-        if (core::trace::IsOpen()) core::trace::Line("NGO", "key=%u owned=%u", key, owned ? 1u : 0u);
+        cmds += buf;
+        if (core::trace::IsOpen())
+            core::trace::Line("NHD", "key=%u ev=%s host=%u why=%s", c.id, npchold::KindName(c.kind), c.hostKey,
+                              npchold::WhyName(c.why));
     }
 }
 
@@ -610,7 +345,7 @@ void AppendTarget(std::string& cmds, const npcrep::Target& t) {
     char tail[96];
     std::snprintf(tail, sizeof tail, " %.2f %.2f %u %.2f\n", t.vel.x, t.vel.y, static_cast<unsigned>(t.gait),
                   std::min(t.age, 99.0));
-    cmds += "N " + npcown::FormatState(s) + tail;
+    cmds += "N " + npcrep::FormatState(s) + tail;
 }
 
 // "R key kind gait mult reissue mx my mz fix nx ny turn fx fy tx ty tz hx hy refuse": drive replica `key` this tick
@@ -684,7 +419,7 @@ void MainTick(lua_State* L, float dt) {
         cmds = std::string("S ") + (sh.active ? "1 " : "0 ") + (sh.isHost ? "1" : "0") + "\n";
         cmds += sh.inCmds;
         sh.inCmds.clear();
-        MirrorCommands(sh, cmds);
+        HoldCommands(sh, cmds);
         if (sh.active && !sh.isHost) {
             for (uint32_t key : sh.hostSet.Update(now)) sh.recordAt.erase(key);
             if (now - sh.targetsAt >= kTargetLines) {
@@ -694,16 +429,6 @@ void MainTick(lua_State* L, float dt) {
             for (const npcrep::Drive& d : sh.hostSet.Commands(now, step)) {
                 AppendDrive(cmds, d.key, d);
                 LogDrive(sh, net::kHostPlayer, d.key, d);
-            }
-        } else if (sh.active) {
-            for (auto& [g, set] : sh.guestSets) {
-                set.Update(now);
-                for (const npcrep::Drive& d : set.Commands(now, step)) {
-                    const uint32_t mid = sh.mirrors.MidOf(g, d.key);
-                    if (mid == 0) continue;
-                    AppendDrive(cmds, mid, d);
-                    LogDrive(sh, g, d.key, d);
-                }
             }
         }
     }
@@ -741,7 +466,7 @@ void MainTick(lua_State* L, float dt) {
         std::istringstream in(events);
         std::string line;
         bool round = false;
-        std::vector<npcown::LocalNpc> locals;
+        std::vector<npchold::Local> locals;
         std::lock_guard lock(sh.mu);
         while (std::getline(in, line)) {
             if (line.rfind("NS ", 0) == 0) {  // host: one of our NPCs this round ("NS cls <state>")
@@ -755,30 +480,14 @@ void MainTick(lua_State* L, float dt) {
                 uint32_t key = 0;
                 npcrep::Report rep;
                 if (!ParseReport(line, now, key, rep)) continue;
-                if (!sh.isHost) {
-                    sh.hostSet.OnReport(rep);
-                    Record(sh, sh.hostSet, net::kHostPlayer, key, now);
-                } else {
-                    net::PlayerId from = 0;
-                    uint32_t gkey = 0;
-                    if (!sh.mirrors.Lookup(key, from, gkey)) continue;  // key = the mirror id here
-                    auto set = sh.guestSets.find(from);
-                    if (set == sh.guestSets.end()) continue;
-                    rep.key = gkey;
-                    set->second.OnReport(rep);
-                    Record(sh, set->second, from, gkey, now);
-                }
+                if (sh.isHost) continue;  // (the host drives no replicas)
+                sh.hostSet.OnReport(rep);
+                Record(sh, sh.hostSet, net::kHostPlayer, key, now);
             } else if (line.rfind("NX ", 0) == 0) {  // a replica no longer driven (unpaired, copy gone)
                 const double k = std::atof(line.c_str() + 3);
                 if (!(k > 0 && k <= 4294967295.0)) continue;
                 const uint32_t key = static_cast<uint32_t>(k);
-                if (!sh.isHost) {
-                    sh.hostSet.Forget(key);
-                } else {
-                    net::PlayerId from = 0;
-                    uint32_t gkey = 0;
-                    if (sh.mirrors.Lookup(key, from, gkey) && sh.guestSets.count(from)) sh.guestSets[from].Forget(gkey);
-                }
+                if (!sh.isHost) sh.hostSet.Forget(key);
             } else if (line == "VPR") {  // the other players' positions follow
                 sh.views.clear();
             } else if (line.rfind("VP ", 0) == 0) {
@@ -791,42 +500,26 @@ void MainTick(lua_State* L, float dt) {
                 sh.outDeaths.push_back(line);
             } else if (line.rfind("NH ", 0) == 0) {
                 if (sh.outHits.size() < 256) sh.outHits.push_back(line);
-            } else if (line == "GOR") {  // guest: a round of our own NPCs starts (it may be empty)
+            } else if (line == "HR") {  // guest: a round of our NPCs with a job starts (it may be empty)
                 round = true;
-            } else if (line.rfind("GO ", 0) == 0) {  // "GO dist hostKey <state fields>"
-                std::istringstream f(line.substr(3));
-                npcown::LocalNpc n;
-                double hostKey = 0;
-                f >> n.dist >> hostKey;
-                if (f.fail()) continue;
-                std::string rest;
-                std::getline(f, rest);
-                if (!npcown::ParseState(rest, n.s)) continue;
+            } else if (line.rfind("HL ", 0) == 0) {  // "HL id ai dead hostKey hostDead"
+                double id = 0, hostKey = 0;
+                unsigned ai = 0, dead = 0, hostDead = 0;
+                if (std::sscanf(line.c_str() + 3, "%lf %u %u %lf %u", &id, &ai, &dead, &hostKey, &hostDead) != 5 ||
+                    !(id > 0 && id <= 4294967295.0))
+                    continue;
+                npchold::Local n;
+                n.id = static_cast<uint32_t>(id);
+                n.ai = static_cast<uint8_t>(std::min(ai, 255u));
+                n.dead = dead != 0;
                 n.hostKey = hostKey > 0 && hostKey <= 4294967295.0 ? static_cast<uint32_t>(hostKey) : 0;
-                if (locals.size() < 512) locals.push_back(std::move(n));
-            } else if (line.rfind("GCS", 0) == 0) {  // our spawned copies (both roles): never sent
-                std::vector<uint32_t> ids = ParseIds(line.substr(3));
-                if (sh.isHost)
-                    sh.mirrors.SetCopies(std::move(ids));
-                else
-                    sh.guest.SetCopies(std::move(ids));
-            } else if (line.rfind("GH ", 0) == 0) {  // host: we hit a mirror's replica
-                if (sh.outMirrorHits.size() < 256) sh.outMirrorHits.push_back(line);
-            } else if (line.rfind("GR ", 0) == 0) {  // guest: a claim we could not carry out
-                std::istringstream f(line.substr(3));
-                double key = 0, hostKey = 0;
-                f >> key >> hostKey;
-                if (!f.fail()) sh.guest.Refuse(static_cast<uint32_t>(key), static_cast<uint32_t>(hostKey));
+                n.hostDead = hostDead != 0;
+                if (locals.size() < 512) locals.push_back(n);
             } else if (line.rfind("ST ", 0) == 0) {
                 sh.status = line.substr(3);
             }
         }
-        if (round && !sh.isHost) {
-            sh.guest.Observe(now, locals);
-            sh.ownReady = true;
-            sh.ownMs = NowMs();
-            sh.ownAt = now;
-        }
+        if (round && !sh.isHost && sh.active) sh.hold.Observe(now, locals);
     }
     lua::SetTop(L, top);
 }
@@ -835,8 +528,9 @@ void MainTick(lua_State* L, float dt) {
 
 void NpcSync::Install() {
     lua::AddTickCallback(&MainTick);
-    MC_LOG_INFO("npc: installed (messages 0x%04x-0x%04x, 0x%04x; guest-owned NPCs 0x%04x-0x%04x)", kMsgNpcDeath,
-                kMsgNpcLeave, kMsgNpcHit, kMsgGuestNpcEnd, kMsgGuestNpcLeave);
+    MC_LOG_INFO("npc: installed (messages 0x%04x-0x%04x, 0x%04x; NPCs come from the host only, a guest's NPC that no "
+                "host NPC is is held hidden)",
+                kMsgNpcDeath, kMsgNpcLeave, kMsgNpcHit);
 }
 
 void NpcSync::Attach(net::Session& session) {
@@ -846,24 +540,15 @@ void NpcSync::Attach(net::Session& session) {
     session.On(kMsgNpcLeave, &OnLeave);
     session.On(kMsgNpcDeath, &OnDeath);
     session.On(kMsgNpcHit, &OnHit);
-    session.On(kMsgGuestNpcStates2, &OnGuestStates2);
-    session.On(kMsgGuestNpcInfo, &OnGuestInfo);
-    session.On(kMsgGuestNpcLeave, &OnGuestLeave);
-    session.On(kMsgGuestNpcEnd, &OnGuestEnd);
-    session.On(kMsgHostNpcHit, &OnHostNpcHit);
-    session.On(kMsgNpcClaim, &OnClaim);
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    sh.guest.Reset();
-    sh.mirrors.Reset();
+    sh.hold.End();  // (left from a session before: shown again, the commands reach the Lua side)
     sh.pub.Reset();
     sh.hostSet.Reset();
-    sh.guestSets.clear();
     sh.roundLines.clear();
-    sh.roundReady = sh.ownReady = false;
+    sh.roundReady = false;
     sh.views.clear();
     sh.recordAt.clear();
-    _relayLast.clear();
     _sentLast.clear();
     _bwBytes.clear();
     _bwAt = 0;
@@ -871,8 +556,7 @@ void NpcSync::Attach(net::Session& session) {
 
 void NpcSync::Detach() {
     if (_session) {
-        for (uint16_t id : {kMsgNpcStates2, kMsgNpcInfo, kMsgNpcLeave, kMsgNpcDeath, kMsgNpcHit, kMsgGuestNpcStates2,
-                            kMsgGuestNpcInfo, kMsgGuestNpcLeave, kMsgGuestNpcEnd, kMsgHostNpcHit, kMsgNpcClaim})
+        for (uint16_t id : {kMsgNpcStates2, kMsgNpcInfo, kMsgNpcLeave, kMsgNpcDeath, kMsgNpcHit})
             _session->Off(id);
     }
     _session = nullptr;
@@ -882,26 +566,20 @@ void NpcSync::Detach() {
     sh.inCmds.clear();
     sh.outDeaths.clear();
     sh.outHits.clear();
-    sh.outMirrorHits.clear();
     sh.status.clear();
-    sh.guest.Reset();
-    sh.mirrors.Reset();  // its "GX" commands reach the Lua side, which drops the copies (it does so anyway: inactive)
+    // the session ended: our held NPCs are shown with their own AI again ("HS id 0 3" reaches the Lua side next tick)
+    sh.hold.End();
+    HoldCommands(sh, sh.inCmds);
     sh.pub.Reset();
     sh.hostSet.Reset();
-    sh.guestSets.clear();
     sh.roundLines.clear();
-    sh.roundReady = sh.ownReady = false;
+    sh.roundReady = false;
     sh.views.clear();
 }
 
 void NpcSync::OnPlayerLeft(net::PlayerId id) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    if (sh.isHost) {
-        sh.mirrors.OnPlayerLeft(id);  // his mirrors go, and with them their relay to the other guests
-        sh.guestSets.erase(id);       // and his NPCs' replicas here (their copies go with the mirrors)
-    }
-    _relayLast.erase(id);
     _sentLast.erase(id);
     _bwBytes.erase(id);
 }
@@ -910,9 +588,7 @@ void NpcSync::Tick(float dt) {
     (void)dt;
     if (!_session) return;
     Shared& sh = S();
-    std::vector<std::string> deaths, hits, mirrorHits;
-    std::vector<NpcState> owned;
-    std::vector<npcown::GuestEnd> ends;
+    std::vector<std::string> deaths, hits;
     {
         std::lock_guard lock(sh.mu);
         const bool wasHost = sh.isHost;
@@ -922,69 +598,20 @@ void NpcSync::Tick(float dt) {
         if (wasHost != sh.isHost) {  // a new role: nothing of the old one carries over
             sh.pub.Reset();
             sh.hostSet.Reset();
-            sh.guestSets.clear();
+            sh.hold.End();  // (the host holds nothing: shown again)
         }
+        if (!sh.active && sh.hold.HeldCount() > 0) sh.hold.End();  // the session is over: shown again
         deaths.swap(sh.outDeaths);
         hits.swap(sh.outHits);
-        mirrorHits.swap(sh.outMirrorHits);
-        if (sh.isHost) {
-            sh.mirrors.Expire(Now());
-        } else {
-            owned = sh.guest.TakeStates();
-            ends = sh.guest.TakeEnds();
-        }
     }
     if (!_session->IsActive()) return;
     if (_session->IsHost()) {
         HostRound();
-        std::vector<npcown::Claim> claims;
-        {
-            std::lock_guard lock(sh.mu);
-            claims = sh.mirrors.TakeClaims();
-        }
         for (const auto& d : deaths) {
             net::ByteWriter w;
             w.U32(static_cast<uint32_t>(std::strtoul(d.c_str() + 3, nullptr, 10)));
             _session->Broadcast(kMsgNpcDeath, w.Span(), net::Reliability::Reliable);
             ++_deathsSent;
-        }
-        for (const auto& c : claims) {
-            net::ByteWriter w;
-            w.U32(c.guestKey);
-            w.U32(c.hostKey);
-            w.U8(c.dead ? 1 : 0);
-            _session->SendTo(c.to, kMsgNpcClaim, w.Span(), net::Reliability::Reliable);
-            ++_gClaims;
-            MC_LOG_INFO("npc: our NPC %u is guest %u's own NPC %u (mirror %u%s): claimed, authority back to us",
-                        c.hostKey, static_cast<unsigned>(c.to), c.guestKey, c.mid, c.dead ? ", dead there" : "");
-            if (core::trace::IsOpen())
-                core::trace::Line("NMC", "mid=%u to=%u key=%u host=%u dead=%u", c.mid, static_cast<unsigned>(c.to),
-                                  c.guestKey, c.hostKey, c.dead ? 1u : 0u);
-        }
-        for (const auto& h : mirrorHits) {  // "GH mid amount dtype zone weapon lethal"
-            std::istringstream in(h.substr(3));
-            double mid = 0, weapon = 0;
-            float amount = 0;
-            unsigned dtype = 0, zone = 0, hitFlags = 0;
-            in >> mid >> amount >> dtype >> zone >> weapon >> hitFlags;
-            net::PlayerId to = 0;
-            uint32_t key = 0;
-            bool known = false;
-            {
-                std::lock_guard lock(sh.mu);
-                known = sh.mirrors.Lookup(static_cast<uint32_t>(mid), to, key);
-            }
-            if (!known || !std::isfinite(amount) || amount < 0) continue;
-            net::ByteWriter w;
-            w.U32(key);
-            w.F32(std::min(amount, 10000.0f));
-            w.U8(static_cast<uint8_t>(dtype));
-            w.U8(static_cast<uint8_t>(zone));
-            w.U32(weapon >= 0 && weapon <= 4294967295.0 ? static_cast<uint32_t>(weapon) : 0u);
-            w.U8(static_cast<uint8_t>(hitFlags & 1u));
-            w.U8(net::kHostPlayer);  // the attacker: we
-            _session->SendTo(to, kMsgHostNpcHit, w.Span(), net::Reliability::Reliable);
-            ++_gHits;
         }
         return;
     }
@@ -1005,49 +632,38 @@ void NpcSync::Tick(float dt) {
         _session->SendToHost(kMsgNpcHit, w.Span(), net::Reliability::Reliable);
         ++_hitsSent;
     }
-    GuestRound(owned);
-    for (const auto& e : ends) {
-        net::ByteWriter w;
-        w.U32(e.key);
-        w.U8(static_cast<uint8_t>(e.reason));
-        w.U32(e.hostKey);
-        w.U16(e.hp);
-        w.U8(e.byHost ? 1 : 0);
-        _session->SendToHost(kMsgGuestNpcEnd, w.Span(), net::Reliability::Reliable);
-        ++_gEnds;
-        MC_LOG_INFO("npc: our own NPC %u: %s (host NPC %u, health %u%s)", e.key, npcown::EndName(e.reason), e.hostKey,
-                    e.hp, e.byHost ? ", the host's kill" : "");
-        if (core::trace::IsOpen())
-            core::trace::Line("NGE", "key=%u why=%u host=%u hp=%u byHost=%u", e.key, static_cast<unsigned>(e.reason),
-                              e.hostKey, e.hp, e.byHost ? 1u : 0u);
-    }
+    // (nothing else goes from a guest: his NPCs that no host NPC is are held, never sent)
 }
 
 void NpcSync::GetStatus(std::vector<render::OverlayLine>& out) {
     if (!_session || !_session->IsActive()) return;
     Shared& sh = S();
     std::string st;
-    size_t ownCount = 0, mirrorCount = 0, known = 0;
+    size_t held = 0, known = 0;
+    uint32_t heldTotal = 0, heldPaired = 0;
     uint32_t snaps = 0, refusals = 0;
     {
         std::lock_guard lock(sh.mu);
         st = sh.status;
-        ownCount = sh.guest.OwnedCount();
-        mirrorCount = sh.mirrors.LiveCount();
+        held = sh.hold.HeldCount();
+        heldTotal = sh.hold.TotalHeld();
+        heldPaired = sh.hold.TotalPaired();
         known = sh.isHost ? sh.pub.Count() : sh.hostSet.Known();
         snaps = sh.hostSet.Snaps();
-        for (const auto& [g, set] : sh.guestSets) snaps += set.Snaps();
         refusals = sh.refusals;
     }
     const bool host = _session->IsHost();
     char buf[400];
-    std::snprintf(buf, sizeof buf,
-                  "%s (%s %zu; states %u/%u, infos %u, leaves %u; replica snaps %u, refused %u; hits %u/%u, deaths %u; "
-                  "%s %zu, their states %u/%u, ends %u, hits %u, claims %u; relay hits %u/%u)",
-                  st.empty() ? "NPCs: -" : st.c_str(), host ? "published" : "known", known, _statesSent, _statesRecv,
-                  _infosSent, _leavesSent, snaps, refusals, _hitsSent, _hitsRecv, _deathsSent,
-                  host ? "guests' own" : "our own", host ? mirrorCount : ownCount, _gStatesSent, _gStatesRecv, _gEnds,
-                  _gHits, _gClaims, _relayFwd, _relayRecv);
+    if (host)
+        std::snprintf(buf, sizeof buf, "%s (published %zu; states %u, infos %u, leaves %u; guest hits %u, deaths %u)",
+                      st.empty() ? "NPCs: -" : st.c_str(), known, _statesSent, _infosSent, _leavesSent, _hitsRecv,
+                      _deathsSent);
+    else
+        std::snprintf(buf, sizeof buf,
+                      "%s (known %zu; states %u; replica snaps %u, refused %u; hits %u; held %zu now, %u so far, %u "
+                      "paired later)",
+                      st.empty() ? "NPCs: -" : st.c_str(), known, _statesRecv, snaps, refusals, _hitsSent, held,
+                      heldTotal, heldPaired);
     out.push_back({buf, 0xFFB0C4DE});
 }
 

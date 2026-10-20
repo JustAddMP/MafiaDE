@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <sstream>
 
 namespace mc::game::npcrep {
 
@@ -33,6 +36,46 @@ void QuatYaw(const float q[4], float& hx, float& hy) {
     hy = std::sin(a);
 }
 }  // namespace
+
+// ---- Lua lines ------------------------------------------------------------------------------------------------------------
+bool SafeWeapon(const std::string& s) {
+    if (s.empty() || s.size() > 48) return false;
+    for (char c : s)
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    return true;
+}
+
+bool ParseState(const std::string& fields, NpcState& s) {
+    std::istringstream in(fields);
+    double key = 0, tag = 0;  // u32 (Lua writes them as integers)
+    unsigned hp = 0, flags = 0, ai = 0, shots = 0;
+    std::string weapon, profile;
+    in >> key >> s.x >> s.y >> s.z >> s.hx >> s.hy >> hp >> flags >> ai >> tag >> weapon >> profile >> shots;
+    if (!in && !in.eof()) return false;
+    if (!(key >= 0 && key <= 4294967295.0) || !std::isfinite(s.x) || !std::isfinite(s.y) || !std::isfinite(s.z))
+        return false;
+    s.key = static_cast<uint32_t>(key);
+    s.hx = std::isfinite(s.hx) ? std::clamp(s.hx, -1.0f, 1.0f) : 0.0f;
+    s.hy = std::isfinite(s.hy) ? std::clamp(s.hy, -1.0f, 1.0f) : 0.0f;
+    s.hp = static_cast<uint16_t>(std::min(hp, 65535u));
+    s.flags = static_cast<uint8_t>(flags & 0xFF);
+    s.ai = static_cast<uint8_t>(ai & 0xFF);
+    s.tag = tag >= 0 && tag <= 4294967295.0 ? static_cast<uint32_t>(tag) : 0u;
+    s.weapon = SafeWeapon(weapon) ? weapon : "-";
+    s.profile = profile.empty() ? 0 : _strtoui64(profile.c_str(), nullptr, 10);
+    s.shots = static_cast<uint8_t>(shots & 0xFF);
+    return true;
+}
+
+std::string FormatState(const NpcState& s) {
+    char buf[208];
+    std::snprintf(buf, sizeof buf, "%u %.2f %.2f %.2f %.3f %.3f %u %u %u %u %s %llu %u", s.key, s.x, s.y, s.z, s.hx,
+                  s.hy, static_cast<unsigned>(s.hp), static_cast<unsigned>(s.flags), static_cast<unsigned>(s.ai),
+                  s.tag, SafeWeapon(s.weapon) ? s.weapon.c_str() : "-", static_cast<unsigned long long>(s.profile),
+                  static_cast<unsigned>(s.shots));
+    return buf;
+}
 
 // ---- wire ----------------------------------------------------------------------------------------------------------------
 std::vector<std::vector<uint8_t>> PackStates(uint32_t timeMs, const std::vector<Fast>& npcs) {
@@ -112,7 +155,7 @@ std::vector<std::vector<uint8_t>> PackInfos(const std::vector<Info>& infos) {
             w.U32(i.key);
             w.U8(i.ai);
             w.U32(i.tag);
-            w.Str(npcown::SafeWeapon(i.weapon) ? i.weapon : "-");
+            w.Str(SafeWeapon(i.weapon) ? i.weapon : "-");
             w.U64(i.profile);
             w.U8(static_cast<uint8_t>(i.cls));
         }
@@ -133,7 +176,7 @@ bool ReadInfos(net::ByteReader& r, std::vector<Info>& out) {
         i.ai = r.U8();
         i.tag = r.U32();
         i.weapon = r.Str(48);
-        if (!npcown::SafeWeapon(i.weapon)) i.weapon = "-";
+        if (!SafeWeapon(i.weapon)) i.weapon = "-";
         i.profile = r.U64();
         const uint8_t c = r.U8();
         i.cls = c <= 2 ? static_cast<NameClass>(c) : NameClass::Unknown;
@@ -358,7 +401,7 @@ void Publisher::Round(uint32_t timeMs, double now, const std::vector<Item>& item
         i.key = s.key;
         i.ai = s.ai;
         i.tag = s.tag;
-        i.weapon = npcown::SafeWeapon(s.weapon) ? s.weapon : "-";
+        i.weapon = SafeWeapon(s.weapon) ? s.weapon : "-";
         i.profile = s.profile;
         i.cls = item.cls;
         e.timeMs = timeMs;

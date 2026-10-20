@@ -29,8 +29,9 @@ int main() {
               SystemOf(0x0243) == latency::kExplosion && SystemOf(0x0250) == latency::kCarDamage &&
               SystemOf(0x0261) == latency::kPolice && SystemOf(0x0270) == latency::kItem &&
               SystemOf(0x0273) == latency::kItemEvent && SystemOf(0x0202) == latency::kWorld &&
-              SystemOf(0x0210) == latency::kNpc && SystemOf(0x0420) == latency::kNpc &&
-              SystemOf(0x0423) == latency::kNpcEvent && SystemOf(0x0400) == latency::kHit &&
+              SystemOf(0x0212) == latency::kNpc && SystemOf(0x0211) == latency::kNpcEvent &&
+              SystemOf(0x0420) == latency::kCount && SystemOf(0x0423) == latency::kCount &&
+              SystemOf(0x0426) == latency::kCount && SystemOf(0x0400) == latency::kHit &&
               SystemOf(0x7000) == latency::kCount,
           "message ids -> systems");
     for (int s = 0; s < latency::kCount; ++s)
