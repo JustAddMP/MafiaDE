@@ -236,7 +236,8 @@ bool LoadModule(lua_State* L) {
 }
 
 // "TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags" (flag 4: no living driver read
-// at the wheel this round; AuthorityTraffic's DriverWatch turns it into the confirmed kNoDriver)
+// at the wheel this round, with 64: farther than kDriverLod from our player, where the game streams drivers out;
+// AuthorityTraffic's DriverWatch turns it into the confirmed kNoDriver)
 bool ParseCar(const std::string& line, HostCar& c) {
     unsigned long key = 0;
     unsigned kind = 0, flags = 0;
@@ -262,7 +263,7 @@ bool ParseCar(const std::string& line, HostCar& c) {
     c.st.steer = v[10];
     c.st.power = v[11];
     c.st.brake = v[12];
-    c.st.flags = static_cast<uint8_t>(flags & (kSiren | kNoDriver | kControls | kReverse));
+    c.st.flags = static_cast<uint8_t>(flags & (kSiren | kNoDriver | kControls | kReverse | kDriverFar));
     if (v[13] > 0.5f) c.st.flags |= kHandbrake;
     if (c.st.power < 0) {  // the controls read a negative throttle: reversing
         c.st.flags |= kReverse;
@@ -284,15 +285,18 @@ void AppendCommands(std::string& cmds, const std::vector<GuestCmd>& list) {
                           s.model.c_str(), s.color[0], s.color[1], s.plate.empty() ? "-" : s.plate.c_str(), t.pos.x,
                           t.pos.y, t.pos.z, t.rot[0], t.rot[1], t.rot[2], t.rot[3], t.flags);
         } else {
+            // the velocity is the one the copy is given (GuestCmd::vel, along its heading); flag 16 in a command: that
+            // speed is backwards (SetSpeed negative)
             const auto& v = c.vc;
             const bool ctl = (t.flags & kControls) != 0;
+            const unsigned flags = (t.flags & ~static_cast<unsigned>(kReverse)) | (c.reverse ? kReverse : 0u);
             std::snprintf(buf, sizeof buf,
                           "C %u %u %.4f %.4f %.4f %.5f %.5f %.5f %.5f %.3f %.3f %.3f %.3f %d %.3f %.3f %.3f %.3f %.3f "
                           "%.3f %u\n",
                           c.key, static_cast<unsigned>(v.fix), v.nudge.x, v.nudge.y, v.nudge.z, v.rot[0], v.rot[1],
                           v.rot[2], v.rot[3], ctl ? v.power : 0.0f, ctl ? t.steer : 0.0f, ctl ? t.brake : 0.0f,
-                          (t.flags & kHandbrake) ? 1.0f : 0.0f, ctl ? 1 : 0, v.vel.x, v.vel.y, v.vel.z, t.pos.x,
-                          t.pos.y, t.pos.z, t.flags);
+                          (t.flags & kHandbrake) ? 1.0f : 0.0f, ctl ? 1 : 0, c.vel.x, c.vel.y, c.vel.z, t.pos.x,
+                          t.pos.y, t.pos.z, flags);
         }
         cmds += buf;
     }
@@ -338,10 +342,12 @@ void ReceiverTrace(Shared& sh, double now) {
         if (rep == sh.reports.end() || !sh.recv.CopyInfo(key, err, pinned, pins) || !sh.recv.Target(key, now, t, &rt))
             continue;
         const CopyReport& r = rep->second;
+        char pre[64] = "-";
+        if (r.havePre) std::snprintf(pre, sizeof pre, "%.3f,%.3f,%.3f", r.pre.x, r.pre.y, r.pre.z);
         core::trace::Line("TRC", "a=%u net=%u rT=%.1f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
-                                 "cv=%.3f,%.3f,%.3f err=%.3f pin=%d pins=%d f=%u",
+                                 "cv=%.3f,%.3f,%.3f err=%.3f pin=%d pins=%d f=%u pp=%s",
                           RefAuthority(key), RefNet(key), rt, t.pos.x, t.pos.y, t.pos.z, t.vel.x, t.vel.y, t.vel.z,
-                          r.pos.x, r.pos.y, r.pos.z, r.vel.x, r.vel.y, r.vel.z, err, pinned ? 1 : 0, pins, t.flags);
+                          r.pos.x, r.pos.y, r.pos.z, r.vel.x, r.vel.y, r.vel.z, err, pinned ? 1 : 0, pins, t.flags, pre);
     }
     // copies gone meanwhile
     for (auto it = _trcDue.begin(); it != _trcDue.end();) {
@@ -489,17 +495,22 @@ void MainTick(lua_State* L, float dt) {
                     sh.mePos = {p[0], p[1], p[2]};
                     haveMe = true;
                 }
-            } else if (line.rfind("TR ", 0) == 0) {  // where our copy is
+            } else if (line.rfind("TR ", 0) == 0) {  // where our copy is (and where it was before our commands)
                 unsigned long id = 0;
-                float v[10] = {};
-                if (std::sscanf(line.c_str() + 3, "%lu %f %f %f %f %f %f %f %f %f %f", &id, &v[0], &v[1], &v[2], &v[3],
-                                &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) == 11 &&
-                    id > 0 && id <= 0xFFFFFFul && InRange(v, 3, kMaxCoord) && InRange(v + 3, 3, kMaxSpeed) &&
-                    InRange(v + 6, 4, 2)) {
+                float v[13] = {};
+                const int n = std::sscanf(line.c_str() + 3, "%lu %f %f %f %f %f %f %f %f %f %f %f %f %f", &id, &v[0],
+                                          &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10], &v[11],
+                                          &v[12]);
+                if ((n == 11 || n == 14) && id > 0 && id <= 0xFFFFFFul && InRange(v, 3, kMaxCoord) &&
+                    InRange(v + 3, 3, kMaxSpeed) && InRange(v + 6, 4, 2)) {
                     CopyReport r;
                     r.pos = {v[0], v[1], v[2]};
                     r.vel = {v[3], v[4], v[5]};
                     for (int i = 0; i < 4; ++i) r.rot[i] = v[6 + i];
+                    if (n == 14 && InRange(v + 10, 3, kMaxCoord)) {
+                        r.pre = {v[10], v[11], v[12]};
+                        r.havePre = true;
+                    }
                     sh.recv.SetReport(static_cast<uint32_t>(id), r, now);
                     sh.reports[static_cast<uint32_t>(id)] = r;
                 }
@@ -636,12 +647,12 @@ void AuthSend(double now) {
     _authTraceAt = now;
     core::trace::Line("TRH",
                       "cars=%zu spawnMsgs=%llu stateMsgs=%llu despawnMsgs=%llu bytes=%llu bumps=%llu nodrv=%zu "
-                      "orphan=%zu orphaned=%llu driven=%llu",
+                      "orphan=%zu orphaned=%llu driven=%llu far=%zu",
                       _auth->CarCount(), static_cast<unsigned long long>(_spawnMsgs),
                       static_cast<unsigned long long>(_stateMsgs), static_cast<unsigned long long>(_despawnMsgs),
                       static_cast<unsigned long long>(_bytesSent), static_cast<unsigned long long>(_bumpsRecv),
                       _auth->MissingNow(), _auth->DeclaredNow(), static_cast<unsigned long long>(_auth->Orphaned()),
-                      static_cast<unsigned long long>(_auth->DrivenAgain()));
+                      static_cast<unsigned long long>(_auth->DrivenAgain()), _auth->FarNow());
     for (const auto& p : _session->Players()) {
         const auto* st = _auth->Stats(p.id);
         if (!st || p.id == me) continue;

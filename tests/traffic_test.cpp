@@ -7,6 +7,7 @@
 #include "game/latency.h"
 #include "game/traffic_model.h"
 #include "traffic_path.h"
+#include "data/traffic_replay.h"
 
 #include <algorithm>
 #include <cmath>
@@ -858,7 +859,7 @@ void TestDriverWatch() {
 }
 
 // End to end: the host's raw read becomes the sent kNoDriver only once confirmed; the guest's Drive command carries
-// kCrewOut only while both cars stand.
+// kCrewOut once both cars stand, held until the authority's car is driven again.
 void TestOrphanEndToEnd() {
     HostTraffic h;
     GuestTraffic g;
@@ -867,9 +868,10 @@ void TestOrphanEndToEnd() {
     std::vector<GuestBump> bumps;
     HostCar car = Car(4242, 20, 0, 0, 10);
     uint8_t lastSent = 0;
-    bool sentNoDriverMoving = false;
+    bool sentNoDriverMoving = false, outWhileRolling = false;
     double sentAt = -1;
     const double base = 100.0;
+    const uint32_t key = 1;  // its first net id (the host's car: RefKey(0, net) = net)
     for (int i = 0; i <= 120; ++i) {
         const double t = i * 0.05;
         // driver read flickers for the first 2 s (moving at 10 m/s), then it is gone and the car brakes to a stop
@@ -902,34 +904,162 @@ void TestOrphanEndToEnd() {
             }
         }
         g.SetLocal({0, 0, 0}, true);
+        // our copy keeps rolling at 5 m/s all this time (its report every tick)
+        CarState tg;
+        if (g.Target(key, base + t, tg)) {
+            CopyReport rep;
+            rep.pos = tg.pos;
+            rep.vel = {0, 5, 0};
+            g.SetReport(key, rep, base + t);
+        }
         g.Tick(base + t, 0.05f, cmds, bumps);
+        for (const auto& c : cmds)
+            if (c.type == GuestCmd::Type::Drive && (c.target.flags & kCrewOut)) outWhileRolling = true;
     }
     Check(!sentNoDriverMoving, "orphan: never sent as driverless while it moves");
     // slow (<= 2 m/s) from t = 3.6: driverless from 4.6
     Check(sentAt > 4.5 && sentAt < 4.75 && (lastSent & kNoDriver), "orphan: sent as driverless 1 s after it stopped",
           Fmt("at %.2f s", sentAt));
     Check(h.Orphaned() == 1 && h.DeclaredNow() == 1, "orphan: counted once", Fmt("%.0f", h.Orphaned()));
-    // the guest: a copy that stands gets kCrewOut, one that still moves (our report) does not
-    const double now = base + 6.02;
-    CopyReport rep;
-    CarState tgt;
-    g.Target(h.NetOf(4242), now, tgt);
-    rep.pos = tgt.pos;
-    rep.vel = {0, 5, 0};
-    g.SetReport(h.NetOf(4242), rep, now);
-    g.Tick(now + 0.02, 0.016f, cmds, bumps);
-    bool out1 = false, drove = false;
-    for (const auto& c : cmds)
-        if (c.type == GuestCmd::Type::Drive) drove = true, out1 |= (c.target.flags & kCrewOut) != 0;
-    Check(drove && !out1, "orphan: our copy still rolling at 5 m/s: no kCrewOut");
-    rep.vel = {0, 0, 0};
-    g.SetReport(h.NetOf(4242), rep, now + 0.04);
-    g.Tick(now + 0.04, 0.016f, cmds, bumps);
-    bool out2 = false;
-    for (const auto& c : cmds)
-        if (c.type == GuestCmd::Type::Drive) out2 |= (c.target.flags & kCrewOut) != 0;
-    Check(out2, "orphan: both stand: kCrewOut in the Drive command");
+    Check(key == h.NetOf(4242), "orphan: the car's net id");
+    // the guest: a copy that still moves (our report) keeps its crew, one that stands lets it out; then it is held
+    Check(!outWhileRolling, "orphan: our copy still rolling at 5 m/s: no kCrewOut");
+    double now = base + 6.02;
+    auto drive = [&](float copySpeed) {  // our report, one tick: kCrewOut in its Drive command?
+        CarState tgt;
+        g.Target(key, now, tgt);
+        CopyReport rep;
+        rep.pos = tgt.pos;
+        rep.vel = {0, copySpeed, 0};
+        g.SetReport(key, rep, now);
+        now += 0.02;
+        g.Tick(now, 0.02f, cmds, bumps);
+        bool crewOut = false;
+        for (const auto& c : cmds)
+            if (c.type == GuestCmd::Type::Drive) crewOut |= (c.target.flags & kCrewOut) != 0;
+        return crewOut;
+    };
+    Check(drive(0.0f), "orphan: both stand: kCrewOut in the Drive command");
+    bool held = true;
+    for (int i = 0; i < 20; ++i) held &= drive(i % 2 ? 3.0f : 0.5f);  // pushed about: 0.5 / 3 m/s
+    Check(held, "orphan: the crew stays out while the copy's speed goes up and down (no in / out loop)");
+    // the authority reads a driver again: the flag goes, our crew gets back in
+    bool back = false;
+    for (int i = 0; i < 40 && !back; ++i) {
+        const double t = 6.05 + i * 0.05;
+        car.st.flags = kControls;
+        h.SetCars({car}, t);
+        h.SetView(1, {0, 0, 5}, t);
+        h.Tick(t, static_cast<uint32_t>(t * 1000), out);
+        for (const auto& po : out)
+            for (const auto& b : po.states) {
+                net::ByteReader r(b.data(), b.size());
+                uint32_t ms = 0;
+                std::vector<CarState> st;
+                ReadStates(r, ms, st);
+                g.OnStates(ms, st, now);
+            }
+        back = !drive(0.0f);
+    }
+    Check(back && h.DrivenAgain() == 1, "orphan: driven again on the authority: the crew gets back in",
+          Fmt("driven again %.0f", h.DrivenAgain()));
 }
+
+// The game's level of detail: beyond kDriverLod of the authority's player a missing driver was streamed out, the car is
+// still driven (2026-10-20 two-PC test: misses at 45-169 m but one, "driverless" 19 times, 40 crews out on the
+// receiver, 36 back in)
+void TestDriverLod() {
+    {
+        DriverWatch w;  // a car at a red light 55 m from the authority's player: no driver read for 30 s, standing
+        bool any = false;
+        for (int i = 0; i < 600; ++i) any |= w.Update(i * 0.05, DriverRead::Far, 0.0f);
+        Check(!any && !w.Missing() && w.Far(), "driver lod: a car standing beyond 40 m without a driver read: driven");
+    }
+    {
+        DriverWatch w;  // its driver gets out next to our player, then we drive away from it
+        for (int i = 0; i <= 30; ++i) w.Update(i * 0.05, DriverRead::Missing, 0.0f);
+        Check(w.Declared(), "driver lod: driverless next to us");
+        bool still = true;
+        for (int i = 31; i <= 200; ++i) still &= w.Update(i * 0.05, DriverRead::Far, 0.0f);
+        Check(still, "driver lod: ... and still driverless once we are 40 m away (no flip to driven)");
+        Check(!w.Update(10.05, DriverRead::Far, 6.0f), "driver lod: ... until it speeds up (someone drives it)");
+    }
+    {
+        // the authority: the Lua's read with kDriverFar is no driverless car, nothing goes out as kNoDriver
+        HostTraffic h;
+        std::vector<PeerOut> out;
+        HostCar car = Car(777, 20, 0, 0, 0);
+        bool sentNoDriver = false;
+        for (int i = 0; i <= 100; ++i) {
+            const double t = i * 0.05;
+            car.st.flags = static_cast<uint8_t>(kControls | kNoDriver | kDriverFar);
+            h.SetCars({car}, t);
+            h.SetView(1, {0, 0, 5}, t);
+            h.Tick(t, static_cast<uint32_t>(t * 1000), out);
+            for (const auto& po : out)
+                for (const auto& b : po.states) {
+                    net::ByteReader r(b.data(), b.size());
+                    uint32_t ms = 0;
+                    std::vector<CarState> st;
+                    ReadStates(r, ms, st);
+                    for (const auto& x : st) sentNoDriver |= (x.flags & (kNoDriver | kDriverFar | kCrewOut)) != 0;
+                }
+        }
+        Check(!sentNoDriver && h.Orphaned() == 0 && h.MissingNow() == 0 && h.FarNow() == 1,
+              "driver lod: the authority sends a streamed-out driver's car as driven",
+              Fmt("orphaned %.0f, far now %.0f", h.Orphaned(), h.FarNow()));
+    }
+}
+
+// The speed a copy is given along its heading (CopySpeed): the 0.16.0 copies got |target velocity + 1.5 x error|
+// along their heading, so a copy past its standing target was driven on, away from it, at up to 4 m/s.
+void TestCopySpeed() {
+    const net::motion::VehicleTuning vt = TrafficVehicleTuning(TrafficCorrection());
+    const float fwd[2] = {0, 1};
+    const Vec3 target{0, 10, 0};
+    Check(CopySpeed({0, 12, 0}, target, 0, fwd, false, vt) == 0.0f, "copy speed: 2 m past a standing target: stops");
+    Check(std::fabs(CopySpeed({0, 8, 0}, target, 0, fwd, false, vt) - 3.0f) < 1e-3f,
+          "copy speed: 2 m short of a standing target: 3 m/s toward it");
+    Check(std::fabs(CopySpeed({1.5f, 10, 0}, target, 10, fwd, false, vt) - 10.0f) < 1e-3f,
+          "copy speed: 1.5 m beside its target: its speed (the blend takes the sideways part)");
+    Check(std::fabs(CopySpeed({0, 9, 0}, target, 10, fwd, false, vt) - 11.5f) < 1e-3f, "copy speed: 1 m behind: +1.5 m/s");
+    Check(std::fabs(CopySpeed({0, 30, 0}, target, 10, fwd, false, vt) - 6.0f) < 1e-3f,
+          "copy speed: far ahead: at most 4 m/s slower");
+    Check(std::fabs(CopySpeed({0, 11, 0}, target, 3, fwd, true, vt) - 4.5f) < 1e-3f,
+          "copy speed: reversing, 1 m behind it (ahead along the heading): faster backwards");
+    // end to end: a copy 2 m past a standing car is not given speed away from it
+    GuestTraffic g;
+    SpawnInfo s;
+    s.net = 5;
+    s.model = "lassiter_v16";
+    s.st.pos = target;
+    YawQuat(0, s.st.rot);  // facing +y
+    g.OnSpawn(s, 0);
+    CarState st = s.st;
+    st.net = 5;
+    std::vector<GuestCmd> cmds;
+    std::vector<GuestBump> bumps;
+    float maxAway = 0;
+    int drives = 0;
+    for (int i = 0; i < 60; ++i) {
+        const double t = i * 0.05;
+        g.OnStates(static_cast<uint32_t>(1000 + t * 1000), {st}, t);
+        g.SetLocal({0, 0, 0}, true);
+        CopyReport rep;
+        rep.pos = {0, 12, 0};
+        YawQuat(0, rep.rot);
+        if (i > 2) g.SetReport(5, rep, t);
+        g.Tick(t, 0.05f, cmds, bumps);
+        for (const auto& c : cmds) {
+            if (c.type != GuestCmd::Type::Drive || i <= 3) continue;
+            ++drives;
+            if (!c.reverse) maxAway = std::max(maxAway, std::hypot(c.vel.x, c.vel.y));
+        }
+    }
+    Check(drives > 40 && maxAway < 0.01f, "copy speed: a copy past its standing target is never driven on",
+          Fmt("%.2f m/s", maxAway));
+}
+
 
 }  // namespace
 
@@ -1399,8 +1529,8 @@ void TestHandOver() {
 // The host's car of the 0.15.0 two-PC trace (tests/traffic_path.h: 45 s, 12.9 m/s mean, 29 max, turns) is a traffic
 // car of an authority. Its states go through AuthorityTraffic (interest, quantisation, the wire), a network (14 ms one
 // way + up to 25 ms jitter, 1 % loss), a receiver (Stream per authority, playout, VehicleController + Corrector) at
-// 60 fps, and a simulated copy: SetPos for a pin / snap, the nudge for a blend, then SetRot and SetSpeed (the speed
-// along the car's heading, 3 % short of it) as RV.Drive does, then its own motion. The true error is the copy against
+// 60 fps, and a simulated copy: SetPos for a pin / snap, the nudge for a blend, then SetRot and SetSpeed (the command's
+// speed along the car's heading, 3 % short of it) as RV.Drive does, then its own motion. The true error is the copy against
 // the authority's car at the same moment (sync_compare's traffic.true_p95, target 1.5 m).
 Vec3 Forward(const float q[4]) {  // the car's heading: (0, 1, 0) by the conjugate of its quaternion (Mafia DE)
     const float x = -q[0], y = -q[1], z = -q[2], w = q[3];
@@ -1521,8 +1651,9 @@ PathResult RunPath(float viewDist, uint64_t seed, const GuestConfig& cfg = {}) {
                 if (c.vc.justPinned) ++res.pins;
                 if (c.vc.fix != Fix::None) {
                     for (int k = 0; k < 4; ++k) cq[k] = c.vc.rot[k];
-                    const float sp = 0.97f * std::sqrt(c.vc.vel.x * c.vc.vel.x + c.vc.vel.y * c.vc.vel.y +
-                                                       c.vc.vel.z * c.vc.vel.z);
+                    // SetSpeed: the command's speed along the copy's heading (GuestCmd::vel / reverse)
+                    const float sp = 0.97f * std::sqrt(c.vel.x * c.vel.x + c.vel.y * c.vel.y + c.vel.z * c.vel.z) *
+                                     (c.reverse ? -1.0f : 1.0f);
                     const Vec3 f = Forward(cq);
                     cv = {f.x * sp, f.y * sp, c.vc.vel.z};
                 }
@@ -1607,6 +1738,267 @@ void TestRecordedPath() {
     }
 }
 
+// ---- the 2026-10-20 two-PC test replayed: traffic.true_p95 on what really happened --------------------------------
+// tests/data/traffic_replay.h holds session A as it was: the host's 28 traffic cars as his game sent them (TRS), the
+// guest's player (where the host's cars were shown) and where the guest's copies really were (TRC). The cars go through
+// the whole chain again: AuthorityTraffic (interest, quantisation, the wire), a network (14 ms one way, jitter, 5 %
+// late by 40 ms, 1 % of the state packets lost), ReceiverTraffic at 60 fps with the guest's real position, and copies
+// simulated as traffic_sync.lua / RV.Drive moves them (SetPos for a pin / snap, the nudge for a blend, SetRot, then
+// SetSpeed: one number, along the copy's heading, 3 % short; then its own motion). The true error is measured where
+// the trace measured it (each TRC row, against the TRS truth at that moment, as tools/sync_compare.py does), so the
+// in-game number of the same rows stands next to it.
+struct ReplayTruth {
+    struct Row {
+        double t;
+        Vec3 p, v;
+        float q[4];
+    };
+    std::map<int, std::vector<Row>> cars;
+    ReplayTruth() {
+        for (const auto& r : kReplayTruth) {
+            Row w;
+            w.t = r[1] / 1000.0;
+            w.p = {kReplayOrigin[0] + r[2] / 100.0f, kReplayOrigin[1] + r[3] / 100.0f, kReplayOrigin[2] + r[4] / 100.0f};
+            w.v = {r[5] / 100.0f, r[6] / 100.0f, r[7] / 100.0f};
+            cars[r[0]].push_back(w);
+        }
+        // TRS has no rotation: the heading of the velocity (Mafia DE: forward = +y by the conjugate, so a yaw a about
+        // z faces (sin a, cos a)), held while the car stands
+        for (auto& [net, rows] : cars) {
+            std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.t < b.t; });
+            float yaw = 0;
+            bool have = false;
+            for (const Row& w : rows)
+                if (std::hypot(w.v.x, w.v.y) > 0.5f) {
+                    yaw = std::atan2(w.v.x, w.v.y);
+                    have = true;
+                    break;
+                }
+            for (Row& w : rows) {
+                if (std::hypot(w.v.x, w.v.y) > 0.5f) yaw = std::atan2(w.v.x, w.v.y);
+                YawQuat(have ? yaw : 0.0f, w.q);
+            }
+        }
+    }
+    double End() const {
+        double e = 0;
+        for (const auto& [net, rows] : cars) e = std::max(e, rows.back().t);
+        return e;
+    }
+    // Where car `net` was at t (s from kReplayT0): Hermite between the rows around t, false outside them or across a
+    // gap longer than maxGap (an unchanged state is not sent again for 1.5 s: a standing car's rows are that far apart)
+    bool At(int net, double t, CarState& s, double maxGap) const {
+        auto it = cars.find(net);
+        if (it == cars.end()) return false;
+        const auto& rows = it->second;
+        auto hi = std::lower_bound(rows.begin(), rows.end(), t, [](const Row& r, double x) { return r.t < x; });
+        if (hi == rows.begin() || hi == rows.end()) return false;
+        const Row& a = *(hi - 1);
+        const Row& b = *hi;
+        const double span = b.t - a.t;
+        if (span > maxGap || span <= 0) return false;
+        const float u = static_cast<float>((t - a.t) / span);
+        s = CarState{};
+        s.net = static_cast<uint16_t>(net);
+        s.pos = net::playout::Hermite(a.p, a.v, b.p, b.v, span, u);
+        s.vel = {a.v.x + (b.v.x - a.v.x) * u, a.v.y + (b.v.y - a.v.y) * u, a.v.z + (b.v.z - a.v.z) * u};
+        net::motion::Nlerp(a.q, b.q, u, s.rot);
+        return true;
+    }
+};
+
+Vec3 ReplayViewer(double t) {
+    const size_t n = sizeof(kReplayViewer) / sizeof(kReplayViewer[0]);
+    size_t i = 0;
+    while (i + 2 < n && kReplayViewer[i + 1][0] / 1000.0 < t) ++i;
+    const auto& a = kReplayViewer[i];
+    const auto& b = kReplayViewer[i + 1];
+    const double ta = a[0] / 1000.0, tb = b[0] / 1000.0;
+    const float u = static_cast<float>(std::clamp((t - ta) / std::max(1e-6, tb - ta), 0.0, 1.0));
+    auto c = [&](int k) { return (a[k] + (b[k] - a[k]) * u) / 100.0f; };
+    return {kReplayOrigin[0] + c(1), kReplayOrigin[1] + c(2), kReplayOrigin[2] + c(3)};
+}
+
+struct ReplayResult {
+    std::vector<float> sim, game, simStand, gameStand, simMove, gameMove;
+    uint32_t snaps = 0, pins = 0, samples = 0, rows = 0;
+    float P95(std::vector<float> v) const {
+        if (v.empty()) return -1;
+        std::sort(v.begin(), v.end());
+        return v[static_cast<size_t>(0.95 * static_cast<double>(v.size() - 1))];
+    }
+};
+
+// legacySpeed: the copy gets |vc.vel| along its heading (backwards only when the authority's car reverses), as the
+// 0.16.0 Lua did with the controller's velocity vector; else GuestCmd::vel / reverse (CopySpeed).
+ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
+    ReplayResult res;
+    const ReplayTruth truth;
+    AuthorityTraffic auth;
+    ReceiverTraffic recv;
+    Rng rng(seed);
+    const double clockGap = 1000.0;  // receiver clock - authority clock (s)
+    struct InFlight {
+        double arrive;
+        PeerOut po;
+    };
+    std::vector<InFlight> fly;
+    std::vector<PeerOut> out;
+    std::vector<GuestCmd> cmds;
+    std::vector<GuestBump> bumps;
+    Delivery to{&recv};
+    struct SimCopy {
+        bool exists = false;
+        double spawnAt = -1;
+        Vec3 cp, cv, lastTarget;
+        float cq[4] = {0, 0, 0, 1};
+    };
+    std::map<uint32_t, SimCopy> copies;  // by the receiver's key
+    // the in-game rows, in time order
+    std::vector<size_t> order(sizeof(kReplayCopies) / sizeof(kReplayCopies[0]));
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [](size_t a, size_t b) { return kReplayCopies[a][0] < kReplayCopies[b][0]; });
+    size_t nextRow = 0;
+    const double end = truth.End();
+    double nextAuth = 0, frame = 0;
+    const double step = 1 / 60.0;
+    while (frame < end) {
+        while (nextAuth <= frame) {  // the authority's rounds at 20 Hz
+            std::vector<HostCar> list;
+            for (const auto& [net, rows] : truth.cars) {
+                CarState s;
+                if (!truth.At(net, nextAuth, s, 2.0)) continue;
+                HostCar hc = Car(static_cast<uint32_t>(100000 + net), 0, 0);
+                hc.st = s;
+                hc.st.flags = 0;  // controls not in the record: the copy goes by its speed
+                list.push_back(hc);
+            }
+            auth.SetCars(list, nextAuth);
+            auth.SetView(1, ReplayViewer(nextAuth), nextAuth);
+            auth.Tick(nextAuth, static_cast<uint32_t>(static_cast<uint64_t>((kReplayT0 + nextAuth) * 1000.0)), out);
+            for (const auto& po : out) {
+                if (rng.Uniform(0, 1) < 0.01f && po.spawns.empty() && po.despawns.empty()) continue;  // lost
+                double owd = 0.014 + rng.Uniform(0, 1) * rng.Uniform(0, 1) * 0.025;
+                if (rng.Uniform(0, 1) < 0.05f) owd += 0.04;
+                fly.push_back({nextAuth + owd, po});
+            }
+            nextAuth += 0.05;
+        }
+        for (size_t i = 0; i < fly.size();) {
+            if (fly[i].arrive <= frame) {
+                to.Apply(fly[i].po, 0, false, fly[i].arrive + clockGap);
+                fly.erase(fly.begin() + static_cast<std::ptrdiff_t>(i));
+            } else {
+                ++i;
+            }
+        }
+        const double local = frame + clockGap;
+        const float dt = static_cast<float>(step);
+        recv.SetLocal(ReplayViewer(frame));
+        recv.Tick(local, dt, cmds, bumps);
+        std::set<uint32_t> driven;
+        for (const auto& c : cmds) {
+            SimCopy& s = copies[c.key];
+            if (c.type == GuestCmd::Type::Add) {
+                s = SimCopy{};
+                s.spawnAt = frame + 0.5;  // obtain + spawn take a while
+                s.lastTarget = c.target.pos;
+            } else if (c.type == GuestCmd::Type::Remove) {
+                s = SimCopy{};
+            } else if (c.type == GuestCmd::Type::Drive) {
+                s.lastTarget = c.target.pos;
+                if (!s.exists) continue;
+                using Fix = net::motion::VehicleCommand::Fix;
+                if (c.vc.fix == Fix::Pin || c.vc.fix == Fix::Snap) {
+                    s.cp = c.target.pos;
+                    if (c.vc.fix == Fix::Snap) ++res.snaps;
+                } else if (c.vc.fix == Fix::Blend) {
+                    s.cp.x += c.vc.nudge.x;
+                    s.cp.y += c.vc.nudge.y;
+                    s.cp.z += c.vc.nudge.z;
+                }
+                if (c.vc.justPinned) ++res.pins;
+                if (c.vc.fix != Fix::None) {
+                    for (int k = 0; k < 4; ++k) s.cq[k] = c.vc.rot[k];
+                    const Vec3 w = legacySpeed ? c.vc.vel : c.vel;
+                    const bool back = legacySpeed ? (c.target.flags & kReverse) != 0 : c.reverse;
+                    const float sp = 0.97f * std::sqrt(w.x * w.x + w.y * w.y + w.z * w.z) * (back ? -1.0f : 1.0f);
+                    const Vec3 f = Forward(s.cq);
+                    s.cv = {f.x * sp, f.y * sp, c.target.vel.z};
+                }
+                driven.insert(c.key);
+            }
+        }
+        for (auto& [key, s] : copies) {
+            if (!s.exists && s.spawnAt >= 0 && frame >= s.spawnAt) {
+                s.exists = true;
+                s.cp = s.lastTarget;
+                s.cv = {};
+                CarState tg;
+                if (recv.Target(key, local, tg))
+                    for (int k = 0; k < 4; ++k) s.cq[k] = tg.rot[k];
+            }
+            if (!s.exists) continue;
+            if (driven.count(key)) {  // the Lua reports a copy it drove this tick (TR)
+                CopyReport r;
+                r.pos = s.cp;
+                r.vel = s.cv;
+                for (int k = 0; k < 4; ++k) r.rot[k] = s.cq[k];
+                recv.SetReport(key, r, local);
+            }
+        }
+        // the trace's samples due by now: the simulated copy and the one in game, against the truth then
+        while (nextRow < order.size() && kReplayCopies[order[nextRow]][0] / 1000.0 <= frame) {
+            const auto& row = kReplayCopies[order[nextRow++]];
+            ++res.rows;
+            const double t = row[0] / 1000.0;
+            CarState tr, trNow;
+            if (!truth.At(row[1], t, tr, 0.6) || !truth.At(row[1], frame, trNow, 0.6)) continue;
+            auto it = copies.find(RefKey(0, static_cast<uint16_t>(row[1])));
+            if (it == copies.end() || !it->second.exists) continue;
+            const Vec3 g{kReplayOrigin[0] + row[2] / 100.0f, kReplayOrigin[1] + row[3] / 100.0f,
+                         kReplayOrigin[2] + row[4] / 100.0f};
+            const float eg = std::hypot(g.x - tr.pos.x, g.y - tr.pos.y);
+            const float es = std::hypot(it->second.cp.x - trNow.pos.x, it->second.cp.y - trNow.pos.y);
+            res.game.push_back(eg);
+            res.sim.push_back(es);
+            const bool stand = std::hypot(tr.vel.x, tr.vel.y) < 0.5f;
+            (stand ? res.gameStand : res.gameMove).push_back(eg);
+            (stand ? res.simStand : res.simMove).push_back(es);
+            ++res.samples;
+        }
+        // their own motion until the next frame (a little side slip)
+        for (auto& [key, s] : copies) {
+            if (!s.exists) continue;
+            s.cp.x += s.cv.x * dt + rng.Uniform(-0.01f, 0.01f);
+            s.cp.y += s.cv.y * dt + rng.Uniform(-0.01f, 0.01f);
+            s.cp.z += s.cv.z * dt;
+        }
+        frame += step + rng.Uniform(-0.002f, 0.002f);
+    }
+    return res;
+}
+
+void TestReplay() {
+    const ReplayResult old = RunReplay(true, 2026);
+    std::printf("INFO  replay 2026-10-20 A: in game p95 %.2f m (standing %.2f, moving %.2f) on %u of %u rows; simulated "
+                "with the 0.16.0 copy speed p95 %.2f m (standing %.2f, moving %.2f), snaps %u pins %u\n",
+                old.P95(old.game), old.P95(old.gameStand), old.P95(old.gameMove), old.samples, old.rows,
+                old.P95(old.sim), old.P95(old.simStand), old.P95(old.simMove), old.snaps, old.pins);
+    const ReplayResult r = RunReplay(false, 2026);
+    std::printf("INFO  replay 2026-10-20 A now: p95 %.2f m (standing %.2f, moving %.2f), snaps %u pins %u\n",
+                r.P95(r.sim), r.P95(r.simStand), r.P95(r.simMove), r.snaps, r.pins);
+    // the simulation stands for the game: with the old copy speed it fails like the game did (the copies past a
+    // standing target driven away), so its verdict on the fix means something
+    Check(old.samples > 700 && old.P95(old.sim) > 1.5f && old.P95(old.simStand) > 2.0f,
+          "replay: the 0.16.0 copy speed fails as in game (standing copies driven off)",
+          Fmt("sim p95 %.2f (standing %.2f), game %.2f", old.P95(old.sim), old.P95(old.simStand), old.P95(old.game)));
+    Check(r.samples > 700 && r.P95(r.sim) >= 0 && r.P95(r.sim) <= 1.5f, "replay: traffic.true_p95 <= 1.5 m",
+          Fmt("p95 %.2f m (standing %.2f, moving %.2f)", r.P95(r.sim), r.P95(r.simStand), r.P95(r.simMove)));
+    Check(r.P95(r.simStand) <= 1.0f, "replay: standing cars' copies stay on them (p95 <= 1 m)",
+          Fmt("%.2f m", r.P95(r.simStand)));
+}
+
 // ---- the authority's sharing count (TRL near) --------------------------------------------------------------------
 // the latency trace's systems (game/latency.cpp): a guest's traffic states are "traffic", the rest "traffic-event"
 void TestLatencySystems() {
@@ -1658,6 +2050,8 @@ int main() {
     TestHostPause();
     TestDriverWatch();
     TestOrphanEndToEnd();
+    TestDriverLod();
+    TestCopySpeed();
     TestMatches015();
     TestRegions();
     TestGuestAuthorityRelay();
@@ -1665,6 +2059,7 @@ int main() {
     TestLatencySystems();
     TestHandOver();
     TestRecordedPath();
+    TestReplay();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -26,18 +26,24 @@
 --   R key grace                                its copy goes (grace 1: its authority stopped sending it)
 --   C key fix nx ny nz qx qy qz qw power steer brake hb ctl vx vy vz tx ty tz flags
 --                                              drive that copy (VehicleCommand, the authority car's controls)
---                                              (flags as TrafficStates, plus 32: the copy's crew may get out now, the
---                                              authority's car is driverless and both stand; CrewGetsOut)
+--                                              (flags as TrafficStates, plus 32: the copy's crew is out, the
+--                                              authority's car is driverless and both stood; CrewGetsOut, held until
+--                                              it is driven again; 16: the speed vx vy vz (along the copy's heading)
+--                                              is backwards)
 -- Output (events, one per line):
 --   TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags
 --                                              one of our traffic cars (flags: 2 siren (police: read, else a guess),
 --                                              4 no living driver read at the wheel this round (the C++ side's
 --                                              DriverWatch sends "driverless" only after 1 s of that while slow),
+--                                              64 with 4: the car is farther than DRIVER_LOD from us (the game
+--                                              streamed its driver out; still driven),
 --                                              8 controls known, 16 reversing); then
 --   TE                                         end of the round
 --   TV id x y z                                where player `id` is (his puppet / his car here), every tick
 --   TP x y z                                   where we are
---   TR key x y z vx vy vz qx qy qz qw          where our copy is, after this tick's commands
+--   TR key x y z vx vy vz qx qy qz qw px py pz
+--                                              where our copy is, after this tick's commands (p: before them, the
+--                                              game's own placement; traces only)
 --   TH key                                     that copy was handed over to player_sync
 --   TG key                                     that copy is gone (the game removed it, a new world)
 --   TL hidden near                             our own cars hidden / still driving near us (while our spawning is off)
@@ -54,6 +60,10 @@ local RANGE = 380           -- m from a guest: host cars reported (the C++ side 
 local SIREN_SPEED = 14      -- m/s: a police car this fast has its siren on (when its signals cannot be read)
 local SIREN_HOLD = 8        -- s the siren stays on after that
 local ORPHAN_KEEP = 20      -- s a traffic car without a driver read, standing (under 2 m/s), is still shared
+local DRIVER_LOD = 40       -- m: the game streams traffic drivers out of cars farther than ~50 m from our player and
+                            --    drives those cars on without them (the 2026-10-20 two-PC test: every "seat 0 empty"
+                            --    45-169 m from the player but one, read again within 44-51 m); a car without a driver
+                            --    read beyond this is a driven car (TC flag 64, the C++ side's kDriverLod)
 local MAX_OBTAINS = 3       -- copies loading at once (guest)
 local LOAD_TIMEOUT = 8      -- s an obtain or spawn may take
 local RETRY_WAIT = 5        -- s before a failed copy is tried again
@@ -214,24 +224,32 @@ end
 -- A car of the list without a driver read now: noted (the C++ side's DriverWatch decides when it is driverless: 1 s
 -- of this while slow). Logged with the reason and how far the host's player is (game-side driver culling or level of
 -- detail far from him was the suspicion after the 0.15.0 test: 118 of 179 cars flagged while moving).
+-- How far car `e` is from our player (m, ground plane; -1 unknown).
+local function distToUs(e)
+  local p = M.Player and M.Player()
+  local okq, q = pcall(e.GetPos, e)
+  local me = p and p:GetPos()
+  if not (okq and q and me) then return -1 end
+  return math.sqrt((q.x - me.x) ^ 2 + (q.y - me.y) ^ 2)
+end
+
 function T.NoteMiss(c, why, e)
   if c.missT then return end
   c.missT, c.missWhy = M.now, why
   T.misses = (T.misses or 0) + 1
-  local q = e:GetPos()
-  local p = M.Player and M.Player()
-  local me = p and p:GetPos()
-  local dist = me and math.sqrt((q.x - me.x) ^ 2 + (q.y - me.y) ^ 2) or -1
+  local dist = distToUs(e)
+  local far = dist > DRIVER_LOD
   local spd = speedOf(e)
   local okd, drv = pcall(e.GetSeatOwner, e, 0)
   local act = (okd and valid(drv)) and (active(drv) and "active" or "inactive") or "-"
   if T.misses <= MISS_LOG or T.misses % 50 == 0 then
-    log(string.format("our traffic car %d: no driver read (%s, %s), %.1f m/s, %.0f m from us; still shared, "
-      .. "driverless only after 1 s of this while slower than 2 m/s (#%d)", c.id, why, act, spd, dist, T.misses))
+    log(string.format("our traffic car %d: no driver read (%s, %s), %.1f m/s, %.0f m from us; %s (#%d)", c.id, why,
+      act, spd, dist, far and "beyond " .. DRIVER_LOD .. " m the game streams drivers out: still driven, shared"
+      or "still shared, driverless only after 1 s of this while slower than 2 m/s", T.misses))
   end
   if mc_trace then
-    mc_trace("TRO", string.format("key=%d ev=miss why=%s drv=%s spd=%.1f dist=%.0f", c.id,
-      token((why:gsub("%s+", "_")), 64), act, spd, dist))
+    mc_trace("TRO", string.format("key=%d ev=miss why=%s drv=%s spd=%.1f dist=%.0f far=%d", c.id,
+      token((why:gsub("%s+", "_")), 64), act, spd, dist, far and 1 or 0))
   end
 end
 
@@ -287,7 +305,12 @@ function T.Scan(p)
             T.NoteMiss(c, miss, e)
             -- no driver and standing: shared a while longer, then it is a parked car (one still rolling or driven
             -- by someone we cannot read stays shared)
-            if speedOf(e) <= 2 then c.slowMissT = c.slowMissT or M.now else c.slowMissT = nil end
+            -- (beyond DRIVER_LOD the game streamed the driver out: a car at a red light, not a parked one)
+            if speedOf(e) <= 2 and distToUs(e) <= DRIVER_LOD then
+              c.slowMissT = c.slowMissT or M.now
+            else
+              c.slowMissT = nil
+            end
             if c.slowMissT and M.now - c.slowMissT > ORPHAN_KEEP then
               T.list[id], seen[id] = nil, nil
               log(string.format("our traffic car %d: no driver for %.0f s and standing: a parked car now, not shared",
@@ -325,7 +348,7 @@ local function viewpoints()
   return v
 end
 
-function T.AuthSend(ev, vps)
+function T.AuthSend(ev, vps, me)
   local n = 0
   if #vps > 0 then
     for id, c in pairs(T.list) do
@@ -366,7 +389,14 @@ function T.AuthSend(ev, vps)
           -- again clears it at once); flag 4 is this round's read, the C++ side confirms it (DriverWatch)
           if c.missT then
             local miss, drv = driverMiss(e)
-            if miss then flags = flags + 4 else c.drv = drv T.NoteBack(c, "round") end
+            if miss then
+              flags = flags + 4
+              -- farther than DRIVER_LOD from us: the game streamed the driver out, the car is still driven
+              if me and (q.x - me.x) ^ 2 + (q.y - me.y) ^ 2 > DRIVER_LOD * DRIVER_LOD then flags = flags + 64 end
+            else
+              c.drv = drv
+              T.NoteBack(c, "round")
+            end
           end
           ev[#ev + 1] = string.format("TC %d %d %s %d %d %s %.3f %.3f %.3f %.3f %.3f %.3f %.5f %.5f %.5f %.5f %.3f %.3f "
             .. "%.3f %.3f %d", id, c.kind, c.model, c.c1, c.c2, c.plate, q.x, q.y, q.z, s.x, s.y, s.z, r.v.x, r.v.y, r.v.z,
@@ -660,7 +690,10 @@ function T.Drive(c, f)
     brake = n(f[13]) or 0, hb = n(f[14]) or 0, ctl = f[15] == "1", vx = n(f[16]) or 0, vy = n(f[17]) or 0,
     vz = n(f[18]) or 0 }
   local flags = n(f[22]) or 0
-  cmd.rev = math.floor(flags / 16) % 2 == 1  -- the authority's car reverses: SetSpeed gets a negative km/h
+  -- 16: the speed the C++ side gives the copy (vx vy vz: along its heading) is backwards (the authority's car
+  -- reverses): SetSpeed gets a negative km/h
+  cmd.rev = math.floor(flags / 16) % 2 == 1
+  local okp, pp = pcall(c.ent.GetPos, c.ent)  -- where the game had it (the trace's TRC pp)
   local good, err = pcall(M.RV.Drive, c.rv, c.ent, cmd, tx, ty, tz)
   if not good then
     c.errs = (c.errs or 0) + 1
@@ -674,8 +707,9 @@ function T.Drive(c, f)
     pcall(c.ent.SetSirenOn, c.ent, siren)
     pcall(c.ent.SetBeaconLightOn, c.ent, siren)
   end
-  -- 32: the authority's car is driverless (confirmed there: no driver read for 1 s while slow) and both cars stand: our
-  -- driver gets out. Never out of a moving copy; the flag gone (a driver read again, or it drives on): back in.
+  -- 32: the authority's car is driverless (confirmed there: no driver read for 1 s while slow, within 40 m of its
+  -- player) and both cars stood: our driver gets out. Never out of a moving copy; the C++ side holds the flag until the
+  -- authority's car is driven again (a driver read again, or it drives on): then back in.
   local crewOut = math.floor(flags / 32) % 2 == 1
   if crewOut and not c.crewOut then
     c.crewOut = true
@@ -701,6 +735,7 @@ function T.Drive(c, f)
     end
   end
   T.ev[#T.ev + 1] = "TR " .. c.key .. " " .. M.RV.Report(c.rv, c.ent)
+    .. ((okp and pp) and string.format(" %.3f %.3f %.3f", pp.x, pp.y, pp.z) or "")
 end
 
 -- A copy keeps its crew seated: one found out of its seat (its AI left the car: a bump, a sound, a car-jack started
@@ -826,7 +861,7 @@ function T.Update(dt, cmds)
   end
   if M.now - (T.sendT or -10) >= SEND_INTERVAL then
     T.sendT = M.now
-    local good, err = pcall(T.AuthSend, ev, vps)
+    local good, err = pcall(T.AuthSend, ev, vps, me)
     if not good then
       log("send error: " .. tostring(err))
       ev[#ev + 1] = "TE"

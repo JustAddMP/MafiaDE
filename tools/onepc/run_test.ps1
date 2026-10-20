@@ -35,4 +35,10 @@ Say "loss on the guest: $(Lua 1 "$PSScriptRoot\losstest.lua")"; Start-Sleep 10; 
 
 # a minute side by side with traffic and pedestrians around
 Start-Sleep 60; Both "12-a-minute-later"
+
+# traffic: the host's own cars by distance from him and whether a driver sits at the wheel (the game streams traffic
+# drivers out beyond ~50 m: those cars are still driven, not "driverless"), the guest's copies of them (driver seated,
+# crews out / put back so far: no in / out loops)
+Say "host traffic: $(Lua 0 "$PSScriptRoot\traffic_probe.lua")"
+Say "guest traffic: $(Lua 1 "$PSScriptRoot\traffic_probe.lua")"
 Say "done: now run_stop.ps1, then compare.ps1"

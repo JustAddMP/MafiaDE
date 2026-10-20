@@ -7,7 +7,8 @@ python -I "$Repo\tools\sync_compare.py" $host_.FullName $guest.FullName --check 
 foreach ($tag in "host", "guest") {
   $log = "$Out\logs\mafiacoop-$tag.log"
   foreach ($p in "cars error", "did not load in", "is gone \(removed by the game", "spawner is stuck", "rides bike",
-      "bike copy ready", "put at its player's spot", "sits in car") {
+      "bike copy ready", "put at its player's spot", "sits in car", "has no driver \(for 1 s",
+      "is driven again: our crew gets back in", "keeps leaving seat", "the game streams drivers out") {
     Add-Content "$Work\compare.txt" ("{0,-6} {1,-40} {2}" -f $tag, $p, @(Select-String -Path $log -Pattern $p).Count)
   }
 }

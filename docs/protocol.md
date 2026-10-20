@@ -848,9 +848,12 @@ sender of a guest -> guest message), so no game can send cars as another. The la
   two-PC test: 179 cars flagged, 118 of them still moving, 84 still at speed 4 s later, mostly 50-100 m from the host's
   player). The dll (`game/traffic_model.h` DriverWatch) sends flag 4 only when no driver was read for **1 s while the
   car was slower than 2 m/s** all that time; it clears it when a driver is read again or the car speeds up past
-  4 m/s (someone drives it). UNVERIFIED in game: why the read fails on moving cars (the log names the reason, `seat 0
-  empty`, `... (no generator human)` or `its driver is dead`, with the distance from the authority's player: driver
-  culling or level of detail far from him was the suspicion; trace `TRO`).
+  4 m/s (someone drives it). Why the read fails on moving cars (2026-10-20 two-PC test, both authorities): 61 of 62
+  misses were `seat 0 empty` 45-169 m from the authority's player and the driver came back within 44-51 m - the game
+  streams traffic drivers out beyond ~50 m and drives their cars on. Unreleased: a car farther than **40 m** from the
+  authority's player without a driver read is a driven car (TC flag 64, never on the wire; DriverWatch `Far`), it is
+  not sent as driverless and, standing, is no parked car either; a car declared driverless near the player stays so
+  when he goes away. No wire change.
 - **Every game shows every other game's cars near it** (0.16.0; before: a guest the host's, only while near him).
   A receiver (`game/traffic_model.h` ReceiverTraffic) keeps the cars of each authority by `{authority, net}` (as one
   number `authority << 16 | net`; the host's cars keep their net id, so car damage, car look and explosions, which only
@@ -874,7 +877,13 @@ sender of a guest -> guest message), so no game can send cars as another. The la
   `DespawnEntity` (when unseen), others at once. Siren and beacons follow flag 2. The copy's driver gets out only when
   the car is driverless (flag 4, confirmed as above) **and** both the authority's car and the copy stand (under 2 m/s;
   the dll adds flag 32 to the copy's drive command, `CrewGetsOut`); a moving copy never loses its crew, and when flag 4
-  goes again its crew gets back in. Twice a second the crew is checked: a member out of his seat (alive, the seat
+  goes again its crew gets back in (unreleased: once out it stays out until then, whatever the copy's speed does -
+  19 of the 40 get-outs of 2026-10-20 were back in within 2 s). The speed a copy is given (`SetSpeed`, one number along
+  its own heading; unreleased) is the authority car's speed plus the error along the copy's heading x 1.5 (that part
+  at most 4 m/s), never below 0 (`CopySpeed`; flag 16 in the drive command: backwards, when the car reverses): in
+  0.16.0 it was the length of the controller's wanted velocity vector, so a copy that had rolled past a car stopping at
+  a light was driven on, away from it, at up to 4 m/s (2026-10-20: 13 % of the standing rows, true error p95 4.2 m
+  there). Twice a second the crew is checked: a member out of his seat (alive, the seat
   free, our player not within 8 m) is put back with a non-animated `GetOnVehicle` (at most once a second, 8 times in
   a row). npc_sync kills the copy's driver when the host's driver died: traffic drivers are NPCs too and pair by
   position.

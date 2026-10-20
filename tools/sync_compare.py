@@ -62,6 +62,8 @@ TARGETS = {
     "traffic.true_p95": ("<=", 1.5, "traffic copy vs the authority's car at the same moment, p95 (m)"),
     "traffic.shown": (">=", 95.0, "authority's traffic shown while near it (% of the time)"),
     "traffic.unshared_near": ("<=", 0, "own traffic cars still driving near a receiver (max)"),
+    "traffic.crew_exits_per_min": ("<=", 1.0, "traffic copies whose crew was sent out, per minute with copies"),
+    "traffic.reseats_per_min": ("<=", 3.0, "traffic copy crew members put back into their seat, per minute with copies"),
     "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
     "npc.max": ("<=", 4.0, "NPC replica vs the authority's NPC, max (m)"),
     "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
@@ -774,6 +776,67 @@ def _truth(auth_tr):
     return {k: TruthTrack(v) for k, v in per.items()}
 
 
+TRAFFIC_DRIVER_LOD = 40.0  # m: src/game/traffic_model.h kDriverLod
+
+
+def _traffic_row(t, f, tt, ta, p, cp, me):
+    """One TRC row lined up with the authority's car: what the car did then and how the copy stood to it."""
+    a, b = tt.at(ta - 0.05), tt.at(ta + 0.05)
+    v = ((b[0] - a[0]) / 0.1, (b[1] - a[1]) / 0.1) if a and b else (0.0, 0.0)
+    spd = math.hypot(v[0], v[1])
+    tgt, cv, pp = vec(f.get("tgt")), vec(f.get("cv")), vec(f.get("pp"))
+    row = {"e": dist2(cp, p), "spd": spd, "pin": f.get("pin") == "1", "d": None, "along": None, "across": None,
+           "away": False, "pre": dist2(pp, p) if pp else None}
+    m = me.at(t) or me.nearest(t, 1.0)
+    if m:
+        row["d"] = dist2(cp, m)
+    if spd > 0.5:
+        ux, uy = v[0] / spd, v[1] / spd
+        dx, dy = cp[0] - p[0], cp[1] - p[1]
+        row["along"], row["across"] = dx * ux + dy * uy, -dx * uy + dy * ux
+    if tgt and cv:
+        tv = vec(f.get("tv")) or (0, 0, 0)
+        cs = math.hypot(cv[0], cv[1])
+        ex, ey = tgt[0] - cp[0], tgt[1] - cp[1]
+        el = math.hypot(ex, ey)
+        # a copy of a standing car that moves away from it (the 0.16.0 copy speed: |target velocity + error| along
+        # the copy's heading drove a copy that was past its standing target on, away from it)
+        row["away"] = (math.hypot(tv[0], tv[1]) < 0.5 and cs >= 2 and el > 0.3 and
+                       (ex * cv[0] + ey * cv[1]) / (cs * el) < -0.5)
+    return row
+
+
+def _traffic_breakdown(rows, recv_name):
+    """Where the true error comes from: standing / moving cars, along / across the way the car drives, the distance
+    from the receiving player, copies driven off a standing car, and the copy before our commands (TRC pp)."""
+    if not rows:
+        return
+    def p95(v):
+        return ("%.2f" % pct(v, 95)) if v else "-"
+    stand = [r for r in rows if r["spd"] < 0.5]
+    move = [r for r in rows if r["spd"] >= 0.5]
+    print("    true error by what the car did: standing p95 %s m (%d), moving p95 %s m (%d); moving along its way p95 "
+          "%s m, across p95 %s m; pinned rows %d" % (
+              p95([r["e"] for r in stand]), len(stand), p95([r["e"] for r in move]), len(move),
+              p95([abs(r["along"]) for r in move if r["along"] is not None]),
+              p95([abs(r["across"]) for r in move if r["across"] is not None]), sum(1 for r in rows if r["pin"])))
+    bands = []
+    for lo, hi in ((0, 30), (30, 90), (90, 1e9)):
+        v = [r["e"] for r in rows if r["d"] is not None and lo <= r["d"] < hi]
+        if v:
+            bands.append("%d%s m p95 %s (%d)" % (lo, ("-%d" % hi) if hi < 1e9 else "+", p95(v), len(v)))
+    if bands:
+        print("    true error by distance from %s's player: %s" % (recv_name, ", ".join(bands)))
+    away = sum(1 for r in stand if r["away"])
+    if stand:
+        print("    copies of a standing car driven off it (>= 2 m/s away from their target): %d of %d standing rows "
+              "(%.0f%%)" % (away, len(stand), 100.0 * away / len(stand)))
+    pre = [r["pre"] for r in rows if r["pre"] is not None]
+    if pre:
+        print("    copy before this tick's commands (TRC pp: the game's own placement) vs the authority's car: %s" %
+              stats_line(pre))
+
+
 def traffic(a, b):
     """Traffic sync by region (docs/sync-trace.md TRS / TRC / TRG / TRA / TRL / TRR / TRH / TRP / TRO): every game is
     the authority for its own traffic and shows the other's; per direction the true error of the copies (TRC on the
@@ -821,7 +884,8 @@ def traffic(a, b):
         truth = _truth(auth) if trs else {}
         if trc and truth:
             rel, _, _ = clock_relation(recv, auth, auth.local)
-            same, at_rt = [], []
+            same, at_rt, rows = [], [], []
+            me = Series([(t, vec(f.get("p"))) for t, f in recv.records["TX"]], gap=1.0)
             for t, f in recv.records["TRC"]:
                 if num(f.get("a"), 0) != auth.local:
                     continue
@@ -832,6 +896,7 @@ def traffic(a, b):
                     p = tt.at(t - rel)
                     if p:
                         same.append(dist2(cp, p))
+                        rows.append(_traffic_row(t, f, tt, t - rel, p, cp, me))
                 rt = num(f.get("rT"), -1)
                 if rt and rt > 0:
                     p = tt.at(rt / 1000.0)
@@ -847,6 +912,7 @@ def traffic(a, b):
                 print("    copy vs the authority's car at its target's time rT: %s" % stats_line(at_rt))
             if not same and not at_rt:
                 print("    no TRC lined up with a TRS (the copies' cars were not written as truth)")
+            _traffic_breakdown(rows, recv.name)
         elif trc:
             print("    no truth records (TRS) on %s's game: the true error cannot be computed" % auth.name)
     # what each receiver showed, its region and its own leftovers
@@ -923,6 +989,11 @@ def traffic(a, b):
             dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
             if dist:
                 print("  %s: distance from its player when a driver was not read: %s" % (tr.name, stats_line(dist)))
+                far = sum(1 for d in dist if d > TRAFFIC_DRIVER_LOD)
+                print("  %s: %d of %d beyond %.0f m (the game streams traffic drivers out there and drives the car on: "
+                      "a driven car, not driverless%s)" % (tr.name, far, len(dist), TRAFFIC_DRIVER_LOD,
+                                                         "" if any("far" in f for f in misses) else
+                                                         "; this trace's build still counted them as missing"))
             trh = tr.records["TRH"]
             last = trh[-1][1] if trh else {}
             print("  %s: driverless (confirmed, 1 s slow) %d, driven again %d" % (
@@ -931,6 +1002,20 @@ def traffic(a, b):
         if ev.get("out") or ev.get("in") or ev.get("reseat"):
             print("  %s (receiver): crews got out %d, back in %d, crew members put back in their seats %d" % (
                 tr.name, ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
+        # churn per minute that this game had copies of the others' cars (TRG every 0.5 s)
+        trg = [f for _, f in tr.records["TRG"]]
+        mins = sum(0.5 for f in trg if num(f.get("copies"), 0) > 0) / 60.0
+        if mins >= 0.5:
+            outs = [(t, (f.get("a"), f.get("net"))) for t, f in tr.records["TRO"] if f.get("ev") == "out"]
+            ins = defaultdict(list)
+            for t, f in tr.records["TRO"]:
+                if f.get("ev") == "in":
+                    ins[(f.get("a"), f.get("net"))].append(t)
+            flaps = sum(1 for t, k in outs if any(0 < ti - t < 2 for ti in ins[k]))
+            print("  %s (receiver): %.1f min with copies: %.1f crews out / min (%d back in within 2 s), %.1f put back "
+                  "/ min" % (tr.name, mins, len(outs) / mins, flaps, ev.get("reseat", 0) / mins))
+            record("traffic.crew_exits_per_min", len(outs) / mins, "on %s's game" % tr.name)
+            record("traffic.reseats_per_min", ev.get("reseat", 0) / mins, "on %s's game" % tr.name)
         notes = [s for _, s in tr.logs if "traffic: " in s and ("failed" in s or "knocked" in s)]
         for s in notes[:6]:
             print("  note (%s): %s" % (tr.name, s.split("traffic: ", 1)[-1][:160]))
