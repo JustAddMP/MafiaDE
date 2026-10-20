@@ -69,6 +69,8 @@ TARGETS = {
     "npc.bw": ("<=", 8.0, "NPC states + infos to one guest, host upload, median (KB/s)"),
     "ped.coverage": (">=", 80.0, "authority pedestrians within 40 m with a replica (%)"),
     "ped.p95": ("<=", 1.5, "pedestrian replica vs the authority's, p95 (m)"),
+    "world.guest_own_cars": ("<=", 0, "guest's own moving traffic cars within 150 m still shown, max 10 s after a world load"),
+    "world.guest_own_peds": ("<=", 0, "guest's own ambient humans within 80 m still shown, max 10 s after a world load"),
     "world.time_err": ("<=", 0.5, "time of day difference (game minutes, max after the first sync)"),
     "join.complete_s": ("<=", 10.0, "a guest's world complete after a join / reconnect (s)"),
     "lat.player.p95": ("<=", 40.0, "PlayerState send -> applied, p95 (ms)"),
@@ -1326,6 +1328,44 @@ def world(host, guest):
               pct(rates, 50))
 
 
+def guest_world(guest):
+    """The guest's own world off (docs/sync-trace.md GW, docs/host-authority.md WP-A): his own moving traffic cars and
+    ambient humans still shown near him, per world, from 10 s after its load; what was hidden; the switches; the
+    pedestrian budget (read, set, put back) and the fallback."""
+    gw = guest.records["GW"] if guest else []
+    if not gw:
+        return
+    section("Guest world: %s's own traffic, police and pedestrians off" % guest.name)
+    worlds = {}
+    for t, f in gw:
+        worlds.setdefault(f.get("w", "?"), []).append((t, f))
+    late_cars, late_peds = [], []
+    for w, rows in worlds.items():
+        late = [f for _, f in rows if num(f.get("inw"), -1) >= 10.0 and f.get("on") == "1"]
+        cars = [num(f.get("cars"), 0) for f in late]
+        peds = [num(f.get("peds"), 0) for f in late]
+        last = rows[-1][1]
+        first = rows[0][1]
+        print("  world %s: %d records, %s s in the world at the last; own world %s; own cars near (after 10 s) max %s, "
+              "own humans near max %s; hidden max %d cars / %d humans, %s in all; peds by %s, budget %s (state %s), "
+              "blocked spots %s, re-applied %s" % (
+                  w, len(rows), last.get("inw", "?"), "off" if first.get("on") == "1" else "not switched",
+                  ("%d" % max(cars)) if cars else "-", ("%d" % max(peds)) if peds else "-",
+                  max(num(f.get("hidC"), 0) for _, f in rows), max(num(f.get("hidP"), 0) for _, f in rows),
+                  last.get("hid", "?"), last.get("mode", "?"), last.get("bud", "?"),
+                  {"0": "untouched", "1": "set 0", "2": "put back", "3": "FAILED", "4": "old value unknown"}.get(
+                      last.get("bs"), last.get("bs", "?")), last.get("blocks", "?"), last.get("ra", "?")))
+        late_cars += cars
+        late_peds += peds
+    if late_cars:
+        record("world.guest_own_cars", max(late_cars), guest.name)
+    if late_peds:
+        record("world.guest_own_peds", max(late_peds), guest.name)
+    restores = [f for _, f in gw if f.get("rs", "0") not in ("0", None)]
+    if restores:
+        print("  everything given back at the end: %s time(s)" % restores[-1].get("rs"))
+
+
 def joins(guest, host):
     """How long a guest waited for his world after a join or a reconnect (JN, docs/sync-trace.md)."""
     jn = guest.records["JN"] if guest else []
@@ -1589,6 +1629,7 @@ def main():
     host = a if a.role == "host" else b if b.role == "host" else None
     world(host, guest)
     joins(guest, host)
+    guest_world(guest)
     traffic(a, b)
     for x, y in ((a, b), (b, a)):
         peds(x, y)

@@ -885,6 +885,11 @@ fail_load = freeride       ; freeride | direct: a failed mission's load (direct 
 net_timeout_s = 4          ; seconds without a packet before a player is dropped (UDP; core v0.8.0; 2..60)
 net_steam_timeout_s = 6    ; the same over Steam P2P
 window = left              ; left|right: keep the game window on that half of its monitor (test instances side by side)
+guest_world = 1            ; 0 = a guest's own traffic, police and pedestrians stay on (docs/host-authority.md WP-A)
+guest_world_peds = budget  ; budget | block | off: how a guest's own pedestrians are stopped (SetMaxHumanElements(0);
+                           ; BlockSpawnersInSphere around him every 20 m; not at all) - block when the budget stops ours
+guest_ped_budget = -1      ; the pedestrian budget a guest puts back when his game's could not be read (the host logs
+                           ; his: "guest world: we host: ... the pedestrian budget here is N"); -1 = the next world load
 ```
 
 ## Logs and crashes

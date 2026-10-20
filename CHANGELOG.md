@@ -5,6 +5,16 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
 ## Unreleased (toward 0.17.0), not yet verified in game
 
+- Host authority, the guest's own world off (docs/host-authority.md work package A; **NOT verified in game**, built
+  and unit-tested only): on a guest's game (never the host's) his own ambient traffic and police spawning are off and
+  his pedestrian budget is 0 for the whole session, switched on the first tick of every world (the loading screen) and
+  again every 5 s; the cars and humans his game had already made are hidden at once behind the loading screen and in
+  the first 3 s, later only while out of view; nothing of ours is ever hidden (puppets, the puppet factory, traffic
+  copies and crews, ped and npc copies and their spawners, player cars - the 0.16 traffic hide took ped_sync's copy
+  spawner along). Everything comes back when the session ends: spawning on, the budget to the value read before
+  (from the traffic manager, found statically), the hidden cars and humans shown. Fallback when the budget call fails
+  (or `guest_world_peds = block`): the spawners around the guest blocked every 20 m. Trace `GW`, sync_compare
+  `world.guest_own_cars` / `world.guest_own_peds` (target 0), tools/onepc `suppress_probe.lua` / `world_extent.lua`.
 - Update check (core v0.13.0): once per game start the mod asks https://justaddmp.com/api/version/mafia-de for the
   newest MafiaCoop release (the newest GitHub release of this repo, pre-releases included). When it is newer than
   this build, a banner at the main menu says so for 20 s ("UPDATE AVAILABLE: MafiaCoop v0.17.0 is out (you have

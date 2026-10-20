@@ -1124,6 +1124,7 @@ run `python re-tools/scan.py <exe> --file <file of "name<TAB>pattern" lines>`.
 | hks_obj_isnumber | 0x4917C60 | `48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 20 48 8B 59 10 4C 8B` |
 | hks_obj_tonumber | 0x4917EC0 | `48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 30 48 8B 59 10 4C 8B DA 8B` |
 | Lua_Game_GetActivePlayer | 0x267D0D0 | `40 53 48 83 EC 20 45 33 C0 33 D2 48 8B D9 E8 ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B C8 48 8B 10 FF 92 90` |
+| TrafficManager budget setter (SetMaxHumanElements' native, 2026-10-20) | 0x2DA3C60 | `48 83 EC 28 3B 91 00 01 00 00 74 ?? 89 91 00 01 00 00 48 8B 49 50 48 85 C9 74 ?? 48 8B 01 FF 50 18` (unique); its thunk 0x2677360 gets the manager from 0x2D974B0 = `mov rax, [rip + 0x3635DC1]; ret` (global at exe + 0x63CD278; the thunk tail `F3 0F 2C D8 E8 ?? ?? ?? ?? 48 8B C8 8B D3 E8 ?? ?? ?? ?? 33 C0 48 83 C4 20 5B C3` has 5 matches, the other SetMax* thunks); budget = `[manager + 0x100]` (src/game/guest_world_sync.cpp) |
 | Lua_GetSelfAdaptor | 0x3811340 | `48 89 5C 24 08 57 48 83 EC 20 48 8B 41 48 48 8B D9 48 2B 41` |
 | Lua_RegisterClass | 0x3812B70 | `48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 81 EC 90 00 00 00 41 8B F9` |
 | Lua_EnvEff_SetWeatherSet | 0x2D4DBE0 | `48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 BA 03 00 00 00 0F 29 74 24` |
