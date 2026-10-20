@@ -257,6 +257,7 @@ void CarDriver::Reset() {
     fix_.Reset();
     sinceSpeed_ = 1e9f;
     skid_ = wasSkid_ = false;
+    blockT_ = -1;
 }
 
 CarCommand CarDriver::Update(const motion::VehicleInput& in) {
@@ -269,6 +270,7 @@ CarCommand CarDriver::Update(const motion::VehicleInput& in) {
     if (o.vc.fix == Fix::Pin || o.vc.fix == Fix::Snap) {
         fix_.Reset();  // its physics is not trusted now: the preset starts fresh once it is
         sinceSpeed_ = 0;  // the glue gives the speed with every move
+        blockT_ = -1;
         return o;
     }
     // Its own physics carries it: the car preset decides about the position (nothing inside 0.5 m, a blend hidden in
@@ -289,6 +291,27 @@ CarCommand CarDriver::Update(const motion::VehicleInput& in) {
     o.skid = skid_;
     o.skidStart = skid_ && !wasSkid_;
     wasSkid_ = skid_;
+    // blocked: his car crawls or stands and the copy does not close in (a wall it is pressed against, CarFixTuning)
+    const float gerr = Len2(in.target.x - in.copy.x, in.target.y - in.copy.y);
+    if (tsp < f_.blockSpeed && gerr > f_.blockDist && o.corr.kind != net::correction::Result::Kind::Snap) {
+        if (blockT_ < 0 || gerr < blockRef_ - f_.blockClose) {
+            blockT_ = 0;
+            blockRef_ = gerr;
+        } else {
+            blockT_ += dt;
+        }
+        if (blockT_ >= f_.blockTime) {
+            blockT_ = -1;
+            ++blocks_;
+            o.blocked = true;
+            o.corr.kind = net::correction::Result::Kind::Snap;
+            o.corr.why = net::correction::Result::Why::Stuck;
+            o.corr.delta = {in.target.x - in.copy.x, in.target.y - in.copy.y, in.target.z - in.copy.z};
+            fix_.Reset();
+        }
+    } else {
+        blockT_ = -1;
+    }
     if (o.corr.kind == net::correction::Result::Kind::Snap) {
         o.vc.fix = Fix::Snap;
         o.vc.nudge = {};

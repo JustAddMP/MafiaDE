@@ -11,6 +11,8 @@
 //   - his car: CarDriver against a simulated copy whose own physics reaches only 85 % of his speed (or 115 %) 300 ms
 //     late, accelerates 6 m/s^2 and brakes 9 m/s^2, steering with his yaw rate 300 ms late; SetPos / SetRot move it,
 //     SetSpeed gives it a speed along its heading. p95 copy vs car, pinned share, copy / driver speed (median).
+//   - the crash of the 2026-10-20 14:36 one-PC run (tests/data/car_crash_1020.h): his car's real states after it hit
+//     a wall, the copy pressed against the same wall beside it and sliding along it when driven into it.
 // Plus the PlayerTrack basics (two cars are never blended, the lead) and the rest blend. Prints PASS/FAIL per check;
 // exits non-zero on any failure. Built by build.cmd (out\player_motion_test.exe), run by tools\make_release.cmd.
 #include <algorithm>
@@ -21,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "data/car_crash_1020.h"
 #include "data/car_path.h"
 #include "data/foot_2pc.h"
 #include "data/foot_mixed.h"
@@ -665,7 +668,7 @@ float QuatYaw(const float q[4]) { return 2 * std::atan2(-q[2], q[3]) + kPi / 2; 
 
 struct CarRun {
     std::vector<float> err, ratio;
-    int samples = 0, pinned = 0, pins = 0, speedFixes = 0;
+    int samples = 0, pinned = 0, pins = 0, speedFixes = 0, blocks = 0;
 };
 
 void RunCar(const Path& path, float power, float lag, uint32_t seed, CarRun& r) {
@@ -748,6 +751,7 @@ void RunCar(const Path& path, float power, float lag, uint32_t seed, CarRun& r) 
         now += frame;
     }
     r.speedFixes += static_cast<int>(drv.SpeedFixes());
+    r.blocks += static_cast<int>(drv.Blocks());
 }
 
 void TestCar() {
@@ -770,8 +774,8 @@ void TestCar() {
               Fmt("%.1f %% (%d pins)", 100.0 * r.pinned / std::max(1, r.samples), r.pins));
         const double med = Pct(r.ratio, 50);
         Check(med >= 0.9 && med <= 1.1, (n + "car.speed_ratio 0.9..1.1").c_str(), Fmt("%.2f", med));
-        std::printf("      (max %.2f m, p50 %.2f m, speed fixes %d)\n", Pct(r.err, 100), Pct(r.err, 50),
-                    r.speedFixes);
+        std::printf("      (max %.2f m, p50 %.2f m, speed fixes %d, block snaps %d)\n", Pct(r.err, 100),
+                    Pct(r.err, 50), r.speedFixes, r.blocks);
     }
     // the preset: a copy inside 0.5 m and turned less than 3 degrees is left alone (no SetPos, no SetRot)
     CarDriver d;
@@ -796,6 +800,129 @@ void TestCar() {
     Check(d.Update(in).vc.fix == VehicleCommand::Fix::Snap, "6 m off: snapped");
 }
 
+// ---- the crash of the 2026-10-20 14:36 one-PC run -------------------------------------------------------------------
+// His car's real states (60 Hz, his clock; 5 ms to the host as on one PC) from 1.4 s after it hit a wall at 6.5 m/s: it
+// slides along the wall (y = 0.6 m here) at ~1 m/s, turns and stops 1.5 s later, then rocks 0.1-0.6 m/s against it.
+// The copy starts where the host's was then (0.5 m off, 2.5 m/s toward the wall) and is a car whose physics keeps
+// the speed it is given (rolling down at 1.5 m/s^2 otherwise) and whose front stops at the wall 0.1 m before his
+// (y 0.49 m: the copy's spot in the run); driven into it, it slides along it away from his car at 0.45 x the speed
+// it was given, as the run's copy did (given 0.7-0.9 m/s every tick, it moved 0.4 m/s along the wall away from him).
+// car.p95 in the run: 1.58 m (1.0-1.8 m off for 2.4 s until the lag pin, 17 % of the 20 s the guest drove).
+struct CrashRun {
+    std::vector<float> err;
+    float overOne = 0;  // s more than 1 m off
+    uint32_t blocks = 0;
+    int pins = 0;
+};
+
+CrashRun RunCrash(const CarFixTuning& f) {
+    constexpr size_t n = sizeof(kCrashCar) / sizeof(kCrashCar[0]);
+    PlayerTrack track;
+    track.SetOneWay(0.005);
+    CarDriver drv(mc::net::motion::VehicleTuning{}, f);
+    const float wallY = 0.49f;
+    float x = kCrashCopy[0] / 100.0f, y = kCrashCopy[1] / 100.0f;
+    const float vx0 = kCrashCopy[2] / 100.0f, vy0 = kCrashCopy[3] / 100.0f;
+    float speed = std::sqrt(vx0 * vx0 + vy0 * vy0), yaw = std::atan2(vy0, vx0);
+    CrashRun r;
+    size_t next = 0;
+    const double end = kCrashCar[n - 1][0] / 1000.0;
+    bool started = false;
+    for (double now = 0.0; now < end - 0.1; now += kDt) {
+        while (next < n && kCrashCar[next][0] / 1000.0 + 0.005 <= now) {
+            const int* row = kCrashCar[next++];
+            const float q[4] = {0, 0, row[5] / 10000.0f, row[6] / 10000.0f};
+            const double st = row[0] / 1000.0;
+            track.Observe(st, st + 0.005);
+            track.PushCar(st, 7, {row[1] / 100.0f, row[2] / 100.0f, 0}, {row[3] / 100.0f, row[4] / 100.0f, 0}, q);
+        }
+        track.Update(now);
+        const mc::net::replica::Out o = track.Car(now);
+        if (!o.valid) continue;
+        VehicleInput in;
+        in.target = o.pos;
+        in.targetVel = o.vel;
+        for (int k = 0; k < 4; ++k) in.targetRot[k] = o.rot[k];
+        in.haveCopy = true;
+        in.copy = {x, y, 0};
+        in.copyVel = {std::cos(yaw) * speed, std::sin(yaw) * speed, 0};
+        YawQuat(yaw, in.copyRot);
+        in.power = 0;
+        in.dt = started ? static_cast<float>(kDt) : 0.0f;
+        started = true;
+        const CarCommand c = drv.Update(in);
+        const float want = std::sqrt(c.vc.vel.x * c.vc.vel.x + c.vc.vel.y * c.vc.vel.y);
+        if (c.vc.fix == VehicleCommand::Fix::Pin || c.vc.fix == VehicleCommand::Fix::Snap) {
+            x = o.pos.x;
+            y = std::min(o.pos.y, wallY);
+            yaw = QuatYaw(c.vc.rot);
+            speed = want;
+        } else if (c.vc.fix == VehicleCommand::Fix::Blend) {
+            x += c.vc.nudge.x;
+            y += c.vc.nudge.y;
+            yaw = QuatYaw(c.vc.rot);
+            speed = want;
+        } else if (c.giveSpeed) {
+            speed = want;
+        }
+        if (c.vc.justPinned) ++r.pins;
+        // its physics: along its heading; the wall stops its front and turns a push into it into a slide along it
+        float nx = x + std::cos(yaw) * speed * static_cast<float>(kDt);
+        const float ny = y + std::sin(yaw) * speed * static_cast<float>(kDt);
+        if (ny > wallY) {
+            nx = x - 0.45f * speed * static_cast<float>(kDt);  // away from his car (the run's copy slid -x)
+            y = wallY;
+        } else {
+            y = ny;
+        }
+        x = nx;
+        speed = std::max(0.0f, speed - 1.5f * static_cast<float>(kDt));
+        // the error as sync_compare measures it: the copy against his car at the same moment
+        size_t i = 1;
+        while (i < n - 1 && kCrashCar[i][0] / 1000.0 < now) ++i;
+        const int* a = kCrashCar[i - 1];
+        const int* b = kCrashCar[i];
+        const double k = std::clamp((now - a[0] / 1000.0) / std::max(1e-3, (b[0] - a[0]) / 1000.0), 0.0, 1.0);
+        const float tx = static_cast<float>((a[1] + (b[1] - a[1]) * k) / 100.0);
+        const float ty = static_cast<float>((a[2] + (b[2] - a[2]) * k) / 100.0);
+        const float e = std::sqrt((x - tx) * (x - tx) + (y - ty) * (y - ty));
+        r.err.push_back(e);
+        if (e > 1.0f) r.overOne += static_cast<float>(kDt);
+    }
+    r.blocks = drv.Blocks();
+    return r;
+}
+
+void TestCarCrash() {
+    CarFixTuning noBlock;
+    noBlock.blockTime = 1e9f;  // the copy driven as before this rule (for the comparison only)
+    const CrashRun before = RunCrash(noBlock);
+    const CrashRun after = RunCrash(CarFixTuning{});
+    std::printf("      crash, the rule left out: p95 %.2f max %.2f m, %.1f s more than 1 m off, lag pins %d\n",
+                Pct(before.err, 95), Pct(before.err, 100), before.overOne, before.pins);
+    Check(before.overOne >= 1.0f, "crash replay: without the block rule the copy stays off as in the run (>1 m 1 s+)",
+          Fmt("%.1f s more than 1 m off (the run: 2.4 s)", before.overOne));
+    Check(after.blocks >= 1 && Pct(after.err, 100) <= 1.0f && after.overOne == 0.0f,
+          "crash replay: the copy not closing in on his crawling car is put at it (never 1 m off)",
+          Fmt("p95 %.2f max %.2f m, blocks %.0f", Pct(after.err, 95), Pct(after.err, 100), after.blocks) +
+              Fmt(" (rule left out: p95 %.2f max %.2f)", Pct(before.err, 95), Pct(before.err, 100)));
+    // a copy that closes in on a car stopping at a light (the blend) is never snapped by it
+    CarDriver d;
+    VehicleInput in;
+    in.haveCopy = true;
+    in.target = {0, 0, 0};
+    in.copy = {0, -0.9f, 0};
+    in.dt = static_cast<float>(kDt);
+    uint32_t blocks = 0;
+    for (int i = 0; i < 180; ++i) {
+        const CarCommand c = d.Update(in);
+        if (c.vc.fix == VehicleCommand::Fix::Blend) in.copy.y += c.vc.nudge.y;
+        blocks += c.blocked ? 1 : 0;
+    }
+    Check(blocks == 0, "block rule: a copy 0.9 m behind a standing car that closes in (the blend) is not snapped",
+          Fmt("%.2f m off after 3 s", -in.copy.y));
+}
+
 }  // namespace
 
 
@@ -805,6 +932,7 @@ int main() {
     TestFoot();
     TestFoot2pc();
     TestCar();
+    TestCarCrash();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

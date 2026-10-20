@@ -3,15 +3,16 @@
 // WP-C "host-peds"): the wire format of the pedestrian messages, the host's sender (which of its ambient humans each
 // guest gets: net ids, spawn / gone / death / packed states per guest on top of core's InterestManager) and a guest's
 // receiver (the host's pedestrians on its clock through core's replica::Stream, each shown by a spawned copy from a
-// pool, a LocomotionController per copy). Pure data in, decisions out: no Lua, no session, no OS calls, so
-// tests/ped_test.cpp runs it without the game. game/ped_sync.cpp feeds it from the Lua glue (ped_sync.lua) and the
-// session. Single-threaded (the caller locks).
+// pool, the puppets' FootDriver per copy: game/player_motion.h). Pure data in, decisions out: no Lua, no session, no
+// OS calls, so tests/ped_test.cpp runs it without the game. game/ped_sync.cpp feeds it from the Lua glue
+// (ped_sync.lua) and the session. Single-threaded (the caller locks).
 //
 // Host authority (docs/host-authority.md): the host's game owns every ambient pedestrian. Only the host runs the
 // sender; a guest never sends pedestrians (his own pedestrian spawning is switched off by guest_world, WP-A) and shows
 // the host's with copies only - nothing is adopted, nothing of his own is hidden by this module. 0.16.0's region
 // authority (every game the authority for the pedestrians near it, guest -> guest relay, adoption of local humans,
 // hiding the surplus) is gone.
+#include "game/player_motion.h"
 #include "net/interest.h"
 #include "net/remote_motion.h"
 #include "net/replica.h"
@@ -90,9 +91,14 @@ uint8_t GaitOf(float speed, uint8_t prev);
 bool InView(const Vec3& cam, const Vec3& dir, const Vec3& p, float halfAngleDeg = 60, float nearDist = 4,
             float farDist = 150);
 
-// The correction rules of core's Corrector preset for NPCs (net/correction.h Tuning::ForNpc: 0.5 m dead zone, a
-// blend capped at 35 % of the target's speed or 0.15 m/s standing, snap beyond 5 m / 3 m up, stuck 0.8 m for 3 s)
-// as a LocomotionController tuning (its nudge implements the same blend rule).
+// A copy's walk: the puppets' LocomotionTuning (game/player_motion.h FootTuning: the game's AI speeds as first
+// guesses, stop distance = start distance) with the snap and stuck rules of core's Corrector preset for NPCs
+// (net/correction.h Tuning::ForNpc: snap beyond 5 m / 3 m up, stuck 0.8 m for 3 s). Its position fix is the
+// FootDriver's (velocity matching while the pedestrian moves, the rest blend and the hold-back of a walk that runs
+// on while it stands): the 2026-10-20 14:36 / 15:00 one-PC runs drove the copies with the NPC blend (0.15 m/s
+// standing, 35 % of the target's speed moving) and the game's AI run did not reach the speed - copies of runners
+// went 2.8 m/s against their pedestrians' 4.7 (medians), 1.1 m behind, 37-43 % of the run / sprint samples more
+// than 1.5 m off, and standing copies walked off 2-4 m from their spot for up to 3 s (ped.p95 2.05 / 1.72 m).
 net::motion::LocomotionTuning LocomotionForPed();
 
 // The copies' looks (docs/host-authority.md D5): a rotation of six civilian spawn profiles, all in spawnprofiles.sds
@@ -415,7 +421,7 @@ private:
         bool loading = false;
         double spawnAskedAt = -1e9, retryAt = -1e9;
         bool diedHere = false, diedHereTold = false;
-        net::motion::LocomotionController loco{LocomotionForPed()};
+        pmotion::FootDriver foot{LocomotionForPed()};
         CopyReport rep;
         double repAt = -1e9;
         bool haveRep = false;

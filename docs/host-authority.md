@@ -268,3 +268,35 @@ and byte-identical afterwards, "profile and save files changed by the run: 0"):
 Still to confirm on two PCs (section 6), plus: a reload / chapter with held NPCs (D), the car pull (E), whether
 `SetMaxHumanElements(0)` also starves mission spawners in a chapter (A: the probe saw npc copies 0 in Free Ride, no
 mission there), the ped.p95 of reused copies, the traffic put-backs after a teleport.
+
+**The failed one-PC checks, looked into (branch `feat/onepc-fixes`, built and unit-tested, not run in game):**
+- `ped.p95` 2.05 / 1.72: not the reuse. The copies (reused or spawned alike) were off their own target: run / sprint
+  copies went 2.84 m/s against their pedestrians' 4.72 (medians; 37-43 % of those samples over 1.5 m), walking ones
+  sometimes kept 1.5-1.9 m behind, standing ones walked off 2-4 m (the stop was a walk to the pedestrian's spot) or
+  fell off a raised spot; the 59.9 m (and run 2's 123.6 m) were the host's game moving a pedestrian 65 m, the truth
+  interpolated across it. Now the copies have the puppets' FootDriver and the stop walk of the puppets;
+  sync_compare no longer interpolates a pedestrian's truth across a jump (2.05 -> 2.04, 1.72 -> 1.71: the rest needs a
+  game run). Replay of every one-PC pedestrian (tests/ped_test.cpp, copies whose AI run is too slow): p95 0.11 / 0.13
+  m, max 0.79 / 0.53 (the old driver in the same model 0.44 / 0.47, max 3.22 / 1.39 - the model does not reproduce
+  the in-game 2.05: watch it).
+- `foot.respawn_s` 5.03 / 5.10: 4.0 s waiting for a known profile on the stuck spawner, 1.0 s before the fresh one
+  was obtained, 0.1 s to make it. Now 1.5 s (a working spawner had it in 0.00-0.1 s) and at once: ~1.6 s
+  (tests/respawn_test.cpp).
+- `traffic.reseats_per_min` 6.4: all 33 put-backs were of copies 81-272 m from the guest (31 of one standing copy,
+  every second for 34 s): his game streams the copies' crews out beyond ~50 m as it does its own traffic's drivers.
+  Beyond 40 m no put-back (kDriverFar in the Drive command; tests/traffic_test.cpp TestFarCrew), and a member who is
+  out again right after each put-back is no longer counted from 0.
+- `car.p95` 1.58: a real lag, not a spike. After the crash his car slid along the wall and stopped; the copy stood
+  against the same wall beside it, was given 0.7-0.9 m/s into it and slid away, 1.0-1.8 m off for 2.4 s until the
+  lag pin; those 3.5 s were 17 % of the 20 s he drove. CarDriver puts a copy that does not close in on a car slower
+  than 1.5 m/s at it after 0.5 s; the replay of the crash (tests/player_motion_test.cpp): p95 1.61 -> 0.73 m, max
+  1.73 -> 0.93.
+- Foot after the scripted teleports: sync_compare leaves out 3 s after a player's own teleport (a jump of over 50 m,
+  a leash pull: run 2 5 teleports, 9.6 s on foot) and the time he was over 300 m from the receiving player (no world
+  there: run 1 136 s - the leash did not work in it - run 2 38 s); `foot.shown` 95.4 % was the guest's loading screen
+  (10 s of the host's states before his world loaded), not a teleport. The puppet took a teleport with one snap (a
+  few more in the next 0.1 s while the player himself slid 4 m after being put down) and no respawn; the one
+  respawn came from the second pull: the guest was put down where his game had no ground yet, fell through the
+  street and was downed (his puppet died with him and came back 10 s later, a logged reason now). Fixed: for 3 s
+  after a pull he is put back on the spot when he sinks 1.5 m under it (leash.h Settle, tests/leash_test.cpp). With
+  these rules run 2's dz p95 1.52 -> 0.01, snaps 0.91 -> 0/min, shown 95.4 -> 98.2 %, respawns 1 -> 0.

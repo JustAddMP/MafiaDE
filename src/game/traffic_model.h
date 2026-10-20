@@ -60,6 +60,8 @@ enum StateFlags : uint8_t {
 constexpr uint8_t kCrewOut = 32;
 // Never on the wire: the host's Lua (TC) sets it for a car without a driver read that is farther than
 // kDriverLod from his player - the game streams traffic drivers out there while their cars drive on (DriverWatch).
+// A guest's receiver sets it in the Drive command to its Lua for a copy farther than kDriverLod from our player: the
+// game streams the copy's crew out there just the same, so a crew member out of his seat is not put back.
 constexpr uint8_t kDriverFar = 64;
 
 // A traffic car is known by the host's net id everywhere (the receiver's key, the Lua's copy key, car damage, car look,

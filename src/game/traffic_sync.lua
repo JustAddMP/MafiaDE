@@ -84,7 +84,8 @@ local FALLBACK_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 local CREW_BAD_AFTER = 2    -- failures of a crew profile (that never worked) before it is not used again
 local SEAT_CHECK = 0.5      -- s between checks that a copy's crew sits in its seats (guest)
 local RESEAT_WAIT = 1.0     -- s between two put-backs of one crew member
-local RESEAT_MAX = 8        -- put-backs of one crew member in a row (seated again resets it) before we give up
+local RESEAT_MAX = 8        -- put-backs of one crew member in a row before we give up ...
+local RESEAT_CALM = 20      -- s: ... the count starts anew once he has stayed seated this long after a put-back
 local RESEAT_NEAR = 8       -- m: no put-back while our player is this close to the copy (he may be taking the car)
 local MISS_LOG = 40         -- "no driver read" lines logged (then every 50th)
 
@@ -647,7 +648,12 @@ function T.Drive(c, f)
     log(string.format("%s is driven again: our crew gets back in", label(c)))
     if mc_trace then mc_trace("TRO", string.format("net=%d ev=in", c.net)) end
   end
-  if not c.crewOut and M.now - (c.seatT or -10) >= SEAT_CHECK then
+  -- 64: the copy is farther than the C++ side's kDriverLod from our player: our game streams its crew out there as it
+  -- does its own traffic's drivers (a crew member out of his seat is its level of detail, nobody sees it): not put
+  -- back (2026-10-20 15:00 one-PC run: all 33 put-backs were of copies 81-272 m away, one of them every second)
+  local far = math.floor(flags / 64) % 2 == 1
+  if far then c.reseat = nil end  -- near again: a crew member out then starts a fresh count
+  if not c.crewOut and not far and M.now - (c.seatT or -10) >= SEAT_CHECK then
     c.seatT = M.now
     local good, err = pcall(T.KeepSeated, c)
     if not good then
@@ -661,9 +667,10 @@ end
 
 -- A copy keeps its crew seated: one found out of its seat (its AI left the car: a bump, a sound, a car-jack started
 -- and given up) is put back with a non-animated GetOnVehicle (docs/game-api.md 7, "Seating"), at most once a second
--- and RESEAT_MAX times in a row. Dead ones stay out (npc_sync killed him: the host's driver died); nobody is put back
--- while our player is near the copy (he may be getting in: player_sync then takes the car over) or while another
--- human holds the seat.
+-- and RESEAT_MAX times in a row (until he stays seated for RESEAT_CALM s). Dead ones stay out (npc_sync killed him: the
+-- host's driver died); nobody is put back while our player is near the copy (he may be getting in: player_sync then
+-- takes the car over), while another human holds the seat, or while the copy is farther than the driver LOD (T.Drive,
+-- flag 64: the game's own streaming, not checked at all).
 function T.KeepSeated(c)
   local ent = c.ent
   if not (c.crew and c.seats and valid(ent)) then return end
@@ -680,7 +687,10 @@ function T.KeepSeated(c)
     if valid(m) and seat and not m:IsDeath() then
       local okh, holder = pcall(ent.GetSeatOwner, ent, seat)
       if okh and same(holder, m) then
-        r.n = 0
+        -- seated: a fresh count only once he has stayed in for RESEAT_CALM s (one who is out again a second after
+        -- each put-back is the same one leaving, not a new one: the count started anew at every seated check and
+        -- he was put back for ever, 31 times in 34 s in the 15:00 one-PC run)
+        if M.now - r.t >= RESEAT_CALM then r.n = 0 end
       elseif okh and not valid(holder) and r.n < RESEAT_MAX and M.now - r.t >= RESEAT_WAIT then
         r.n, r.t = r.n + 1, M.now
         local okg = pcall(m.GetOnVehicle, m, ent, seat + 1, false, "WALK")

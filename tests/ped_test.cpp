@@ -4,13 +4,16 @@
 // receiver (every pedestrian of the host gets a copy; the pool: a gone pedestrian's copy hidden and given to the next
 // one, the handover when every copy is in use, a cancelled request's late copy; the six-look rotation by net id and
 // a profile that never loads dropped from it; deaths; the spawner's health), recorded-like walks through the whole
-// chain (host -> lossy, jittery link -> replica::Stream -> LocomotionController -> a simulated AI walker) asserting
+// chain (host -> lossy, jittery link -> replica::Stream -> the puppets' FootDriver -> a simulated AI walker) asserting
 // ped.p95 <= 1.5 m and ped.coverage >= 80 %, and the 2026-10-20 two-PC traces (tests/data/ped_trace.h) replayed:
 // every recorded pedestrian's real walk and its copy's recorded answer, the tram riders, and both whole sessions
 // through the host's interest to a copies-only guest walking his real way with a model of the game's copy spawner
 // (one profile load at a time, 0.8-2.5 s each, session A's hidden spawner) - before (0.16.0's rules,
-// feat/sync-peds) and after. Prints PASS/FAIL per check; exits non-zero on any failure.
+// feat/sync-peds) and after; and every pedestrian of the 2026-10-20 one-PC runs (tests/data/ped_onepc_1020.h) through
+// the chain with copies whose AI run does not reach the speed (as there). Prints PASS/FAIL per check; exits non-zero
+// on any failure.
 #include "game/ped_model.h"
+#include "game/player_motion.h"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "data/ped_onepc_1020.h"
 #include "data/ped_trace.h"
 
 using namespace mc;
@@ -188,8 +192,10 @@ void TestRules() {
               !InView(cam, dir, {200, 0, 0}) && !InView(cam, dir, {10, 30, 0}),
           "view: cone, near always, far never");
     const auto t = LocomotionForPed();
-    Check(t.nudgeStart == 0.5f && t.snapDist == 5.0f && t.stuckTime == 3.0f && t.nudgeSpeedShare == 0.35f,
-          "locomotion tuning = Corrector::ForNpc rules");
+    const auto f = mc::game::pmotion::FootTuning();
+    Check(t.snapDist == 5.0f && t.snapHeight == 3.0f && t.stuckDist == 0.8f && t.stuckTime == 3.0f &&
+              t.walkSpeed == f.walkSpeed && t.runSpeed == f.runSpeed && t.stopDist == f.stopDist,
+          "locomotion tuning = the puppets' speeds with Corrector::ForNpc's snap / stuck rules");
 }
 
 // ---- authority -----------------------------------------------------------------------------------------------------
@@ -650,10 +656,11 @@ void TestRotation() {
           "rotation: when every look fails, the last one stays",
           Fmt("%.0f left", static_cast<double>(z.rx.Stats().profilesLive)));
 }
-// ---- end to end: one pedestrian's walk through the whole chain -------------------------------------------------------
+// ---- end to end: one pedestrian's walk through the whole chain ------------------------------------------------------
 // The game's AI walk of the replica: commands act after a lag, gait speeds off by up to 20 %, a turn rate, braking.
 struct AiWalker {
     float realSpeed[4] = {0, 1.3f * 0.85f, 4.0f * 1.15f, 6.0f * 0.9f};
+    float cap[4] = {0, 1e9f, 1e9f, 1e9f};  // m/s the AI reaches at most in a gait, whatever the multiplier
     float lag = 0.18f;
     float x = 0, y = 0, hx = 1, hy = 0, speed = 0;
     Gait gait = Gait::Stand;
@@ -682,9 +689,8 @@ struct AiWalker {
             x += c.nudge.x;
             y += c.nudge.y;
         }
-        queue.push_back({clock + lag, c.gait, c.speedMult, c.reissue,
-                         c.reissue && c.gait == Gait::Stand ? target.x : c.moveTo.x,
-                         c.reissue && c.gait == Gait::Stand ? target.y : c.moveTo.y});
+        (void)target;  // a stop walks to the command's point too (ped_sync.lua P.Drive: the FootDriver's stop point)
+        queue.push_back({clock + lag, c.gait, c.speedMult, c.reissue, c.moveTo.x, c.moveTo.y});
     }
     void Step(float dt) {
         clock += dt;
@@ -702,7 +708,7 @@ struct AiWalker {
         float want = 0;
         const float dx = tx - x, dy = ty - y, d = std::sqrt(dx * dx + dy * dy);
         if (walking && d > 0.1f) {
-            want = realSpeed[static_cast<int>(gait)] * mult;
+            want = std::min(realSpeed[static_cast<int>(gait)] * mult, cap[static_cast<int>(gait)]);
             const float a = std::atan2(hx * dy - hy * dx, hx * dx + hy * dy);
             const float r = std::clamp(a, -kTurn * dt, kTurn * dt);
             const float c = std::cos(r), s = std::sin(r);
@@ -766,7 +772,7 @@ struct Packet {
     uint16_t id;
     std::vector<uint8_t> body;
 };
-// ---- the 2026-10-20 two-PC traces replayed (tests/data/ped_trace.h) ----------------------------------------------------
+// ---- the 2026-10-20 two-PC traces replayed (tests/data/ped_trace.h) -------------------------------------------------
 struct TPt {
     double t;  // s on the authority's clock since the session's T0
     float x, y;
@@ -1146,11 +1152,11 @@ void TestRider() {
 // `deafTrack`: the recorded copy of a pedestrian whose copy never answered (A net 81): the replayed copy walks exactly
 // as that one did (its own pace, deaf to multipliers and nudges), moved only by our snaps and respawns.
 ReplayOut ReplayOne(const Track& truth, double deadAt, const Track* deafTrack, const ReceiverConfig& rc,
-                    const AuthorityConfig& ac) {
+                    const AuthorityConfig& ac, const AiWalker& proto = CopyWalker()) {
     ReplayOut o;
     PedAuthority auth(ac);
     PedReceiver rx(rc);
-    AiWalker w = CopyWalker();
+    AiWalker w = proto;
     float offX = 0, offY = 0;  // deaf: our snaps' shift of the recorded copy
     const double kCopyLag = 0.15;  // the recorded copy's rows are stamped with its target's time (rT): about now - this
     auto deafAt = [&](double t, float& x, float& y) { return deafTrack && At(*deafTrack, t - kCopyLag, x, y); };
@@ -1238,7 +1244,7 @@ ReplayOut ReplayOne(const Track& truth, double deadAt, const Track* deafTrack, c
                 copyId += 256;
                 spawnAt = t + 0.1;
                 const float hx = w.hx, hy = w.hy;
-                w = CopyWalker();
+                w = proto;
                 w.x = c.target.pos.x;
                 w.y = c.target.pos.y;
                 w.hx = hx;
@@ -1257,7 +1263,7 @@ ReplayOut ReplayOne(const Track& truth, double deadAt, const Track* deafTrack, c
                 spawnKey = c.key;  // back from the pool: put at its spot
                 have = true;
                 const float hx = w.hx, hy = w.hy;
-                w = CopyWalker();
+                w = proto;
                 w.x = c.target.pos.x;
                 w.y = c.target.pos.y;
                 w.hx = hx;
@@ -1749,6 +1755,73 @@ void TestSessionPool() {
               Fmt(", %.0f looks left", b.profilesLive));
 }
 
+// ---- the 2026-10-20 one-PC runs (tests/data/ped_onepc_1020.h) -------------------------------------------------------
+// The copies' AI there (14:36 / 15:00, sync_compare on the guest's PDR against the host's PDT): copies of running
+// pedestrians went 2.84 m/s (median) against their pedestrians' 4.72 at whatever multiplier they were given - as the
+// puppets' AI did (RUN x1.8 measured 2.94 m/s, 2026-10-20 13:55 run) - walkers kept pace. The walker below: the
+// puppets' AI speeds at multiplier 1 (FootTuning) and at most ~3 m/s running, ~3.6 m/s sprinting.
+AiWalker OnePcWalker() {
+    AiWalker w = CopyWalker();
+    w.realSpeed[1] = 1.4f;
+    w.realSpeed[2] = 2.2f;
+    w.realSpeed[3] = 3.3f;
+    w.cap[1] = 2.2f;
+    w.cap[2] = 3.0f;
+    w.cap[3] = 3.6f;
+    w.lag = 0.2f;
+    return w;
+}
+
+// A recorded track as the host's game had the pedestrian: split where it jumped (faster than 12 m/s between two
+// rows: his game moved it, sync_compare ped_truth_at), and the rows of a standing one (sent again only every ~2 s
+// while unchanged) filled in, so it is there all the time it stood.
+std::vector<Track> AsTheHostHadIt(const Track& tr) {
+    std::vector<Track> out(1);
+    for (size_t i = 0; i < tr.size(); ++i) {
+        if (i > 0) {
+            const TPt& a = tr[i - 1];
+            const TPt& b = tr[i];
+            const double dt = b.t - a.t;
+            const float d = std::hypot(b.x - a.x, b.y - a.y);
+            if (dt > 0 && d / dt > 12.0f) {
+                out.emplace_back();
+            } else if (dt > 0.9 && dt <= 2.6 && d / dt < 0.3f) {
+                for (double t = a.t + 0.5; t < b.t - 0.05; t += 0.5) {
+                    const float k = static_cast<float>((t - a.t) / dt);
+                    out.back().push_back({t, a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k});
+                }
+            }
+        }
+        out.back().push_back(tr[i]);
+    }
+    return out;
+}
+
+// Every pedestrian of a one-PC run through the chain (ReplayOne: the host's sender, the link, the receiver, a copy
+// walking like the one-PC copies). The run's own ped.p95 (its copies were driven by the NPC blend, 0.16-style stop
+// walk to the pedestrian's spot): 2.05 m (run 1), 1.72 m (run 2).
+template <size_t NT>
+void TestOnePc(const char* tag, const int (&truthRows)[NT][4], float recordedP95) {
+    std::vector<float> errs;
+    int peds = 0, snaps = 0, lagSnaps = 0;
+    for (const auto& [net, tr] : Tracks(truthRows)) {
+        for (const Track& part : AsTheHostHadIt(tr)) {
+            if (part.size() < 4) continue;
+            const ReplayOut o = ReplayOne(part, 1e18, nullptr, ReceiverConfig{}, AuthorityConfig{}, OnePcWalker());
+            errs.insert(errs.end(), o.errs.begin(), o.errs.end());
+            snaps += o.snaps;
+            lagSnaps += o.lagSnaps;
+            ++peds;
+        }
+    }
+    const std::string n = std::string("one-PC run ") + tag + ": ";
+    Check(Pct(errs, 95) <= 1.5f, (n + "replayed ped.p95 <= 1.5 m (copies whose AI run is too slow)").c_str(),
+          Fmt("p50 %.2f p95 %.2f max %.2f m", Pct(errs, 50), Pct(errs, 95), Pct(errs, 100)) +
+              Fmt(" (recorded in the run %.2f m; %.0f tracks", recordedP95, peds) +
+              Fmt(", %.0f samples, snaps %.0f", static_cast<double>(errs.size()), snaps) +
+              Fmt(", lag snaps %.0f)", lagSnaps));
+}
+
 }  // namespace
 
 int main() {
@@ -1771,6 +1844,8 @@ int main() {
     TestSession("A", kPedATruth, kPedAGuest, kPedASpawnerHiddenMs / 1000.0);
     TestSession("B", kPedBTruth, kPedBGuest, -1);
     TestSessionPool();
+    TestOnePc("1 (14:36)", kPedOnePc1Truth, 2.05f);
+    TestOnePc("2 (15:00)", kPedOnePc2Truth, 1.72f);
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }

@@ -379,7 +379,8 @@ local function speedMult(r, h, m)
   r.mult = m
 end
 
--- Walk a copy as the C++ side's LocomotionController says (player_sync.lua M.Walk does the same for puppets).
+-- Walk a copy as the C++ side's FootDriver says (player_sync.lua M.Walk does the same for puppets): its nudge (fix 1)
+-- comes every tick while the pedestrian moves (velocity matching).
 function P.Drive(r, f)
   local h = r.h
   if not valid(h) or h:IsDeath() then return end
@@ -401,8 +402,12 @@ function P.Drive(r, f)
   end
   if reissue then
     if gait == 0 then
+      -- stop: a walk to where the copy comes to rest by itself on its own line of motion (the C++ side's stop point,
+      -- game/player_motion.h FootDriver, as the puppets' M.Walk); the rest blend slides it onto its spot. Not a walk
+      -- to the pedestrian's spot: the 2026-10-20 one-PC runs' copies walked off 2-4 m on such a walk (a spot it
+      -- could not reach: a step up, a pushed copy)
       speedMult(r, h, 1)
-      h:MoveVec(V(tx, ty, tz), "WALK")
+      h:MoveVec(V(mx, my, mz), "WALK")
     else
       speedMult(r, h, mult)
       h:MoveVec(V(mx, my, mz), GAITS[gait] or "WALK")

@@ -1013,6 +1013,56 @@ void TestDriverLod() {
     }
 }
 
+// A guest's copies farther than kDriverLod from him: our game streams their crews out as it does its own traffic's
+// drivers, so the Drive command says so (kDriverFar) and the glue puts nobody back there. The 2026-10-20 15:00
+// one-PC run (guest trace 145536): the host's car 60 stood at (-899.2, -284.2) the whole time; after the leash pull
+// the guest stood at (-949.3, -221.0) (81 m from it), then the leash check moved him to (-904.5, -556.5) (272 m);
+// the glue put its driver back 31 times in 34 s (traffic.reseats_per_min 6.4, all 33 put-backs of the run were of
+// copies 81-272 m away). Near copies (within 40 m) keep their put-backs.
+void TestFarCrew() {
+    const Vec3 car{-899.23f, -284.19f, 2.93f};
+    struct Leg {
+        double from, to;
+        Vec3 me;
+    };
+    const Leg legs[] = {{0, 31, {-949.34f, -220.96f, 2.93f}}, {31, 55, {-904.48f, -556.49f, 7.87f}},
+                        {55, 70, {-905.0f, -270.0f, 2.9f}}};  // the last: 15 m from it (near: put-backs stay)
+    GuestTraffic g;
+    SpawnInfo s = Spawn(60, car.x, car.y);
+    s.st.pos = car;
+    g.OnSpawn(s, 0);
+    CarState st = s.st;
+    st.flags = kControls;
+    std::vector<GuestCmd> cmds;
+    std::vector<GuestBump> bumps;
+    int farDrives = 0, farFlagged = 0, nearDrives = 0, nearFlagged = 0;
+    for (int i = 0; i < 70 * 20; ++i) {
+        const double t = i * 0.05;
+        Vec3 me;
+        for (const Leg& l : legs)
+            if (t >= l.from && t < l.to) me = l.me;
+        g.OnStates(static_cast<uint32_t>(5000 + t * 1000), {st}, t);
+        g.SetLocal(me, true);
+        CopyReport rep;
+        rep.pos = car;
+        if (i > 2) g.SetReport(60, rep, t);
+        g.Tick(t, 0.05f, cmds, bumps);
+        for (const auto& c : cmds) {
+            if (c.type != GuestCmd::Type::Drive) continue;
+            const bool far = std::hypot(me.x - car.x, me.y - car.y) > kDriverLod;
+            const bool flagged = (c.target.flags & kDriverFar) != 0;
+            (far ? farDrives : nearDrives) += 1;
+            (far ? farFlagged : nearFlagged) += flagged ? 1 : 0;
+        }
+    }
+    Check(farDrives > 0 && farFlagged == farDrives,
+          "far crew: a copy 81 / 272 m from us is driven with kDriverFar (no put-backs: 31 in 34 s -> 0)",
+          Fmt("%.0f of %.0f drive commands", farFlagged, farDrives));
+    Check(nearDrives > 0 && nearFlagged == 0, "far crew: within 40 m it is not (a crew that left is put back)",
+          Fmt("%.0f of %.0f flagged", nearFlagged, nearDrives));
+    Check((st.flags & kDriverFar) == 0, "far crew: never on the wire (the host's state flags untouched)");
+}
+
 // The speed a copy is given along its heading (CopySpeed): the 0.16.0 copies got |target velocity + 1.5 x error|
 // along their heading, so a copy past its standing target was driven on, away from it, at up to 4 m/s.
 void TestCopySpeed() {
@@ -1900,6 +1950,7 @@ int main() {
     TestDriverWatch();
     TestOrphanEndToEnd();
     TestDriverLod();
+    TestFarCrew();
     TestCopySpeed();
     TestMatches015();
     TestRoute();

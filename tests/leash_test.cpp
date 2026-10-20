@@ -2,8 +2,9 @@
 // players' positions at 1 Hz of the 2026-10-20 sessions (tests/data/leash_1020.h, tools/extract_leash.py): session A
 // (at most 98 m apart) gives no warning, session B (the guest drove from 205 m to 674 m from the host in ~25 s) a
 // warning at 300 m, the countdown at 400 m and one pull; then every suspension rule, the hysteresis, the host's
-// config (wire, ini, who gets it), warning-only mode, the banners and a failed pull. Prints PASS/FAIL per check;
-// exits non-zero on any failure.
+// config (wire, ini, who gets it), warning-only mode, the banners and a failed pull; after a pull, the hold on the
+// spot while our game loads the ground there (the 2026-10-20 15:00 one-PC run: we fell through the street). Prints
+// PASS/FAIL per check; exits non-zero on any failure.
 #include "game/leash.h"
 
 #include "data/leash_1020.h"
@@ -448,7 +449,66 @@ void TestConfig() {
 
 }  // namespace
 
+// After the pull (Settle). The recorded fall (guest trace 145536, LR at ~3 Hz after the pull at 15:05:13.0): put at
+// z 2.86 beside the host, then z 1.06, -3.46, -9.19, -15.20 (falling through the street: our game had not loaded the
+// ground there yet), downed at health 1. Model of the game: we fall from rest under gravity whenever there is no
+// ground and each HOLD puts us back on the spot; the ground is there `loadS` s after the pull.
+void TestSettle() {
+    {
+        Settle s;
+        s.Start(0, -951.04f, -219.57f, 2.86f);
+        const double t[] = {0.05, 0.35, 0.71, 1.06, 1.40};
+        const float z[] = {2.86f, 1.06f, -3.46f, -9.19f, -15.20f};
+        std::string holds;
+        for (int i = 0; i < 5; ++i) holds += s.Update(t[i], z[i]) ? '1' : '0';
+        Check(holds[0] == '0' && holds[1] == '1', "settle: the recorded fall is caught at its first reading under the "
+              "spot (1.8 m down)", holds);
+    }
+    for (double loadS : {0.0, 0.8, 1.5, 2.5}) {
+        Settle s;
+        const float spot = 2.86f;
+        s.Start(0, 0, 0, spot);
+        float z = spot, vz = 0, minZ = spot;
+        int holds = 0;
+        bool hold = false;
+        for (double t = 0; t < 6.0; t += 1.0 / 60) {
+            if (hold) {  // the glue's HOLD on the next tick
+                z = spot;
+                vz = 0;
+                hold = false;
+            }
+            if (t < loadS) {  // no ground yet: falling (once it is there we stand where the last hold put us)
+                vz -= 9.81f / 60;
+                z += vz / 60;
+            }
+            minZ = std::min(minZ, z);
+            if (s.Update(t, z)) {
+                hold = true;
+                ++holds;
+            }
+        }
+        char name[120];
+        std::snprintf(name, sizeof name, "settle: the ground loads %.1f s after the pull: never ~2 m under the spot",
+                      loadS);
+        Check(spot - minZ <= kSettleDropM + 0.6f && holds <= kSettleMax, name,
+              F("lowest %.2f m under it, %.0f holds", spot - minZ, holds));
+    }
+    {
+        Settle s;  // the ground is there: a pull onto a kerb, a slope 1 m down the street - nothing held
+        s.Start(0, 0, 0, 3.0f);
+        bool any = false;
+        for (double t = 0; t < 4.0; t += 1.0 / 60) any |= s.Update(t, 3.0f - static_cast<float>(t) * 0.3f);
+        Check(!any, "settle: walking down 1 m after the pull: no hold");
+        Settle late;
+        late.Start(0, 0, 0, 3.0f);
+        Check(!late.Update(kSettleS + 0.1, -20.0f), "settle: only within 3 s of the pull (a fall later is the game's)");
+        Settle none;
+        Check(!none.Update(1.0, -20.0f), "settle: no pull, no hold");
+    }
+}
+
 int main() {
+    TestSettle();
     TestReplay();
     TestSuspensions();
     TestHysteresis();

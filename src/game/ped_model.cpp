@@ -259,17 +259,14 @@ bool InView(const Vec3& cam, const Vec3& dir, const Vec3& p, float halfAngleDeg,
 
 net::motion::LocomotionTuning LocomotionForPed() {
     const net::correction::Tuning c = net::correction::Tuning::ForNpc();
-    net::motion::LocomotionTuning t;
-    t.nudgeStart = c.deadZone;
-    t.nudgeGain = c.gain;
-    t.nudgeSpeedShare = c.speedShare;
-    t.nudgeRestSpeed = c.restSpeed;
+    // the game's AI human (the puppets' first guesses, calibrated at run time from the copy's measured speed); the
+    // FootDriver's position fix replaces the controller's nudge fields
+    net::motion::LocomotionTuning t = pmotion::FootTuning();
     t.snapDist = c.snapDist;
     t.snapHeight = c.snapHeight;
     t.stuckDist = c.stuckDist;
     t.stuckTime = c.stuckTime;
     t.standSpeed = c.standSpeed;
-    t.walkSpeed = 1.3f;  // a pedestrian's stroll (calibrated at run time from the copy's measured speed)
     return t;
 }
 
@@ -749,7 +746,7 @@ void PedReceiver::Bind(Remote& r, uint32_t local, How how) {
     r.killed = false;
     r.lagSince = -1;
     r.fresh = true;
-    r.loco.Reset();
+    r.foot.Reset();
     Copy& c = copies_[local];
     c.key = Key(r.auth, r.net);
     c.shown = true;
@@ -1192,7 +1189,7 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
         c.key = key;
         c.local = r.local;
         c.target = tgt;
-        c.lc = r.loco.Update(in);
+        c.lc = r.foot.Update(in);
         // a copy that keeps its gap behind a moving target (it walks at the target's pace, the multiplier and the
         // nudges do not move it): snapped; lagging again soon after: removed, the pedestrian gets another copy
         using Fix = net::motion::LocomotionCommand::Fix;
@@ -1208,7 +1205,7 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
                 c.lc.reissue = true;
                 c.lc.moveTo.x += sx;
                 c.lc.moveTo.y += sy;
-                r.loco.Reset();
+                r.foot.Reset();
             }
         }
         const float tspeed = std::hypot(tgt.vel.x, tgt.vel.y);
@@ -1233,7 +1230,7 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
                 c.lc.moveTo.x += sx;
                 c.lc.moveTo.y += sy;
                 c.why = RecvCmd::Why::LagSnap;
-                r.loco.Reset();
+                r.foot.Reset();
                 ++stats_.lagSnaps;
             }
         } else {

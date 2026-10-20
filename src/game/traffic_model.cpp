@@ -1002,6 +1002,7 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             for (int k = 0; k < 4; ++k) cmd.vc.rot[k] = c.frozenRot[k];
             c.accDt = 0;
             c.haveLast = false;
+            if (DistToMe(c, key) > kDriverLod) cmd.target.flags |= kDriverFar;  // see below
             out.push_back(cmd);
             continue;
         }
@@ -1089,6 +1090,12 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             maxErr = std::max(maxErr, cmd.vc.error);
             ++nErr;
         }
+        // Farther than kDriverLod from our player our game streams the copy's crew out as it does its own traffic's
+        // drivers (the copy is still driven by us): a crew member out of his seat there is its level of detail, not
+        // a crew that left - the glue does not put him back (2026-10-20 15:00 one-PC run: 33 put-backs in 5.2
+        // minutes with copies, every one of a copy 81-272 m from the guest, 31 of them of one standing copy every
+        // second for 34 s; traffic.reseats_per_min 6.4)
+        if (DistToMe(c, key) > kDriverLod) cmd.target.flags |= kDriverFar;
         out.push_back(cmd);
     }
     stats_.frozen = frozenAny;

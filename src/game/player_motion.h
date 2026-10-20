@@ -164,6 +164,17 @@ struct CarFixTuning {
     float skidDeg = 15.0f;
     float skidSpeed = 2.0f;
     float skidShare = 1.0f;
+    // Blocked (2026-10-20 14:36 one-PC run, the guest's car into a wall): his car crawls or stands (slower than
+    // blockSpeed: after a crash it slides along the wall at ~1 m/s and rocks against it at 0.1-0.6 m/s, too fast for
+    // the preset's stuck rule at 0.35) and the copy is more than blockDist off (0.1 m beyond the preset's dead zone)
+    // without getting blockClose nearer for blockTime: put at his car (a snap, in the crash). The copy there stood
+    // against the same wall beside him, was given 0.7-0.9 m/s along its heading (into the wall) every tick, slid away
+    // along it, 1.0-1.8 m off for 2.4 s until the lag pin (car.p95 1.58 m: those 3.5 s were 17 % of the 20 s the
+    // guest drove). A copy the blend brings in (0.15 m in 0.5 s from 0.6 m on) is left to it.
+    float blockSpeed = 1.5f;     // m/s
+    float blockDist = 0.6f;      // m
+    float blockClose = 0.1f;     // m
+    float blockTime = 0.5f;      // s
 };
 
 // The correction preset for a player's car copy: core's ForCar (nothing inside 0.5 m, snap from 4 m) with a blend
@@ -183,6 +194,7 @@ struct CarCommand {
     net::correction::Result corr;  // the car preset's verdict (Blend: vc.nudge is its delta)
     bool skid = false;          // his car slides (CarFixTuning skidDeg): blended at skidShare
     bool skidStart = false;     // ... from this update on (for the log)
+    bool blocked = false;       // snapped: his car crawls / stands and the copy did not close in (CarFixTuning block*)
 };
 
 class CarDriver {
@@ -196,6 +208,7 @@ public:
     int Retries() const { return veh_.Retries(); }
     uint32_t SpeedFixes() const { return speedFixes_; }
     bool Skid() const { return skid_; }  // the last update saw his car slide (skidShare applied)
+    uint32_t Blocks() const { return blocks_; }  // snaps of a copy that did not close in on his crawling car
 
 private:
     motion::VehicleController veh_;
@@ -206,6 +219,8 @@ private:
     float sinceSpeed_ = 1e9f;
     uint32_t speedFixes_ = 0;
     bool skid_ = false, wasSkid_ = false;
+    float blockT_ = -1, blockRef_ = 0;  // s the copy has not closed in on his slow car (-1: not), its error then
+    uint32_t blocks_ = 0;
 };
 
 }  // namespace mc::game::pmotion

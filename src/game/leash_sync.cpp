@@ -69,7 +69,8 @@ uint32_t _rxEvents = 0;
 
 // main thread
 Leash _leash;
-bool _running = false, _pullCmd = false, _noGlueLogged = false;
+Settle _settle;  // after a pull: held on the spot while the ground there loads
+bool _running = false, _pullCmd = false, _holdCmd = false, _noGlueLogged = false;
 uint32_t _luaErrors = 0, _logged = 0;
 Config _lastConfig;
 bool _haveLastConfig = false;
@@ -177,6 +178,8 @@ void MainTick(lua_State* L, float) {
         if (_running) {  // the session ended or the host is gone: a new start
             _running = false;
             _pullCmd = false;
+            _holdCmd = false;
+            _settle.Reset();
             _leash.Reset();
             std::lock_guard lock(sh.mu);
             sh.banner.clear();
@@ -193,25 +196,40 @@ void MainTick(lua_State* L, float) {
             core::trace::Line("LSH", "ev=config warn=%u max=%u cd=%u on=%d from=%s", cfg.warnM, cfg.maxM, cfg.countdownS,
                               cfg.On() ? 1 : 0, fromHost ? "host" : "default");
     }
-    const char* cmd = _pullCmd ? "PULL" : "";
-    _pullCmd = false;
+    char cmd[96] = "";
+    if (_pullCmd)
+        std::snprintf(cmd, sizeof cmd, "PULL");
+    else if (_holdCmd)
+        std::snprintf(cmd, sizeof cmd, "HOLD %.3f %.3f %.3f", _settle.X(), _settle.Y(), _settle.Z());
+    _pullCmd = _holdCmd = false;
     std::string reading;
     if (!CallGlue(L, cmd, reading) || reading.empty()) return;
     int inWorld = 0, seen = 0, cut = 0, selfDown = 0, hostDown = 0, hostCar = 0, passenger = 0, drive = 0;
-    float x = 0, y = 0, hx = 0, hy = 0;
-    if (std::sscanf(reading.c_str(), "R %d %f %f %d %f %f %d %d %d %d %d %d", &inWorld, &x, &y, &seen, &hx, &hy, &cut,
-                    &selfDown, &hostDown, &hostCar, &passenger, &drive) != 12)
+    float x = 0, y = 0, hx = 0, hy = 0, z = 0;
+    if (std::sscanf(reading.c_str(), "R %d %f %f %d %f %f %d %d %d %d %d %d %f", &inWorld, &x, &y, &seen, &hx, &hy,
+                    &cut, &selfDown, &hostDown, &hostCar, &passenger, &drive, &z) != 13)
         return;
     const double now = Now();
     const size_t at = reading.find(" P ");
     if (at != std::string::npos) {
         int ok = 0;
         char how[32] = {};
-        if (std::sscanf(reading.c_str() + at, " P %d %31s", &ok, how) >= 1) {
+        float sx = 0, sy = 0, sz = 0;
+        const int got = std::sscanf(reading.c_str() + at, " P %d %31s %f %f %f", &ok, how, &sx, &sy, &sz);
+        if (got >= 1) {
             _leash.PullDone(ok != 0, now);
             MC_LOG_INFO("leash: %s (%s)", ok ? "pulled back beside the host" : "the pull did not work", how);
             if (core::trace::IsOpen()) core::trace::Line("LSH", "ev=pulled ok=%d how=%s", ok, how[0] ? how : "-");
+            if (ok && got == 5) _settle.Start(now, sx, sy, sz);  // where it put us: held there while we sink
         }
+    }
+    if (inWorld && _settle.Update(now, z)) {
+        _holdCmd = true;  // carried out by the glue on the next tick
+        if (_settle.Holds() <= 20)
+            MC_LOG_INFO("leash: %.1f m under the spot we were pulled to (the ground there not loaded yet?): put back "
+                        "on it (#%d after this pull)", _settle.Z() - z, _settle.Count());
+        if (core::trace::IsOpen())
+            core::trace::Line("LSH", "ev=hold n=%d z=%.2f spot=%.2f", _settle.Count(), z, _settle.Z());
     }
     Input in;
     in.now = now;

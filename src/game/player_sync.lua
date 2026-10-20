@@ -118,7 +118,11 @@ local DEFAULT_PROFILES = { [0] = "tommy", "characters/scotch/game/main/game_main
 local LOAD_TIMEOUT = 12    -- s a spawn profile may take to load (puppet) or to switch (our player) before it is bad
 M.badProfiles = M.badProfiles or {}
 M.loadedProfiles = M.loadedProfiles or {}  -- profiles a puppet spawner loaded on this game (not bad when one hangs)
-local RELOAD_TIMEOUT = 4  -- s: a profile that loaded before and is not ready again: the spawner is stuck
+-- s: a profile that loaded before and is not ready again: the spawner is stuck. A spawner that works has a known
+-- profile ready at once (2026-10-20 one-PC runs: 0.00-0.06 s, a character change 0.06-0.1 s); after the game removed a
+-- puppet it never is (14:39 / 15:02: not ready in 4 s both times, the fresh spawner had it at once). Was 4 s: with the
+-- 1 s before a fresh spawner started the loss took 5.03 / 5.10 s (foot.respawn_s, target 5).
+local RELOAD_TIMEOUT = 1.5
 
 local function V(x, y, z) return Math:newVector(x, y, z) end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -180,7 +184,9 @@ end
 -- C_RuntimeSpawnerComponent added to him creates puppets with that AI archetype and any spawn profile. (Humans
 -- spawned with the player as archetype have no AI locomotion.) Despawning the factory removes every puppet.
 -- ---------------------------------------------------------------------------------------------------------------
-function M.FactoryReset(why)
+-- soon: the fresh factory is obtained at once (a stuck spawner: the old one is gone at once and a puppet waits for it),
+-- else after a second.
+function M.FactoryReset(why, soon)
   local f = M.fac
   for _, pp in pairs(M.pup) do
     if M.Burning(pp) and why ~= "session ended" then  -- the factory's despawn would release the burning puppet
@@ -199,7 +205,7 @@ function M.FactoryReset(why)
   end
   if f.id then pcall(game.traffic.DespawnEntityImmediately, game.traffic, f.id) end
   if why then log("factory reset: " .. tostring(why)) end
-  M.fac = { st = "none", t = -1 }
+  M.fac = { st = "none", t = soon and 0 or -1 }
   for _, pp in pairs(M.pup) do M.Unmark(pp); M.ScriptForget(pp); pp.so = nil; pp.st = "queued" end
 end
 
@@ -287,17 +293,19 @@ function M.SpawnTick()
       local limit = known and RELOAD_TIMEOUT or LOAD_TIMEOUT
       if M.now - (f.loadT or M.now) > limit then
         if known then
-          log(string.format("puppet %s: profile %s (loaded before) not ready in %d s: the spawner is stuck, a fresh one "
-            .. "spawns it", pp.id, pp.profile, limit))
+          log(string.format("puppet %s: profile %s (loaded before) not ready in %.1f s: the spawner is stuck, a fresh "
+            .. "one spawns it", pp.id, pp.profile, limit))
         else
           M.badProfiles[pp.profile] = true
           local fb = M.Fallback(pp.id)
-          log(string.format("puppet %s: profile %s did not load in %d s, using %s instead", pp.id, pp.profile,
+          log(string.format("puppet %s: profile %s did not load in %.1f s, using %s instead", pp.id, pp.profile,
             limit, fb))
           if fb ~= pp.profile then pp.profile = fb end
         end
-        pp.st, pp.retryT = "queued", M.now + 1
-        M.FactoryReset(known and "the spawner is stuck" or "a profile did not load")
+        -- stuck: the fresh factory and the puppet at once (the factory is obtained and spawned in ~0.1 s); a bad
+        -- profile: after a second, as before
+        pp.st, pp.retryT = "queued", known and M.now or M.now + 1
+        M.FactoryReset(known and "the spawner is stuck" or "a profile did not load", known)
       end
       return
     end
@@ -4819,7 +4827,7 @@ function M.NearHost(p)
   end
   p:SetPos(V(x, y, host.tz + 0.2))
   p:SetDir(V(hx, hy, 0))
-  return true
+  return true, x, y, host.tz + 0.2
 end
 
 -- Guest only: instead of dying (the YOU DIED screen would reload his own game) the player is downed at low health:
@@ -4889,13 +4897,16 @@ end
 -- The leash (src/game/leash.h, docs/host-authority.md 3), guest only: the decisions are in C++; this reads what they
 -- need and carries out the pull. src/game/leash_sync.cpp calls MafiaCoop.Leash(cmd) once per script tick after
 -- M.Update. cmd "PULL": the screen fades out (HUD_FaderFadeOut, as mission_sync.lua uses it), we are put back near the
--- host (M.LeashPull), it fades in again. Returns "" outside a session and on the host, else
---   "R inWorld x y host hx hy cut selfDown hostDown hostCar passenger drive" [.. " P ok how"]
+-- host (M.LeashPull), it fades in again. cmd "HOLD x y z" (src/game/leash.h Settle: for 3 s after a pull, when we sank
+-- 1.5 m under the spot - the ground there not loaded yet): we (our car) are put back on x y z. Returns "" outside a
+-- session and on the host, else
+--   "R inWorld x y host hx hy cut selfDown hostDown hostCar passenger drive z" [.. " P ok how [sx sy sz]"]
 -- x y: us (our car while we sit in one); host 1: the host's puppet's spot is known (a state of his came in the last
 -- second), hx hy: that spot; cut: a cutscene plays or the host's holds us (M.cutscene, mission_sync.lua); selfDown:
 -- we are downed / dead / respawning (M.DownTick); hostDown: his health is 0 (downed or dead); hostCar: we sit in the
 -- car the host is in; passenger: we sit in another car, not at the wheel (its driver's leash moves it); drive: we
--- are at the wheel; P: the answer to the pull (ok 1/0; how: foot, road, beside, or why not).
+-- are at the wheel; z: our height (our car's); P: the answer to the pull (ok 1/0; how: foot, road, beside, or why not;
+-- sx sy sz: the spot it put us on).
 -- ---------------------------------------------------------------------------------------------------------------
 local LEASH_BEHIND = 15    -- m behind the host: where a driver's car is put (on the road there if there is one)
 local LEASH_BESIDE = 4     -- m to the host's right: the car's spot without a road point
@@ -4910,7 +4921,8 @@ function M.LeashPull(p)
   if not (host and host.tx) then return false, "nohost" end
   local my = M.my
   if not (my and my.c and valid(my.c.ent)) then
-    if M.NearHost(p) then return true, "foot" end
+    local ok, px, py, pz = M.NearHost(p)
+    if ok then return true, "foot", px, py, pz end
     return false, "nearhost"
   end
   if my.seat ~= 0 then return false, "passenger" end
@@ -4942,7 +4954,7 @@ function M.LeashPull(p)
   q.s = math.cos(a / 2)
   pcall(car.SetRot, car, q)
   pcall(car.SetSpeed, car, 0)
-  return true, how
+  return true, how, x, y, z + 0.3
 end
 
 function M.Leash(cmd)
@@ -4956,17 +4968,33 @@ function M.Leash(cmd)
   end
   if M.leashPullAt and M.now - M.leashPullAt >= LEASH_FADE then
     M.leashPullAt = nil
-    local ok, how = false, "notinworld"
+    local ok, how, sx, sy, sz = false, "notinworld", nil, nil, nil
     if p then
-      local good, a, b = pcall(M.LeashPull, p)
-      if good then ok, how = a, b else how = "error"; logErr("leash pull", a) end
+      local good, a, b, c, d, e = pcall(M.LeashPull, p)
+      if good then ok, how, sx, sy, sz = a, b, c, d, e else how = "error"; logErr("leash pull", a) end
     end
     if M.leashFaded then pcall(HUD_FaderFadeIn, 0.5) end
     log(ok and ("leash: pulled back beside the host (" .. tostring(how) .. ")") or
       ("leash: the pull did not work (" .. tostring(how) .. "), tried again in 2 s"))
     answer = string.format(" P %d %s", ok and 1 or 0, tostring(how))
+    if ok and sx and sy and sz then answer = answer .. string.format(" %.3f %.3f %.3f", sx, sy, sz) end
   end
-  if not p then return "R 0 0 0 0 0 0 0 0 0 0 0 0" .. answer end
+  local hx, hy, hz = cmd:match("^HOLD (%S+) (%S+) (%S+)")
+  if hx and p then
+    local x, y, z = tonumber(hx), tonumber(hy), tonumber(hz)
+    local my = M.my
+    if x and y and z then
+      if my and my.c and valid(my.c.ent) then
+        pcall(my.c.ent.SetPos, my.c.ent, V(x, y, z))
+        pcall(my.c.ent.SetSpeed, my.c.ent, 0)
+      else
+        pcall(p.SetPos, p, V(x, y, z))
+      end
+      M.leashHolds = (M.leashHolds or 0) + 1
+      if M.leashHolds <= 10 then log("leash: put back on the spot we were pulled to (we sank under it)") end
+    end
+  end
+  if not p then return "R 0 0 0 0 0 0 0 0 0 0 0 0 0" .. answer end
   local my = M.my
   local inCar = my and my.c and valid(my.c.ent)
   local pos = inCar and my.c.ent:GetPos() or p:GetPos()
@@ -4978,9 +5006,9 @@ function M.Leash(cmd)
   local hostCar = inCar and seen and host.vkey ~= nil and my.key == host.vkey
   local passenger = inCar and my.seat ~= 0 and not hostCar
   local function b(v) return v and 1 or 0 end
-  return string.format("R 1 %.2f %.2f %d %.2f %.2f %d %d %d %d %d %d", pos.x, pos.y, b(seen),
+  return string.format("R 1 %.2f %.2f %d %.2f %.2f %d %d %d %d %d %d %.2f", pos.x, pos.y, b(seen),
     seen and host.tx or 0, seen and host.ty or 0, b(M.cutscene), b(selfDown), b(hostDown), b(hostCar), b(passenger),
-    b(inCar and my.seat == 0)) .. answer
+    b(inCar and my.seat == 0), pos.z) .. answer
 end
 
 -- Our demigod flag: on while shielded or downed (not while a replayed bullet is on its way), off otherwise (only

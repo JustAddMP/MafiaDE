@@ -84,6 +84,23 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
   host's is dead) and shown again when the session ends. The guest-owned NPC messages (0x0421-0x0426) are retired.
   In the 2026-10-20 session A the guest's game sent 1350 states of one such cop; the replay of it (tests/npc_hold_test)
   holds it instead and sends nothing. sync_compare: `npc.guest_sent` (target 0) and a "held NPCs" section.
+- Fixes for the 2026-10-20 one-PC checks (built and unit-tested, not run in game yet):
+  - Pedestrian copies are walked with the puppets' FootDriver (velocity matching while they move, the rest blend and
+    hold-back while they stand, a stop walked to where the copy comes to rest): with the NPC blend the copies of
+    runners fell 1.1 m behind (the game's AI run did not reach the speed) and standing ones walked 2-4 m off their
+    spot; `ped.p95` was 2.05 / 1.72 m.
+  - A puppet the game removed is back in ~1.6 s (was 5.03 / 5.10 s): a spawner that has a known profile not ready in
+    1.5 s (a working one has it at once) is stuck, and the fresh one is obtained at once.
+  - Traffic copies farther than 40 m from the guest's player keep no crew put-backs (his game streams their crews out
+    there, as its own traffic's drivers): one copy's driver was put back 31 times in 34 s after a leash teleport;
+    a crew member leaving again right after each put-back is no longer counted from 0 every time.
+  - A player's car copy that does not close in on his crawling or standing car (a crash against a wall: it was given
+    speed into the wall and slid away, 1.0-1.8 m off for 2.4 s) is put at his car after 0.5 s.
+  - After a leash pull the guest is put back on the spot when he sinks 1.5 m under it in the first 3 s (his game had
+    not loaded the ground: he fell through the street and was downed).
+  - sync_compare: the foot numbers leave out 3 s after a player's own teleport (a jump of over 50 m, a leash pull) and
+    the time he is more than 300 m from the receiving player, `foot.shown` the receiver's loading screen, a respawn
+    after his being downed has a reason; a pedestrian's truth is not interpolated across a jump of the host's game.
 
 ## 0.16.0 (2026-10-20), pre-release, not yet verified in game
 

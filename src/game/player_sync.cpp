@@ -867,6 +867,9 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
     if (cc.skidStart)
         MC_LOG_INFO("sync: player %u's car %s slides (its velocity is off its heading at %.1f m/s): the copy is "
                     "blended faster meanwhile", id, key, vc.tspeed);
+    if (cc.blocked && rem.car.Blocks() <= 20)
+        MC_LOG_INFO("sync: player %u's car %s crawls (%.1f m/s) and the copy did not close in (%.1f m off, against "
+                    "a wall?): put at his car (#%u)", id, key, vc.tspeed, cc.corr.error, rem.car.Blocks());
     rem.lastLoco = lc;
     rem.lastVeh = vc;
     rem.inCar = inCar;

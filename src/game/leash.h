@@ -46,7 +46,7 @@ constexpr double kPullWaitS = 3.0;      // the glue did not answer the pull with
 constexpr double kPullRetryS = 2.0;     // a failed pull is tried again after this
 constexpr double kRepeatS = 5.0;        // the current event again while far (the host's panel keeps the distance)
 
-// ---- LeashConfig 0x0208: u16 warnM, u16 maxM, u8 countdownS, u8 flags (bit0 1 = leash on) ----------------------------
+// ---- LeashConfig 0x0208: u16 warnM, u16 maxM, u8 countdownS, u8 flags (bit0 1 = leash on) ---------------------------
 struct Config {
     uint16_t warnM = 300;
     uint16_t maxM = 400;
@@ -64,7 +64,7 @@ Config FromIni(int warnM, int maxM, int countdownS);
 void Write(net::ByteWriter& w, const Config& c);
 bool Read(net::ByteReader& r, Config& c);  // trailing bytes accepted (later additions)
 
-// ---- LeashEvent 0x0209: u8 kind, u16 distM -------------------------------------------------------------------------------
+// ---- LeashEvent 0x0209: u8 kind, u16 distM --------------------------------------------------------------------------
 enum class EventKind : uint8_t { None = 0, Warn = 1, Countdown = 2, Pulled = 3, Back = 4 };
 const char* EventName(EventKind k);
 struct Event {
@@ -74,7 +74,7 @@ struct Event {
 void Write(net::ByteWriter& w, const Event& e);
 bool Read(net::ByteReader& r, Event& e);
 
-// ---- the guest's leash ---------------------------------------------------------------------------------------------------
+// ---- the guest's leash ----------------------------------------------------------------------------------------------
 enum class State : uint8_t {
     Near,       // under the warning distance (or back under it)
     Warn,       // warn .. max (or beyond max with the pull off)
@@ -165,7 +165,37 @@ private:
 // The banner text for a state ("" none). dist in m, left in s.
 std::string Banner(State s, float dist, double left);
 
-// ---- the host: who gets the config ---------------------------------------------------------------------------------------
+// ---- after the pull: held on the spot while the ground there loads --------------------------------------------------
+// A pull moves us hundreds of metres; our game may not have the ground at the new spot yet (2026-10-20 15:00 one-PC
+// run, the second pull from 450 m: put down beside the host at z 2.86, we fell through the street - z 1.06, -3.5,
+// -9.2, -15.2 within 1.4 s - and landed downed at health 1, our puppet on the host died with us and was spawned again
+// 10 s later). For kSettleS after a pull, once we are more than kSettleDropM below the spot we are put back on it (the
+// glue's HOLD), at most kSettleMax times; then the game's own fall goes on.
+constexpr double kSettleS = 3.0;
+constexpr float kSettleDropM = 1.5f;
+constexpr int kSettleMax = 8;
+
+class Settle {
+public:
+    void Start(double now, float x, float y, float z);  // a pull put us (our car) at x y z
+    // Every tick: where we are now (z: our height, our car's while we drive). True: put us back on the spot now.
+    bool Update(double now, float z);
+    bool Active(double now) const { return now - at_ <= kSettleS && n_ < kSettleMax; }
+    float X() const { return x_; }
+    float Y() const { return y_; }
+    float Z() const { return z_; }
+    int Count() const { return n_; }          // holds after the last pull
+    uint32_t Holds() const { return holds_; }  // so far
+    void Reset() { *this = Settle(); }
+
+private:
+    double at_ = -1e9;
+    float x_ = 0, y_ = 0, z_ = 0;
+    int n_ = 0;
+    uint32_t holds_ = 0;
+};
+
+// ---- the host: who gets the config ----------------------------------------------------------------------------------
 // Every guest once per (id, joinSeq) (a join, a return after a lost connection), everyone again when the config
 // changes.
 class ConfigSender {

@@ -93,6 +93,21 @@ const char* WhyName(Why w) {
     return "?";
 }
 
+void Settle::Start(double now, float x, float y, float z) {
+    at_ = now;
+    x_ = x;
+    y_ = y;
+    z_ = z;
+    n_ = 0;
+}
+
+bool Settle::Update(double now, float z) {
+    if (!Active(now) || z >= z_ - kSettleDropM) return false;
+    ++n_;
+    ++holds_;
+    return true;
+}
+
 std::string Banner(State s, float dist, double left) {
     char buf[96];
     switch (s) {

@@ -584,7 +584,10 @@ while we are still over 400 m: the screen fades out (`HUD_FaderFadeOut(0.25)`, a
 on foot we are put beside the host (`M.NearHost`, as after being downed), at the wheel our car goes on the road 15 m
 behind the host (`game.traffic:GetClosestPointOnRoad`, its second argument UNVERIFIED; else 4 m to his right),
 facing his heading and stopped, and we stay in it (its copies on the other games jump with it); the screen fades in
-and `PULLED BACK TO THE HOST` shows for 3 s. A pull that does not work is tried again 2 s later. The banner is the
+and `PULLED BACK TO THE HOST` shows for 3 s. For 3 s after a pull, once we (our car) are more than 1.5 m under the
+spot it put us on (our game had not loaded the ground there: the 2026-10-20 15:00 one-PC run fell through the street
+and landed downed), we are put back on it (leash.h `Settle`, the glue's `HOLD`; at most 8 times). A pull that does not
+work is tried again 2 s later. The banner is the
 centre notice (module.cpp `DrawNotice`) after the reconnect and the story notices. Suspended (no banner, no
 countdown): our world not loaded and 5 s after; a fail-flow reload; the join / reconnect not settled (JoinReport
 complete or its 15 s verdict, `JoinSync::Settled`) and 20 s after; no state of the host's here; the host paused
@@ -1320,9 +1323,12 @@ more. A receiver still keys a pedestrian by (sender, net) (`NetRef {authority, P
 - **The spawner's health** (feat/sync-peds): CreateObject failing twice in a row, or 3+ copies gone within 0.5 s, with
   no copy of it left (free ones included: its despawn would take them along), asks for a new spawner (`FR`, at most
   every 5 s); the Lua's own resets (spawner lost, deactivated, idle 30 s without any copy, an error) tell the dll
-  (`PFR`) so it does not ask again on top. The copies are walked like puppets: core's LocomotionController with the
-  host's gait as the hint and the correction rules of `Corrector::ForNpc` (0.5 m dead zone, a nudge capped at 35 % of
-  its speed or 0.15 m/s standing, a snap beyond 5 m or 3 m up, stuck 0.8 m for 3 s), applied with `MoveVec`,
+  (`PFR`) so it does not ask again on top. The copies are walked like puppets, with the puppets' FootDriver
+  (game/player_motion.h; unreleased, onepc-fixes - before: core's LocomotionController with the NPC blend, whose copies
+  of runners fell 1.1 m behind in the 2026-10-20 one-PC runs): the host's gait as the hint, velocity matching while
+  the pedestrian moves (a nudge every tick for what the AI walk does not give), the rest blend and the hold-back of a
+  walk that runs on while it stands, a stop walked to where the copy comes to rest (not to his spot), and the snap /
+  stuck rules of `Corrector::ForNpc` (a snap beyond 5 m or 3 m up, stuck 0.8 m for 3 s), applied with `MoveVec`,
   `SetMovementSpeedMult`, `SetPos` / `SetDir`; a copy more than 1.5 m behind a moving target for 2 s is snapped, and
   removed (another one comes) when it lags like that again within 6 s.
 - **Deaths and panic** follow the host: a PedDeath (or the dead flag) kills the copy (`DoDamage`); the crouch flag

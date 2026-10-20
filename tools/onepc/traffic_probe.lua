@@ -1,7 +1,9 @@
 -- Traffic drivers and copies right now (tools/onepc run_test.ps1 "traffic"): on the host (the only traffic authority),
 -- his traffic cars by distance from his player and whether a driver sits at the wheel (the game streams drivers out
 -- beyond ~50 m: traffic_sync.lua DRIVER_LOD); on a guest, his copies of the host's cars: driver seated, crew out (and
--- the totals of crews sent out / put back); a guest's "ours" must be 0 everywhere (he shares no traffic). One line back.
+-- the totals of crews sent out / put back), the copies within 40 m apart (beyond, his game streams their crews out as
+-- its own traffic's drivers: not put back, onepc-fixes); a guest's "ours" must be 0 everywhere (he shares no traffic).
+-- One line back.
 local M = MafiaCoop
 local T = M and M.Traffic
 if not T then return "no MafiaCoop.Traffic" end
@@ -25,12 +27,17 @@ for _, c in pairs(T.list or {}) do
     end
   end
 end
-local copies, seated, out = 0, 0, 0
+local copies, seated, out, near, nearSeated = 0, 0, 0, 0, 0
 for _, c in pairs(T.copies or {}) do
   if c.st == "ready" and c.ent and IsObjectValid(c.ent) then
     copies = copies + 1
     local okd, drv = pcall(c.ent.GetSeatOwner, c.ent, 0)
-    if okd and drv and IsObjectValid(drv) then seated = seated + 1 end
+    local sits = okd and drv and IsObjectValid(drv)
+    if sits then seated = seated + 1 end
+    if d2(c.ent:GetPos()) < 40 then
+      near = near + 1
+      if sits then nearSeated = nearSeated + 1 end
+    end
     if c.crewOut then out = out + 1 end
   end
 end
@@ -38,5 +45,5 @@ local parts = {}
 for i, b in ipairs(bands) do
   parts[#parts + 1] = string.format("%s-%s m %d (no driver %d)", b[1], b[2] < 1e9 and b[2] or "", own[i][1], own[i][2])
 end
-return string.format("ours: %s; copies %d: driver seated %d, crew out %d; crews out so far %d, put back %d",
-  table.concat(parts, ", "), copies, seated, out, T.outs or 0, T.reseats or 0)
+return string.format("ours: %s; copies %d: driver seated %d (within 40 m: %d of %d), crew out %d; crews out so far %d, "
+  .. "put back %d", table.concat(parts, ", "), copies, seated, nearSeated, near, out, T.outs or 0, T.reseats or 0)

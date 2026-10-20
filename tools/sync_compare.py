@@ -260,6 +260,67 @@ def section(title):
     print("-" * len(title))
 
 
+# ---- a player's own teleports (onepc-fixes) --------------------------------------------------------------------------
+# A teleport of the player himself (a jump of more than TELEPORT_M between two of his states, or a leash pull) puts his
+# puppet on the other game at his new spot at once (one snap) and may drop him from a height (a scripted move 30 m up
+# fell onto a roof in the 2026-10-20 15:00 one-PC run: ~2.5 s of falling from 30 m): the foot metrics leave out
+# TELEPORT_HOLD_S after each one, and say how much they left out.
+TELEPORT_M = 50.0
+TELEPORT_SPEED = 70.0  # m/s: a jump that big this fast (no car drives it)
+TELEPORT_HOLD_S = 3.0
+
+
+def own_teleports(tr):
+    """The times (his state clock, TX sT in s) of player tr.local's own teleports on his game: a jump of more than
+    TELEPORT_M at more than TELEPORT_SPEED between two of his states (TX), or a leash pull that moved him (LSH
+    ev=pulled ok=1, on the trace clock: mapped to the state clock by the TX records)."""
+    tx = [(t, num(f["sT"]) / 1000.0, vec(f.get("p"))) for t, f in tr.records["TX"] if "sT" in f]
+    tx = [r for r in tx if r[1] is not None and r[2] is not None]
+    if not tx:
+        return []
+    out = []
+    for (_, s0, p0), (_, s1, p1) in zip(tx, tx[1:]):
+        d = dist2(p0, p1)
+        if d > TELEPORT_M and d / max(s1 - s0, 1e-3) > TELEPORT_SPEED:
+            out.append(s1)
+    off = statistics.median(t - s for t, s, _ in tx[: min(len(tx), 500)])
+    for t, f in tr.records["LSH"]:
+        if f.get("ev") == "pulled" and f.get("ok") == "1":
+            out.append(t - off)
+    merged = []
+    for s in sorted(out):  # a pull is also a jump: one teleport
+        if not merged or s - merged[-1] > 1.0:
+            merged.append(s)
+    return merged
+
+
+def after_teleport(teleports, s):
+    """True when state-clock time s is within TELEPORT_HOLD_S after one of `teleports`."""
+    i = bisect.bisect_right(teleports, s)
+    return i > 0 and s - teleports[i - 1] <= TELEPORT_HOLD_S
+
+
+# Beyond this from the receiving player his game has no world (docs/host-authority.md section 9 / D1: the host's cars
+# and humans end at ~300 m, the leash warns there): a puppet there has no ground under it (the 15:00 one-PC run: the
+# guest on a roof 340 m from the host, his puppet on the host 3 m below him for 21 s). Left out of the foot metrics
+# and counted, like the teleports.
+WORLD_EDGE_M = 300.0
+
+
+def own_positions(tr):
+    """A Series of the game's own player position on its trace clock (its TX records)."""
+    return Series([(t, vec(f.get("p"))) for t, f in tr.records["TX"]], gap=1.0)
+
+
+def first_in_world(tr):
+    """Trace time of the game's first "local player in world" (its world loaded), None if never: before it no puppet
+    can be shown on it (a guest still on his loading screen while the host's states already come in)."""
+    for t, s in tr.logs:
+        if "local player in world" in s:
+            return t
+    return None
+
+
 def compare(sender, receiver, args, worst):
     """How player `sender.local` looked on `receiver`'s game."""
     sid = sender.local
@@ -316,8 +377,25 @@ def compare(sender, receiver, args, worst):
         return i < len(seated_t) and seated_t[i] <= t + 1.5
 
     errs_seated = []
+    teleports = own_teleports(sender)
+    me_at = own_positions(receiver)
+    tele_left = far_left = 0  # PUP samples left out: after his own teleports / beyond the receiver's world
+
+    def beyond_world(t):
+        me, him = me_at.at(t), truth_p.at(to_sender(t))
+        return me is not None and him is not None and dist2(me, him) > WORLD_EDGE_M
+
+    def left_out(t):  # the foot metrics leave this sample out (counted in tele_left / far_left)
+        return bool(teleports) and after_teleport(teleports, to_sender(t)) or beyond_world(t)
+
     for t, f in pup:
         if f.get("have") != "1":
+            continue
+        if teleports and after_teleport(teleports, to_sender(t)):
+            tele_left += 1
+            continue
+        if beyond_world(t):
+            far_left += 1
             continue
         if seated_t and seated(t):
             cp, tp = vec(f.get("cp")), truth_p.at(to_sender(t))
@@ -353,6 +431,14 @@ def compare(sender, receiver, args, worst):
     if errs_seated:
         print("    left out: he sat on something sent as on foot (puppet > 0.45 m below him): %s" % stats_line(
             errs_seated))
+    if teleports:
+        print("    left out: %d samples (%.1f s on foot) within %.0f s after his own %d teleport(s) (a jump of more "
+              "than %.0f m between two of his states, or a leash pull): his puppet is put there and may fall with "
+              "him" % (
+                  tele_left, tele_left / 60.0, TELEPORT_HOLD_S, len(teleports), TELEPORT_M))
+    if far_left:
+        print("    left out: %d samples (%.1f s on foot) while he was more than %.0f m from %s's player (no world "
+              "there on that game)" % (far_left, far_left / 60.0, WORLD_EDGE_M, receiver.name))
     if errs_true:
         print("    puppet vs the player at the same moment: %s" % stats_line(errs_true))
         record("foot.p95", pct(errs_true, 95), who)
@@ -374,7 +460,7 @@ def compare(sender, receiver, args, worst):
         print("    fixes: %d snaps, %d nudged samples (%.2f m in all), catching up in %.1f %% of samples" % (
             snaps, nudges, nudge_sum, 100.0 * carry_n / total))
         record("foot.gait", 100.0 * same / total, who)
-        on_foot_s = [t for t, f in pup if f.get("have") == "1"]
+        on_foot_s = [t for t, f in pup if f.get("have") == "1" and not left_out(t)]
         if len(on_foot_s) > 1:
             # PUP is written at 60 Hz while on foot: minutes on foot from the sample count (gaps not counted)
             record("foot.snaps_per_min", snaps / max(len(on_foot_s) / 60.0 / 60.0, 1e-6), who)
@@ -423,15 +509,23 @@ def compare(sender, receiver, args, worst):
         if since is not None:
             paused.update(range(int(since * 2) - 1, int(rx[-1][0] * 2) + 3))
         bins = sorted(set(int(t * 2) for t, _ in rx) - paused)
+        # ... and the receiver's loading screen before his first world (his states came in already; no puppet can be)
+        w0 = first_in_world(receiver)
+        loading = len([b for b in bins if w0 is not None and b < int(w0 * 2)])
+        if loading:
+            bins = [b for b in bins if b >= int(w0 * 2)]
         ok = sum(1 for b in bins if b in have or b - 1 in have or b + 1 in have)
         share = 100.0 * ok / max(1, len(bins))
-        print("    shown: his puppet (or the car copy he sits in) there in %.1f %% of %.0f s with his states arriving" % (
-            share, len(bins) / 2.0))
+        left = (" (left out: %.1f s before %s's world loaded)" % (loading / 2.0, receiver.name)) if loading else ""
+        print("    shown: his puppet (or the car copy he sits in) there in %.1f %% of %.0f s with his states "
+              "arriving%s" % (share, len(bins) / 2.0, left))
         record("foot.shown", share, who)
     spawns = [(t, s) for t, s in receiver.logs if ("puppet %d spawned" % sid) in s]
     gone = [t for t, s in receiver.logs if ("puppet %d is gone" % sid) in s]
+    # (and his being downed: the puppet dies with him and is spawned again when he is back, player_sync.lua)
     reasons = [t for t, s in receiver.logs if ("puppet %d removed" % sid) in s or ("puppet %d queued (" % sid) in s
-               or "local player in world" in s or "a new world" in s] + gone
+               or "local player in world" in s or "a new world" in s
+               or ("puppet %d: its player is back, respawning it" % sid) in s] + gone
     if gone:
         backs = []
         for tg in gone:
@@ -453,7 +547,8 @@ def compare(sender, receiver, args, worst):
     for t, f in pup:
         cp = vec(f.get("cp"))
         tp = truth_p.at(to_sender(t))
-        if cp and tp and len(cp) > 2 and len(tp) > 2 and f.get("have") == "1" and f.get("busy", "0") == "0":
+        if cp and tp and len(cp) > 2 and len(tp) > 2 and f.get("have") == "1" and f.get("busy", "0") == "0" and not (
+                left_out(t)):
             dz.append(abs(cp[2] - tp[2]))
     if dz:
         print("    height, puppet vs player on foot: %s" % stats_line(dz))
@@ -1092,6 +1187,21 @@ def traffic(a, b):
             print("  note (%s): %s" % (tr.name, s.split("traffic: ", 1)[-1][:160]))
 
 
+PED_JUMP_SPEED = 12.0  # m/s between two truth records of a pedestrian: the host's game moved it (no walk is this fast)
+
+
+def ped_truth_at(ser, t):
+    """Where the host's pedestrian was at t (ser: its PDT Series), None across a jump of its truth: two records more
+    than PED_JUMP_SPEED apart (the 2026-10-20 14:36 one-PC run: net 113 moved 65 m in 0.5 s on the host, its copy
+    followed in one tick, and the line between the two spots - nowhere it ever was - made the 59.9 m "error")."""
+    i = bisect.bisect_left(ser.t, t)
+    if 0 < i < len(ser.t):
+        dt = ser.t[i] - ser.t[i - 1]
+        if dt > 0 and dist2(ser.v[i - 1], ser.v[i]) / dt > PED_JUMP_SPEED:
+            return None
+    return ser.at(t)
+
+
 def peds(auth, recv):
     """Pedestrians (docs/sync-trace.md PDT / PDR / PDC / PDS; docs/protocol.md "Pedestrians"): the host's pedestrians
     as copies on a guest's game (since host authority, docs/host-authority.md WP-C, a guest shares none: no regions,
@@ -1118,7 +1228,7 @@ def peds(auth, recv):
         if ser is None or cp is None or rt is None:
             missing += 1
             continue
-        tp = ser.at(rt / 1000.0)
+        tp = ped_truth_at(ser, rt / 1000.0)
         if tp is None:
             missing += 1
             continue
