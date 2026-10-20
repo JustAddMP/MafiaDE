@@ -119,6 +119,13 @@ struct AuthorityConfig {
     uint32_t bytesPerSecond = 16 * 1024;       // state budget per receiving player (interest manager)
     double refresh = 1.0;                      // s: an unchanged state is sent again after this long anyway
     size_t maxPerPacket = kMaxPerPacket;
+    // A human faster than any walk / run / sprint rides something (2026-10-20 two-PC test: four passengers of a tram,
+    // 11-12 m/s for 6 s, were sent as pedestrians; their copies on the street fell 35-39 m behind, two of them died
+    // under the guest's tram and his PedKill killed the passengers): not shared while it rides (gone for every
+    // receiver), shared again (a new net id) once it has been slower than this for rideHold.
+    float rideSpeed = 8.0f;  // m/s, ground speed between two rounds (an AI sprint is ~6.5)
+    int rideRounds = 2;      // rounds in a row this fast
+    double rideHold = 3.0;   // s
     net::authority::RegionTuning region;  // who simulates the ambient world where (core defaults)
 };
 
@@ -155,8 +162,11 @@ public:
     // Who simulates local human `id` now (its region authority, kept with hysteresis); kNoPlayer: not known.
     uint8_t OwnerOf(uint32_t id) const;
     // The local humans whose owner is another player (their region is not ours): candidates for adoption / hiding.
+    // Not the ones riding something.
     std::vector<LocalPed> Foreign() const;
-    size_t OwnedCount() const;  // humans we are the authority for
+    size_t OwnedCount() const;                  // humans we are the authority for
+    size_t RidingCount() const;                 // humans riding something now (not shared)
+    uint64_t Rides() const { return rides_; }  // times a human was found riding (total)
     size_t PedCount() const { return peds_.size(); }
     uint32_t IdOf(uint16_t net) const;  // 0: unknown
     uint16_t NetOf(uint32_t id) const;  // 0: not sent
@@ -176,6 +186,8 @@ private:
         double lastAt = 0;
         uint8_t gait = 0;
         bool deadSent = false;
+        int fastRounds = 0;        // rounds in a row faster than rideSpeed
+        double rideUntil = -1e9;   // riding (not shared) until then
     };
     struct Sent {
         PedState q;
@@ -200,6 +212,8 @@ private:
     std::map<uint8_t, Peer> peers_;
     uint8_t me_ = 0, host_ = 0;
     uint16_t nextNet_ = 1;
+    double now_ = 0;
+    uint64_t rides_ = 0;
 };
 
 // ---- the receiver -----------------------------------------------------------------------------------------------------
@@ -213,9 +227,36 @@ struct ReceiverConfig {
     float adoptFar = 45.0f;      // m: ... this near when neither is in sight (it is put there unseen)
     double spawnWait = 0.8;      // s an authority pedestrian stays unmatched before a copy is spawned (out of sight)
     double spawnWaitSeen = 2.5;  // ... when its spot is in sight (a copy appearing in view)
-    size_t maxSpawned = 10;      // spawned copies at once (loading included)
-    size_t maxLoading = 2;       // spawn requests outstanding at once
+    double spawnWaitNone = 0.2;  // ... when there is no free local human in our zone at all (nothing to adopt: our
+                                 //    own spawners are blocked while another's pedestrians show here, and that
+                                 //    clears our ambient humans - 2026-10-20 two-PC test, PDL amb=0 in all 145
+                                 //    records with blocks > 0)
+    // Spawned copies at once (loading included). 10 in 0.16.0: with nothing to adopt the copies are all there is, and
+    // 21-24 authority pedestrians stood within 40 m of the guest (2026-10-20 test, session A; the cap cost 14 % of
+    // the coverage). 24 is the game's own ambient density near a player (24-31 counted).
+    size_t maxSpawned = 24;
+    size_t maxLoading = 4;       // spawn requests outstanding at once (a ready spawner makes one per tick)
     double spawnRetry = 5.0;     // s after a failed spawn before that pedestrian is tried again
+    double resetRetry = 0.3;     // ... after a failure because the spawner was reset (the new one is ready in ~0.1 s)
+    // The copy spawner is broken (2026-10-20 test, session A: the guest's traffic sync hid it as its own traffic car;
+    // its 10 copies went with it and every CreateObject after that failed - 139 failures in 30 s, coverage 18 %, until
+    // the Lua's 30 s idle rule replaced it): a new one is asked for (ResetSpawner) after this many CreateObject failures
+    // in a row, or when at least massLoss spawned copies were gone within massLossWindow and none is left.
+    int spawnerFails = 2;
+    int massLoss = 3;
+    double massLossWindow = 0.5;     // s
+    double spawnerResetGap = 5.0;    // s: at most one reset this often
+    // A replica that does not close its gap (2026-10-20 test, session A: one spawned copy walked 3.2 m behind its
+    // target at exactly its speed for 14 s, 118 of the 121 samples beyond 3 m; neither the multiplier nor the nudges
+    // moved it): more than lagDist behind a moving target (>= lagMinSpeed) without getting lagClose nearer for
+    // lagTime: put at its target (a snap). Lagging like that again within lagRespawn after such a snap: the replica
+    // does not answer at all, it is released (a spawned copy removed, an adopted human given back) and the pedestrian
+    // gets a new copy - fewer but correct replicas instead of one walking metres off.
+    float lagDist = 1.5f;        // m
+    float lagClose = 0.3f;       // m
+    float lagMinSpeed = 0.5f;    // m/s
+    double lagTime = 2.0;        // s
+    double lagRespawn = 6.0;     // s
     double unspawnGrace = 3.0;   // s a spawned copy of a gone pedestrian may wait for nobody looking
     double showAfter = 2.0;      // s a hidden human's spot must be ours (our region) before it is shown again
     float showFar = 150;         // m: a hidden human this far from us is shown again (the game may clean it up)
@@ -237,23 +278,45 @@ struct Camera {
 
 enum class How : uint8_t { None, Adopted, Spawned };
 
+// Why a spawn failed (the Lua's PSF reason).
+enum class SpawnFail : uint8_t {
+    Create,     // create_failed: the spawner's CreateObject gave nothing
+    NoProfile,  // no_profile: the copies' profile did not load
+    Reset,      // spawner_reset: the spawner was replaced while the request waited
+    Timeout,    // the spawn never came back (20 s)
+    Other,
+    Count
+};
+const char* SpawnFailName(SpawnFail w);
+SpawnFail SpawnFailOf(const std::string& why);  // the Lua's reason word
+
 struct RecvCmd {
     enum class Type : uint8_t {
-        Adopt,    // local human `local` is the replica of `key` from now on
-        Spawn,    // spawn a copy for `key` at target
-        Release,  // `key`'s replica is released (adopted: given back to its own AI; spawned: removed)
-        Hide,     // local human `local` is hidden (surplus, not in sight)
-        Show,     // local human `local` is shown again
-        Drive,    // drive `key`'s replica: lc, target
-        Kill,     // `key`'s replica dies (the authority's died)
+        Adopt,         // local human `local` is the replica of `key` from now on
+        Spawn,         // spawn a copy for `key` at target
+        Release,       // `key`'s replica is released (adopted: given back to its own AI; spawned: removed)
+        Hide,          // local human `local` is hidden (surplus, not in sight)
+        Show,          // local human `local` is shown again
+        Drive,         // drive `key`'s replica: lc, target
+        Kill,          // `key`'s replica dies (the authority's died)
+        ResetSpawner,  // the copy spawner is broken: replace it (why)
+    };
+    enum class Why : uint8_t {
+        None,
+        LagSnap,        // Drive: a snap of a replica that did not close its gap
+        Unresponsive,   // Release: ... that lagged again right after such a snap
+        CreateFailing,  // ResetSpawner: CreateObject failed spawnerFails times in a row
+        CopiesLost,     // ResetSpawner: the spawned copies were gone at once
     };
     Type type = Type::Drive;
+    Why why = Why::None;
     uint32_t key = 0;     // (authority << 16) | net
     uint32_t local = 0;   // local entity id (Adopt / Hide / Show; Release of an adopted one)
     How how = How::None;  // Release: what the replica was
     PedState target;      // Spawn / Drive: where the authority's pedestrian is now (Present)
     net::motion::LocomotionCommand lc;
 };
+const char* WhyName(RecvCmd::Why w);
 
 struct ReceiverStats {
     uint32_t known = 0;        // authority pedestrians (not stale)
@@ -262,6 +325,10 @@ struct ReceiverStats {
     uint32_t adopted = 0, spawned = 0, loading = 0, hidden = 0;
     uint64_t states = 0, spawns = 0, gones = 0, deaths = 0, dropsOld = 0;
     uint64_t adoptions = 0, spawnsAsked = 0, spawnFails = 0, hides = 0, shows = 0, releases = 0, snaps = 0, kills = 0;
+    uint64_t failsBy[static_cast<size_t>(SpawnFail::Count)] = {};
+    uint64_t lost = 0;           // spawned copies gone without our release (the game removed them)
+    uint64_t spawnerResets = 0;  // ResetSpawner asked
+    uint64_t lagSnaps = 0, unresponsive = 0;
 };
 
 // What a replica looked like this tick (traces: PDR).
@@ -273,6 +340,7 @@ struct ReplicaInfo {
     PedState target;
     CopyReport copy;
     bool haveCopy = false;
+    bool dead = false;  // the authority's died or ours died here: a body, no target to follow (no PDR)
     float err = 0;
 };
 
@@ -297,8 +365,8 @@ public:
     // Where a replica is (after this tick's commands); dead: it died here.
     void SetReport(uint32_t key, const CopyReport& r, double now);
     void Spawned(uint32_t key, uint32_t local);  // the spawned copy of key is in the world now (local id)
-    void SpawnFailed(uint32_t key, double now);
-    void LocalGone(uint32_t local);  // an adopted / hidden / spawned local human is gone (the game)
+    void SpawnFailed(uint32_t key, double now, SpawnFail why = SpawnFail::Other);
+    void LocalGone(uint32_t local, double now);  // an adopted / hidden / spawned local human is gone (the game)
     // Our replica of `key` died here while the authority's lives: true once per replica (send PedKill).
     bool DiedHere(uint32_t key);
     void Clear();  // world change / session end: everything forgotten (the game removed or reset it)
@@ -335,6 +403,9 @@ private:
         float lastErr = 0;
         PedState lastTarget;
         double lastTargetT = 0;
+        double lagSince = -1;     // lagging behind a moving target since (-1: not)
+        float lagRef = 0;         // the error when that started (or last got lagClose nearer)
+        double lagSnapAt = -1e9;  // our last lag snap of it
     };
     struct Auth {
         net::replica::Stream stream;
@@ -365,6 +436,12 @@ private:
     bool haveRegion_ = false;
     uint8_t myId_ = 0;
     ReceiverStats stats_;
+    // the copy spawner's health
+    int createFails_ = 0;           // CreateObject failures in a row (since the last copy made)
+    std::vector<double> lostAt_;    // when spawned copies were gone without our release (recent)
+    double resetAt_ = -1e9;         // our last ResetSpawner
+    bool resetWanted_ = false;
+    RecvCmd::Why resetWhy_ = RecvCmd::Why::None;
 };
 
 // One-to-one matching of authority pedestrians to free local humans (exposed for the tests): pairs (remote index,

@@ -31,13 +31,16 @@
 --   K key local                            `key`'s replica dies (the authority's died)
 --   KL id                                  our own pedestrian `id` dies (a receiver killed his replica of it)
 --   B 1|0                                  keep our pedestrian spawners around us blocked (another's pedestrians show)
+--   FR why                                 the copy spawner is broken (C++: CreateObject failing / every copy gone
+--                                          at once): a new one now
 -- Output (events, one per line):
 --   PP id x y z inWorld                    every player (us too): where he is (his car while he drives)
 --   PC x y z dx dy dz                      our camera
 --   PH id x y z hx hy flags look           an ambient human of ours near a player (flags: 1 dead, 2 panic, 4 crouch)
 --   PE                                     end of a round of PH lines
 --   PR key x y z hx hy dead                where a replica is, after this tick's commands
---   PSR key id / PSF key why               a spawned copy is in the world (its id) / failed
+--   PSR key id / PSF key why               a spawned copy is in the world (its id) / failed (why: create_failed,
+--                                          no_profile, spawner_reset)
 --   PGL id                                 a local human we controlled (replica / hidden) is gone (the game)
 --   PW                                     a new world: everything of the old one is gone
 --   ST text                                status for the overlay (once a second)
@@ -61,6 +64,7 @@ local FACTORY_PROFILE = "visuals/hero/game_main_tommy_gangster_trenchcoat"
 local COPY_PROFILE = "characters/traffic/traffic_base_ambient_combined"
 local LOAD_TIMEOUT = 12      -- s a profile may take to load
 local FACTORY_IDLE = 30      -- s without a spawned copy or request: the spawner goes
+local FACTORY_FOLLOW = 50    -- m: the spawner car is put under us again when we are this far from it (ground)
 local BLOCK_RADIUS = 60      -- m: spawners blocked around us (BlockSpawnersInSphere, UNVERIFIED for pedestrians)
 local BLOCK_STEP = 20        -- m: blocked again when we moved this far from every blocked spot
 local BLOCK_MAX = 40         -- spots remembered (to unblock them later)
@@ -447,7 +451,7 @@ function P.FacTick(dt, p)
       pcall(drv.SetReactionOnSound, drv, false)
       pcall(drv.InterruptCivilWander, drv)
       pcall(drv.LockControls, drv, true)
-      f.car, f.drv, f.drvId, f.comp, f.st, f.t = car, drv, idOf(drv), comp, "ready", 0
+      f.car, f.drv, f.drvId, f.comp, f.st, f.t, f.readyT = car, drv, idOf(drv), comp, "ready", 0, M.now
       if f.drvId then M.PedOwned[f.drvId] = true end
       log("copy spawner ready")
     elseif f.t > 8 then
@@ -455,6 +459,20 @@ function P.FacTick(dt, p)
     end
   elseif f.st == "ready" then
     if not valid(f.drv) or not valid(f.car) or f.drv:IsDeath() then P.FacReset("copy spawner lost") return end
+    -- deactivated (2026-10-20 two-PC test: the guest's traffic sync hid it as one of its own traffic cars - its copies
+    -- went with it and every CreateObject failed for 30 s): a new one
+    if not active(f.car) or not active(f.drv) then
+      P.FacReset("copy spawner deactivated")
+      P.fac.t = 0
+      return
+    end
+    if M.now - (f.followT or 0) >= 1 then
+      f.followT = M.now
+      local q, cp = p:GetPos(), f.car:GetPos()
+      if (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 > FACTORY_FOLLOW * FACTORY_FOLLOW then
+        f.car:SetPos(V(q.x - 3, q.y, q.z - 40))
+      end
+    end
     if not f.loaded then
       if not f.load then
         local prof = mc_fnv and tostring(mc_fnv(COPY_PROFILE)) or COPY_PROFILE
@@ -507,10 +525,6 @@ function P.FacTick(dt, p)
       end
       if any then f.t = 0 end
       if f.t > FACTORY_IDLE then P.FacReset("idle") P.fac.t = 0 return end
-      if f.t % 3 < dt then
-        local q, cp = p:GetPos(), f.car:GetPos()
-        if (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 > 120 * 120 then f.car:SetPos(V(q.x - 3, q.y, q.z - 40)) end
-      end
     end
   end
 end
@@ -627,6 +641,12 @@ function P.Update(dt, cmds)
       end
     elseif op == "B" then
       good, err = pcall(P.Block, f[2] == "1", p)
+    elseif op == "FR" then
+      -- only a spawner that has been ready a while (one being made, or made just now after our own reset, is new)
+      if P.fac.st == "ready" and M.now - (P.fac.readyT or M.now) >= 1 then
+        good, err = pcall(P.FacReset, "asked (" .. tostring(f[2]) .. ")")
+        P.fac.t = 0
+      end
     end
     if not good then
       P.errs = (P.errs or 0) + 1

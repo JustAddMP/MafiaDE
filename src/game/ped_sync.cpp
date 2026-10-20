@@ -92,6 +92,7 @@ uint32_t _luaErrors = 0;
 double _roundAt = 0, _replicaTraceAt = 0, _summaryAt = 0;
 bool _wasActive = false;
 std::map<uint16_t, uint32_t> _truthCount;  // PDT 1 in 2 per pedestrian
+uint64_t _ridesLogged = 0;
 
 void Append(Shared& sh, const std::string& line) {
     if (sh.inCmds.size() + line.size() < kMaxInCmds) sh.inCmds += line;
@@ -222,7 +223,18 @@ void AppendCommands(std::string& cmds, const std::vector<RecvCmd>& list) {
                 break;
             case RecvCmd::Type::Release:
                 std::snprintf(buf, sizeof buf, "R %u %s %u\n", c.key, HowName(c.how), c.local);
-                core::trace::Line("PDE", "ev=release key=%u how=%s local=%u", c.key, HowName(c.how), c.local);
+                core::trace::Line("PDE", "ev=release key=%u how=%s local=%u why=%s", c.key, HowName(c.how), c.local,
+                                  WhyName(c.why));
+                if (c.why == RecvCmd::Why::Unresponsive)
+                    MC_LOG_INFO("peds: our copy of player %u's pedestrian %u lagged again right after a snap: released, "
+                                "a new one is spawned",
+                                c.key >> 16, c.key & 0xFFFF);
+                break;
+            case RecvCmd::Type::ResetSpawner:
+                std::snprintf(buf, sizeof buf, "FR %s\n", WhyName(c.why));
+                core::trace::Line("PDE", "ev=spawnerreset why=%s", WhyName(c.why));
+                MC_LOG_INFO("peds: the copy spawner is broken (%s): a new one is made",
+                            c.why == RecvCmd::Why::CopiesLost ? "every copy gone at once" : "CreateObject keeps failing");
                 break;
             case RecvCmd::Type::Hide:
                 std::snprintf(buf, sizeof buf, "H %u\n", c.local);
@@ -238,6 +250,8 @@ void AppendCommands(std::string& cmds, const std::vector<RecvCmd>& list) {
                 break;
             case RecvCmd::Type::Drive: {
                 const auto& lc = c.lc;
+                if (c.why == RecvCmd::Why::LagSnap)
+                    core::trace::Line("PDE", "ev=lagsnap key=%u local=%u err=%.2f", c.key, c.local, lc.error);
                 std::snprintf(buf, sizeof buf,
                               "D %u %u %.3f %d %.3f %.3f %.3f %u %.4f %.4f %d %.4f %.4f %.3f %.3f %.3f %.4f %.4f %u\n",
                               c.key, static_cast<unsigned>(lc.gait), lc.speedMult, lc.reissue ? 1 : 0, lc.moveTo.x,
@@ -317,10 +331,18 @@ void ParseEvents(Shared& sh, const char* events, double now) {
             unsigned long key = 0, id = 0;
             if (std::sscanf(s + 4, "%lu %lu", &key, &id) == 2)
                 sh.recv.Spawned(static_cast<uint32_t>(key), static_cast<uint32_t>(id));
-        } else if (line.rfind("PSF ", 0) == 0) {  // a spawn failed: key
-            sh.recv.SpawnFailed(static_cast<uint32_t>(std::strtoul(s + 4, nullptr, 10)), now);
+        } else if (line.rfind("PSF ", 0) == 0) {  // a spawn failed: key why
+            unsigned long key = 0;
+            char why[32] = {};
+            if (std::sscanf(s + 4, "%lu %31s", &key, why) >= 1) {
+                const SpawnFail w = SpawnFailOf(why);
+                sh.recv.SpawnFailed(static_cast<uint32_t>(key), now, w);
+                core::trace::Line("PDE", "ev=spawnfail key=%lu why=%s", key, SpawnFailName(w));
+            }
         } else if (line.rfind("PGL ", 0) == 0) {  // a local human of ours (replica / hidden) is gone
-            sh.recv.LocalGone(static_cast<uint32_t>(std::strtoul(s + 4, nullptr, 10)));
+            const auto id = static_cast<uint32_t>(std::strtoul(s + 4, nullptr, 10));
+            core::trace::Line("PDE", "ev=gone local=%u", id);
+            sh.recv.LocalGone(id, now);
         } else if (line == "PW") {  // a new world: the old one's humans are gone
             sh.recv.Clear();
             sh.auth->SetPeds({}, now);
@@ -350,6 +372,14 @@ void AuthorityRound(Shared& sh, double now) {
     std::vector<PeerOut> out;
     std::vector<Truth> truths;
     sh.auth->Tick(now, ms, out, core::trace::IsOpen() ? &truths : nullptr);
+    if (sh.auth->Rides() < _ridesLogged) _ridesLogged = 0;  // a new authority (session end)
+    if (sh.auth->Rides() > _ridesLogged) {
+        _ridesLogged = sh.auth->Rides();
+        if (_ridesLogged <= 20 || _ridesLogged % 100 == 0)
+            MC_LOG_INFO("peds: one of our pedestrians rides something (faster than any walk; %zu now, #%llu): not "
+                        "shared while it does",
+                        sh.auth->RidingCount(), static_cast<unsigned long long>(_ridesLogged));
+    }
     for (PeerOut& po : out) {
         const auto to = static_cast<net::PlayerId>(po.peer);
         for (auto& b : po.gones) {
@@ -394,7 +424,7 @@ void Traces(Shared& sh, double now) {
     if (now - _replicaTraceAt >= kReplicaTrace) {
         _replicaTraceAt = now;
         for (const ReplicaInfo& i : sh.recv.Replicas(now)) {
-            if (!i.haveCopy) continue;
+            if (!i.haveCopy || i.dead) continue;  // a body has no target to follow
             const auto rT = static_cast<uint32_t>(static_cast<uint64_t>(std::llround(i.targetT * 1000.0)));
             core::trace::Line("PDR", "from=%u net=%u rT=%u cp=%.3f,%.3f,%.3f tp=%.3f,%.3f,%.3f err=%.3f how=%s g=%u",
                               i.key >> 16, i.key & 0xFFFF, rT, i.copy.pos.x, i.copy.pos.y, i.copy.pos.z, i.target.pos.x,
@@ -404,19 +434,24 @@ void Traces(Shared& sh, double now) {
     if (now - _summaryAt >= kSummaryTrace) {
         _summaryAt = now;
         const ReceiverStats& st = sh.recv.Stats();
+        using U = unsigned long long;
+        const auto fb = [&](SpawnFail w) { return static_cast<U>(st.failsBy[static_cast<size_t>(w)]); };
         core::trace::Line("PDC",
                           "near=%u rep=%u hidden=%u adopted=%u spawned=%u loading=%u known=%u snaps=%llu "
-                          "fails=%llu",
+                          "fails=%llu asked=%llu fcreate=%llu fprofile=%llu freset=%llu ftimeout=%llu lost=%llu "
+                          "resets=%llu lagsnaps=%llu unresp=%llu",
                           st.nearby, st.nearReplica, st.hidden, st.adopted, st.spawned, st.loading, st.known,
-                          static_cast<unsigned long long>(st.snaps), static_cast<unsigned long long>(st.spawnFails));
+                          static_cast<U>(st.snaps), static_cast<U>(st.spawnFails), static_cast<U>(st.spawnsAsked),
+                          fb(SpawnFail::Create), fb(SpawnFail::NoProfile), fb(SpawnFail::Reset),
+                          fb(SpawnFail::Timeout), static_cast<U>(st.lost), static_cast<U>(st.spawnerResets),
+                          static_cast<U>(st.lagSnaps), static_cast<U>(st.unresponsive));
         core::trace::Line("PDS",
                           "peds=%zu owned=%zu bytes=%llu states=%llu spawns=%llu gones=%llu deaths=%llu "
-                          "killreq=%llu",
-                          sh.auth->PedCount(), sh.auth->OwnedCount(), static_cast<unsigned long long>(sh.sentBytes),
-                          static_cast<unsigned long long>(sh.sentStates),
-                          static_cast<unsigned long long>(sh.sentSpawns), static_cast<unsigned long long>(sh.sentGones),
-                          static_cast<unsigned long long>(sh.sentDeaths),
-                          static_cast<unsigned long long>(sh.killsRecv));
+                          "killreq=%llu riding=%zu rides=%llu",
+                          sh.auth->PedCount(), sh.auth->OwnedCount(), static_cast<U>(sh.sentBytes),
+                          static_cast<U>(sh.sentStates), static_cast<U>(sh.sentSpawns), static_cast<U>(sh.sentGones),
+                          static_cast<U>(sh.sentDeaths), static_cast<U>(sh.killsRecv), sh.auth->RidingCount(),
+                          static_cast<U>(sh.auth->Rides()));
         for (net::PlayerId id : sh.players) {
             const auto* ps = sh.auth->Stats(id);
             if (!ps || id == sh.localId) continue;
