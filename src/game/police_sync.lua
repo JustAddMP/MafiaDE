@@ -19,9 +19,10 @@
 --     its own here when the host's police see us and our game has none, when our zone decays while they are on us, or
 --     when it decayed away while they were still on us (ZoneCreate on our own player); released when the chase is
 --     over (the decay goes on from where it stood: we still have to lose them). Never on the host: his zone is his.
---     Far from the host nothing is touched: our own police spawn and work as always (traffic_sync.lua switches our
---     police spawning off only near the host).
--- traffic_sync.lua asks P.ChaseNear(x, y, z) for the sirens of police copies when a police car's siren cannot be read.
+--     The host's game is the authority for the police too (docs/host-authority.md): our own police spawning is off
+--     everywhere for the whole session (guest_world), the police cars we see are copies of the host's.
+-- traffic_sync.lua (on the host) asks P.ChaseNear(x, y, z) for the sirens of his police cars when a siren cannot be
+-- read.
 --
 -- Input (cmds, one line per command):
 --   S active host localId          session running, we host, our player id

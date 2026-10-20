@@ -29,12 +29,9 @@ namespace {
 
 using namespace traffic;
 
-constexpr double kSendInterval = 0.05;  // s: authority send rounds (20 Hz; the interest manager spaces far cars out)
-constexpr double kTraceInterval = 0.5;  // s: TRH / TRP / TRG / TRA / TRC / TRL records
+constexpr double kSendInterval = 0.05;  // s: the host's send rounds (20 Hz; the interest manager spaces far cars out)
+constexpr double kTraceInterval = 0.5;  // s: TRH / TRP / TRG records
 constexpr double kTruthInterval = 0.1;  // s: TRS per car at most this often (10 Hz: every other state of a near car)
-constexpr double kViewFresh = 3.0;      // s: a player's position older than this: not in the world (regions)
-constexpr float kNearOwn = 70.0f;       // m: our own cars this near us count for TRL (hidden beyond it, as before)
-constexpr double kUnsharedGrace = 2.0;  // s a car near another player may take to reach him (scan, admission)
 constexpr size_t kMaxInCmds = 256 * 1024;
 constexpr float kMaxCoord = 100000.0f, kMaxSpeed = 200.0f;
 
@@ -55,39 +52,25 @@ bool InRange(const float* v, int n, float lim) {
     return true;
 }
 
-// "a:net" for logs (the host's cars: their net id alone, as in 0.15)
-std::string Label(uint32_t key) {
-    char buf[24];
-    if (RefAuthority(key) == 0)
-        std::snprintf(buf, sizeof buf, "%u", RefNet(key));
-    else
-        std::snprintf(buf, sizeof buf, "%u:%u", RefAuthority(key), RefNet(key));
-    return buf;
-}
-
 struct Shared {
     std::mutex mu;
     bool active = false, isHost = false;
-    net::PlayerId me = net::kNoPlayer, host = net::kHostPlayer;
-    // authority (every game): the cars of the last Lua round (fresh = not handed to AuthorityTraffic yet), the other
-    // players' positions (their puppets / their cars here)
+    net::PlayerId me = net::kNoPlayer;
+    // the host: the cars of the last Lua round (fresh = not handed to AuthorityTraffic yet), the guests' positions
+    // (their puppets / their cars on his game)
     std::vector<HostCar> cars;
     bool carsFresh = false;
     std::map<uint32_t, std::pair<Vec3, double>> views;
     std::string inCmds;  // network -> Lua ("B ..." bump lines)
-    // receiver (every game)
+    // a guest: the copies of the host's cars
     ReceiverTraffic recv;
     std::vector<GuestBump> outBumps;
     std::map<uint32_t, CopyReport> reports;
     std::string status;
     uint32_t ownCars = 0;
-    // where we are, whose region (our own spawning on / off)
+    // where we are
     Vec3 mePos;
     bool haveMe = false;
-    RegionFollow region;
-    // hand-over (render thread computes, main thread traces): our cars near us not yet shared with a player near them
-    size_t unshared = 0, mine = 0;
-    uint32_t hidden = 0, left = 0;  // Lua: our own cars hidden / still driving near us while our spawning is off
 };
 
 Shared& S() {
@@ -97,10 +80,10 @@ Shared& S() {
 
 // render thread
 net::Session* _session = nullptr;
-AuthorityTraffic* _auth = nullptr;
+AuthorityTraffic* _auth = nullptr;  // the host only (RunsAuthority): a guest's game has none
 double _sendAccum = 0, _authTraceAt = 0;
 uint64_t _spawnMsgs = 0, _stateMsgs = 0, _despawnMsgs = 0, _bumpsSent = 0, _bumpsRecv = 0, _bytesSent = 0;
-uint32_t _rxSpawns = 0, _rxStates = 0, _rxDespawns = 0, _rxBad = 0;
+uint32_t _rxSpawns = 0, _rxStates = 0, _rxDespawns = 0, _rxIgnored = 0;
 std::map<uint16_t, double> _truthAt;  // TRS: when each of our cars was last written
 std::string _authStatus;
 // main thread
@@ -115,71 +98,57 @@ void Append(Shared& sh, const std::string& line) {
 }
 
 // ---- messages (render thread) ------------------------------------------------------------------------------------------
-// Whose traffic a message is: the host's old ones (0x0220-0x0222) only from the host; the new ones (0x0224-0x0226)
-// carry the authority, which must be the sender (core's relay keeps the sender of a guest -> guest message).
-bool Accept(net::PlayerId from, bool v2, net::ByteReader& r, uint8_t& auth) {
+// Only 0x0220-0x0223 are registered; Route (game/traffic_model.h) decides whether this game reads one: a guest the
+// host's spawn / despawn / states, the host a guest's bump. The host shows nobody's traffic; the retired 0x0224-0x0227
+// (a guest's own traffic, guest -> guest) are not registered at all.
+bool Accept(uint16_t id, net::PlayerId from, Inbound want) {
     if (!_session) return false;
-    const net::PlayerId me = _session->LocalId();
-    if (v2) {
-        auth = r.U8();
-        if (r.Failed() || auth != from || from == me) {
-            ++_rxBad;
-            return false;
-        }
-        return true;
-    }
-    auth = 0;
-    return from == net::kHostPlayer && !_session->IsHost();
+    if (Route(id, _session->IsHost(), from) == want) return true;
+    if (++_rxIgnored <= 10 || _rxIgnored % 500 == 0)
+        MC_LOG_INFO("traffic: message 0x%04x from player %u ignored (the host's game owns all traffic; #%u)", id,
+                    static_cast<unsigned>(from), _rxIgnored);
+    return false;
 }
 
-void HandleSpawn(net::PlayerId from, net::ByteReader& r, bool v2) {
-    uint8_t auth = 0;
-    if (!Accept(from, v2, r, auth)) return;
+void OnSpawn(net::PlayerId from, net::ByteReader& r) {
+    if (!Accept(kMsgSpawn, from, Inbound::Spawn)) return;
     std::vector<SpawnInfo> list;
     if (!ReadSpawns(r, list)) return;
     join::Mark(join::System::Traffic);
     Shared& sh = S();
     const double now = Now();
     std::lock_guard lock(sh.mu);
-    for (const auto& s : list) sh.recv.OnSpawn(auth, s, now);
+    for (const auto& s : list) sh.recv.OnSpawn(s, now);
     _rxSpawns += static_cast<uint32_t>(list.size());
 }
 
-void HandleDespawn(net::PlayerId from, net::ByteReader& r, bool v2) {
-    uint8_t auth = 0;
-    if (!Accept(from, v2, r, auth)) return;
+void OnDespawn(net::PlayerId from, net::ByteReader& r) {
+    if (!Accept(kMsgDespawn, from, Inbound::Despawn)) return;
     std::vector<uint16_t> nets;
     if (!ReadDespawns(r, nets)) return;
     Shared& sh = S();
     const double now = Now();
     std::lock_guard lock(sh.mu);
-    for (uint16_t n : nets) sh.recv.OnDespawn(auth, n, now);
+    for (uint16_t n : nets) sh.recv.OnDespawn(n, now);
     _rxDespawns += static_cast<uint32_t>(nets.size());
 }
 
-void HandleStates(net::PlayerId from, net::ByteReader& r, bool v2) {
-    uint8_t auth = 0;
-    if (!Accept(from, v2, r, auth)) return;
+void OnStates(net::PlayerId from, net::ByteReader& r) {
+    if (!Accept(kMsgStates, from, Inbound::States)) return;
     uint32_t ms = 0;
     std::vector<CarState> states;
     if (!ReadStates(r, ms, states)) return;
     Shared& sh = S();
     const double now = Now();
     std::lock_guard lock(sh.mu);
-    sh.recv.OnStates(auth, ms, states, now);
+    sh.recv.OnStates(ms, states, now);
     ++_rxStates;
 }
 
-void OnSpawn(net::PlayerId from, net::ByteReader& r) { HandleSpawn(from, r, false); }
-void OnDespawn(net::PlayerId from, net::ByteReader& r) { HandleDespawn(from, r, false); }
-void OnStates(net::PlayerId from, net::ByteReader& r) { HandleStates(from, r, false); }
-void OnSpawn2(net::PlayerId from, net::ByteReader& r) { HandleSpawn(from, r, true); }
-void OnDespawn2(net::PlayerId from, net::ByteReader& r) { HandleDespawn(from, r, true); }
-void OnStates2(net::PlayerId from, net::ByteReader& r) { HandleStates(from, r, true); }
-
-// TrafficBump: logged by the car's authority (and in its trace). Its car is not moved: the reporter's own car (a copy
-// on the authority's game, player sync) already hits the authority's car there when it was a ram.
-void HandleBump(net::PlayerId from, net::ByteReader& r) {
+// TrafficBump: logged by the host (and in his trace). His car is not moved: the reporter's own car (a copy on the
+// host's game, player sync) already hits the host's car there when it was a ram.
+void OnBump(net::PlayerId from, net::ByteReader& r) {
+    if (!Accept(kMsgBump, from, Inbound::Bump)) return;
     BumpInfo b;
     if (!_auth || !ReadBump(r, b)) return;
     ++_bumpsRecv;
@@ -190,18 +159,6 @@ void HandleBump(net::PlayerId from, net::ByteReader& r) {
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     Append(sh, buf);
-}
-
-void OnBump(net::PlayerId from, net::ByteReader& r) {
-    if (!_session || !_session->IsHost() || from == net::kHostPlayer) return;
-    HandleBump(from, r);
-}
-
-void OnBump2(net::PlayerId from, net::ByteReader& r) {
-    if (!_session) return;
-    const uint8_t auth = r.U8();
-    if (r.Failed() || auth != _session->LocalId() || from == auth) return;
-    HandleBump(from, r);
 }
 
 // ---- Lua (main thread) -------------------------------------------------------------------------------------------------
@@ -236,8 +193,8 @@ bool LoadModule(lua_State* L) {
 }
 
 // "TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags" (flag 4: no living driver read
-// at the wheel this round, with 64: farther than kDriverLod from our player, where the game streams drivers out;
-// AuthorityTraffic's DriverWatch turns it into the confirmed kNoDriver)
+// at the wheel this round, with 64: farther than kDriverLod from the host's player, where the game streams drivers
+// out; AuthorityTraffic's DriverWatch turns it into the confirmed kNoDriver)
 bool ParseCar(const std::string& line, HostCar& c) {
     unsigned long key = 0;
     unsigned kind = 0, flags = 0;
@@ -272,7 +229,7 @@ bool ParseCar(const std::string& line, HostCar& c) {
     return true;
 }
 
-// Commands to the Lua carry the car's RefKey (authority << 16 | net; the host's cars: the net id as in 0.15).
+// Commands to the Lua carry the car's key: the host's net id.
 void AppendCommands(std::string& cmds, const std::vector<GuestCmd>& list) {
     char buf[512];
     for (const GuestCmd& c : list) {
@@ -302,32 +259,22 @@ void AppendCommands(std::string& cmds, const std::vector<GuestCmd>& list) {
     }
 }
 
-// Receiver records (docs/sync-trace.md): TRG totals, TRA per authority, TRL our own traffic, and TRC per copy at its
-// first report after the 2 Hz mark (the copy where it is after this tick's commands, the target it was driven to and
-// the authority time rT that target stands for, so sync_compare lines it up with the authority's TRS).
+// A guest's records (docs/sync-trace.md): TRG totals and TRC per copy at its first report after the 2 Hz mark (the
+// copy where it is after this tick's commands, the target it was driven to and the host time rT that target stands
+// for, so sync_compare lines it up with the host's TRS).
 void ReceiverTrace(Shared& sh, double now) {
     if (now - _recvTraceAt >= kTraceInterval) {
         _recvTraceAt = now;
         const GuestStats& st = sh.recv.Stats();
         core::trace::Line("TRG",
-                          "mode=%d auth=%u known=%u live=%u copies=%u avg=%.2f max=%.2f pins=%u snaps=%u bumps=%u "
+                          "known=%u live=%u copies=%u avg=%.2f max=%.2f pins=%u snaps=%u bumps=%u "
                           "states=%llu spawns=%llu despawns=%llu old=%llu frozen=%d quiet=%u due=%u shown=%u "
-                          "blends=%llu fsnaps=%llu",
-                          sh.region.Own() ? 0 : 1, sh.region.Authority(), st.known, st.live, st.copies, st.avgErr,
-                          st.maxErr, st.pins, st.snaps, st.bumps, static_cast<unsigned long long>(st.states),
-                          static_cast<unsigned long long>(st.spawns), static_cast<unsigned long long>(st.despawns),
-                          static_cast<unsigned long long>(st.dropsOld), st.frozen ? 1 : 0, st.quietBumps, st.due,
-                          st.shown, static_cast<unsigned long long>(st.blends),
-                          static_cast<unsigned long long>(st.fixSnaps));
-        for (uint8_t a : sh.recv.Authorities()) {
-            const AuthorityStats as = sh.recv.StatsOf(a);
-            core::trace::Line("TRA", "a=%u d=%.0f live=%u copies=%u due=%u shown=%u paused=%d pd=%.0f", a,
-                              sh.region.DistTo(a), as.live, as.copies, as.due, as.shown, as.paused ? 1 : 0,
-                              sh.recv.PlayoutDelay(a) * 1000.0);
-        }
-        core::trace::Line("TRL", "own=%d auth=%u hidden=%u near=%zu mine=%zu left=%u since=%.1f",
-                          sh.region.Own() ? 1 : 0, sh.region.Authority(), sh.hidden, sh.unshared, sh.mine, sh.left,
-                          sh.region.Since(now));
+                          "blends=%llu fsnaps=%llu pd=%.0f",
+                          st.known, st.live, st.copies, st.avgErr, st.maxErr, st.pins, st.snaps, st.bumps,
+                          static_cast<unsigned long long>(st.states), static_cast<unsigned long long>(st.spawns),
+                          static_cast<unsigned long long>(st.despawns), static_cast<unsigned long long>(st.dropsOld),
+                          st.frozen ? 1 : 0, st.quietBumps, st.due, st.shown, static_cast<unsigned long long>(st.blends),
+                          static_cast<unsigned long long>(st.fixSnaps), sh.recv.PlayoutDelay() * 1000.0);
         for (const auto& [key, rep] : sh.reports) _trcDue.insert(key);
     }
     if (_trcDue.empty()) return;
@@ -344,10 +291,10 @@ void ReceiverTrace(Shared& sh, double now) {
         const CopyReport& r = rep->second;
         char pre[64] = "-";
         if (r.havePre) std::snprintf(pre, sizeof pre, "%.3f,%.3f,%.3f", r.pre.x, r.pre.y, r.pre.z);
-        core::trace::Line("TRC", "a=%u net=%u rT=%.1f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
+        core::trace::Line("TRC", "net=%u rT=%.1f tgt=%.3f,%.3f,%.3f tv=%.3f,%.3f,%.3f cp=%.3f,%.3f,%.3f "
                                  "cv=%.3f,%.3f,%.3f err=%.3f pin=%d pins=%d f=%u pp=%s",
-                          RefAuthority(key), RefNet(key), rt, t.pos.x, t.pos.y, t.pos.z, t.vel.x, t.vel.y, t.vel.z,
-                          r.pos.x, r.pos.y, r.pos.z, r.vel.x, r.vel.y, r.vel.z, err, pinned ? 1 : 0, pins, t.flags, pre);
+                          key, rt, t.pos.x, t.pos.y, t.pos.z, t.vel.x, t.vel.y, t.vel.z, r.pos.x, r.pos.y, r.pos.z,
+                          r.vel.x, r.vel.y, r.vel.z, err, pinned ? 1 : 0, pins, t.flags, pre);
     }
     // copies gone meanwhile
     for (auto it = _trcDue.begin(); it != _trcDue.end();) {
@@ -356,29 +303,6 @@ void ReceiverTrace(Shared& sh, double now) {
         else
             ++it;
     }
-}
-
-// Whose region we are in: every player we know (us from TP, the others from TV), in the world when seen lately.
-void UpdateRegion(Shared& sh, double now) {
-    if (sh.me == net::kNoPlayer) return;
-    std::vector<net::authority::PlayerSpot> spots;
-    spots.push_back({sh.me, sh.mePos, sh.haveMe});
-    for (const auto& [id, v] : sh.views)
-        if (id != sh.me && id < net::kMaxPlayers)
-            spots.push_back({static_cast<net::PlayerId>(id), v.first, now - v.second <= kViewFresh});
-    const net::PlayerId before = sh.region.Authority();
-    if (!sh.region.Update(sh.me, sh.host, spots, now)) return;
-    const net::PlayerId a = sh.region.Authority();
-    const float d = sh.region.DistTo(a);
-    if (sh.region.Own())
-        MC_LOG_INFO("traffic: our own traffic runs here (no other player's region: player %u's was %.0f m away)",
-                    static_cast<unsigned>(before), sh.region.DistTo(before));
-    else
-        MC_LOG_INFO("traffic: we are in player %u's region (%.0f m from him): our own spawning goes off, our cars "
-                    "already here keep driving and are shared until they leave",
-                    static_cast<unsigned>(a), d);
-    core::trace::Line("TRR", "auth=%u from=%u own=%d d=%.0f", a, before == net::kNoPlayer ? 255u : before,
-                      sh.region.Own() ? 1 : 0, d);
 }
 
 void MainTick(lua_State* L, float dt) {
@@ -399,20 +323,19 @@ void MainTick(lua_State* L, float dt) {
         cmds = head;
         cmds += sh.inCmds;
         sh.inCmds.clear();
-        if (active) {
+        if (active && ShowsCopies(host)) {
             std::vector<GuestCmd> list;
             std::vector<GuestBump> bumps;
-            // each authority's pause (PeerPaused, game/peer_pause.h): its copies are held, no knocks reported
-            for (uint8_t a : sh.recv.Authorities()) {
-                const bool paused = peer_pause::Remote(a, now) == peer_pause::Quiet::Paused;
-                if (paused == sh.recv.Paused(a)) continue;
+            // the host's pause (PeerPaused, game/peer_pause.h): his cars' copies are held, no knocks reported
+            const bool paused = peer_pause::Remote(net::kHostPlayer, now) == peer_pause::Quiet::Paused;
+            if (paused != sh.recv.HostPaused()) {
                 const uint32_t quiet0 = sh.recv.Stats().quietBumps;
-                sh.recv.SetPaused(a, paused, now);
-                MC_LOG_INFO("traffic: player %u %s: %u copies of his cars %s (knocks not reported so far: %u)", a,
-                            paused ? "paused his game" : "resumed his game", sh.recv.StatsOf(a).copies,
+                sh.recv.SetHostPaused(paused, now);
+                MC_LOG_INFO("traffic: the host %s: %u copies of his cars %s (knocks not reported so far: %u)",
+                            paused ? "paused his game" : "resumed his game", sh.recv.Stats().copies,
                             paused ? "held where they stand" : "driven again, no knock reports for 1 s", quiet0);
-                core::trace::Line("TRZ", "ev=%s a=%u copies=%u quiet=%u", paused ? "freeze" : "thaw", a,
-                                  sh.recv.StatsOf(a).copies, quiet0);
+                core::trace::Line("TRZ", "ev=%s copies=%u quiet=%u", paused ? "freeze" : "thaw", sh.recv.Stats().copies,
+                                  quiet0);
             }
             const uint32_t gaps0 = sh.recv.Stats().localGaps;
             sh.recv.Tick(now, dt, list, bumps);
@@ -421,21 +344,19 @@ void MainTick(lua_State* L, float dt) {
                 core::trace::Line("TRZ", "ev=localgap copies=%u quiet=%u", sh.recv.Stats().copies,
                                   sh.recv.Stats().quietBumps);
             }
-            cmds += sh.region.Own() ? "M 0\n" : "M 1\n";
             AppendCommands(cmds, list);
             for (const auto& c : list)
                 if (c.type == GuestCmd::Type::Remove) sh.reports.erase(c.key);
             for (const auto& b : bumps) {
                 if (sh.outBumps.size() < 64) sh.outBumps.push_back(b);
-                MC_LOG_INFO("traffic: our copy of car %s was knocked %.1f m off it (copy %.1f m/s, its authority's "
-                            "car %.1f m/s): put back, reported to player %u",
-                            Label(b.key).c_str(), b.error, b.copySpeed, b.targetSpeed, RefAuthority(b.key));
+                MC_LOG_INFO("traffic: our copy of host car %u was knocked %.1f m off it (copy %.1f m/s, the host's car "
+                            "%.1f m/s): put back, reported to the host",
+                            b.key, b.error, b.copySpeed, b.targetSpeed);
             }
-        } else if (_wasActive) {
+        } else if (_wasActive && !active) {
             sh.recv.Clear();
             sh.reports.clear();
             sh.views.clear();
-            sh.region = RegionFollow();
             _trcDue.clear();
         }
     }
@@ -473,20 +394,21 @@ void MainTick(lua_State* L, float dt) {
     const char* events = lua::ToString(L, -1);
     std::vector<HostCar> cars;
     bool round = false, haveMe = false;
+    const bool authority = RunsAuthority(host), shows = ShowsCopies(host);
     std::lock_guard lock(sh.mu);
     if (events && *events) {
         std::istringstream in(events);
         std::string line;
         while (std::getline(in, line)) {
-            if (line.rfind("TC ", 0) == 0) {
+            if (line.rfind("TC ", 0) == 0) {  // the host's traffic car (a guest's Lua sends none; ignored if it did)
                 HostCar c;
-                if (cars.size() < 512 && ParseCar(line, c)) cars.push_back(std::move(c));
-            } else if (line == "TE") {  // end of an authority round (also when it found no car)
-                round = true;
-            } else if (line.rfind("TV ", 0) == 0) {  // another player's position (his puppet / his car here)
+                if (authority && cars.size() < 512 && ParseCar(line, c)) cars.push_back(std::move(c));
+            } else if (line == "TE") {  // end of the host's round (also when it found no car)
+                round = authority;
+            } else if (line.rfind("TV ", 0) == 0) {  // a guest's position (his puppet / his car on the host's game)
                 unsigned id = 0;
                 float p[3] = {};
-                if (std::sscanf(line.c_str() + 3, "%u %f %f %f", &id, &p[0], &p[1], &p[2]) == 4 &&
+                if (authority && std::sscanf(line.c_str() + 3, "%u %f %f %f", &id, &p[0], &p[1], &p[2]) == 4 &&
                     id < net::kMaxPlayers && id != sh.me && InRange(p, 3, kMaxCoord))
                     sh.views[id] = {{p[0], p[1], p[2]}, now};
             } else if (line.rfind("TP ", 0) == 0) {  // our position
@@ -495,13 +417,13 @@ void MainTick(lua_State* L, float dt) {
                     sh.mePos = {p[0], p[1], p[2]};
                     haveMe = true;
                 }
-            } else if (line.rfind("TR ", 0) == 0) {  // where our copy is (and where it was before our commands)
+            } else if (shows && line.rfind("TR ", 0) == 0) {  // where our copy is (and where it was before our commands)
                 unsigned long id = 0;
                 float v[13] = {};
                 const int n = std::sscanf(line.c_str() + 3, "%lu %f %f %f %f %f %f %f %f %f %f %f %f %f", &id, &v[0],
                                           &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9], &v[10], &v[11],
                                           &v[12]);
-                if ((n == 11 || n == 14) && id > 0 && id <= 0xFFFFFFul && InRange(v, 3, kMaxCoord) &&
+                if ((n == 11 || n == 14) && id > 0 && id <= 0xFFFFul && InRange(v, 3, kMaxCoord) &&
                     InRange(v + 3, 3, kMaxSpeed) && InRange(v + 6, 4, 2)) {
                     CopyReport r;
                     r.pos = {v[0], v[1], v[2]};
@@ -514,20 +436,14 @@ void MainTick(lua_State* L, float dt) {
                     sh.recv.SetReport(static_cast<uint32_t>(id), r, now);
                     sh.reports[static_cast<uint32_t>(id)] = r;
                 }
-            } else if (line.rfind("TH ", 0) == 0) {  // player sync took our copy (a jacked car)
+            } else if (shows && line.rfind("TH ", 0) == 0) {  // player sync took our copy (a jacked car)
                 const auto id = static_cast<uint32_t>(std::strtoul(line.c_str() + 3, nullptr, 10));
                 sh.recv.Release(id);
                 sh.reports.erase(id);
-            } else if (line.rfind("TG ", 0) == 0) {  // our copy is gone (the game removed it)
+            } else if (shows && line.rfind("TG ", 0) == 0) {  // our copy is gone (the game removed it)
                 const auto id = static_cast<uint32_t>(std::strtoul(line.c_str() + 3, nullptr, 10));
                 sh.recv.Gone(id);
                 sh.reports.erase(id);
-            } else if (line.rfind("TL ", 0) == 0) {  // our own cars hidden / still driving near us (spawning off)
-                unsigned h = 0, l = 0;
-                if (std::sscanf(line.c_str() + 3, "%u %u", &h, &l) == 2) {
-                    sh.hidden = h;
-                    sh.left = l;
-                }
             } else if (line.rfind("ST ", 0) == 0) {
                 sh.status = line.substr(3);
             }
@@ -543,20 +459,18 @@ void MainTick(lua_State* L, float dt) {
         lua::SetTop(L, top);
         return;
     }
-    sh.recv.SetLocal(sh.mePos, haveMe);
-    UpdateRegion(sh, now);
-    if (core::trace::IsOpen()) ReceiverTrace(sh, now);
+    if (shows) {
+        sh.recv.SetLocal(sh.mePos, haveMe);
+        if (core::trace::IsOpen()) ReceiverTrace(sh, now);
+    }
     lua::SetTop(L, top);
 }
 
-// ---- authority sending (render thread) ---------------------------------------------------------------------------------
+// ---- the host's sending (render thread) --------------------------------------------------------------------------------
 void AuthSend(double now) {
     Shared& sh = S();
     std::vector<PeerOut> out;
     const net::PlayerId me = _session->LocalId();
-    const bool isHost = _session->IsHost();
-    Vec3 mePos;
-    bool haveMe = false;
     {
         std::lock_guard lock(sh.mu);
         if (sh.carsFresh) {
@@ -579,31 +493,22 @@ void AuthSend(double now) {
         }
         for (const auto& [id, v] : sh.views)
             if (id != me && _session->FindPlayer(static_cast<net::PlayerId>(id))) _auth->SetView(id, v.first, v.second);
-        mePos = sh.mePos;
-        haveMe = sh.haveMe;
     }
     const auto ms = static_cast<uint32_t>(static_cast<uint64_t>(now * 1000.0));
     _auth->Tick(now, ms, out);
-    // the host's own traffic keeps the 0.15 messages; a guest's goes with its id in front (guest -> guest relayed)
-    const uint16_t idSpawn = isHost ? kMsgSpawn : kMsgSpawn2, idDespawn = isHost ? kMsgDespawn : kMsgDespawn2,
-                   idStates = isHost ? kMsgStates : kMsgStates2;
-    auto body = [&](const std::vector<uint8_t>& b) { return isHost ? b : WithAuthority(me, b); };
     for (const PeerOut& po : out) {
         const auto peer = static_cast<net::PlayerId>(po.peer);
         for (const auto& b : po.despawns) {
-            const auto m = body(b);
-            if (_session->SendTo(peer, idDespawn, m, net::Reliability::Reliable)) ++_despawnMsgs;
-            _bytesSent += m.size();
+            if (_session->SendTo(peer, kMsgDespawn, b, net::Reliability::Reliable)) ++_despawnMsgs;
+            _bytesSent += b.size();
         }
         for (const auto& b : po.spawns) {
-            const auto m = body(b);
-            if (_session->SendTo(peer, idSpawn, m, net::Reliability::Reliable)) ++_spawnMsgs;
-            _bytesSent += m.size();
+            if (_session->SendTo(peer, kMsgSpawn, b, net::Reliability::Reliable)) ++_spawnMsgs;
+            _bytesSent += b.size();
         }
         for (const auto& b : po.states) {
-            const auto m = body(b);
-            if (_session->SendTo(peer, idStates, m, net::Reliability::Unreliable)) ++_stateMsgs;
-            _bytesSent += m.size();
+            if (_session->SendTo(peer, kMsgStates, b, net::Reliability::Unreliable)) ++_stateMsgs;
+            _bytesSent += b.size();
         }
         if (po.spawned || po.despawned) {
             const auto* st = _auth->Stats(po.peer);
@@ -613,20 +518,12 @@ void AuthSend(double now) {
                             po.peer, po.spawned, po.despawned, st ? st->admitted : 0, st ? st->relevant : 0);
         }
     }
-    // the hand-over: our cars near us that a player near them has not got (main thread traces it in TRL)
-    {
-        size_t mine = 0;
-        const size_t unshared = haveMe ? _auth->Unshared(mePos, kNearOwn, now, kUnsharedGrace, &mine) : 0;
-        std::lock_guard lock(sh.mu);
-        sh.unshared = unshared;
-        sh.mine = haveMe ? mine : 0;
-    }
     char buf[160];
-    std::string s = "Traffic: " + std::to_string(_auth->CarCount()) + " own cars";
+    std::string s = "Traffic: host authority, " + std::to_string(_auth->CarCount()) + " cars";
     for (const auto& p : _session->Players()) {
         if (p.id == me) continue;
         if (const auto* st = _auth->Stats(p.id)) {
-            // per player (three or four players: each has his own share and budget): cars, and bytes sent so far
+            // per guest (three or four players: each has his own share and budget): cars, and bytes sent so far
             std::snprintf(buf, sizeof buf, ", to %u: %u of %u (%llu KB)", p.id, st->admitted, st->relevant,
                           static_cast<unsigned long long>(st->bytes / 1024));
             s += buf;
@@ -647,12 +544,12 @@ void AuthSend(double now) {
     _authTraceAt = now;
     core::trace::Line("TRH",
                       "cars=%zu spawnMsgs=%llu stateMsgs=%llu despawnMsgs=%llu bytes=%llu bumps=%llu nodrv=%zu "
-                      "orphan=%zu orphaned=%llu driven=%llu far=%zu",
+                      "orphan=%zu orphaned=%llu driven=%llu far=%zu ignored=%u",
                       _auth->CarCount(), static_cast<unsigned long long>(_spawnMsgs),
                       static_cast<unsigned long long>(_stateMsgs), static_cast<unsigned long long>(_despawnMsgs),
                       static_cast<unsigned long long>(_bytesSent), static_cast<unsigned long long>(_bumpsRecv),
                       _auth->MissingNow(), _auth->DeclaredNow(), static_cast<unsigned long long>(_auth->Orphaned()),
-                      static_cast<unsigned long long>(_auth->DrivenAgain()), _auth->FarNow());
+                      static_cast<unsigned long long>(_auth->DrivenAgain()), _auth->FarNow(), _rxIgnored);
     for (const auto& p : _session->Players()) {
         const auto* st = _auth->Stats(p.id);
         if (!st || p.id == me) continue;
@@ -670,29 +567,25 @@ void AuthSend(double now) {
 
 void TrafficSync::Install() {
     lua::AddTickCallback(&MainTick);
-    MC_LOG_INFO("traffic: installed (messages 0x%04x-0x%04x)", kMsgSpawn, kMsgBump2);
+    MC_LOG_INFO("traffic: installed (host authority: messages 0x%04x-0x%04x; 0x%04x-0x%04x retired)", kMsgSpawn,
+                kMsgBump, kRetiredFirst, kRetiredLast);
 }
 
 void TrafficSync::Attach(net::Session& session) {
     _session = &session;
     delete _auth;
-    _auth = new AuthorityTraffic();
+    _auth = nullptr;  // made in Tick on the host only (RunsAuthority)
     _sendAccum = 0;
     _truthAt.clear();
     session.On(kMsgSpawn, &OnSpawn);
     session.On(kMsgDespawn, &OnDespawn);
     session.On(kMsgStates, &OnStates);
     session.On(kMsgBump, &OnBump);
-    session.On(kMsgSpawn2, &OnSpawn2);
-    session.On(kMsgDespawn2, &OnDespawn2);
-    session.On(kMsgStates2, &OnStates2);
-    session.On(kMsgBump2, &OnBump2);
 }
 
 void TrafficSync::Detach() {
     if (_session) {
-        for (uint16_t id : {kMsgSpawn, kMsgDespawn, kMsgStates, kMsgBump, kMsgSpawn2, kMsgDespawn2, kMsgStates2, kMsgBump2})
-            _session->Off(id);
+        for (uint16_t id : {kMsgSpawn, kMsgDespawn, kMsgStates, kMsgBump}) _session->Off(id);
     }
     _session = nullptr;
     delete _auth;
@@ -710,37 +603,41 @@ void TrafficSync::Detach() {
 }
 
 void TrafficSync::OnPlayerLeft(net::PlayerId id) {
-    if (_auth) _auth->RemovePeer(id);
+    if (_auth) _auth->RemovePeer(id);  // the host: nothing is sent to him any more
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
     sh.views.erase(id);
-    // his cars: our copies of them go (a guest who drops is a new authority when back: his cars come again)
-    sh.recv.RemoveAuthority(id);
 }
 
 void TrafficSync::Tick(float dt) {
     if (!_session) return;
     Shared& sh = S();
     std::vector<GuestBump> bumps;
+    const bool isHost = _session->IsHost();
     {
         std::lock_guard lock(sh.mu);
         sh.active = _session->IsActive();
-        sh.isHost = _session->IsHost();
+        sh.isHost = isHost;
         sh.me = _session->LocalId();
         bumps.swap(sh.outBumps);
     }
+    // the authority exists on the host's game only: a guest's game scans and sends no traffic of its own
+    if (RunsAuthority(isHost) && !_auth) {
+        _auth = new AuthorityTraffic();
+        _sendAccum = 0;
+        _truthAt.clear();
+    } else if (!RunsAuthority(isHost) && _auth) {
+        delete _auth;
+        _auth = nullptr;
+    }
     if (!_session->IsActive()) return;
-    const net::PlayerId me = _session->LocalId();
-    for (const auto& b : bumps) {
-        BumpInfo bi{RefNet(b.key), b.error, b.copySpeed, b.targetSpeed};
-        const uint8_t auth = RefAuthority(b.key);
-        if (auth == me) continue;
-        bool sent;
-        if (auth == net::kHostPlayer)
-            sent = _session->SendToHost(kMsgBump, PackBump(bi), net::Reliability::Reliable);
-        else
-            sent = _session->SendTo(auth, kMsgBump2, WithAuthority(auth, PackBump(bi)), net::Reliability::Reliable);
-        if (sent) ++_bumpsSent;
+    if (!isHost) {
+        // a guest: his copies' knocks go to the host (who owns every car)
+        for (const auto& b : bumps) {
+            const BumpInfo bi{static_cast<uint16_t>(b.key), b.error, b.copySpeed, b.targetSpeed};
+            if (_session->SendToHost(kMsgBump, PackBump(bi), net::Reliability::Reliable)) ++_bumpsSent;
+        }
+        return;
     }
     _sendAccum += dt;
     if (_sendAccum < kSendInterval || !_auth) return;
@@ -759,13 +656,18 @@ void TrafficSync::GetStatus(std::vector<render::OverlayLine>& out) {
     char buf[320];
     Shared& sh = S();
     std::lock_guard lock(sh.mu);
-    const GuestStats& st = sh.recv.Stats();
-    std::string region = sh.region.Own() ? std::string("our own") : "player " + std::to_string(sh.region.Authority()) + "'s";
-    std::snprintf(buf, sizeof buf,
-                  "%s | region %s | copies %u of %u (shown %u/%u), err %.1f/%.1f m, pins %u, bumps %u (rx %u/%u/%u)%s%s",
-                  _authStatus.empty() ? "Traffic: -" : _authStatus.c_str(), region.c_str(), st.copies, st.live,
-                  st.shown, st.due, st.avgErr, st.maxErr, st.pins, st.bumps, _rxSpawns, _rxStates, _rxDespawns,
-                  sh.status.empty() ? "" : " | ", sh.status.c_str());
+    if (_session->IsHost()) {
+        std::snprintf(buf, sizeof buf, "%s, bumps reported %llu%s%s",
+                      _authStatus.empty() ? "Traffic: host authority, -" : _authStatus.c_str(),
+                      static_cast<unsigned long long>(_bumpsRecv), sh.status.empty() ? "" : " | ", sh.status.c_str());
+    } else {
+        const GuestStats& st = sh.recv.Stats();
+        std::snprintf(buf, sizeof buf,
+                      "Traffic: the host's | copies %u of %u (shown %u/%u), err %.1f/%.1f m, pins %u, bumps %u "
+                      "(rx %u/%u/%u)%s%s",
+                      st.copies, st.live, st.shown, st.due, st.avgErr, st.maxErr, st.pins, st.bumps, _rxSpawns,
+                      _rxStates, _rxDespawns, sh.status.empty() ? "" : " | ", sh.status.c_str());
+    }
     out.push_back({buf, 0xFFB0C4DE});
 }
 

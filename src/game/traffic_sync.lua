@@ -1,52 +1,50 @@
--- MafiaCoop traffic glue (B4: ambient traffic and police shared, by region). Runs in the game's Lua state on
--- GameMainThread after player_sync.lua and npc_sync.lua, called once per script tick by src/game/traffic_sync.cpp
--- (MafiaCoop.Traffic.Update). Embedded into the dll; a copy at <dll dir>\traffic_sync.lua overrides it.
+-- MafiaCoop traffic glue (B4: ambient traffic and police shared; the host's game owns all of it,
+-- docs/host-authority.md). Runs in the game's Lua state on GameMainThread after player_sync.lua and npc_sync.lua, called
+-- once per script tick by src/game/traffic_sync.cpp (MafiaCoop.Traffic.Update). Embedded into the dll; a copy at
+-- <dll dir>\traffic_sync.lua overrides it.
 --
--- Every game is the authority for its own traffic: it reports its moving traffic and police cars (a car whose driver
--- came from the traffic or police generators, docs/game-api.md 15: `behavior_object_prime-NN-` with an empty suffix)
--- near any other player, 20 times a second; the C++ side (game/traffic_model.h) tells each other player's game which
--- of them it gets. Every game shows a copy of every other game's cars near it (a car with a crew of its own,
--- ObtainCarWithCrew), driven every tick the way the C++ side's VehicleController and Corrector say (the authority
--- driver's controls, a correction hidden in the motion, pinned when its physics does not follow), with
--- player_sync.lua's remote-car helpers (M.RV). Whose region we are in (the C++ side's RegionFollow: near the host, or
--- near a lower-id guest far from the host) only switches our own ambient traffic and police spawning off (M 1): our own
--- cars already there keep driving and are shared like any of ours, and are hidden only once out of everyone's sight
--- (beyond 70 m of every player). Parked cars, mission cars and player cars are not traffic: they stay as they were
--- (parked cars local, mission cars from each game's own mission, player cars through player_sync).
--- When a player takes over a car that is a traffic copy here (player_sync adopts it: its authority or we jacked a
--- traffic car) the copy is handed over: its crew gets out and it is player_sync's car from then on.
+-- The host's game is the only authority: it reports its moving traffic and police cars (a car whose driver came from
+-- the traffic or police generators, docs/game-api.md 15: `behavior_object_prime-NN-` with an empty suffix) near any
+-- guest, 20 times a second; the C++ side (game/traffic_model.h) tells each guest's game which of them it gets. A
+-- guest's game shows a copy of the host's cars near it (a car with a crew of its own, ObtainCarWithCrew), driven every
+-- tick the way the C++ side's VehicleController and Corrector say (the host driver's controls, a correction hidden in
+-- the motion, pinned when its physics does not follow), with player_sync.lua's remote-car helpers (M.RV). A guest's
+-- game scans and reports no cars of its own: its own ambient traffic and police spawning are off and its leftover cars
+-- hidden by guest_world (not by this file any more). The host's game shows no copies (nobody else has traffic).
+-- Parked cars, mission cars and player cars are not traffic: they stay as they were (parked cars local, mission cars
+-- from each game's own mission, player cars through player_sync).
+-- When a player takes over a car that is a traffic copy here (player_sync adopts it: the host or we jacked a traffic
+-- car) the copy is handed over: its crew gets out and it is player_sync's car from then on.
 --
--- A copy is known by its key = authority x 65536 + net (the host's cars: their net id, as in 0.15).
+-- A copy is known by its key = the host's net id of the car.
 -- Input (cmds, one line per command):
 --   S active host me                           session running, we host, our player id
---   B from net key err copySpeed hostSpeed     player `from`'s copy of our car `key` was knocked off (logged)
---   M 1|0                                      our own spawning off (another player's region) / on (ours)
+--   B from net key err copySpeed hostSpeed     (host) guest `from`'s copy of our car `key` was knocked off (logged)
 --   A key kind model c1 c2 plate x y z qx qy qz qw flags
---                                              make a copy of car `key` (kind 0 traffic, 1 police)
---   R key grace                                its copy goes (grace 1: its authority stopped sending it)
+--                                              (guest) make a copy of host car `key` (kind 0 traffic, 1 police)
+--   R key grace                                (guest) its copy goes (grace 1: the host stopped sending it)
 --   C key fix nx ny nz qx qy qz qw power steer brake hb ctl vx vy vz tx ty tz flags
---                                              drive that copy (VehicleCommand, the authority car's controls)
+--                                              (guest) drive that copy (VehicleCommand, the host car's controls)
 --                                              (flags as TrafficStates, plus 32: the copy's crew is out, the
---                                              authority's car is driverless and both stood; CrewGetsOut, held until
+--                                              host's car is driverless and both stood; CrewGetsOut, held until
 --                                              it is driven again; 16: the speed vx vy vz (along the copy's heading)
 --                                              is backwards)
 -- Output (events, one per line):
 --   TC key kind model c1 c2 plate x y z vx vy vz qx qy qz qw steer power brake hb flags
---                                              one of our traffic cars (flags: 2 siren (police: read, else a guess),
---                                              4 no living driver read at the wheel this round (the C++ side's
+--                                              (host) one of our traffic cars (flags: 2 siren (police: read, else a
+--                                              guess), 4 no living driver read at the wheel this round (the C++ side's
 --                                              DriverWatch sends "driverless" only after 1 s of that while slow),
 --                                              64 with 4: the car is farther than DRIVER_LOD from us (the game
 --                                              streamed its driver out; still driven),
 --                                              8 controls known, 16 reversing); then
---   TE                                         end of the round
---   TV id x y z                                where player `id` is (his puppet / his car here), every tick
+--   TE                                         (host) end of the round
+--   TV id x y z                                (host) where guest `id` is (his puppet / his car here), every tick
 --   TP x y z                                   where we are
 --   TR key x y z vx vy vz qx qy qz qw px py pz
---                                              where our copy is, after this tick's commands (p: before them, the
---                                              game's own placement; traces only)
---   TH key                                     that copy was handed over to player_sync
---   TG key                                     that copy is gone (the game removed it, a new world)
---   TL hidden near                             our own cars hidden / still driving near us (while our spawning is off)
+--                                              (guest) where our copy is, after this tick's commands (p: before them,
+--                                              the game's own placement; traces only)
+--   TH key                                     (guest) that copy was handed over to player_sync
+--   TG key                                     (guest) that copy is gone (the game removed it, a new world)
 --   ST text                                    status for the overlay (once a second)
 MafiaCoop = MafiaCoop or {}
 local M = MafiaCoop
@@ -70,10 +68,6 @@ local RETRY_WAIT = 5        -- s before a failed copy is tried again
 local BAD_AFTER = 3         -- failures of a model before it is not tried again
 local COPY_IDLE = 0.3       -- s without a drive command: the copy's controls are released
 local NEAR_DESPAWN = 80     -- m: a copy this close goes when unseen (DespawnEntity), else at once
-local CLEAR_WAIT = 6        -- s after switching our traffic off before our own moving cars are hidden
-local CLEAR_DIST = 70       -- m: our own traffic cars farther than this from every player are hidden (until then
-                            --    they drive on, shared with every player near them like all our traffic)
-local CLEAR_INTERVAL = 1.0
 -- Crews of the copies: spawn profile names (ObtainCarWithCrew takes the name; the game hashes it, FNV-1 64). The names
 -- come from the game's own Lua (data_traffic.human_models, read from the order of its constants: `civilian` ->
 -- traffic_base_ambient_combined, `civilian_white_man` -> game_attractivemen, `police_lvl1` -> ai_police_lvl1; the
@@ -115,9 +109,8 @@ local function token(s, max)
   return s:sub(1, max)
 end
 
-T.list = T.list or {}      -- ours: entity id -> { e, id, model, kind, c1, c2, plate, drv, missT, slowMissT, sirenT }
-T.copies = T.copies or {}  -- others': key -> { key, auth, net, kind, model, st, ent, qid, rv, ... }
-T.hidden = T.hidden or {}  -- our own traffic cars hidden while in another's region: id -> { car, crew }
+T.list = T.list or {}      -- the host's: entity id -> { e, id, model, kind, c1, c2, plate, drv, missT, slowMissT, sirenT }
+T.copies = T.copies or {}  -- a guest's copies of the host's cars: key (net) -> { key, net, kind, model, st, ent, qid, rv, ... }
 T.badModels = T.badModels or {}
 
 -- A human the traffic or police generators made (not a mission spawner's, not one of our puppets).
@@ -159,7 +152,7 @@ local function ourCar(e, mine)
 end
 
 -- Is car `e` ambient traffic of this game (one of the host's shared traffic cars, or a car a traffic/police generator
--- driver sits at the wheel of)? player_sync.lua asks when it adopts a car (M.CarTick): such a car gets its despawn
+-- driver sits at the wheel of: on a guest's game a leftover of his own, guest_world hides those)? player_sync.lua asks when it adopts a car (M.CarTick): such a car gets its despawn
 -- immunity back off when player_sync is done with it.
 function T.IsTraffic(e)
   if not valid(e) then return false end
@@ -170,8 +163,8 @@ function T.IsTraffic(e)
   return okd and valid(drv) and generatorHuman(drv) or false
 end
 
--- Is human `h` the crew of one of our copies of another game's traffic (seated or got out)? For npc_sync: a copy's
--- crew is a picture of the authority's driver, never one of this game's own NPCs.
+-- Is human `h` the crew of one of our copies of the host's traffic (seated or got out)? For npc_sync (and guest_world:
+-- never hidden): a copy's crew is a picture of the host's driver, never one of this game's own NPCs.
 function T.IsCopyCrew(h)
   if not valid(h) then return false end
   for _, c in pairs(T.copies) do
@@ -182,10 +175,9 @@ function T.IsCopyCrew(h)
   return false
 end
 
--- How a copy is named in the log: the host's cars by their net id (as in 0.15), others as "player A's car N".
+-- How a copy is named in the log: the host's car by its net id (as in 0.15).
 local function label(c)
-  if (c.auth or 0) == 0 then return "host car " .. tostring(c.net) end
-  return "player " .. tostring(c.auth) .. "'s car " .. tostring(c.net)
+  return "host car " .. tostring(c.net)
 end
 
 local function crewOf(car)
@@ -220,7 +212,7 @@ local function driverMiss(e)
   return nil, drv
 end
 
--- ---- authority (every game: our own traffic) --------------------------------------------------------------------------
+-- ---- authority (the host's game only: his traffic) ---------------------------------------------------------------------
 -- A car of the list without a driver read now: noted (the C++ side's DriverWatch decides when it is driverless: 1 s
 -- of this while slow). Logged with the reason and how far the host's player is (game-side driver culling or level of
 -- detail far from him was the suspicion after the 0.15.0 test: 118 of 179 cars flagged while moving).
@@ -410,78 +402,7 @@ function T.AuthSend(ev, vps, me)
   T.hostSent = n
 end
 
--- ---- our own spawning (off in another player's region) ---------------------------------------------------------------
--- T.localOn: nil = never switched (the game's own settings stand), true = ours on, false = off (another's region),
--- "?" = off before a load (the new world may have reset it: switched again either way).
-function T.LocalTraffic(on, why)
-  if T.localOn == on then return end
-  if T.localOn == nil and on then T.localOn = true return end  -- never touched: leave the game's (mission's) settings
-  T.localOn = on
-  local t = game.traffic
-  local a = pcall(t.SetEnableAmbientTrafficSpawning, t, on)
-  local b = pcall(game.police.PreventPoliceSpawning, game.police, not on)
-  if on then
-    local n = 0
-    for _, h in pairs(T.hidden) do
-      if valid(h.car) then pcall(h.car.Activate, h.car) n = n + 1 end
-      for _, m in ipairs(h.crew) do
-        if valid(m) then pcall(m.Activate, m) end
-      end
-    end
-    T.hidden = {}
-    log(string.format("our own traffic is back (%s): ambient spawning %s, police spawning %s, %d hidden cars shown",
-      why, a and "on" or "FAILED", b and "allowed" or "FAILED", n))
-  else
-    T.clearT = M.now + CLEAR_WAIT
-    log(string.format("another player's traffic runs here (%s): our ambient spawning %s, police spawning %s", why,
-      a and "off" or "FAILED", b and "prevented" or "FAILED"))
-  end
-end
-
--- Our own moving traffic (generator drivers) left over in another player's region drives on (shared with every player
--- near it, like all our traffic: no pop) and is hidden only once out of everyone's sight: farther than CLEAR_DIST from
--- us and from every other player. UNVERIFIED: whether switching ambient spawning off removes the cars already there
--- (the hiding is the fallback).
-function T.ClearLocal(p, vps)
-  if M.now < (T.clearT or 0) or M.now - (T.clearScanT or -10) < CLEAR_INTERVAL then return end
-  T.clearScanT = M.now
-  local me, mine = p:GetPos(), p:GetOwner()
-  local pts = { { x = me.x, y = me.y } }
-  for _, v in ipairs(vps or {}) do pts[#pts + 1] = v end
-  local left, hid = 0, 0
-  for s in string.gmatch(mc_entity_ids(10), "%d+") do
-    local id = tonumber(s)
-    local e = mc_entity(id)
-    if e and e.GetVehicleModelName and not T.hidden[id] and active(e) and not ourCar(e, mine) then
-      local good, drv = pcall(e.GetSeatOwner, e, 0)
-      if good and valid(drv) and generatorHuman(drv) then
-        local q = e:GetPos()
-        local seen = false
-        for _, v in ipairs(pts) do
-          if (q.x - v.x) ^ 2 + (q.y - v.y) ^ 2 <= CLEAR_DIST * CLEAR_DIST then seen = true break end
-        end
-        if not seen then
-          local crew = crewOf(e)
-          for _, m in ipairs(crew) do pcall(m.Deactivate, m) end
-          pcall(e.Deactivate, e)
-          T.hidden[id] = { car = e, crew = crew }
-          hid = hid + 1
-        elseif (q.x - me.x) ^ 2 + (q.y - me.y) ^ 2 <= CLEAR_DIST * CLEAR_DIST then
-          left = left + 1
-        end
-      end
-    end
-  end
-  T.localLeft = left
-  T.hiddenCount = (T.hiddenCount or 0) + hid
-  if hid > 0 and (T.hiddenCount <= 60 or hid > 3) then
-    log(string.format("hid %d of our own traffic cars out of everyone's sight (%d near us still drive, shared; "
-      .. "%d hidden so far)", hid, left,
-      T.hiddenCount))
-  end
-end
-
--- ---- copies of the other games' cars ---------------------------------------------------------------------------------
+-- ---- copies of the host's cars (a guest's game) ----------------------------------------------------------------------
 -- The crew profile of a copy: the first of CIV_CREW / POLICE_CREW (police: then the civilian ones) that has not
 -- failed, else the puppet factory's Tommy.
 T.crewBad = T.crewBad or {}    -- profile -> true: not used again
@@ -583,7 +504,7 @@ function T.CopyTick(c, p)
       if not valid(car) then T.Fail(c, "no car") return end
       c.ent, c.st, c.cmdT = car, "ready", M.now
       try("SetDespawnImmunity", car.SetDespawnImmunity, car, true)
-      -- an explosion here only would leave the authority's car driving on: copies do not explode
+      -- an explosion here only would leave the host's car driving on: copies do not explode
       try("DisableExplosion", car.DisableExplosion, car, true)
       c.crew, c.seats = crewOf(car)
       if c.prof then
@@ -635,7 +556,7 @@ function T.CopyTick(c, p)
           pcall(m.LockControls, m, false)
         end
       end
-      -- player_sync's record takes the obtain id along: the car is a copy of another game's car, not ours, so
+      -- player_sync's record takes the obtain id along: the car is a copy of the host's car, not ours, so
       -- player_sync despawns it like its own copies (session end, a lost connection, the record dropped) instead of
       -- leaving it in the world with despawn immunity (player_sync.lua M.RemoveAll, M.LeftCopiesTick)
       local _, pc = M.KeyOf(c.ent)
@@ -672,7 +593,7 @@ function T.Remove(c, grace, p)
   T.copies[c.key] = nil
   T.removed = (T.removed or 0) + 1
   if T.removed <= 40 or T.removed % 50 == 0 then
-    log(string.format("copy of %s removed (%s, #%d)", label(c), grace and "its authority no longer sends it" or
+    log(string.format("copy of %s removed (%s, #%d)", label(c), grace and "the host no longer sends it" or
       "out of range or stale", T.removed))
   end
 end
@@ -690,7 +611,7 @@ function T.Drive(c, f)
     brake = n(f[13]) or 0, hb = n(f[14]) or 0, ctl = f[15] == "1", vx = n(f[16]) or 0, vy = n(f[17]) or 0,
     vz = n(f[18]) or 0 }
   local flags = n(f[22]) or 0
-  -- 16: the speed the C++ side gives the copy (vx vy vz: along its heading) is backwards (the authority's car
+  -- 16: the speed the C++ side gives the copy (vx vy vz: along its heading) is backwards (the host's car
   -- reverses): SetSpeed gets a negative km/h
   cmd.rev = math.floor(flags / 16) % 2 == 1
   local okp, pp = pcall(c.ent.GetPos, c.ent)  -- where the game had it (the trace's TRC pp)
@@ -707,9 +628,9 @@ function T.Drive(c, f)
     pcall(c.ent.SetSirenOn, c.ent, siren)
     pcall(c.ent.SetBeaconLightOn, c.ent, siren)
   end
-  -- 32: the authority's car is driverless (confirmed there: no driver read for 1 s while slow, within 40 m of its
+  -- 32: the host's car is driverless (confirmed there: no driver read for 1 s while slow, within 40 m of his
   -- player) and both cars stood: our driver gets out. Never out of a moving copy; the C++ side holds the flag until the
-  -- authority's car is driven again (a driver read again, or it drives on): then back in.
+  -- host's car is driven again (a driver read again, or it drives on): then back in.
   local crewOut = math.floor(flags / 32) % 2 == 1
   if crewOut and not c.crewOut then
     c.crewOut = true
@@ -720,11 +641,11 @@ function T.Drive(c, f)
       log(string.format("%s has no driver (for 1 s and standing): ours gets out (npc_sync kills him if the "
         .. "host's died) (#%d)", label(c), T.outs))
     end
-    if mc_trace then mc_trace("TRO", string.format("a=%d net=%d ev=out", c.auth, c.net)) end
+    if mc_trace then mc_trace("TRO", string.format("net=%d ev=out", c.net)) end
   elseif not crewOut and c.crewOut then
     c.crewOut = false
     log(string.format("%s is driven again: our crew gets back in", label(c)))
-    if mc_trace then mc_trace("TRO", string.format("a=%d net=%d ev=in", c.auth, c.net)) end
+    if mc_trace then mc_trace("TRO", string.format("net=%d ev=in", c.net)) end
   end
   if not c.crewOut and M.now - (c.seatT or -10) >= SEAT_CHECK then
     c.seatT = M.now
@@ -772,8 +693,7 @@ function T.KeepSeated(c)
             okg and "" or " (GetOnVehicle failed)", r.n, T.reseats))
         end
         if mc_trace then
-          mc_trace("TRO", string.format("a=%d net=%d ev=reseat seat=%d try=%d ok=%d", c.auth, c.net, seat, r.n,
-            okg and 1 or 0))
+          mc_trace("TRO", string.format("net=%d ev=reseat seat=%d try=%d ok=%d", c.net, seat, r.n, okg and 1 or 0))
         end
         if r.n == RESEAT_MAX then
           log(string.format("copy of %s: crew member %d keeps leaving seat %d: no more put-backs", label(c), i,
@@ -798,14 +718,13 @@ end
 function T.Update(dt, cmds)
   T.ev = {}
   local ev = T.ev
-  local isActive, host, mode = false, false, nil
+  local isActive, host = false, false
   local p = M.Player and M.Player()
   local key = p and (tostring(game.game:GetLoadedSaveId()) .. "|" .. tostring(M.inWorldAt)) or nil
-  if key ~= T.worldKey then  -- another world: our copies and hidden cars went with the old one
+  if key ~= T.worldKey then  -- another world: our copies went with the old one
     T.worldKey = key
     for k, _ in pairs(T.copies) do ev[#ev + 1] = "TG " .. k end
-    T.copies, T.list, T.hidden = {}, {}, {}
-    if T.localOn == false then T.localOn = "?" end
+    T.copies, T.list = {}, {}
     T.scanT = -10
   end
   local adds, drives, removes = {}, {}, {}
@@ -815,8 +734,6 @@ function T.Update(dt, cmds)
     local op = f[1]
     if op == "S" then
       isActive, host, T.me = f[2] == "1", f[3] == "1", f[4]
-    elseif op == "M" then
-      mode = f[2] == "1"
     elseif op == "A" then
       adds[#adds + 1] = f
     elseif op == "C" then
@@ -843,77 +760,73 @@ function T.Update(dt, cmds)
     if isActive then
       for _, f in ipairs(adds) do ev[#ev + 1] = "TG " .. tostring(f[2]) end
     end
-    if T.localOn ~= nil and T.localOn ~= true and p then T.LocalTraffic(true, "the session ended") end
     if next(T.copies) then T.DropAll("the session ended", p) end
+    if next(T.list) then T.list = {} end
     return table.concat(ev, "\n")
   end
-  -- where everyone is: us, and every other player (his puppet, or his car) for the C++ side's regions and interest
   local me = p:GetPos()
   ev[#ev + 1] = string.format("TP %.2f %.2f %.2f", me.x, me.y, me.z)
-  local vps = viewpoints()
-  for _, v in ipairs(vps) do ev[#ev + 1] = string.format("TV %s %.2f %.2f %.2f", tostring(v.id), v.x, v.y, v.z) end
-  -- our own traffic (every game is the authority for the traffic its game spawned): scanned once a second, reported
-  -- 20 times a second while another player is in the world
-  if M.now - (T.scanT or -10) >= SCAN_INTERVAL then
-    T.scanT = M.now
-    local good, err = pcall(T.Scan, p)
-    if not good then log("scan error: " .. tostring(err)) end
-  end
-  if M.now - (T.sendT or -10) >= SEND_INTERVAL then
-    T.sendT = M.now
-    local good, err = pcall(T.AuthSend, ev, vps, me)
-    if not good then
-      log("send error: " .. tostring(err))
-      ev[#ev + 1] = "TE"
+  if host then
+    -- the host's traffic (his game owns all of it): every guest's position (his puppet, or his car) for the C++ side's
+    -- interest; the car table scanned once a second, reported 20 times a second while a guest is in the world
+    local vps = viewpoints()
+    for _, v in ipairs(vps) do ev[#ev + 1] = string.format("TV %s %.2f %.2f %.2f", tostring(v.id), v.x, v.y, v.z) end
+    if M.now - (T.scanT or -10) >= SCAN_INTERVAL then
+      T.scanT = M.now
+      local good, err = pcall(T.Scan, p)
+      if not good then log("scan error: " .. tostring(err)) end
     end
-  end
-  -- our own spawning: off in another player's region (the host's game: always on)
-  if mode ~= nil then T.LocalTraffic(not mode, mode and "in another player's region" or "our own region") end
-  -- the other games' cars near us
-  for _, f in ipairs(removes) do
-    local c = T.copies[tonumber(f[2]) or -1]
-    if c then
-      local good, err = pcall(T.Remove, c, f[3] == "1", p)
+    if M.now - (T.sendT or -10) >= SEND_INTERVAL then
+      T.sendT = M.now
+      local good, err = pcall(T.AuthSend, ev, vps, me)
       if not good then
-        log("remove error: " .. tostring(err))
-        T.copies[c.key] = nil
+        log("send error: " .. tostring(err))
+        ev[#ev + 1] = "TE"
       end
     end
-  end
-  for _, f in ipairs(adds) do
-    local k = tonumber(f[2])
-    if k and not T.copies[k] then
-      local n = tonumber
-      local c = { key = k, auth = math.floor(k / 65536), net = k % 65536, kind = n(f[3]) or 0, model = f[4],
-        c1 = n(f[5]) or -1, c2 = n(f[6]) or -1, plate = f[7], tx = n(f[8]) or 0, ty = n(f[9]) or 0, tz = n(f[10]) or 0,
-        qx = n(f[11]) or 0, qy = n(f[12]) or 0, qz = n(f[13]) or 0, qw = n(f[14]) or 1,
-        st = T.badModels[f[4]] and "failed" or "new", retryT = 1e9 }
-      T.copies[k] = c
-    end
-  end
-  for _, c in pairs(T.copies) do
-    local good, err = pcall(T.CopyTick, c, p)
-    if not good then
-      c.errs = (c.errs or 0) + 1
-      if c.errs <= 3 then log("copy " .. c.key .. " error: " .. tostring(err)) end
-    end
-  end
-  for _, f in ipairs(drives) do
-    local c = T.copies[tonumber(f[2]) or -1]
-    if c then
-      T.Drive(c, f)
-    elseif not T.told or T.told[f[2]] ~= M.now then
-      -- the C++ side drives a copy we do not have (lost on the way): it is told, and adds it again
-      T.told = T.told or {}
-      T.told[f[2]] = M.now
-      ev[#ev + 1] = "TG " .. f[2]
-    end
-  end
-  if T.localOn == false then
-    local good, err = pcall(T.ClearLocal, p, vps)
-    if not good then log("clear error: " .. tostring(err)) end
+    if next(T.copies) then T.DropAll("we host: the host's game shows no copies", p) end
   else
-    T.localLeft = 0
+    -- a guest: no scan, nothing of ours is reported (the host's game owns all traffic); the host's cars near us
+    if next(T.list) then T.list = {} end
+    for _, f in ipairs(removes) do
+      local c = T.copies[tonumber(f[2]) or -1]
+      if c then
+        local good, err = pcall(T.Remove, c, f[3] == "1", p)
+        if not good then
+          log("remove error: " .. tostring(err))
+          T.copies[c.key] = nil
+        end
+      end
+    end
+    for _, f in ipairs(adds) do
+      local k = tonumber(f[2])
+      if k and not T.copies[k] then
+        local n = tonumber
+        local c = { key = k, net = k, kind = n(f[3]) or 0, model = f[4],
+          c1 = n(f[5]) or -1, c2 = n(f[6]) or -1, plate = f[7], tx = n(f[8]) or 0, ty = n(f[9]) or 0, tz = n(f[10]) or 0,
+          qx = n(f[11]) or 0, qy = n(f[12]) or 0, qz = n(f[13]) or 0, qw = n(f[14]) or 1,
+          st = T.badModels[f[4]] and "failed" or "new", retryT = 1e9 }
+        T.copies[k] = c
+      end
+    end
+    for _, c in pairs(T.copies) do
+      local good, err = pcall(T.CopyTick, c, p)
+      if not good then
+        c.errs = (c.errs or 0) + 1
+        if c.errs <= 3 then log("copy " .. c.key .. " error: " .. tostring(err)) end
+      end
+    end
+    for _, f in ipairs(drives) do
+      local c = T.copies[tonumber(f[2]) or -1]
+      if c then
+        T.Drive(c, f)
+      elseif not T.told or T.told[f[2]] ~= M.now then
+        -- the C++ side drives a copy we do not have (lost on the way): it is told, and adds it again
+        T.told = T.told or {}
+        T.told[f[2]] = M.now
+        ev[#ev + 1] = "TG " .. f[2]
+      end
+    end
   end
   local ready, loading, ours, nd = 0, 0, 0, 0
   for _, c in pairs(T.copies) do
@@ -923,12 +836,12 @@ function T.Update(dt, cmds)
     ours = ours + 1
     if c.missT then nd = nd + 1 end
   end
-  local hidden = 0
-  for _, _ in pairs(T.hidden) do hidden = hidden + 1 end
-  ev[#ev + 1] = string.format("TL %d %d", hidden, T.localLeft or 0)
-  T.status = string.format("%s, ours %d (%d near others, %d without a driver read), copies %d (+%d loading), ours "
-    .. "hidden %d, ours near %d, crews out %d, put back %d", T.localOn == false and "spawning off" or "spawning on",
-    ours, T.hostSent or 0, nd, ready, loading, T.hiddenCount or 0, T.localLeft or 0, T.outs or 0, T.reseats or 0)
+  if host then
+    T.status = string.format("ours %d (%d near guests, %d without a driver read)", ours, T.hostSent or 0, nd)
+  else
+    T.status = string.format("copies %d (+%d loading), crews out %d, put back %d", ready, loading, T.outs or 0,
+      T.reseats or 0)
+  end
   if M.now - (T.stT or -10) >= 1 then
     T.stT = M.now
     ev[#ev + 1] = "ST " .. (T.status or "")

@@ -1,9 +1,11 @@
-// traffic_test: unit tests for the traffic sync model (src/game/traffic_model.h): the wire format, an authority's
-// per-player tracking (interest, admission cap, spawn / despawn / changed-only states, sharing), a receiver's table
-// (copies near us, interpolation through core's replica::Stream, removal, hand-over, bumps, several authorities), the
-// regions (whose traffic runs where), a guest authority's cars through the relay to a second guest, the hand-over when
-// players converge, and a recorded car path (the 0.15.0 two-PC trace) through the whole chain with simulated copy
-// physics against the true-error target. Prints PASS/FAIL per check; exits non-zero on any failure.
+// traffic_test: unit tests for the traffic sync model (src/game/traffic_model.h) under host authority
+// (docs/host-authority.md): the wire format, the host's per-guest tracking (interest, admission cap, spawn / despawn /
+// changed-only states), a guest's table of the host's cars (copies near him, interpolation through core's
+// replica::Stream, removal, hand-over, bumps, the host's pause), who reads which message (Route: a guest the host's
+// cars only, the host a guest's bumps only, the retired 0x0224-0x0227 never), two games where only the host's game
+// runs an authority, a recorded car path (the 0.15.0 two-PC trace) and the 2026-10-20 session A replay through the
+// whole chain with simulated copy physics against the true-error target. Prints PASS/FAIL per check; exits non-zero on
+// any failure.
 #include "game/latency.h"
 #include "game/traffic_model.h"
 #include "traffic_path.h"
@@ -871,7 +873,7 @@ void TestOrphanEndToEnd() {
     bool sentNoDriverMoving = false, outWhileRolling = false;
     double sentAt = -1;
     const double base = 100.0;
-    const uint32_t key = 1;  // its first net id (the host's car: RefKey(0, net) = net)
+    const uint32_t key = 1;  // its first net id (a copy's key is the host's net id)
     for (int i = 0; i <= 120; ++i) {
         const double t = i * 0.05;
         // driver read flickers for the first 2 s (moving at 10 m/s), then it is gone and the car brakes to a stop
@@ -1212,322 +1214,190 @@ void TestMatches015() {
               Fmt(", rot %.2g deg, controls %.2g, flags %.0f", worstR, worstC, flagsDiff));
 }
 
-// ---- regions: whose traffic runs where ------------------------------------------------------------------------------
-using net::authority::PlayerSpot;
-
-void TestRegions() {
-    auto spots = [](std::initializer_list<PlayerSpot> l) { return std::vector<PlayerSpot>(l); };
-    RegionFollow g;  // guest 1
-    double t = 0;
-    g.Update(1, 0, spots({{0, {300, 0, 0}, true}, {1, {0, 0, 0}, true}}), t);
-    Check(g.Own() && g.Authority() == 1, "region: host 300 m away -> our own traffic (join at 250)");
-    const bool changed = g.Update(1, 0, spots({{0, {240, 0, 0}, true}, {1, {0, 0, 0}, true}}), t += 1);
-    Check(changed && !g.Own() && g.Authority() == 0 && g.Since(t) == 0, "region: host at 240 m -> his region");
-    g.Update(1, 0, spots({{0, {390, 0, 0}, true}, {1, {0, 0, 0}, true}}), t += 1);
-    Check(g.Authority() == 0, "region: host at 390 m -> still his (leave at 400)");
-    g.Update(1, 0, spots({{0, {420, 0, 0}, true}, {1, {0, 0, 0}, true}}), t += 1);
-    Check(g.Own(), "region: host at 420 m -> our own again");
-    g.Update(1, 0, spots({{0, {100, 0, 0}, true}, {1, {0, 0, 0}, false}}), t += 1);
-    Check(g.Own(), "region: we are not in the world (loading): we keep what we had");
-    g.Update(1, 0, spots({{0, {100, 0, 0}, true}, {1, {0, 0, 0}, true}}), t += 1);
-    Check(g.Authority() == 0, "region: back in the world near the host -> his");
-    RegionFollow h;  // the host
-    h.Update(0, 0, spots({{0, {0, 0, 0}, true}, {1, {10, 0, 0}, true}}), 0);
-    Check(h.Own(), "region: the host's game always runs its own traffic");
-
-    // two guests together far from the host: the lower id's region
-    RegionFollow b, c;
-    auto all = [&](Vec3 host, Vec3 pb, Vec3 pc) {
-        return spots({{0, host, true}, {1, pb, true}, {2, pc, true}});
-    };
-    b.Update(1, 0, all({0, 0, 0}, {5000, 0, 0}, {5100, 0, 0}), 10);
-    c.Update(2, 0, all({0, 0, 0}, {5000, 0, 0}, {5100, 0, 0}), 10);
-    Check(b.Own() && !c.Own() && c.Authority() == 1, "region: two guests far from the host -> the lower id's");
-    // guest 2 walks away from guest 1: his own beyond 400 m
-    c.Update(2, 0, all({0, 0, 0}, {5000, 0, 0}, {5350, 0, 0}), 11);
-    Check(c.Authority() == 1, "region: 350 m from guest 1 -> still his");
-    c.Update(2, 0, all({0, 0, 0}, {5000, 0, 0}, {5450, 0, 0}), 12);
-    Check(c.Own(), "region: 450 m from guest 1 -> his own");
-    // the host arrives: both in the host's region
-    c.Update(2, 0, all({0, 0, 0}, {5000, 0, 0}, {5100, 0, 0}), 13);
-    b.Update(1, 0, all({4900, 0, 0}, {5000, 0, 0}, {5100, 0, 0}), 14);
-    c.Update(2, 0, all({4900, 0, 0}, {5000, 0, 0}, {5100, 0, 0}), 14);
-    Check(b.Authority() == 0 && c.Authority() == 0, "region: the host arrives -> both in his region",
-          Fmt("guest 1: %.0f, guest 2: %.0f", b.Authority(), c.Authority()));
-    // the host out of the world (a loading screen) while we follow him: our own, as the 0.15 guest did without him
-    b.Update(1, 0, spots({{0, {4900, 0, 0}, false}, {1, {5000, 0, 0}, true}}), 15);
-    Check(b.Own(), "region: the host not in the world -> our own");
-}
-
-// ---- a guest's traffic: guest 1 (authority) -> the host relays -> guest 2; and the host himself ----------------------
-// Core's relay delivers a guest -> guest message with the real sender; the body carries the authority (must be it).
+// ---- who reads what: the host's game owns all traffic -----------------------------------------------------------
+// One game's traffic messages as traffic_sync.cpp reads them: every message goes through Route, then to the receiver
+// (a guest) or the bump count (the host).
 struct Delivery {
     ReceiverTraffic* recv;
-    uint32_t spawns = 0, despawns = 0;
+    bool host = false;  // the receiving game hosts
+    uint32_t spawns = 0, despawns = 0, states = 0, bumps = 0, ignored = 0;
     size_t bytes = 0;
-    bool refused = false;
-    void Apply(const PeerOut& po, uint8_t from, bool v2, double now) {
-        auto prefix = [&](net::ByteReader& r) {
-            if (!v2) return true;
-            const uint8_t a = r.U8();
-            if (a != from) refused = true;
-            return a == from;
-        };
-        for (const auto& b0 : po.spawns) {
-            const auto b = v2 ? WithAuthority(from, b0) : b0;
-            bytes += b.size();
-            net::ByteReader r(b.data(), b.size());
+    void Message(uint16_t id, const std::vector<uint8_t>& b, net::PlayerId from, double now) {
+        bytes += b.size();
+        net::ByteReader r(b.data(), b.size());
+        switch (Route(id, host, from)) {
+        case Inbound::Spawn: {
             std::vector<SpawnInfo> s;
-            if (prefix(r) && ReadSpawns(r, s))
-                for (auto& x : s) recv->OnSpawn(from, x, now), ++spawns;
+            if (ReadSpawns(r, s))
+                for (auto& x : s) recv->OnSpawn(x, now), ++spawns;
+            break;
         }
-        for (const auto& b0 : po.despawns) {
-            const auto b = v2 ? WithAuthority(from, b0) : b0;
-            bytes += b.size();
-            net::ByteReader r(b.data(), b.size());
+        case Inbound::Despawn: {
             std::vector<uint16_t> n;
-            if (prefix(r) && ReadDespawns(r, n))
-                for (auto x : n) recv->OnDespawn(from, x, now), ++despawns;
+            if (ReadDespawns(r, n))
+                for (auto x : n) recv->OnDespawn(x, now), ++despawns;
+            break;
         }
-        for (const auto& b0 : po.states) {
-            const auto b = v2 ? WithAuthority(from, b0) : b0;
-            bytes += b.size();
-            net::ByteReader r(b.data(), b.size());
+        case Inbound::States: {
             uint32_t ms = 0;
             std::vector<CarState> st;
-            if (prefix(r) && ReadStates(r, ms, st)) recv->OnStates(from, ms, st, now);
+            if (ReadStates(r, ms, st)) recv->OnStates(ms, st, now), ++states;
+            break;
         }
+        case Inbound::Bump: {
+            BumpInfo bi;
+            if (ReadBump(r, bi)) ++bumps;
+            break;
+        }
+        case Inbound::Ignore:
+            ++ignored;
+            break;
+        }
+    }
+    // the host's round for one guest (spawns, despawns, states: the order the session delivers them in)
+    void Apply(const PeerOut& po, double now, net::PlayerId from = net::kHostPlayer) {
+        for (const auto& b : po.spawns) Message(kMsgSpawn, b, from, now);
+        for (const auto& b : po.despawns) Message(kMsgDespawn, b, from, now);
+        for (const auto& b : po.states) Message(kMsgStates, b, from, now);
     }
 };
 
-void TestGuestAuthorityRelay() {
-    AuthorityTraffic b1;                 // guest 1's own traffic
-    ReceiverTraffic host, g2;            // the host's and guest 2's copies
-    Delivery toHost{&host}, toG2{&g2};
-    std::vector<HostCar> cars;
-    for (uint32_t i = 0; i < 12; ++i) cars.push_back(Car(9000 + i, 5000.0f + i * 15.0f, 0, 0, 6));  // 5000 .. 5165
-    std::vector<PeerOut> out;
-    std::vector<GuestCmd> cmds;
-    std::vector<GuestBump> bumps;
-    Vec3 hostAt{0, 0, 5}, g2At{5050, 0, 5};
-    std::set<uint32_t> hostKeys, g2Keys;
-    auto step = [&](double t) {
-        for (auto& c : cars) c.st.pos.y += 0.3f;
-        b1.SetCars(cars, t);
-        b1.SetView(0, hostAt, t);
-        b1.SetView(2, g2At, t);
-        b1.Tick(t, static_cast<uint32_t>(t * 1000), out);
-        for (const auto& po : out) (po.peer == 0 ? toHost : toG2).Apply(po, 1, true, t + 0.03);
-        host.SetLocal(hostAt);
-        g2.SetLocal(g2At);
-        for (auto* r : {&host, &g2}) {
-            r->Tick(t + 0.03, 0.05f, cmds, bumps);
-            for (const auto& c : cmds) {
-                if (c.type == GuestCmd::Type::Add) (r == &host ? hostKeys : g2Keys).insert(c.key);
-                if (c.type == GuestCmd::Type::Remove) (r == &host ? hostKeys : g2Keys).erase(c.key);
+void TestRoute() {
+    // every id of the traffic range, both roles, every sender: only the host's cars on a guest and a guest's bump on
+    // the host are read
+    bool table = true;
+    uint32_t read = 0;
+    for (uint16_t id = 0x0220; id <= 0x022F; ++id)
+        for (int weHost = 0; weHost < 2; ++weHost)
+            for (net::PlayerId from = 0; from < 4; ++from) {
+                Inbound want = Inbound::Ignore;
+                if (!weHost && from == net::kHostPlayer) {
+                    if (id == kMsgSpawn) want = Inbound::Spawn;
+                    if (id == kMsgDespawn) want = Inbound::Despawn;
+                    if (id == kMsgStates) want = Inbound::States;
+                }
+                if (weHost && from != net::kHostPlayer && id == kMsgBump) want = Inbound::Bump;
+                const Inbound got = Route(id, weHost != 0, from);
+                if (got != want) {
+                    table = false;
+                    std::printf("      0x%04x weHost %d from %u: %d, want %d\n", id, weHost, from, static_cast<int>(got),
+                                static_cast<int>(want));
+                }
+                read += got != Inbound::Ignore;
             }
-        }
-    };
-    double t = 0;
-    for (int i = 0; i < 20; ++i) step(t += 0.05);
-    bool allOf1 = !g2Keys.empty();
-    for (uint32_t k : g2Keys) allOf1 &= RefAuthority(k) == 1 && b1.KeyOf(RefNet(k)) >= 9000;
-    Check(g2Keys.size() == 12 && allOf1 && !toG2.refused, "relay: guest 2 shows guest 1's cars (authority 1)",
-          Fmt("%.0f copies", g2Keys.size()));
-    Check(hostKeys.empty() && toHost.spawns == 0, "relay: the host 5 km away gets none of them");
-    // the host comes near: he gets guest 1's cars too, under the same keys as guest 2
-    hostAt = {5100, 30, 5};
-    for (int i = 0; i < 20; ++i) step(t += 0.05);
-    size_t same = 0;
-    for (uint32_t k : hostKeys) same += g2Keys.count(k);
-    Check(hostKeys.size() == 12 && same == 12, "relay: the host near: the same cars, the same keys",
-          Fmt("%.0f / %.0f", hostKeys.size(), same));
-    // guest 2 drives off: only he loses them (despawned, removed after the grace)
-    g2At = {9000, 0, 5};
-    for (int i = 0; i < 40; ++i) step(t += 0.05);
-    Check(g2Keys.empty() && toG2.despawns == 12 && hostKeys.size() == 12, "relay: guest 2 away: his copies go, the host's stay",
-          Fmt("guest 2 %.0f, host %.0f", g2Keys.size(), hostKeys.size()));
-    // budget per receiver (the relay costs guest 1's relay budget, the states his per-player budget)
-    const double kbps = static_cast<double>(toHost.bytes) / t / 1024.0;
-    Check(kbps < HostConfig{}.bytesPerSecond / 1024.0, "relay: within the per-player budget", Fmt("%.1f KB/s", kbps));
-    // guest 1 leaves the session: his copies go everywhere
-    host.RemoveAuthority(1);
-    host.Tick(t + 1, 0.05f, cmds, bumps);
-    Check(Count(cmds, GuestCmd::Type::Remove) == 12 && host.Stats().known == 0, "relay: guest 1 leaves -> his copies go");
-    // a body whose authority is not its sender is refused (a guest cannot send as another)
-    Delivery liar{&g2};
-    PeerOut po;
-    po.spawns.push_back(PackSpawns({Spawn(5, 0, 0)}));
-    liar.Apply(po, 1, true, 0);  // WithAuthority(1) from 1: fine
-    std::vector<uint8_t> forged = WithAuthority(3, po.spawns[0]);
-    net::ByteReader fr(forged.data(), forged.size());
-    Check(!liar.refused && fr.U8() == 3, "relay: the authority byte is the first byte (checked against the sender)");
+    Check(table && read == 3 * 1 + 3, "route: a guest reads the host's spawn / despawn / states, the host a guest's bump",
+          Fmt("%.0f of 128 combinations read", read));
+    bool retired = kRetiredFirst == 0x0224 && kRetiredLast == 0x0227;
+    for (uint16_t id = kRetiredFirst; id <= kRetiredLast; ++id)
+        for (int weHost = 0; weHost < 2; ++weHost)
+            for (net::PlayerId from = 0; from < 4; ++from) retired &= Route(id, weHost != 0, from) == Inbound::Ignore;
+    Check(retired, "route: the retired 0x0224-0x0227 are read by nobody");
+    Check(Route(kMsgSpawn, true, 1) == Inbound::Ignore && Route(kMsgStates, true, 2) == Inbound::Ignore &&
+              Route(kMsgStates, false, 2) == Inbound::Ignore && Route(kMsgBump, false, 0) == Inbound::Ignore &&
+              Route(kMsgBump, false, 2) == Inbound::Ignore && Route(kMsgBump, true, 0) == Inbound::Ignore,
+          "route: no guest's traffic on the host or another guest; no bump to a guest");
+    Check(RunsAuthority(true) && !RunsAuthority(false) && ShowsCopies(false) && !ShowsCopies(true),
+          "roles: the host runs the authority, a guest shows copies");
 }
 
-// ---- hand-over: players converge and part; no pops ----------------------------------------------------------------------
-// Two games, the host (0) and guest 1, each a small traffic generator (cars around its player while its own spawning
-// runs; off in another's region), an AuthorityTraffic for its cars, a ReceiverTraffic for the other's, a RegionFollow;
-// copies report exactly at their target (the Lua side). Guest 1 stands; the host drives to him, stays, drives away.
-struct World {
-    struct SimCar {
-        uint32_t ent;
-        Vec3 pos, vel;
-        bool hidden = false;
+// Two games the way traffic_sync.cpp builds them (RunsAuthority / ShowsCopies): the host drives 12 cars around both
+// players, the guest's game still has 8 leftover cars of its own near him (guest_world hides them; here they stand in
+// for "a guest's game that has cars"). 10 s side by side. The guest's game builds no authority and sends no traffic
+// message (its copies' bumps are all it may send); it shows the host's cars, under the host's net ids, and nothing of
+// its own. The host's game shows nothing, and everything an 0.16 guest would have sent it (his own traffic as
+// TrafficSpawn / States, the retired 0x0224-0x0227 bodies) is ignored.
+void TestHostOnlyGames() {
+    struct Game {
+        bool host;
+        AuthorityTraffic* auth = nullptr;  // RunsAuthority only
+        ReceiverTraffic recv;
+        Delivery in{&recv};
+        Vec3 me;
+        std::vector<HostCar> own;
+        uint32_t sentTraffic = 0, sentBumps = 0;
+        std::set<uint32_t> copies;
+        Game(bool h, Vec3 at) : host(h), me(at) {
+            in.host = h;
+            if (RunsAuthority(h)) auth = new AuthorityTraffic();
+        }
+        ~Game() { delete auth; }
     };
-    uint8_t id;
-    Vec3 me;
-    std::vector<SimCar> cars;
-    uint32_t nextEnt;
-    AuthorityTraffic auth;
-    ReceiverTraffic recv;
-    RegionFollow region;
-    std::map<uint32_t, uint16_t> netOf;    // entity -> the net id it had (a car keeps one for its life)
-    std::set<uint32_t> copies;             // our copies of the other's cars (keys)
-    uint32_t netChanged = 0, popped = 0;   // a car's net id changed while it lived / a copy removed in view, car alive
-    Rng rng;
-    World(uint8_t i, Vec3 at) : id(i), me(at), nextEnt(i * 100000u + 1), rng(7 + i) {}
-    void Generate(bool on, double offFor, const Vec3& other) {
-        for (auto& c : cars) {
-            c.pos.x += c.vel.x * 0.05f;
-            c.pos.y += c.vel.y * 0.05f;
-        }
-        // the game: cars far from us go; with our spawning on new ones come at 100-150 m (out of view)
-        cars.erase(std::remove_if(cars.begin(), cars.end(),
-                                  [&](const SimCar& c) { return Dist3(c.pos, me) > 220 || c.hidden; }),
-                   cars.end());
-        if (on)
-            while (cars.size() < 14) {
-                const float a = rng.Uniform(0, 6.28f), r = rng.Uniform(100, 150), h = rng.Uniform(0, 6.28f);
-                cars.push_back({nextEnt++, {me.x + r * std::cos(a), me.y + r * std::sin(a), 0},
-                                {8 * std::cos(h), 8 * std::sin(h), 0}});
-            }
-        else if (offFor >= 6)  // in another's region: ours are hidden 6 s on (CLEAR_WAIT), once out of everyone's
-            for (auto& c : cars)  // sight (70 m from us and from him)
-                if (Dist3(c.pos, me) > 70 && Dist3(c.pos, other) > 70) c.hidden = true;
-        cars.erase(std::remove_if(cars.begin(), cars.end(), [](const SimCar& c) { return c.hidden; }), cars.end());
-    }
-    std::vector<HostCar> Report() const {
-        std::vector<HostCar> v;
-        for (const auto& c : cars) {
-            HostCar h = Car(c.ent, c.pos.x, c.pos.y, c.vel.x, c.vel.y);
-            h.st.pos.z = 0;
-            v.push_back(h);
-        }
-        return v;
-    }
-    const SimCar* Find(uint32_t ent) const {
-        for (const auto& c : cars)
-            if (c.ent == ent) return &c;
-        return nullptr;
-    }
-};
-
-void TestHandOver() {
-    World host(0, {-1200, 0, 0}), guest(1, {0, 0, 0});
+    Game host(true, {0, 0, 5}), guest(false, {12, 0, 5});
+    for (uint32_t i = 0; i < 12; ++i) host.own.push_back(Car(500 + i, -60.0f + i * 12.0f, 20, 8, 0));
+    for (uint32_t i = 0; i < 8; ++i) guest.own.push_back(Car(900 + i, -40.0f + i * 10.0f, -20, -6, 0));
     std::vector<PeerOut> out;
     std::vector<GuestCmd> cmds;
     std::vector<GuestBump> bumps;
-    uint32_t unsharedLate = 0, unsharedSamples = 0;
-    uint64_t due = 0, shown = 0;
-    bool guestOffNear = false, guestOnAfter = false, leftoverShared = true;
-    double switchedAt = -1;
-    std::vector<uint32_t> leftovers;  // the guest's cars near him when the host's region took over
-    uint32_t leftoversNearHost = 0;
-    for (int tick = 0; tick < 2400; ++tick) {  // 120 s
-        const double t = tick * 0.05;
-        // the host drives to the guest at 15 m/s, stays 40 s, drives away
-        if (t < 75) host.me.x = std::min(-30.0f, -1200.0f + 15.0f * static_cast<float>(t));
-        if (t > 80) host.me.x = -30.0f - 15.0f * static_cast<float>(t - 80);
-        const std::vector<PlayerSpot> spots = {{0, host.me, true}, {1, guest.me, true}};
-        for (World* w : {&host, &guest}) {
-            World& other = w == &host ? guest : host;
-            w->region.Update(w->id, 0, spots, t);
-            w->Generate(w->region.Own(), w->region.Since(t), other.me);
-            w->auth.SetCars(w->Report(), t);
-            for (const auto& c : w->cars) {
-                const uint16_t n = w->auth.NetOf(c.ent);
-                auto it = w->netOf.find(c.ent);
-                if (it == w->netOf.end())
-                    w->netOf[c.ent] = n;
-                else if (it->second != n)
-                    ++w->netChanged;
-            }
-            w->auth.SetView(other.id, other.me, t);
-            w->auth.Tick(t, static_cast<uint32_t>(t * 1000), out);
-            Delivery d{&other.recv};
-            for (const auto& po : out) d.Apply(po, w->id, w->id != 0, t);
-        }
-        if (!guest.region.Own() && switchedAt < 0) {
-            switchedAt = t;
-            for (const auto& c : guest.cars)
-                if (Dist3(c.pos, guest.me) <= 150) leftovers.push_back(c.ent);
-        }
-        if (switchedAt >= 0 && t > switchedAt + 3 && t < switchedAt + 3.06) {
-            // 3 s after the switch: every leftover still alive on the guest's game and within the host's copy range
-            // (240 m) has a copy on the host's
-            for (uint32_t e : leftovers) {
-                const World::SimCar* car = guest.Find(e);
-                if (car && Dist3(car->pos, host.me) < 220 && !host.copies.count(RefKey(1, guest.auth.NetOf(e)))) {
-                    leftoverShared = false;
-                    std::printf("      leftover %u at %.0f m from the host has no copy there\n", e,
-                                Dist3(car->pos, host.me));
-                }
-                if (car && Dist3(car->pos, host.me) < 220) ++leftoversNearHost;
-            }
-        }
-        for (World* w : {&host, &guest}) {
-            World& other = w == &host ? guest : host;
-            w->recv.SetLocal(w->me);
-            w->recv.Tick(t + 0.02, 0.05f, cmds, bumps);
-            for (const auto& c : cmds) {
-                if (c.type == GuestCmd::Type::Add) w->copies.insert(c.key);
-                if (c.type == GuestCmd::Type::Remove) {
-                    w->copies.erase(c.key);
-                    // a pop: removed while its car still lives on its game within 150 m of us
-                    const uint32_t ent = other.auth.KeyOf(RefNet(c.key));
-                    const World::SimCar* car = ent ? other.Find(ent) : nullptr;
-                    if (car && Dist3(car->pos, w->me) < 150) ++w->popped;
+    double t = 0;
+    for (int tick = 0; tick < 200; ++tick, t += 0.05) {
+        for (Game* g : {&host, &guest}) {
+            for (auto& c : g->own) c.st.pos.x += c.st.vel.x * 0.05f;
+            Game& other = g == &host ? guest : host;
+            if (g->auth) {  // only the host's game has one
+                g->auth->SetCars(g->own, t);
+                g->auth->SetView(g == &host ? 1u : 0u, other.me, t);
+                g->auth->Tick(t, static_cast<uint32_t>(t * 1000), out);
+                for (const auto& po : out) {
+                    g->sentTraffic += static_cast<uint32_t>(po.spawns.size() + po.despawns.size() + po.states.size());
+                    other.in.Apply(po, t + 0.02, g == &host ? net::kHostPlayer : net::PlayerId{1});
                 }
             }
-            for (uint32_t k : w->copies) {  // the Lua side: every copy reports, on its target
-                CarState tg;
-                if (!w->recv.Target(k, t + 0.02, tg)) continue;
-                CopyReport r;
-                r.pos = tg.pos;
-                r.vel = tg.vel;
-                w->recv.SetReport(k, r, t + 0.02);
-            }
-            // TRL's "near": our cars within 70 m of us that the other player near them has not had for 2 s
-            const size_t un = w->auth.Unshared(w->me, 70, t, 2.0);
-            if (w->region.Since(t) >= 10 && t > 10) {
-                ++unsharedSamples;
-                unsharedLate = std::max<uint32_t>(unsharedLate, static_cast<uint32_t>(un));
+            if (ShowsCopies(g->host)) {
+                g->recv.SetLocal(g->me);
+                g->recv.Tick(t + 0.02, 0.05f, cmds, bumps);
+                for (const auto& c : cmds) {
+                    if (c.type == GuestCmd::Type::Add) g->copies.insert(c.key);
+                    if (c.type == GuestCmd::Type::Remove) g->copies.erase(c.key);
+                }
+                g->sentBumps += static_cast<uint32_t>(bumps.size());
             }
         }
-        // shown: while the players are within 250 m, the other's cars within 150 m with a copy that reports
-        if (Dist3(host.me, guest.me) < 250 && t > switchedAt + 2 && switchedAt >= 0) {
-            due += guest.recv.Stats().due + host.recv.Stats().due;
-            shown += guest.recv.Stats().shown + host.recv.Stats().shown;
-        }
-        if (t > 60 && t < 75 && !guest.region.Own()) guestOffNear = true;
-        if (t > 118 && guest.region.Own()) guestOnAfter = true;
     }
-    Check(switchedAt > 0 && guestOffNear && guestOnAfter, "hand-over: the guest's spawning off near the host, on after",
-          Fmt("switched at %.1f s", switchedAt));
-    Check(host.netChanged == 0 && guest.netChanged == 0, "hand-over: a car keeps its authority and id while it lives");
-    Check(leftoverShared && leftoversNearHost > 0, "hand-over: the guest's own cars near him are shared, not left driving",
-          Fmt("%.0f leftovers, %.0f of them near the host", leftovers.size(), leftoversNearHost));
-    Check(host.popped == 0 && guest.popped == 0, "hand-over: no copy vanishes within 150 m while its car lives",
-          Fmt("host %.0f, guest %.0f", host.popped, guest.popped));
-    Check(unsharedSamples > 100 && unsharedLate == 0, "hand-over: traffic.unshared_near 0 after 10 s",
-          Fmt("max %.0f of %.0f samples", unsharedLate, unsharedSamples));
-    const double pct = due ? 100.0 * static_cast<double>(shown) / static_cast<double>(due) : 0;
-    Check(due > 0 && pct >= 95.0, "hand-over: traffic.shown >= 95 % near each other", Fmt("%.1f %%", pct));
+    Check(!guest.auth && host.auth, "host only: the guest's game builds no authority");
+    Check(guest.sentTraffic == 0 && host.in.spawns == 0 && host.in.states == 0,
+          "host only: the guest's game sends no traffic message", Fmt("%.0f sent", guest.sentTraffic));
+    bool allHost = guest.copies.size() == 12;
+    for (uint32_t k : guest.copies) allHost &= k <= 0xFFFF && host.auth->KeyOf(static_cast<uint16_t>(k)) >= 500 &&
+                                               host.auth->KeyOf(static_cast<uint16_t>(k)) < 512;
+    Check(allHost, "host only: the guest shows the host's 12 cars, keyed by the host's net ids",
+          Fmt("%.0f copies", guest.copies.size()));
+    Check(host.copies.empty() && host.recv.Stats().known == 0, "host only: the host's game shows no copies");
+    // an 0.16 guest still sending his own traffic to the host, a forged "host" body from a guest, the retired ids
+    AuthorityTraffic old;
+    old.SetCars(guest.own, t);
+    old.SetView(0, host.me, t);
+    old.Tick(t, static_cast<uint32_t>(t * 1000), out);
+    const uint32_t ign0 = host.in.ignored;
+    size_t msgs = 0;
+    for (const auto& po : out) {
+        host.in.Apply(po, t, 1);  // 0x0220-0x0222 from guest 1
+        for (uint16_t id = kRetiredFirst; id <= kRetiredLast; ++id)
+            for (const auto& b : po.spawns) host.in.Message(id, b, 1, t);
+        msgs += po.spawns.size() * 5 + po.despawns.size() + po.states.size();
+    }
+    host.recv.SetLocal(host.me);
+    host.recv.Tick(t + 0.1, 0.05f, cmds, bumps);
+    Check(msgs > 0 && host.in.ignored - ign0 == msgs && host.recv.Stats().known == 0 && cmds.empty(),
+          "host only: the host ignores a guest's traffic and the retired ids",
+          Fmt("%.0f of %.0f ignored", host.in.ignored - ign0, msgs));
+    // on a guest: the retired ids and another guest's TrafficSpawn are ignored too; the host's bump is not his to read
+    const uint32_t g0 = guest.in.ignored, known0 = guest.recv.Stats().known;
+    std::vector<uint8_t> spawn = PackSpawns({Spawn(4000, 12, 0)});
+    std::vector<uint8_t> retired;
+    retired.push_back(0);  // the 0.16 body: the authority byte, then the TrafficSpawn
+    retired.insert(retired.end(), spawn.begin(), spawn.end());
+    for (uint16_t id = kRetiredFirst; id <= kRetiredLast; ++id) guest.in.Message(id, retired, 0, t);
+    guest.in.Message(kMsgSpawn, spawn, 2, t);
+    guest.in.Message(kMsgBump, PackBump({7, 4.0f, 3.0f, 0.0f}), 0, t);
+    guest.recv.Tick(t + 0.1, 0.05f, cmds, bumps);
+    Check(guest.in.ignored - g0 == 6 && guest.recv.Stats().known == known0,
+          "host only: a guest ignores the retired ids, another guest's cars and bumps",
+          Fmt("%.0f of 6 ignored", guest.in.ignored - g0));
 }
 
 // ---- a recorded car path through the whole chain: traffic.true_p95 ------------------------------------------------
 // The host's car of the 0.15.0 two-PC trace (tests/traffic_path.h: 45 s, 12.9 m/s mean, 29 max, turns) is a traffic
-// car of an authority. Its states go through AuthorityTraffic (interest, quantisation, the wire), a network (14 ms one
+// car of the host. Its states go through AuthorityTraffic (interest, quantisation, the wire), a network (14 ms one
 // way + up to 25 ms jitter, 1 % loss), a receiver (Stream per authority, playout, VehicleController + Corrector) at
 // 60 fps, and a simulated copy: SetPos for a pin / snap, the nudge for a blend, then SetRot and SetSpeed (the command's
 // speed along the car's heading, 3 % short of it) as RV.Drive does, then its own motion. The true error is the copy against
@@ -1616,7 +1486,7 @@ PathResult RunPath(float viewDist, uint64_t seed, const GuestConfig& cfg = {}) {
         const double local = frame + clockGap;
         for (size_t i = 0; i < fly.size();) {
             if (fly[i].arrive <= frame) {
-                to.Apply(fly[i].po, 1, true, fly[i].arrive + clockGap);
+                to.Apply(fly[i].po, fly[i].arrive + clockGap);
                 fly.erase(fly.begin() + static_cast<std::ptrdiff_t>(i));
             } else {
                 ++i;
@@ -1627,7 +1497,7 @@ PathResult RunPath(float viewDist, uint64_t seed, const GuestConfig& cfg = {}) {
         recv.SetLocal({now.pos.x + viewDist, now.pos.y, now.pos.z});
         const float dt = static_cast<float>(step);
         recv.Tick(local, dt, cmds, bumps);
-        const uint32_t key = RefKey(1, auth.NetOf(4711));
+        const uint32_t key = auth.NetOf(4711);
         for (const auto& c : cmds) {
             if (c.key != key) continue;
             if (c.type == GuestCmd::Type::Add) {
@@ -1886,7 +1756,7 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
         }
         for (size_t i = 0; i < fly.size();) {
             if (fly[i].arrive <= frame) {
-                to.Apply(fly[i].po, 0, false, fly[i].arrive + clockGap);
+                to.Apply(fly[i].po, fly[i].arrive + clockGap);
                 fly.erase(fly.begin() + static_cast<std::ptrdiff_t>(i));
             } else {
                 ++i;
@@ -1954,7 +1824,7 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
             const double t = row[0] / 1000.0;
             CarState tr, trNow;
             if (!truth.At(row[1], t, tr, 0.6) || !truth.At(row[1], frame, trNow, 0.6)) continue;
-            auto it = copies.find(RefKey(0, static_cast<uint16_t>(row[1])));
+            auto it = copies.find(static_cast<uint32_t>(row[1]));
             if (it == copies.end() || !it->second.exists) continue;
             const Vec3 g{kReplayOrigin[0] + row[2] / 100.0f, kReplayOrigin[1] + row[3] / 100.0f,
                          kReplayOrigin[2] + row[4] / 100.0f};
@@ -1997,42 +1867,21 @@ void TestReplay() {
           Fmt("p95 %.2f m (standing %.2f, moving %.2f)", r.P95(r.sim), r.P95(r.simStand), r.P95(r.simMove)));
     Check(r.P95(r.simStand) <= 1.0f, "replay: standing cars' copies stay on them (p95 <= 1 m)",
           Fmt("%.2f m", r.P95(r.simStand)));
+    // host authority (docs/host-authority.md WP-B): the session A result of the 2026-10-20 fixes is kept (0.75 m)
+    Check(r.P95(r.sim) <= 0.8f, "replay: host authority keeps the 2026-10-20 result (p95 <= 0.8 m)",
+          Fmt("%.2f m", r.P95(r.sim)));
 }
 
-// ---- the authority's sharing count (TRL near) --------------------------------------------------------------------
-// the latency trace's systems (game/latency.cpp): a guest's traffic states are "traffic", the rest "traffic-event"
+// the latency trace's systems (game/latency.cpp): the host's traffic states are "traffic", spawn / despawn / bump
+// "traffic-event"; the retired 0x0224-0x0227 belong to no system
 void TestLatencySystems() {
     using namespace mc::game;
-    Check(latency::SystemOf(0x0226) == latency::kTraffic && latency::SystemOf(0x0222) == latency::kTraffic &&
-              latency::SystemOf(0x0224) == latency::kTrafficEvent && latency::SystemOf(0x0225) == latency::kTrafficEvent &&
-              latency::SystemOf(0x0227) == latency::kTrafficEvent,
-          "latency: 0x0226 traffic, 0x0224 / 0x0225 / 0x0227 traffic-event");
-}
-
-void TestUnshared() {
-    HostConfig cfg;
-    cfg.maxPerPeer = 3;
-    AuthorityTraffic a(cfg);
-    std::vector<HostCar> cars;
-    for (uint32_t i = 0; i < 6; ++i) cars.push_back(Car(100 + i, 10.0f + i * 5.0f, 0));  // 10 .. 35 m from us
-    std::vector<PeerOut> out;
-    size_t mine = 0;
-    double t = 0;
-    a.SetCars(cars, t);
-    a.SetView(1, {0, 0, 5}, t);
-    a.Tick(t, 0, out);
-    Check(a.Unshared({0, 0, 0}, 70, t, 2.0, &mine) == 0 && mine == 6, "unshared: none within the grace");
-    for (int i = 0; i < 50; ++i) {
-        t += 0.05;
-        a.SetCars(cars, t);
-        a.SetView(1, {0, 0, 5}, t);
-        a.Tick(t, static_cast<uint32_t>(t * 1000), out);
-    }
-    Check(a.Unshared({0, 0, 0}, 70, t, 2.0) == 3, "unshared: cars a near player cannot get (his cap) count after 2 s",
-          Fmt("%.0f", a.Unshared({0, 0, 0}, 70, t, 2.0)));
-    a.SetView(1, {5000, 0, 5}, t + 0.05);
-    a.Tick(t + 0.05, 0, out);
-    Check(a.Unshared({0, 0, 0}, 70, t + 3, 2.0) == 0, "unshared: nobody near them: nothing unshared");
+    bool retired = true;
+    for (uint16_t id = 0x0224; id <= 0x0227; ++id) retired &= latency::SystemOf(id) == latency::kCount;
+    Check(latency::SystemOf(0x0222) == latency::kTraffic && latency::SystemOf(0x0220) == latency::kTrafficEvent &&
+              latency::SystemOf(0x0221) == latency::kTrafficEvent && latency::SystemOf(0x0223) == latency::kTrafficEvent &&
+              retired,
+          "latency: 0x0222 traffic, 0x0220 / 0x0221 / 0x0223 traffic-event, 0x0224-0x0227 none");
 }
 
 }  // namespace
@@ -2053,11 +1902,9 @@ int main() {
     TestDriverLod();
     TestCopySpeed();
     TestMatches015();
-    TestRegions();
-    TestGuestAuthorityRelay();
-    TestUnshared();
+    TestRoute();
+    TestHostOnlyGames();
     TestLatencySystems();
-    TestHandOver();
     TestRecordedPath();
     TestReplay();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");

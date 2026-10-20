@@ -367,10 +367,6 @@ public:
         case 0x0221: return "TrafficDespawn";
         case 0x0222: return "TrafficStates";
         case 0x0223: return "TrafficBump";
-        case 0x0224: return "TrafficSpawn2";
-        case 0x0225: return "TrafficDespawn2";
-        case 0x0226: return "TrafficStates2";
-        case 0x0227: return "TrafficBump2";
         case 0x0230: return "DoorEvent";
         case 0x0231: return "DoorApply";
         case 0x0232: return "DoorSnapshot";

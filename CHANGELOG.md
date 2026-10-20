@@ -5,6 +5,14 @@ game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
 ## Unreleased (toward 0.17.0), not yet verified in game
 
+- **Traffic from the host only** (host authority, docs/host-authority.md WP-B): the host's game owns every traffic
+  and police car; a guest's game no longer scans, shares or keeps a region for its own traffic, the host's game shows
+  no one's copies, and no traffic goes from guest to guest. TrafficSpawn2 / Despawn2 / States2 / Bump2 (0x0224-0x0227)
+  are retired (neither sent nor read, ids reserved); a guest reads TrafficSpawn / Despawn / States only from the host,
+  the host TrafficBump only from a guest. The 2026-10-20 fixes stay (copy speed along the heading, driver level of
+  detail, crews held out). Switching the guest's own spawning off and hiding his leftover cars moves to guest_world.
+  sync_compare's traffic section compares the host's cars on the guest only (`traffic.unshared_near` gone); the replay
+  of 2026-10-20 session A gives the same true p95 of 0.75 m. Not run in game.
 - Update check (core v0.13.0): once per game start the mod asks https://justaddmp.com/api/version/mafia-de for the
   newest MafiaCoop release (the newest GitHub release of this repo, pre-releases included). When it is newer than
   this build, a banner at the main menu says so for 20 s ("UPDATE AVAILABLE: MafiaCoop v0.17.0 is out (you have
