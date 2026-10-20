@@ -3,7 +3,31 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
-## Unreleased (toward 0.17.0), not yet verified in game
+## 0.17.0 (2026-10-20), pre-release, checked on one PC, not yet tested on two PCs
+
+The host's game owns the world now (docs/host-authority.md): traffic, police, pedestrians and enemies are the host's
+on every game, a guest's own game makes none of them, and a guest far from the host is warned and brought back (the
+leash). Plus the diagnostics for the next two-PC test (one zip per session to send) and the fixes for the checks the
+first one-PC runs failed. **Both players need 0.17.0** (session build 1700): a 0.16.0 game is turned away with the
+version mismatch message. Core v0.14.0 (protocol stays 9).
+
+**Checked on one PC** (two copies of the game over UDP loopback, tools/onepc, the release build, 2026-10-20 21:57-22:03;
+the earlier runs of 14:36 and 15:00 are in docs/host-authority.md section 9): the guest's own traffic, police and
+pedestrians off (none within 150 m at 10 s and after a minute); pedestrians from the host 96.7 % covered, 0.61 m p95
+(was 2.05 / 1.72 m); the host's NPCs 0.01 m p95; the players on foot 0.25 / 0.10 m p95, cars 0.03 / 0.58 m p95; a
+puppet the game removed back in 1.7 s (was 5.0 s); traffic shown 99.9 % with no crews sent out or put back; the
+leash countdown at 450 m and the pull beside the host; join complete in 4.6 s; latency p95 9 / 17 ms; host upload
+10.5 KB/s with one guest; the session header, summaries, visibility events, clock samples and end totals in the logs;
+Lua errors with their stack; a bundle zip at each game exit (0.1-0.2 s) and a `-recovered` one for an earlier game
+that was killed; no save or profile file changed. `sync_compare --check` on that run failed three targets:
+`traffic.true_p95` 1.97 m (target 1.5; 1.32 / 1.41 m in the earlier runs with the same car code: the copies of moving
+cars across their way, most of it 90+ m from the guest), `foot.dz_p95` 0.75 m for the host's puppet on the guest
+(after the host got off the motorbike his puppet stood on the parked bike's copy 0.75 m up, later 0.3 m beside it,
+while he stood still) and `world.guest_own_cars` 1 (one car of the guest's own for 10 s, two minutes in, then hidden).
+
+**Not tested on two PCs yet**: everything (Steam, real latency and loss, two different machines). The item texts
+below were written before the one-PC run; the paragraph above says what it showed.
+
 
 - **Session diagnostics** for the two-PC tests (core session-logs; **NOT verified in game**, built and unit-tested,
   sync_compare checked on the 2026-10-20 one-PC traces): every session writes a header (`SES`: versions, exe CRC,

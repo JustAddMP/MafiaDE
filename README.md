@@ -4,13 +4,14 @@
 server, Steam invites. Players see each other walking, running, armed and driving, can shoot, punch and run each
 other over, and each picks the character he plays as. Weather, time and the story follow the host (chapter,
 checkpoint, objectives, cutscenes); mission NPCs are kept in step with the host's (deaths, your hits on them) and
-mission cars are not doubled. The host's enemies aim at every player; since 0.16.0 traffic and pedestrians are
-shared wherever players are (not yet verified in game).
+mission cars are not doubled. Since 0.17.0 the host's game runs the whole world for everyone: traffic, police,
+pedestrians and enemies (a friend's game shows copies of them and makes none of its own); a friend who goes more than
+400 m from the host is counted down and brought back beside him.
 
 ## Download
 
-The current version is the **0.16.0 pre-release** (not yet tested in game on two PCs; everyone needs 0.16.0, it
-cannot play with 0.15.0): download `MafiaCoop-0.16.0.zip` from
+The current version is the **0.17.0 pre-release** (checked on one PC with two copies of the game, not yet tested
+on two PCs; **everyone needs 0.17.0**, it cannot play with 0.16.0): download `MafiaCoop-0.17.0.zip` from
 [Releases](https://github.com/JustAddMP/MafiaDE/releases), extract it anywhere and read its `README.txt` (requirements,
 how to play, known issues, uninstall). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -45,11 +46,16 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- 0.16.0 is a pre-release that has not been tested in game on two PCs: the fixes for the 2026-10-18 and 2026-10-19
-  tests and the rewritten sync (players, cars, NPCs, pedestrians, traffic, time of day) are checked by automated
-  tests only. See [CHANGELOG.md](CHANGELOG.md) for what was verified with 0.15.0 and what is new.
-- A player sitting in a car cannot be shot; a motorbike's copy may stay up to a second after its rider got off; car
-  damage and look are not shared for a guest's own traffic.
+- 0.17.0 is a pre-release: the host-owns-the-world sync was checked on one PC with two copies of the game, not yet
+  on two PCs. See [CHANGELOG.md](CHANGELOG.md) for what the one-PC check showed.
+- **The leash:** the streets only live around the host (Mafia brings the world to life around its own player only).
+  From 300 m away from the host a friend sees a warning, beyond 400 m a 10 s countdown, then he is put back beside
+  the host (in his car if he drives). The host can change the numbers in his `MafiaCoop.ini` (`leash_warn_m`,
+  `leash_max_m`, `leash_countdown_s`; his count for everyone).
+- **Sending logs:** after playing, both players send the newest zip from the `logs\bundles` folder next to
+  `MafiaCoop.exe` (one per session, made when the session ends or the game closes; after a crash a
+  `...-recovered.zip` is made at the next start).
+- A player sitting in a car cannot be shot; a motorbike's copy may stay up to a second after its rider got off.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only; enemy
   fights in one chapter's shootout (Bon Appetit's restaurant).
 - JOIN FRIEND and a physical gamepad have not been tested between two PCs / with a real controller yet.

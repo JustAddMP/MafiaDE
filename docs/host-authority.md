@@ -265,6 +265,18 @@ and byte-identical afterwards, "profile and save files changed by the run: 0"):
   nudged): the AI walk does not reach ~4 m/s at x1.8 even without a SetPos every frame, the velocity matching covers
   the rest (with some foot sliding).
 
+One PC again with the 0.17.0 release build (2026-10-20 21:57-22:03; the one-PC fixes of feat/onepc-fixes and the session
+diagnostics of feat/session-logs merged; games muted and unmuted, saves byte-identical afterwards), `sync_compare
+--check` on the two session bundles: PASS `ped.p95` 0.61 m (coverage 96.7 %), `foot.respawn_s` 1.66 s, `car.p95`
+0.03 / 0.58 m, `traffic.reseats_per_min` 0, `traffic.shown` 99.9 %, `npc.p95` 0.01, `leash.pulls` 1 /
+`leash.false_pulls` 0, `join.complete_s` 4.6, `session.mismatch` 0, every other foot target; FAIL `traffic.true_p95`
+1.97 m (moving cars across their way, 90+ m p95 2.36 m; 1.32 / 1.41 m in the 14:36 / 15:00 runs, the car driving code
+unchanged since), `foot.dz_p95` 0.75 m for the host's puppet on the guest (it stood on the copy of the host's parked
+motorbike 0.75 m up after he got off, until the loss step respawned it 0.3 m below his spot beside the bike; he stood
+still the whole time), `world.guest_own_cars` 1 (one own moving car within 150 m for 10 s, 124 s into the world, then
+hidden). Bundles written at each game exit in 0.1-0.2 s (2.2 / 3.8 MB), `-recovered` bundles for the killed 15:00 games
+at the next start; Lua tracebacks on.
+
 Still to confirm on two PCs (section 6), plus: a reload / chapter with held NPCs (D), the car pull (E), whether
 `SetMaxHumanElements(0)` also starves mission spawners in a chapter (A: the probe saw npc copies 0 in Free Ride, no
 mission there), the ped.p95 of reused copies, the traffic put-backs after a teleport.

@@ -1,11 +1,11 @@
-Mafia: Definitive Edition - Co-op (MafiaCoop) 0.16.0, pre-release
+Mafia: Definitive Edition - Co-op (MafiaCoop) 0.17.0, pre-release
 ==================================================================
 
 An unofficial, fan-made co-op mod: play Mafia: Definitive Edition together with friends. One small DLL, no separate
-server, Steam invites. This is a PRE-RELEASE: 0.16.0 has NOT been tested in game on two PCs yet.
-Read "Known issues" below before you play.
+server, Steam invites. This is a PRE-RELEASE: 0.17.0 was checked on one PC with two copies of the game, but it
+has NOT been tested on two PCs yet. Read "Known issues" below before you play.
 
-EVERYONE NEEDS 0.16.0: it cannot play with 0.15.0 or older. A player with another version is turned away
+EVERYONE NEEDS 0.17.0: it cannot play with 0.16.0 or older. A player with another version is turned away
 with "version mismatch ... Both players need the same MafiaCoop version."
 
 Contents of this zip
@@ -58,6 +58,20 @@ JOIN A GAME
 You land in the lobby: pick your CHARACTER and OUTFIT and set READY. If the host is already playing, choose JOIN GAME.
 
 
+THE HOST'S WORLD AND THE LEASH
+------------------------------
+Since 0.17.0 the host's game runs the whole world: traffic, police, pedestrians and enemies. Your friends' games show
+copies of them and make none of their own. Mafia only brings the streets to life around its own player, so far from
+the host a friend's streets would be empty. That is why there is a leash:
+- from 300 m away from the host a friend sees FAR FROM THE HOST - THE STREETS THIN OUT;
+- beyond 400 m TOO FAR FROM THE HOST - BACK IN 10 S counts down (coming back under 380 m stops it);
+- at 0 the screen fades and he is put back beside the host (in his car, on the road behind the host, if he drives).
+Nothing is counted during loading screens and cutscenes, while the host has paused, while someone is down, or in the
+first seconds after joining. The host can change the numbers in
+his MafiaCoop.ini (they count for everyone):  leash_warn_m = 300   leash_max_m = 400   leash_countdown_s = 10
+(leash_countdown_s = 0: only the warning, never a pull).
+
+
 SETTINGS
 --------
 CO-OP > SETTINGS (main menu, lobby or pause menu):
@@ -94,29 +108,25 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- 0.16.0 is NOT yet tested in game on two PCs. It fixes the problems found in the 2026-10-18 and 2026-10-19 tests
-  (punches and throws on the other player's character, the minimap marker, how a player's car looks on the other
-  screen, car damage after an explosion, seats after a reload, a wanted friend's police level, the garage file,
-  car copies driving too slowly, two drivers in one car, shots between players, motorbikes, swimming, a paused
-  game, traffic losing its drivers, changing character) and rewrites how the games stay in step: the other
-  players, their cars, enemies, pedestrians (now shared), traffic (now shared wherever players are) and the time
-  of day. All of it is built and checked by automated tests only. After playing, please send the newest zip from
-  the logs\bundles folder (both players).
+- 0.17.0 is NOT yet tested on two PCs. It was checked on one PC with two copies of the game: the host's traffic,
+  pedestrians and enemies on the friend's game, the friend's own traffic and pedestrians switched off, the leash
+  countdown and pull, a player removed by the game coming back in under 2 seconds, and the new session logs. A few
+  numbers were still off in that check (traffic copies up to 2 m from the host's cars at the 95 % mark, a player's
+  copy standing on a parked motorbike) - please send your logs (see PROBLEMS at the end).
 - A player sitting in a car cannot be shot by the other players, not even through an open window.
 - After a player gets off a motorbike, its copy may stay on the other screens for up to a second.
-- Car damage and car colours are not shared for traffic that a friend's game spawned.
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
   both ways (a friend's kill also kills the host's enemy, so a friend can clear a fight on his own), health follows
   the host's game, and the host's enemies also aim at the other players. An enemy that only the host's game spawned
-  shows on a friend's game as a copy that moves and fires with it and can be killed; since 0.15.0 an enemy that only
-  a friend's game spawned shows on the host's game too (not yet tested). Tested in one chapter's shootout (Bon
+  shows on a friend's game as a copy that moves and fires with it and can be killed. Since 0.17.0 an enemy that only
+  a friend's game spawned (he got somewhere first) is kept hidden on his game until the host's game has it. Tested in one chapter's shootout (Bon
   Appetit's restaurant, cleared to the last enemy, the chapter not played past it); other chapters' fights were not
   tried. enemies_target_guests = 0 in MafiaCoop.ini turns the enemies-aim-at-friends part off if it causes trouble.
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
   screen (checked in Taxi and Bon Appetit). Since 0.15.0 the mission car comes back when the driver parks and gets
   out (not yet tested). Only a few chapters were checked.
-- Traffic and pedestrians are shared wherever players are (new in 0.16.0, not yet tested); in 0.15.0 a friend
-  saw the host's traffic near the host (seen working in the 2026-10-19 test).
+- Traffic, police and pedestrians come from the host's game only (0.17.0): far from the host the streets thin out,
+  hence the leash above. Parked cars, trams and boats are still each game's own.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit, the start of Salieri); other chapters and
   checkpoints may behave differently. A friend who falls behind the host's checkpoint is reloaded at the host's
   checkpoint.

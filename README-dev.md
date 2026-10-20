@@ -540,6 +540,26 @@ Unexplained (2026-10-18):
 - [ ] CHAPTER 13: SALIERI: the guest's scripts stopped about 10 s after the opening cutscene (no Lua lines, status
   `no local player`, no error). Play the chapter start again and watch the guest's log.
 
+## Test checklist: 0.17.0
+
+0.17.0 (pre-release 2026-10-20): host authority (docs/host-authority.md) and the session diagnostics. Checked on one PC
+(tools/onepc, CHANGELOG 0.17.0), **not yet on two PCs**. The two-PC test is the script of docs/host-authority.md
+section 6 (about 45 minutes, eight scenarios: join, walking downtown, driving and riding along, the leash countdown and
+pull, the host paused with the guest 350+ m away, the host's police on the guest, a chapter to its first fight, a far
+death and a rejoin). Then:
+1. Both players send the newest zip of `logs\bundles` next to MafiaCoop.exe (`MafiaCoop-<date>-<time>-host.zip` /
+   `-guest.zip`; a `-recovered.zip` after a crash). Each holds the session's trace, the main log, the redacted ini,
+   the launcher logs, crash dumps of the session and a manifest.
+2. `python -I tools/sync_compare.py <host zip> <guest zip> --check` (zips or traces): every line PASS. Read the session
+   headers side by side first (`session.mismatch` 0: versions, exe, leash), the clock section (session clocks used),
+   then the per-entity VIS breakdowns for anything that failed.
+3. In both logs: `session: ---- session start`, `lua: error tracebacks on`, `session: summary (60 s)` every minute,
+   `session: ---- session end` and `bundle: wrote ...`; no `repeated N more times` storms.
+4. The targets the one-PC run failed (CHANGELOG 0.17.0): `traffic.true_p95` (1.97 m there), `foot.dz_p95` near a
+   parked motorbike (0.75 m there), `world.guest_own_cars` (1 there).
+Also: a 0.16.0 game joining a 0.17.0 host is turned away with `version mismatch: host has protocol 9 build 1700, you
+have protocol 9 build 1600`.
+
 ## Test checklist: 0.16.0
 
 0.16.0 (pre-release 2026-10-20) is not yet tested in game. The next two-PC test (about 25 minutes) plays the

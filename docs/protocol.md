@@ -48,6 +48,18 @@ PedStates / PedSpawn / PedGone / PedDeath / PedKill (0x0280-0x0284); retired: Np
 (0x0420); WorldEnv gets an optional trailing u32 sampleMs; the PlayerState pose byte gets bits 3-5 (swimming, under
 water, motorbike) without a format change.
 
+0.17.0 (`modVersion` 0.17.0, session build 1700; core 0.14.0, `kProtocolVersion` stays 9; host authority,
+docs/host-authority.md): not playable with 0.16.0 (a 0.16.0 game, build 1600, is rejected in the handshake with the
+version mismatch message). New: LeashConfig (0x0208, host -> guests) and LeashEvent (0x0209, guest -> host), see "The
+leash". Retired, neither sent nor read (no handler, no name, no lane or priority; the ids stay reserved and are never
+reused): TrafficSpawn2 / TrafficDespawn2 / TrafficStates2 / TrafficBump2 (0x0224-0x0227: a guest shares no traffic,
+the host is the only traffic authority) and GuestNpcEnd / HostNpcHit / NpcClaim / GuestNpcStates2 / GuestNpcInfo /
+GuestNpcLeave (0x0421-0x0426: a guest's own NPCs are held on his game, nothing of them is sent). Unchanged on the wire
+but host -> guest only now: TrafficSpawn / Despawn / States (0x0220-0x0222; TrafficBump 0x0223 guest -> host),
+PedStates / PedSpawn / PedGone / PedDeath (0x0280-0x0283; PedKill 0x0284 guest -> host), NpcStates2 / NpcInfo /
+NpcLeave (0x0212-0x0214). The session diagnostics of core 0.14.0 (SES / SCK / SUM / FIN, bundles) and our VIS trace
+records add no message.
+
 Host authority, NPCs (unreleased, docs/host-authority.md WP-D `host-npcs`; NOT checked in game): NPCs come from the
 host only. Retired, neither sent nor read (ids reserved, never reused): GuestNpcEnd / HostNpcHit / NpcClaim
 (0x0421-0x0423) and GuestNpcStates2 / GuestNpcInfo / GuestNpcLeave (0x0424-0x0426), as GuestNpcStates (0x0420) since
