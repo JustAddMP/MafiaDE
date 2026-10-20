@@ -25,6 +25,20 @@
 // may hold the co-op changes. Its later writes of that file in this process go to the held tree too, until the
 // game restarts (save_guard: "<scratch>-held").
 // Achievements are Steam's (ISteamUserStats), not a file: not handled here.
+//
+// Who is kept out, and of what (Guard below; since the 2026-10-20 two-PC test, where the HOST's garage.pf was written
+// for real at every garage visit in a co-op Free Ride: up to then only guests and lobby CHAPTER hosts were covered):
+//   a guest, the host of a lobby CHAPTER (Block)         All: saves, slot profiles, progress, unknown profile files
+//   the host of any other session (Host), in a world loaded from the story slot (storage "aslot": CONTINUE, his
+//     checkpoints, his fail screen)                     Progress: progress + unknown profile files only; his story
+//                                                       saves and aslot.pf stay real (a STORY session is his campaign)
+//   the host in any other world (FREE RIDE, the chapter loader, his own Free Ride he started hosting from)
+//                                                       All (a co-op Free Ride writes gamesaves\default\aslot\save1.sav
+//                                                       and aslot.pf: guests' logs of 2026-10-20 show the path)
+//   nobody (no session, or back at the main menu after one)   None (held files stay held, see HELD)
+// Settings are never redirected. While a file is kept out the real one is never opened for writing, so a crash in a
+// session leaves it as it was; the scratch tree is per process and removed at the next start.
+#include <set>
 #include <string>
 
 namespace mc::game::save_paths {
@@ -50,5 +64,44 @@ std::string Target(const std::string& path, const std::string& root);
 const char* KindName(Kind k);
 // Why this file is redirected or left alone (for the log).
 const char* Why(const Mapped& m);
+
+enum class Scope { None, Progress, All };
+// Kind k is kept out of the real files under scope s.
+bool KeptOut(Kind k, Scope s);
+const char* ScopeName(Scope s);
+
+// Where one file access goes.
+enum class Where { Real, Scratch, Held };
+
+// The decision state of save_guard (one per process, under its mutex). Pure: tests replay logged sessions through it.
+class Guard {
+public:
+    // A save load request (save_guard's LoadDetour) and the storage it reads: "aslot" is the player's story (CONTINUE,
+    // its checkpoints, its fail screen); anything else ("debugloadchapter": FREE RIDE and our chapter loads, "bslot")
+    // is not.
+    void Load(const std::string& storage);
+    // What the session needs (mission_sync, every session frame; (false, false) at its end): a guest or the host of
+    // a lobby CHAPTER (block), the host of any session (host). Turned on at once; turned off only by MainMenu().
+    void Want(bool block, bool host);
+    // Block now (a CHAPTER start, before its load) or end it now (on = false; also no longer wanted).
+    void SetBlock(bool on);
+    // The main menu is up (the co-op world is gone, its quit save written): what is no longer wanted ends.
+    void MainMenu();
+    bool Block() const { return _block; }
+    bool Host() const { return _host; }
+    bool StoryWorld() const { return _story; }
+    Scope Current() const;
+    // Where an access of `m` goes now. A write kept out of a file that is HeldAfterSession marks it held: when nothing
+    // is kept out any more (Current() None) its accesses go to the held tree for the rest of the process.
+    Where Route(const Mapped& m, bool write);
+    bool AnyHeld() const { return !_held.empty(); }
+    bool IsHeld(const std::string& file) const { return _held.count(file) != 0; }
+    std::string HeldList() const;  // "garage.pf, my2k_game_stats.pf"
+
+private:
+    bool _block = false, _host = false, _story = false;
+    bool _wantBlock = false, _wantHost = false;
+    std::set<std::string> _held;
+};
 
 }  // namespace mc::game::save_paths

@@ -233,7 +233,10 @@ public:
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
         sectors_guard::Install();  // makes the friend-brain puppets safe (player_sync.lua M.Ally)
     }
-    void RenderTick(float dt) override { lua::PollRender(dt); }
+    void RenderTick(float dt) override {
+        lua::PollRender(dt);
+        save_guard::Tick(menu::AtMainMenu());  // after a session: the real save files again once the menu is up
+    }
 
     void OnSessionStart(net::Session& session) override {
         _session = &session;

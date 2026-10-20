@@ -17,6 +17,8 @@
 #include <vector>
 
 namespace mc::game::save_guard {
+void OnLoad(const std::string& storage);  // below: the storage of a world load (a STORY host keeps his saves)
+
 namespace {
 
 // ---- the save system's load request (docs/re-notes.md 7) --------------------------------------------------------------
@@ -92,6 +94,7 @@ void* LoadDetour(void* self, void* out, uint32_t slot, void* id, void* name) {
         MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)%s",
                     _block.load() ? ": it gets the session's checkpoint instead" : "");
     }
+    OnLoad(storage);
     if (storage == "debugloadchapter") {
         std::lock_guard lock(_dbgMu);
         _dbgId = saveId;
@@ -201,9 +204,18 @@ void* SlotFindDetour(void* self, uint32_t slot, void* id) {
 // start; UNVERIFIED whether a later save load re-reads them), so a progress file the session wrote stays held for the
 // rest of the process: its writes go to <scratch>-held\profiles\... (cleared when a later start finds the process
 // gone), and the player's real garage changes again only after a restart of the game.
-std::set<std::string> _held;           // progress files (lower-case names) a co-op session of this process wrote
-std::atomic<bool> _anyHeld{false};
+// Since the 2026-10-20 two-PC test the HOST is covered too (his garage.pf was written for real at each garage visit of
+// a co-op Free Ride, and his aslot\save1.sav / aslot.pf with it): save_paths::Guard decides per file, from Block (a
+// guest, a CHAPTER host), Host (the host of any session) and the storage of the last world load (a STORY host keeps
+// his story saves; save_paths.h has the table).
+save_paths::Guard _guard;              // under _mu
+std::atomic<bool> _any{false};         // something is kept out or held (the fast path of every CreateFileA)
+std::atomic<bool> _host{false};        // mirrors _guard.Host()
 std::atomic<uint32_t> _profileRedirects{0};
+
+void UpdateAny() {  // under _mu
+    _any = _guard.Current() != save_paths::Scope::None || _guard.AnyHeld();
+}
 
 struct Routed {
     std::string target;  // "" = the real file
@@ -213,35 +225,37 @@ struct Routed {
 
 Routed Route(const char* path, bool write) {
     Routed r;
-    if (!path) return r;
-    const bool blocking = _block.load();
-    if (!blocking && !_anyHeld.load()) return r;
+    if (!path || !_any.load()) return r;
     r.m = save_paths::Classify(path);
     if (!save_paths::Redirected(r.m.kind)) return r;
-    std::string root;
+    std::string root, heldRoot;
     {
         std::lock_guard lock(_mu);
-        if (blocking) {
+        if (_scratch.empty()) return r;
+        const save_paths::Where w = _guard.Route(r.m, write);
+        UpdateAny();
+        heldRoot = _guard.IsHeld(r.m.file) ? _scratch + "-held" : std::string();
+        if (w == save_paths::Where::Scratch) {
             root = _scratch;
-        } else if (save_paths::HeldAfterSession(r.m.kind) && _held.count(r.m.file)) {
-            root = _scratch.empty() ? std::string() : _scratch + "-held";
+        } else if (w == save_paths::Where::Held) {
+            root = heldRoot;
             r.held = true;
         }
     }
     if (root.empty()) return r;
-    const std::string target = save_paths::Join(root, r.m.sub);  // ...\coop-saves\<pid>\gamesaves\... or \profiles\...
+    std::string target = save_paths::Join(root, r.m.sub);  // ...\coop-saves\<pid>\gamesaves\... or \profiles\...
     if (target.empty()) return r;
     if (write) {
         CreateDirectoryA(root.c_str(), nullptr);
         for (size_t i = root.size() + 1; (i = target.find('\\', i)) != std::string::npos; ++i)
             CreateDirectoryA(target.substr(0, i).c_str(), nullptr);
-        if (blocking && save_paths::HeldAfterSession(r.m.kind)) {
-            std::lock_guard lock(_mu);
-            _held.insert(r.m.file);
-            _anyHeld = true;
-        }
     } else if (GetFileAttributesA(target.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        return r;  // nothing written in this session: the real file is read
+        // nothing written in this session: an earlier session's held copy if there is one (the game's own copy of
+        // that file is the held one), else the real file
+        const std::string held = r.held || heldRoot.empty() ? std::string() : save_paths::Join(heldRoot, r.m.sub);
+        if (held.empty() || GetFileAttributesA(held.c_str()) == INVALID_FILE_ATTRIBUTES) return r;
+        target = held;
+        r.held = true;
     }
     r.target = target;
     return r;
@@ -301,9 +315,12 @@ HANDLE WINAPI CreateFileADetour(LPCSTR name, DWORD access, DWORD share, LPSECURI
         if (write && name && (std::strstr(name, "gamesaves") || std::strstr(name, "profiles")) &&
             std::strstr(name, "Mafia Definitive Edition")) {
             const save_paths::Mapped m = r.m.file.empty() ? save_paths::Classify(name) : r.m;
+            const bool coop = _block.load() || _host.load();
             MC_LOG_INFO("savesys: written: %s (%s: %s%s)", m.file.c_str(), save_paths::KindName(m.kind),
                         save_paths::Why(m),
-                        _block.load() && !save_paths::Redirected(m.kind) ? ", left alone in co-op" : "");
+                        !coop                                  ? ""
+                        : !save_paths::Redirected(m.kind)      ? ", left alone in co-op"
+                                                               : ", the STORY host's own story: kept as in single player");
         }
         if (!write && name && _block.load() && std::strstr(name, "gamesaves"))
             MC_LOG_INFO("savesys: read of a real save in a co-op session: %s", name);
@@ -402,6 +419,12 @@ void Install() {
         CreateDirectoryA(_scratch.c_str(), nullptr);
         RemoveStale(_scratch);
         _scratch += "\\" + std::to_string(GetCurrentProcessId());
+        // a tree of an earlier process with our pid (it crashed and the pid came round again) is not ours: nothing of
+        // it may be read back (RemoveStale skips our own pid)
+        ClearScratch(_scratch);
+        RemoveDirectoryA(_scratch.c_str());
+        ClearScratch(_scratch + "-held");
+        RemoveDirectoryA((_scratch + "-held").c_str());
     }
     bool ok = false;
     if (HMODULE kb = GetModuleHandleW(L"kernelbase.dll")) {
@@ -416,37 +439,84 @@ void Install() {
     if (!ok) MC_LOG_WARN("savesys: file hooks failed: a following guest's checkpoints would go into his own save slot");
 }
 
-void Block(bool on) {
-    if (_block.load() == on) return;
-    std::string dir;
+namespace {
+
+// Changes the guard's state (fn, under _mu). The scratch tree is cleared when keeping out starts (nothing was kept out
+// before) and removed when it ends; a change between the two (a host who starts a CHAPTER, a guest who becomes a host,
+// a host whose next world is his story) keeps it. The real files are never touched here.
+template <typename Fn>
+void Change(Fn fn, const char* why) {
+    std::string dir, held;
+    save_paths::Scope before, after;
+    bool block, host;
     {
         std::lock_guard lock(_mu);
+        before = _guard.Current();
+        const bool b0 = _guard.Block(), h0 = _guard.Host();
+        fn(_guard);
+        after = _guard.Current();
+        block = _guard.Block();
+        host = _guard.Host();
+        if (before == after && b0 == block && h0 == host) return;
+        _block = block;
+        _host = host;
         dir = _scratch;
-    }
-    if (on && !dir.empty()) {
-        ClearScratch(dir);
-        CreateDirectoryA(dir.c_str(), nullptr);
-    }
-    _block = on;
-    if (!on && !dir.empty()) {
-        ClearScratch(dir);
-        RemoveDirectoryA(dir.c_str());
-    }
-    MC_LOG_INFO("savesys: %s", on ? ("saves now go to " + dir + " (co-op session: the real save slots, slot "
-                                     "profiles and progress profiles (garage, stats, persistent data) are not "
-                                     "touched; settings are)").c_str()
-                                  : "saves go to the real save slots again");
-    if (!on) {
-        std::string held;
-        {
-            std::lock_guard lock(_mu);
-            for (const std::string& f : _held) held += (held.empty() ? "" : ", ") + f;
+        if (before == save_paths::Scope::None && after != save_paths::Scope::None && !dir.empty()) {
+            ClearScratch(dir);
+            CreateDirectoryA(dir.c_str(), nullptr);
         }
+        if (after == save_paths::Scope::None && before != save_paths::Scope::None && !dir.empty()) {
+            ClearScratch(dir);
+            RemoveDirectoryA(dir.c_str());
+        }
+        UpdateAny();
+        held = _guard.HeldList();
+    }
+    if (after == before && after != save_paths::Scope::None) {
+        MC_LOG_INFO("savesys: %s: still kept out: %s", why, save_paths::ScopeName(after));
+    } else if (after != save_paths::Scope::None) {
+        MC_LOG_INFO("savesys: %s: %s now go to %s (%s); settings are the player's own", why,
+                    after == save_paths::Scope::All ? "saves, slot profiles and progress profiles (garage, stats, "
+                                                      "persistent data)"
+                                                    : "the progress profiles (garage, stats, persistent data)",
+                    dir.c_str(),
+                    block                             ? "a co-op session: a guest or a CHAPTER host"
+                    : after == save_paths::Scope::All ? "the host, in a world that is not his own story"
+                                                      : "the host of his own story: his story saves stay his own");
+    } else {
+        MC_LOG_INFO("savesys: %s: saves and profile files go to the real files again", why);
         if (!held.empty())
             MC_LOG_INFO("savesys: held until the game restarts (the co-op session wrote them and the game may still "
                         "hold its changes): %s -> %s-held",
                         held.c_str(), dir.c_str());
     }
+}
+
+}  // namespace
+
+void Block(bool on) {
+    Change([on](save_paths::Guard& g) { g.SetBlock(on); }, on ? "save slots blocked" : "save slots unblocked");
+}
+
+void Want(bool block, bool host) {
+    if (block == _block.load() && host == _host.load()) {
+        std::lock_guard lock(_mu);  // nothing turns on or off now: only what Tick will end later
+        _guard.Want(block, host);
+        return;
+    }
+    Change([block, host](save_paths::Guard& g) { g.Want(block, host); },
+           block ? "a co-op session (guest or CHAPTER host)" : host ? "hosting" : "the session ended");
+}
+
+void Tick(bool atMainMenu) {
+    // the co-op world (or its loading screen, its quit save) may still write: kept out until the main menu is up
+    if (!atMainMenu || (!_block.load() && !_host.load())) return;
+    Change([](save_paths::Guard& g) { g.MainMenu(); }, "out of the co-op world (main menu)");
+}
+
+void OnLoad(const std::string& storage) {
+    Change([&storage](save_paths::Guard& g) { g.Load(storage); },
+           storage == "aslot" ? "a load from the story slot" : "a load (not the story slot)");
 }
 
 void SetSessionSave(const std::vector<uint8_t>& bytes, const std::string& id) {
@@ -479,9 +549,8 @@ void ForgetFailEntry() {
     }
 }
 std::string ScratchDir() {
-    if (!_block.load()) return {};
     std::lock_guard lock(_mu);
-    return _scratch;
+    return _guard.Current() == save_paths::Scope::All ? _scratch : std::string();
 }
 uint32_t Redirected() { return _redirected.load(); }
 uint32_t MissionAborts() { return _aborts.load(); }
