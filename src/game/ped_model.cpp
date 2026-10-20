@@ -375,6 +375,7 @@ uint16_t PedAuthority::NewNet() {
 }
 
 void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
+    now_ = now;
     std::set<uint32_t> seen;
     for (const LocalPed& lp : peds) {
         if (lp.id == 0 || !Finite(lp.pos) || seen.count(lp.id)) continue;
@@ -385,6 +386,16 @@ void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
         if (e.haveLast && now - e.lastAt > 1e-3) {
             const float dt = static_cast<float>(now - e.lastAt);
             Vec3 v{(lp.pos.x - e.lastPos.x) / dt, (lp.pos.y - e.lastPos.y) / dt, 0};
+            // riding something (a tram, a train): faster than any gait for rideRounds rounds in a row
+            const float raw = std::hypot(v.x, v.y);
+            if (dt <= 1.0f && raw > cfg_.rideSpeed && Ground(lp.pos, e.lastPos) < 30.0f) {
+                if (++e.fastRounds >= cfg_.rideRounds) {
+                    if (now >= e.rideUntil) ++rides_;
+                    e.rideUntil = now + cfg_.rideHold;
+                }
+            } else {
+                e.fastRounds = 0;
+            }
             if (Ground(lp.pos, e.lastPos) > 5.0f || dt > 1.0f || std::hypot(v.x, v.y) > 12.0f) {
                 e.vel = {};
             } else {
@@ -401,7 +412,8 @@ void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
         e.gait = (lp.flags & kDead) ? 0 : GaitOf(std::hypot(e.vel.x, e.vel.y), e.gait);
         e.owner = (fresh || e.owner == net::kNoPlayer) ? region_.AuthorityAt(lp.pos) : region_.Keep(e.owner, lp.pos);
         const net::interest::Vec3 ip{lp.pos.x, lp.pos.y, lp.pos.z}, iv{e.vel.x, e.vel.y, 0};
-        if (e.owner == me_) {
+        const bool riding = now < e.rideUntil;
+        if (e.owner == me_ && !riding) {
             if (e.net == 0) {
                 e.net = NewNet();
                 if (e.net != 0) {
@@ -419,7 +431,7 @@ void PedAuthority::SetPeds(const std::vector<LocalPed>& peds, double now) {
             } else {
                 im_.UpdateEntity(e.net, ip, iv);
             }
-        } else if (e.net != 0) {  // its region went to another player: not ours to send any more
+        } else if (e.net != 0) {  // its region went to another player, or it rides something: not sent any more
             im_.RemoveEntity(e.net);
             byNet_.erase(e.net);
             e.net = 0;
@@ -566,12 +578,20 @@ uint8_t PedAuthority::OwnerOf(uint32_t id) const {
 std::vector<LocalPed> PedAuthority::Foreign() const {
     std::vector<LocalPed> out;
     for (const auto& [id, e] : peds_)
-        if (e.owner != me_ && e.owner != net::kNoPlayer && !(e.p.flags & kDead)) out.push_back(e.p);
+        if (e.owner != me_ && e.owner != net::kNoPlayer && !(e.p.flags & kDead) && now_ >= e.rideUntil)
+            out.push_back(e.p);
     return out;
 }
 
 size_t PedAuthority::OwnedCount() const {
     return byNet_.size();
+}
+
+size_t PedAuthority::RidingCount() const {
+    size_t n = 0;
+    for (const auto& [id, e] : peds_)
+        if (now_ < e.rideUntil) ++n;
+    return n;
 }
 
 uint32_t PedAuthority::IdOf(uint16_t net) const {
@@ -590,6 +610,34 @@ const AuthorityPeerStats* PedAuthority::Stats(uint8_t peer) const {
 }
 
 // ---- receiver ----------------------------------------------------------------------------------------------------------
+const char* SpawnFailName(SpawnFail w) {
+    switch (w) {
+        case SpawnFail::Create: return "create_failed";
+        case SpawnFail::NoProfile: return "no_profile";
+        case SpawnFail::Reset: return "spawner_reset";
+        case SpawnFail::Timeout: return "timeout";
+        default: return "other";
+    }
+}
+
+SpawnFail SpawnFailOf(const std::string& why) {
+    for (int i = 0; i < static_cast<int>(SpawnFail::Count); ++i) {
+        const auto w = static_cast<SpawnFail>(i);
+        if (why == SpawnFailName(w)) return w;
+    }
+    return SpawnFail::Other;
+}
+
+const char* WhyName(RecvCmd::Why w) {
+    switch (w) {
+        case RecvCmd::Why::LagSnap: return "lag";
+        case RecvCmd::Why::Unresponsive: return "unresponsive";
+        case RecvCmd::Why::CreateFailing: return "create_failing";
+        case RecvCmd::Why::CopiesLost: return "copies_lost";
+        default: return "-";
+    }
+}
+
 PedReceiver::PedReceiver(const ReceiverConfig& cfg) : cfg_(cfg) {}
 
 PedReceiver::Auth& PedReceiver::AuthOf(uint8_t auth) {
@@ -724,28 +772,36 @@ void PedReceiver::Spawned(uint32_t key, uint32_t local) {
     r.how = How::Spawned;
     r.local = local;
     r.haveRep = false;
+    r.lagSince = -1;
     r.loco.Reset();
     boundLocal_[local] = key;
+    createFails_ = 0;
 }
 
-void PedReceiver::SpawnFailed(uint32_t key, double now) {
+void PedReceiver::SpawnFailed(uint32_t key, double now, SpawnFail why) {
+    ++stats_.failsBy[static_cast<size_t>(why)];
+    ++stats_.spawnFails;
+    if (why == SpawnFail::Create) ++createFails_;
     auto it = remotes_.find(key);
     if (it == remotes_.end()) return;
     Remote& r = it->second;
     if (r.how == How::Spawned && r.local != 0) return;
     r.loading = false;
     r.how = How::None;
-    r.retryAt = now + cfg_.spawnRetry;
-    ++stats_.spawnFails;
+    r.retryAt = now + (why == SpawnFail::Reset ? cfg_.resetRetry : cfg_.spawnRetry);
 }
 
-void PedReceiver::LocalGone(uint32_t local) {
+void PedReceiver::LocalGone(uint32_t local, double now) {
     hidden_.erase(local);
     cands_.erase(local);
     auto it = boundLocal_.find(local);
     if (it == boundLocal_.end()) return;
     auto rt = remotes_.find(it->second);
     if (rt != remotes_.end()) {
+        if (rt->second.how == How::Spawned) {
+            ++stats_.lost;
+            lostAt_.push_back(now);
+        }
         rt->second.how = How::None;
         rt->second.local = 0;
         rt->second.haveRep = false;
@@ -769,6 +825,9 @@ void PedReceiver::Clear() {
     cands_.clear();
     boundLocal_.clear();
     hidden_.clear();
+    createFails_ = 0;
+    lostAt_.clear();
+    resetWanted_ = false;
 }
 
 void PedReceiver::ShowAll(std::vector<RecvCmd>& out) {
@@ -826,6 +885,7 @@ void PedReceiver::ReleaseReplica(Remote& r, std::vector<RecvCmd>& out) {
     r.loading = false;
     r.haveRep = false;
     r.diedHere = r.diedHereTold = false;
+    r.lagSince = -1;
     ++stats_.releases;
 }
 
@@ -854,8 +914,42 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
             r.loading = false;
             r.retryAt = now + cfg_.spawnRetry;
             ++stats_.spawnFails;
+            ++stats_.failsBy[static_cast<size_t>(SpawnFail::Timeout)];
         }
         ++it;
+    }
+    // 1b. the copy spawner's health: CreateObject failing again and again, or every copy gone at once (the spawner
+    //     went and took them along): a new spawner, and the pedestrians waiting for a copy are asked for again soon.
+    //     Only while no copy of it is left (a new spawner's despawn of the old one would take living copies along).
+    {
+        lostAt_.erase(std::remove_if(lostAt_.begin(), lostAt_.end(),
+                                     [&](double t) { return now - t > cfg_.massLossWindow; }),
+                      lostAt_.end());
+        size_t spawnedNow = 0;
+        for (const auto& [key, r] : remotes_)
+            if (r.how == How::Spawned && r.local != 0) ++spawnedNow;
+        if (!resetWanted_ && spawnedNow == 0) {
+            if (static_cast<int>(lostAt_.size()) >= cfg_.massLoss) {
+                resetWanted_ = true;
+                resetWhy_ = RecvCmd::Why::CopiesLost;
+            } else if (createFails_ >= cfg_.spawnerFails) {
+                resetWanted_ = true;
+                resetWhy_ = RecvCmd::Why::CreateFailing;
+            }
+        }
+        if (resetWanted_ && now - resetAt_ >= cfg_.spawnerResetGap) {
+            RecvCmd c;
+            c.type = RecvCmd::Type::ResetSpawner;
+            c.why = resetWhy_;
+            out.push_back(c);
+            ++stats_.spawnerResets;
+            resetAt_ = now;
+            resetWanted_ = false;
+            createFails_ = 0;
+            lostAt_.clear();
+            for (auto& [key, r] : remotes_)
+                if (r.how == How::None && !r.loading && r.retryAt > now) r.retryAt = now + cfg_.resetRetry;
+        }
     }
     // 2. targets of the live ones
     struct Live {
@@ -926,12 +1020,13 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
         if (r.loading || r.how == How::Spawned) ++spawned;
     }
     std::vector<std::pair<float, size_t>> want;
+    const bool nothingToAdopt = lIds.size() == adoptedIdx.size();  // every free local human in our zone is used
     for (size_t k = 0; k < unmatched.size(); ++k) {
         if (adoptedIdx.count(k)) continue;
         const Live& l = live[unmatched[k]];
         const Remote& r = *l.r;
         if (l.d > cfg_.spawnRadius || now < r.retryAt) continue;
-        const double wait = rSeen[k] ? cfg_.spawnWaitSeen : cfg_.spawnWait;
+        const double wait = nothingToAdopt ? cfg_.spawnWaitNone : rSeen[k] ? cfg_.spawnWaitSeen : cfg_.spawnWait;
         if (now - r.unmatchedSince < wait) continue;
         want.push_back({l.d, unmatched[k]});
     }
@@ -1028,7 +1123,40 @@ void PedReceiver::Tick(double now, float dt, std::vector<RecvCmd>& out) {
         c.local = r.local;
         c.target = l.t;
         c.lc = r.loco.Update(in);
-        if (c.lc.fix == net::motion::LocomotionCommand::Fix::Snap) ++stats_.snaps;
+        // a replica that keeps its gap behind a moving target (it walks at the target's pace, the multiplier and the
+        // nudges do not move it): snapped; lagging again soon after: released, the pedestrian gets a new copy
+        using Fix = net::motion::LocomotionCommand::Fix;
+        const float tspeed = std::hypot(l.t.vel.x, l.t.vel.y);
+        if (in.haveCopy && c.lc.fix != Fix::Snap && tspeed >= cfg_.lagMinSpeed && c.lc.error > cfg_.lagDist) {
+            if (r.lagSince < 0 || c.lc.error < r.lagRef - cfg_.lagClose) {
+                r.lagSince = now;
+                r.lagRef = c.lc.error;
+            } else if (now - r.lagSince >= cfg_.lagTime) {
+                r.lagSince = -1;
+                if (now - r.lagSnapAt <= cfg_.lagRespawn) {
+                    ++stats_.unresponsive;
+                    r.retryAt = now;
+                    r.unmatchedSince = -1;
+                    ReleaseReplica(r, out);
+                    out.back().why = RecvCmd::Why::Unresponsive;
+                    continue;
+                }
+                r.lagSnapAt = now;
+                // walk on from the target's spot (the walk point was picked from the old one)
+                const float sx = l.t.pos.x - r.rep.pos.x, sy = l.t.pos.y - r.rep.pos.y;
+                c.lc.fix = Fix::Snap;
+                c.lc.nudge = {};
+                c.lc.reissue = true;
+                c.lc.moveTo.x += sx;
+                c.lc.moveTo.y += sy;
+                c.why = RecvCmd::Why::LagSnap;
+                r.loco.Reset();
+                ++stats_.lagSnaps;
+            }
+        } else {
+            r.lagSince = -1;
+        }
+        if (c.lc.fix == Fix::Snap) ++stats_.snaps;
         r.lastErr = c.lc.error;
         out.push_back(c);
     }
@@ -1063,6 +1191,7 @@ std::vector<ReplicaInfo> PedReceiver::Replicas(double now) const {
         i.targetT = r.lastTargetT;
         i.copy = r.rep;
         i.haveCopy = r.haveRep && now - r.repAt <= 1.0;
+        i.dead = r.dead || r.diedHere || (r.haveRep && r.rep.dead);
         i.err = i.haveCopy ? Ground(r.rep.pos, r.lastTarget.pos) : 0;
         out.push_back(i);
     }

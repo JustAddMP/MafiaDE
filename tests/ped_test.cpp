@@ -3,19 +3,25 @@
 // second guest), the one-to-one adoption matching, the receiver (adopt first, spawn second, hide the surplus only out
 // of sight, release, show again, deaths), and recorded-like pedestrian walks through the whole chain (authority ->
 // lossy, jittery link -> replica::Stream -> LocomotionController -> a simulated AI walker) asserting the targets of
-// docs/sync-architecture.md section 4 (ped.p95 <= 1.5 m, ped.coverage >= 80 %). Prints PASS/FAIL per check; exits
-// non-zero on any failure.
+// docs/sync-architecture.md section 4 (ped.p95 <= 1.5 m, ped.coverage >= 80 %). The 2026-10-20 two-PC traces
+// (tests/data/ped_trace.h) are replayed through the same chain: every recorded pedestrian's real walk, the copy's
+// recorded answer (a copy that never closed its gap), the tram riders, the deaths, and session A's coverage with the
+// guest's real walk and its copy spawner hidden mid-session - before (0.16.0 rules) and after. Prints PASS/FAIL per
+// check; exits non-zero on any failure.
 #include "game/ped_model.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
+
+#include "data/ped_trace.h"
 
 using namespace mc;
 using namespace mc::game::ped;
@@ -502,7 +508,8 @@ struct AiWalker {
     std::deque<Pending> queue;
     float clock = 0;
     int snaps = 0;
-    static constexpr float kTurn = 300.0f * 3.14159265f / 180, kAccel = 6.0f;
+    static constexpr float kTurn = 300.0f * 3.14159265f / 180;
+    float kAccel = 6.0f;  // m/s^2
 
     void Apply(const LocomotionCommand& c, const Vec3& target) {
         if (c.fix == LocomotionCommand::Fix::Snap) {
@@ -774,6 +781,594 @@ void TestCoverage(bool lookAround, float minCoverage, const char* name) {
     Check(st.spawned + st.loading <= 10, "coverage: at most 10 spawned copies", Fmt("%.0f", st.spawned + st.loading));
 }
 
+// ---- the 2026-10-20 two-PC traces replayed (tests/data/ped_trace.h) ----------------------------------------------------
+struct TPt {
+    double t;  // s on the authority's clock since the session's T0
+    float x, y;
+};
+using Track = std::vector<TPt>;
+
+// Position at t, linear between rows; false in a gap longer than maxGap (the pedestrian was not sent then).
+bool At(const Track& tr, double t, float& x, float& y, double maxGap = 1.0) {
+    auto it = std::lower_bound(tr.begin(), tr.end(), t, [](const TPt& p, double v) { return p.t < v; });
+    if (it == tr.begin() || it == tr.end()) {
+        if (it != tr.end() && std::fabs(it->t - t) < 1e-6) {
+            x = it->x;
+            y = it->y;
+            return true;
+        }
+        return false;
+    }
+    const TPt& b = *it;
+    const TPt& a = *(it - 1);
+    if (b.t - a.t > maxGap) return false;
+    const float k = static_cast<float>((t - a.t) / std::max(1e-6, b.t - a.t));
+    x = a.x + (b.x - a.x) * k;
+    y = a.y + (b.y - a.y) * k;
+    return true;
+}
+
+template <size_t N>
+std::map<int, Track> Tracks(const int (&rows)[N][4]) {
+    std::map<int, Track> out;
+    for (const auto& r : rows) out[r[0]].push_back({r[1] / 1000.0, r[2] / 100.0f, r[3] / 100.0f});
+    for (auto& [net, tr] : out)
+        std::sort(tr.begin(), tr.end(), [](const TPt& a, const TPt& b) { return a.t < b.t; });
+    return out;
+}
+
+// What the recorded copy did: the true error of every replica record (its spot vs the truth at its target time, as
+// sync_compare's ped.p95), and whether it ever closed a gap (1 s windows starting > 1 m behind a target walking
+// faster than 0.8 m/s: closing = the gap shrank by more than 0.2 m/s).
+struct Recorded {
+    std::vector<float> errs;
+    int windows = 0, closing = 0;
+    bool deaf() const { return windows >= 10 && closing * 10 < windows; }
+};
+
+Recorded RecordedOf(const Track& truth, const Track& rep, double deadAt) {
+    Recorded r;
+    std::vector<std::pair<double, float>> e;
+    for (const TPt& p : rep) {
+        if (p.t >= deadAt) break;
+        float x, y;
+        if (!At(truth, p.t, x, y)) continue;
+        const float d = std::hypot(p.x - x, p.y - y);
+        r.errs.push_back(d);
+        e.push_back({p.t, d});
+    }
+    for (size_t i = 0, j = 0; i < e.size(); ++i) {
+        if (e[i].second < 1.0f) continue;
+        while (j < e.size() && e[j].first < e[i].first + 1.0) ++j;
+        if (j >= e.size() || e[j].first > e[i].first + 1.3) continue;
+        float x0, y0, x1, y1;
+        if (!At(truth, e[i].first, x0, y0) || !At(truth, e[j].first, x1, y1)) continue;
+        const double dt = e[j].first - e[i].first;
+        if (std::hypot(x1 - x0, y1 - y0) / dt < 0.8) continue;
+        ++r.windows;
+        if ((e[j].second - e[i].second) / dt < -0.2) ++r.closing;
+    }
+    return r;
+}
+
+// One recorded pedestrian through the whole chain: its truth rows (5 Hz, interpolated to the authority's 20 Hz
+// rounds) -> PedAuthority -> a 30 ms link -> PedReceiver (no local human to adopt: spawned copies, made 0.1 s after
+// they are asked for) -> LocomotionController -> the simulated copy. The receiving player walks 8 m beside it.
+struct ReplayOut {
+    std::vector<float> errs;  // the copy vs the truth at its target time, 10 Hz, while alive and shown
+    int snaps = 0, lagSnaps = 0, unresponsive = 0, spawns = 0;
+    double sharedS = 0, ridingShownS = 0;  // s the receiver had a replica; ... while the truth moved > 8 m/s
+    uint64_t rides = 0;
+};
+
+// The game's AI walk of a spawned copy, as the recorded copies show it: 1.5-1.7 m/s at multiplier 1.
+AiWalker CopyWalker() {
+    AiWalker w;
+    w.realSpeed[1] = 1.6f;
+    w.realSpeed[2] = 4.0f;
+    w.realSpeed[3] = 6.0f;
+    w.lag = 0.2f;
+    return w;
+}
+
+// `deafTrack`: the recorded copy of a pedestrian whose copy never answered (A net 81): the replayed copy walks exactly
+// as that one did (its own pace, deaf to multipliers and nudges), moved only by our snaps and respawns.
+ReplayOut ReplayOne(const Track& truth, double deadAt, const Track* deafTrack, const ReceiverConfig& rc,
+                    const AuthorityConfig& ac) {
+    ReplayOut o;
+    PedAuthority auth(ac);
+    PedReceiver rx(rc);
+    AiWalker w = CopyWalker();
+    float offX = 0, offY = 0;  // deaf: our snaps' shift of the recorded copy
+    const double kCopyLag = 0.15;  // the recorded copy's rows are stamped with its target's time (rT): about now - this
+    auto deafAt = [&](double t, float& x, float& y) { return deafTrack && At(*deafTrack, t - kCopyLag, x, y); };
+    const uint32_t pedId = 77 * 256 + 8, copyId = 5000 * 256 + 8;
+    struct Pk {
+        double at;
+        uint16_t id;
+        std::vector<uint8_t> body;
+    };
+    std::deque<Pk> wire;
+    const double t0 = truth.front().t, t1 = std::min(truth.back().t, deadAt);
+    const float dt = 1.0f / 60.0f;
+    double roundAt = -1, sampleAt = 0, spawnAt = -1;
+    uint32_t spawnKey = 0;
+    bool have = false;
+    float meX = 0, meY = 0;
+    for (double t = t0; t < t1; t += dt) {
+        float px, py;
+        const bool present = At(truth, t, px, py);
+        if (present) {
+            meX = px + 6.0f;
+            meY = py + 5.0f;
+        }
+        if (t - roundAt >= 0.05 - 1e-9) {
+            roundAt = t;
+            auth.SetPlayers({{0, {meX - 3, meY, 0}, true}, {1, {meX, meY, 0}, true}}, 0, 0);
+            std::vector<LocalPed> peds;
+            if (present) {
+                LocalPed lp = Ped(pedId, px, py);
+                float qx, qy;
+                if (At(truth, t + 0.1, qx, qy) && std::hypot(qx - px, qy - py) > 0.01f) {
+                    const float l = std::hypot(qx - px, qy - py);
+                    lp.heading[0] = (qx - px) / l;
+                    lp.heading[1] = (qy - py) / l;
+                }
+                peds.push_back(lp);
+            }
+            auth.SetPeds(peds, 1000.0 + t);
+            std::vector<PeerOut> out;
+            auth.Tick(1000.0 + t, static_cast<uint32_t>((1000.0 + t) * 1000.0), out);
+            for (auto& po : out) {
+                for (auto& b : po.gones) wire.push_back({t + 0.03, kMsgGone, b});
+                for (auto& b : po.spawns) wire.push_back({t + 0.03, kMsgSpawn, b});
+                for (auto& b : po.states) wire.push_back({t + 0.03, kMsgStates, b});
+            }
+        }
+        const double rnow = 50.0 + t;
+        while (!wire.empty() && wire.front().at <= t) {
+            const Pk& p = wire.front();
+            net::ByteReader r(p.body);
+            if (p.id == kMsgSpawn) {
+                std::vector<PedSpawnInfo> l;
+                if (ReadSpawns(r, l))
+                    for (const auto& s : l) rx.OnSpawn(0, s, rnow);
+            } else if (p.id == kMsgGone) {
+                std::vector<uint16_t> l;
+                if (ReadGone(r, l))
+                    for (uint16_t n : l) rx.OnGone(0, n, rnow);
+            } else {
+                uint32_t ms = 0;
+                std::vector<PedState> l;
+                if (ReadStates(r, ms, l)) rx.OnStates(0, ms, l, rnow);
+            }
+            wire.pop_front();
+        }
+        rx.SetLocal({meX, meY, 0}, Camera{});
+        rx.SetCandidates({});
+        if (have) {
+            CopyReport rep;
+            rep.pos = {w.x, w.y, 0};
+            rep.heading[0] = w.hx;
+            rep.heading[1] = w.hy;
+            rx.SetReport(spawnKey, rep, rnow);
+        }
+        if (spawnAt >= 0 && t >= spawnAt) {
+            rx.Spawned(spawnKey, copyId);
+            have = true;
+            spawnAt = -1;
+        }
+        std::vector<RecvCmd> cmds;
+        rx.Tick(rnow, dt, cmds);
+        for (const auto& c : cmds) {
+            if (c.type == RecvCmd::Type::Spawn) {
+                spawnKey = c.key;
+                spawnAt = t + 0.1;
+                const float hx = w.hx, hy = w.hy;
+                w = CopyWalker();
+                w.x = c.target.pos.x;
+                w.y = c.target.pos.y;
+                w.hx = hx;
+                w.hy = hy;
+                float rx0, ry0;
+                if (deafAt(t, rx0, ry0)) {
+                    offX = c.target.pos.x - rx0;
+                    offY = c.target.pos.y - ry0;
+                }
+                ++o.spawns;
+            } else if (c.type == RecvCmd::Type::Release) {
+                have = false;
+            } else if (c.type == RecvCmd::Type::Drive && have) {
+                float rx0, ry0;
+                if (c.lc.fix == LocomotionCommand::Fix::Snap) {
+                    ++o.snaps;
+                    if (deafAt(t, rx0, ry0)) {
+                        offX = c.target.pos.x - rx0;
+                        offY = c.target.pos.y - ry0;
+                    }
+                }
+                w.Apply(c.lc, c.target.pos);
+            }
+        }
+        if (have) {
+            w.Step(dt);
+            float rx0, ry0;
+            if (deafAt(t, rx0, ry0)) {
+                w.x = rx0 + offX;
+                w.y = ry0 + offY;
+            }
+        }
+        if (t >= sampleAt) {
+            sampleAt = t + 0.1;
+            for (const ReplicaInfo& i : rx.Replicas(rnow)) {
+                if (!i.haveCopy || i.dead) continue;
+                o.sharedS += 0.1;
+                const double tt = i.targetT - 1000.0;  // the authority clock time its target stood for
+                float tx, ty;
+                if (!At(truth, tt, tx, ty)) continue;
+                o.errs.push_back(std::hypot(w.x - tx, w.y - ty));
+                float ax, ay;
+                if (At(truth, tt - 0.25, ax, ay) && std::hypot(tx - ax, ty - ay) / 0.25 > 8.0) o.ridingShownS += 0.1;
+            }
+        }
+    }
+    o.lagSnaps = static_cast<int>(rx.Stats().lagSnaps);
+    o.unresponsive = static_cast<int>(rx.Stats().unresponsive);
+    o.rides = auth.Rides();
+    return o;
+}
+
+// 0.16.0's rules (for the "before" runs): riders shared; no lag snap, no spawner health, 10 copies, 2 loading.
+AuthorityConfig OldAuthority() {
+    AuthorityConfig c;
+    c.rideSpeed = 1e9f;
+    return c;
+}
+
+ReceiverConfig OldRules() {
+    ReceiverConfig c;
+    c.lagTime = 1e9;
+    c.maxSpawned = 10;
+    c.maxLoading = 2;
+    c.spawnWaitNone = 2.5;  // no camera on the guest's side of the replay: every spot counted as in sight
+    c.spawnerFails = 1 << 30;
+    c.massLoss = 1 << 30;
+    return c;
+}
+
+template <size_t N>
+double DeathOf(const int (&deaths)[N][3], int net) {
+    double at = 1e18;
+    for (const auto& d : deaths)
+        if (d[0] == net && d[1] >= 0) at = std::min(at, d[1] / 1000.0);
+    return at;
+}
+
+template <size_t NT, size_t NR, size_t ND>
+void TestRecordedDrift(const char* tag, const int (&truthRows)[NT][4], const int (&repRows)[NR][4],
+                       const int (&deaths)[ND][3], float wantP95) {
+    const auto truth = Tracks(truthRows);
+    const auto reps = Tracks(repRows);
+    std::vector<float> recAll, before, after;
+    int deafNets = 0, lagSnaps = 0, unresp = 0;
+    uint64_t rides = 0;
+    double ridingBefore = 0, ridingAfter = 0;
+    std::string deafList;
+    for (const auto& [net, rep] : reps) {
+        auto ti = truth.find(net);
+        if (ti == truth.end() || ti->second.size() < 4) continue;
+        const double deadAt = DeathOf(deaths, net);
+        const Recorded rec = RecordedOf(ti->second, rep, deadAt);
+        if (rec.errs.empty()) continue;
+        recAll.insert(recAll.end(), rec.errs.begin(), rec.errs.end());
+        const bool deaf = rec.deaf();
+        if (deaf) {
+            ++deafNets;
+            deafList += " " + std::to_string(net);
+        }
+        const Track* deafTrack = deaf ? &rep : nullptr;
+        const ReplayOut b = ReplayOne(ti->second, deadAt, deafTrack, OldRules(), OldAuthority());
+        const ReplayOut a = ReplayOne(ti->second, deadAt, deafTrack, ReceiverConfig{}, AuthorityConfig{});
+        before.insert(before.end(), b.errs.begin(), b.errs.end());
+        after.insert(after.end(), a.errs.begin(), a.errs.end());
+        lagSnaps += a.lagSnaps;
+        unresp += a.unresponsive;
+        rides += a.rides;
+        ridingBefore += b.ridingShownS;
+        ridingAfter += a.ridingShownS;
+    }
+    const std::string n = std::string("recorded ") + tag + ": ";
+    std::printf("      %s recorded copies: p50 %.2f p95 %.2f max %.2f m (%zu samples, as sync_compare); copies that "
+                "never closed a gap:%s\n",
+                tag, Pct(recAll, 50), Pct(recAll, 95), Pct(recAll, 100), recAll.size(),
+                deafList.empty() ? " none" : deafList.c_str());
+    std::printf("      %s replayed, 0.16.0 rules: p50 %.2f p95 %.2f max %.2f m; riders shown %.1f s\n", tag,
+                Pct(before, 50), Pct(before, 95), Pct(before, 100), ridingBefore);
+    Check(Pct(after, 95) <= wantP95, (n + "replayed ped.p95 within target").c_str(),
+          Fmt("p50 %.2f p95 %.2f max %.2f m", Pct(after, 50), Pct(after, 95), Pct(after, 100)) +
+              Fmt(" (target %.1f; lag snaps %.0f, released unresponsive %.0f)", wantP95, lagSnaps, unresp));
+    Check(Pct(after, 95) < Pct(before, 95) || Pct(before, 95) <= wantP95, (n + "better than 0.16.0's rules").c_str(),
+          Fmt("p95 %.2f -> %.2f m", Pct(before, 95), Pct(after, 95)));
+    Check(ridingAfter <= 0.3, (n + "no copy follows a rider").c_str(),
+          Fmt("%.1f s shown while its pedestrian rode (0.16.0: %.1f s), rides seen %.0f", ridingAfter, ridingBefore,
+              static_cast<double>(rides)));
+}
+
+// Session A's coverage on the guest: every pedestrian the host sent him (its real walk), the guest's real walk, no
+// local human to adopt (our spawners were blocked: PDL amb=0), the copy spawner ready 2.6 s after the first request
+// (as recorded), then hidden at kPedASpawnerHiddenMs: every copy gone, every CreateObject failing until a new spawner
+// (0.16.0: the Lua's 30 s idle reset; now the receiver asks for one).
+struct CoverOut {
+    double coverage = 0;
+    uint64_t fails = 0, resets = 0;
+    double brokenS = 0;
+};
+
+CoverOut ReplayCoverageA(const ReceiverConfig& rc, const AuthorityConfig& ac, bool luaIdleOnly) {
+    CoverOut o;
+    const auto truth = Tracks(kPedATruth);
+    Track guest;
+    for (const auto& g : kPedAGuest) guest.push_back({g[0] / 1000.0, g[1] / 100.0f, g[2] / 100.0f});
+    PedAuthority auth(ac);
+    PedReceiver rx(rc);
+    struct Pk {
+        double at;
+        uint16_t id;
+        std::vector<uint8_t> body;
+    };
+    std::deque<Pk> wire;
+    const double hiddenAt = kPedASpawnerHiddenMs / 1000.0;
+    double readyAt = -1, lastMade = -1e9, firstAsk = -1;
+    bool broken = false;
+    std::map<uint32_t, uint32_t> copies;  // key -> local id
+    std::vector<std::pair<uint32_t, double>> asked;
+    uint32_t nextId = 9000 * 256 + 8;
+    uint64_t near = 0, rep = 0;
+    double brokenSince = -1;
+    const float dt = 1.0f / 30.0f;
+    double roundAt = -1, sampleAt = 0;
+    const double tEnd = guest.back().t;
+    for (double t = guest.front().t; t < tEnd; t += dt) {
+        float gx, gy;
+        if (!At(guest, t, gx, gy, 2.0)) continue;
+        if (t - roundAt >= 0.05 - 1e-9) {
+            roundAt = t;
+            auth.SetPlayers({{0, {gx + 3, gy, 0}, true}, {1, {gx, gy, 0}, true}}, 0, 0);
+            std::vector<LocalPed> peds;
+            // (a standing pedestrian's unchanged state went out once a second, PDT is 1 in 2: rows 2 s apart)
+            for (const auto& [net, tr] : truth) {
+                float px, py;
+                if (At(tr, t, px, py, 2.5)) peds.push_back(Ped(static_cast<uint32_t>(net) * 256 + 8, px, py));
+            }
+            auth.SetPeds(peds, 1000.0 + t);
+            std::vector<PeerOut> out;
+            auth.Tick(1000.0 + t, static_cast<uint32_t>((1000.0 + t) * 1000.0), out);
+            for (auto& po : out) {
+                for (auto& b : po.gones) wire.push_back({t + 0.03, kMsgGone, b});
+                for (auto& b : po.spawns) wire.push_back({t + 0.03, kMsgSpawn, b});
+                for (auto& b : po.states) wire.push_back({t + 0.03, kMsgStates, b});
+            }
+        }
+        const double rnow = 50.0 + t;
+        while (!wire.empty() && wire.front().at <= t) {
+            const Pk& p = wire.front();
+            net::ByteReader r(p.body);
+            if (p.id == kMsgSpawn) {
+                std::vector<PedSpawnInfo> l;
+                if (ReadSpawns(r, l))
+                    for (const auto& s : l) rx.OnSpawn(0, s, rnow);
+            } else if (p.id == kMsgGone) {
+                std::vector<uint16_t> l;
+                if (ReadGone(r, l))
+                    for (uint16_t n : l) rx.OnGone(0, n, rnow);
+            } else {
+                uint32_t ms = 0;
+                std::vector<PedState> l;
+                if (ReadStates(r, ms, l)) rx.OnStates(0, ms, l, rnow);
+            }
+            wire.pop_front();
+        }
+        // the game's side: the spawner hidden; the old Lua's idle reset 30 s after its last copy
+        if (!broken && t >= hiddenAt && hiddenAt > 0 && brokenSince < 0) {
+            broken = true;
+            brokenSince = t;
+            for (const auto& [key, id] : copies) rx.LocalGone(id, rnow);
+            copies.clear();
+        }
+        if (broken && luaIdleOnly && t - std::max(lastMade, brokenSince) > 30.0) {
+            broken = false;
+            readyAt = t + 0.1;
+            o.brokenS += t - brokenSince;
+        }
+        rx.SetLocal({gx, gy, 0}, Camera{});
+        rx.SetCandidates({});
+        for (const auto& [key, id] : copies) {
+            CopyReport cr;
+            float x = gx, y = gy;
+            const auto tr = truth.find(static_cast<int>(key & 0xFFFF));
+            if (tr != truth.end()) At(tr->second, t - 0.15, x, y, 2.5);
+            cr.pos = {x, y, 0};
+            rx.SetReport(key, cr, rnow);
+        }
+        // the requests: failed at once by a hidden spawner, else made one per tick once the spawner is ready
+        if (broken) {
+            for (const auto& [key, at] : asked) rx.SpawnFailed(key, rnow, SpawnFail::Create);
+            asked.clear();
+        } else if (!asked.empty() && readyAt >= 0 && t >= readyAt) {
+            const uint32_t key = asked.front().first;
+            asked.erase(asked.begin());
+            copies[key] = nextId;
+            rx.Spawned(key, nextId);
+            nextId += 256;
+            lastMade = t;
+        }
+        std::vector<RecvCmd> cmds;
+        rx.Tick(rnow, dt, cmds);
+        for (const auto& c : cmds) {
+            if (c.type == RecvCmd::Type::Spawn) {
+                if (firstAsk < 0) {
+                    firstAsk = t;
+                    readyAt = t + 2.6;
+                }
+                asked.push_back({c.key, t});
+            } else if (c.type == RecvCmd::Type::Release) {
+                copies.erase(c.key);
+                asked.erase(std::remove_if(asked.begin(), asked.end(),
+                                           [&](const std::pair<uint32_t, double>& a) { return a.first == c.key; }),
+                            asked.end());
+            } else if (c.type == RecvCmd::Type::ResetSpawner) {
+                for (const auto& [key, at] : asked) rx.SpawnFailed(key, rnow, SpawnFail::Reset);
+                asked.clear();
+                if (broken) o.brokenS += t - brokenSince;
+                broken = false;
+                readyAt = t + 0.1;
+            }
+        }
+        if (t >= sampleAt) {
+            sampleAt = t + 1.0;
+            near += rx.Stats().nearby;
+            rep += rx.Stats().nearReplica;
+            if (std::getenv("PED_DEBUG"))
+                std::printf("   t=%.0f near=%u rep=%u spawned=%u loading=%u known=%u fails=%llu broken=%d\n", t,
+                            rx.Stats().nearby, rx.Stats().nearReplica, rx.Stats().spawned, rx.Stats().loading,
+                            rx.Stats().known, static_cast<unsigned long long>(rx.Stats().spawnFails), broken ? 1 : 0);
+        }
+    }
+    o.coverage = near ? 100.0 * static_cast<double>(rep) / static_cast<double>(near) : 0;
+    o.fails = rx.Stats().spawnFails;
+    o.resets = rx.Stats().spawnerResets;
+    return o;
+}
+
+void TestRecordedCoverage() {
+    const CoverOut b = ReplayCoverageA(OldRules(), OldAuthority(), true);
+    const CoverOut a = ReplayCoverageA(ReceiverConfig{}, AuthorityConfig{}, false);
+    std::printf("      session A coverage recorded 18.2 %% (139 spawn failures); replayed with 0.16.0's rules %.1f %% (%.0f "
+                "failures, spawner broken %.0f s)\n",
+                b.coverage, static_cast<double>(b.fails), b.brokenS);
+    Check(a.coverage >= 80.0, "recorded A: replayed ped.coverage >= 80 %",
+          Fmt("%.1f %% (0.16.0 rules: %.1f %%)", a.coverage, b.coverage) +
+              Fmt(", %.0f failures, %.0f spawner resets", static_cast<double>(a.fails),
+                  static_cast<double>(a.resets)) +
+              Fmt(", spawner broken %.1f s", a.brokenS));
+    Check(a.resets >= 1 && a.brokenS <= 1.0, "recorded A: the hidden spawner replaced within 1 s",
+          Fmt("%.2f s (0.16.0: %.0f s)", a.brokenS, b.brokenS));
+}
+
+// The copy spawner's health on its own: CreateObject failing twice in a row, or every copy gone at once, asks for a
+// new spawner (once; not while copies of it live); a reset's failures are retried at once.
+void TestSpawnerHealth() {
+    ReceiverConfig cfg;
+    PedReceiver rx(cfg);
+    double now = 0;
+    std::map<uint16_t, Vec3> rp;
+    for (uint16_t n = 1; n <= 4; ++n) rp[n] = {static_cast<float>(n) * 3, 5, 0};
+    std::vector<RecvCmd> cmds;
+    auto step = [&](double dt) {
+        now += dt;
+        rx.OnStates(0, static_cast<uint32_t>(now * 1000) + 5000, StatesAt(rp), now);
+        rx.SetLocal({0, 0, 0}, Camera{});
+        rx.SetCandidates({});
+        cmds.clear();
+        rx.Tick(now, static_cast<float>(dt), cmds);
+    };
+    auto count = [&](RecvCmd::Type ty) {
+        size_t n = 0;
+        for (const auto& c : cmds)
+            if (c.type == ty) ++n;
+        return n;
+    };
+    std::vector<uint32_t> keys;
+    size_t spawnCmds = 0;
+    for (int i = 0; i < 10; ++i) {
+        step(0.1);
+        for (const auto& c : cmds)
+            if (c.type == RecvCmd::Type::Spawn) keys.push_back(c.key);
+        spawnCmds += count(RecvCmd::Type::Spawn);
+    }
+    Check(spawnCmds == 4, "spawner: nothing to adopt -> every pedestrian asked for at once",
+          Fmt("%.0f spawn requests in 1 s", spawnCmds));
+    uint32_t id = 100 * 256 + 8;
+    for (uint32_t k : keys) rx.Spawned(k, id += 256);
+    step(0.1);
+    Check(rx.Stats().spawned == 4, "spawner: 4 copies");
+    // every copy gone at once (the spawner was hidden)
+    for (uint32_t i = 0; i < 4; ++i) rx.LocalGone(100 * 256 + 8 + (i + 1) * 256, now);
+    step(0.05);
+    Check(count(RecvCmd::Type::ResetSpawner) == 1 && cmds.front().type == RecvCmd::Type::ResetSpawner &&
+              cmds.front().why == RecvCmd::Why::CopiesLost,
+          "spawner: every copy gone at once -> a new spawner", Fmt("%.0f lost", static_cast<double>(rx.Stats().lost)));
+    // asked again soon; two CreateObject failures in a row -> another reset, but not within the 5 s gap
+    keys.clear();
+    for (int i = 0; i < 10; ++i) {
+        step(0.1);
+        for (const auto& c : cmds)
+            if (c.type == RecvCmd::Type::Spawn) keys.push_back(c.key);
+    }
+    Check(keys.size() == 4, "spawner: asked again within 1 s", Fmt("%.0f", keys.size()));
+    for (uint32_t k : keys) rx.SpawnFailed(k, now, SpawnFail::Create);
+    step(0.1);
+    Check(count(RecvCmd::Type::ResetSpawner) == 0, "spawner: no second reset within 5 s");
+    size_t resets = 0;
+    for (int i = 0; i < 60; ++i) {
+        step(0.1);
+        resets += count(RecvCmd::Type::ResetSpawner);
+    }
+    Check(resets == 1 && rx.Stats().spawnerResets == 2, "spawner: CreateObject failing -> a new spawner after the gap",
+          Fmt("%.0f resets", static_cast<double>(rx.Stats().spawnerResets)));
+    Check(rx.Stats().failsBy[static_cast<size_t>(SpawnFail::Create)] == 4, "spawner: failures counted by reason");
+    // a living copy keeps its spawner: failures alone do not reset it then
+    rx.Clear();
+    keys.clear();
+    for (int i = 0; i < 10; ++i) {
+        step(0.1);
+        for (const auto& c : cmds)
+            if (c.type == RecvCmd::Type::Spawn) keys.push_back(c.key);
+    }
+    Check(keys.size() == 4, "spawner: (after Clear) asked for again", Fmt("%.0f", keys.size()));
+    if (keys.empty()) return;
+    rx.Spawned(keys[0], 555 * 256 + 8);
+    for (size_t i = 1; i < keys.size(); ++i) rx.SpawnFailed(keys[i], now, SpawnFail::Create);
+    resets = 0;
+    for (int i = 0; i < 80; ++i) {
+        step(0.1);
+        resets += count(RecvCmd::Type::ResetSpawner);
+    }
+    Check(resets == 0, "spawner: not replaced while a copy of it lives");
+}
+
+// A tram passenger (session B, net 256: 11-12 m/s for 6 s): not shared while it rides, shared again after it walks.
+void TestRider() {
+    const auto truth = Tracks(kPedBTruth);
+    const Track& tr = truth.at(256);
+    PedAuthority auth;
+    const double t0 = tr.front().t;
+    int roundsShared = 0, rounds = 0;
+    for (double t = t0; t < tr.back().t; t += 0.05) {
+        float x, y;
+        if (!At(tr, t, x, y)) continue;
+        ++rounds;
+        auth.SetPlayers({{0, {x + 5, y, 0}, true}, {1, {x, y + 5, 0}, true}}, 0, 0);
+        auth.SetPeds({Ped(256 * 256 + 8, x, y)}, 1000 + t);
+        std::vector<PeerOut> out;
+        auth.Tick(1000 + t, static_cast<uint32_t>((1000 + t) * 1000), out);
+        if (auth.OwnedCount() > 0) ++roundsShared;
+    }
+    // it rode the whole time it was recorded: shared only until the second fast round
+    Check(rounds > 50 && roundsShared <= 2 && auth.Rides() == 1,
+          "rider: a tram passenger (B net 256, 11-12 m/s) is not shared",
+          Fmt("shared %.0f of %.0f rounds, rides %.0f", roundsShared, rounds, static_cast<double>(auth.Rides())));
+    // and back once it walks: a walker after 3 s below 8 m/s is shared again
+    PedAuthority a2;
+    a2.SetPlayers({{0, {5, 0, 0}, true}, {1, {0, 5, 0}, true}}, 0, 0);
+    double t = 0;
+    float x = 0;
+    for (; t < 1.0; t += 0.05, x += 0.6f) a2.SetPeds({Ped(9 * 256 + 8, x, 0)}, t);  // 12 m/s
+    const bool notOwned = a2.OwnedCount() == 0 && a2.RidingCount() == 1 && a2.Foreign().empty();
+    for (; t < 5.0; t += 0.05, x += 0.07f) a2.SetPeds({Ped(9 * 256 + 8, x, 0)}, t);  // 1.4 m/s
+    Check(notOwned && a2.OwnedCount() == 1 && a2.RidingCount() == 0, "rider: shared again once it walks 3 s");
+}
+
 }  // namespace
 
 int main() {
@@ -787,6 +1382,11 @@ int main() {
     TestEndToEnd(60, 2, 2, "60 ms jitter, 2 % loss");
     TestCoverage(true, 80.0f, "coverage: looking around >= 80 % (ped.coverage)");
     TestCoverage(false, 60.0f, "coverage: staring one way >= 60 %");
+    TestSpawnerHealth();
+    TestRider();
+    TestRecordedDrift("A", kPedATruth, kPedAReplica, kPedADeaths, 1.5f);
+    TestRecordedDrift("B", kPedBTruth, kPedBReplica, kPedBDeaths, 1.5f);
+    TestRecordedCoverage();
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "OK", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
 }
