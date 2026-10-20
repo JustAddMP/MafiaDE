@@ -490,9 +490,10 @@ Doors and world items (docs/protocol.md "Doors" / "World items"):
   ITG / ITE / ITL). A collectible counts for the player who took it (COL).
 
 Traffic and police (docs/game-api.md 19, protocol.md "Traffic" / "Police"):
-- [ ] Free Ride, both on a busy street within 250 m: the guest's log `the host's traffic shows here (...)`, his own
-  traffic goes, the host's cars drive past on both screens with the same model, colours and plate (colours and
-  plates not compared on 2026-10-18). Walk the guest > 250 m away: `our own traffic is back (...)`.
+- [ ] Free Ride, both on a busy street: the host's cars drive past on both screens with the same model, colours and
+  plate (colours and plates not compared on 2026-10-18); the guest's status line `Traffic: the host's | copies ...`,
+  the host's `Traffic: host authority, N cars`; the guest's game has no traffic of its own anywhere (guest_world),
+  the host's log has no `message 0x022x from player N ignored` lines.
 - [ ] Police: a guest commits a real crime near the host's police: the host stays clean (no `we are wanted` on the
   host), the host's cops chase the guest's puppet (`our police chase guest N`), the guest's own level is held while
   they do (2026-10-18: it ran down) and drops once they lose him. Bump a police copy: put back, TrafficBump logged.
@@ -560,9 +561,9 @@ Play in this order, both players together unless a step says otherwise (about 25
    `foot.snaps_per_min` <= 0.5, both directions. Watch: no foot sliding beyond a short stop slide, no walking back.
 2. **Driving, 4 min:** each player drives his own car through town, then crashes and drifts.
    `car.p95` <= 1.0 m, `car.pinned` <= 10 %, `car.speed_ratio` 0.9-1.1. VEH `gs=1` rare, `pf` short.
-3. **Traffic, 4 min:** together near the host, then the guest drives more than 400 m away and back.
-   `traffic.true_p95` <= 1.5 m, `traffic.shown` >= 95 %, `traffic.unshared_near` 0 (both directions). No car pops in
-   view when the guest comes back (`TRR` changes, `TRL near=0` 10 s later). Stop next to a red light with cars
+3. **Traffic, 4 min:** together near the host, then the guest drives 250 m away and back (host authority: all
+   traffic is the host's). `traffic.true_p95` <= 1.5 m, `traffic.shown` >= 95 % (the host's cars on the guest's
+   game); the report's `guests' traffic messages ignored` 0 and no copies on the host. Stop next to a red light with cars
    waiting (the host 50+ m away): `traffic.crew_exits_per_min` <= 1, `traffic.reseats_per_min` <= 3, the
    report's `copies of a standing car driven off it` near 0 %; the waiting copies keep their drivers and stand still
    (2026-10-20: drivers got out and back in, copies crept away from the stop line at 4 m/s).

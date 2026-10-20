@@ -1,13 +1,12 @@
 #pragma once
-// Phase 4 (B4) and the region authority (docs/sync-architecture.md principle 1): ambient traffic and police in co-op.
-// Every game is the authority for the traffic its own game spawned: it reports its moving traffic and police cars near
-// any other player (traffic_sync.lua), and sends each other player the cars near him (net ids, spawn / despawn /
-// packed states, core's InterestManager, game/traffic_model.h; the host with 0x0220-0x0222, a guest with 0x0224-0x0226
-// through core's relay). Every game shows copies of every other game's cars near it (a crewed car each, driven with
-// core's VehicleController and Corrector like a remote player's car, interpolated by core's replica::Stream per
-// authority). Whose region a game is in decides only whether its own spawning runs: a guest near the host (or near a
-// lower-id guest far from the host) switches his generators off and his own leftover cars are shared until they leave.
-// Mission cars and player cars are not traffic (player_sync / npc_sync handle them). docs/protocol.md "Traffic".
+// Phase 4 (B4) under host authority (docs/host-authority.md): ambient traffic and police in co-op. The host's game owns
+// all of it: it reports its moving traffic and police cars near any guest (traffic_sync.lua) and sends each guest the
+// cars near him (net ids, spawn / despawn / packed states 0x0220-0x0222, core's InterestManager, game/traffic_model.h).
+// A guest's game shows copies of the host's cars near him (a crewed car each, driven with core's VehicleController and
+// Corrector like a remote player's car, interpolated by core's replica::Stream) and sends nothing but TrafficBump; it
+// scans and shares no cars of its own (its own spawning is off and its leftovers hidden: game/guest_world). The host's
+// game shows nobody's traffic. The 0.16 region authority (a guest's own traffic, 0x0224-0x0227 through core's relay) is
+// gone. Mission cars and player cars are not traffic (player_sync / npc_sync handle them). docs/protocol.md "Traffic".
 // Threads: messages and sending on the render thread; Lua on GameMainThread (tick callback); a mutex in between.
 #include "net/session.h"
 #include "render/overlay.h"
@@ -29,7 +28,7 @@ public:
     // explosion_sync (CarExploded for a traffic car).
     static uint16_t NetOfKey(uint32_t key);
     // host, render thread: the net id of our traffic car `key` (its entity id) and back; 0 = not shared (car damage).
-    // 0 on a guest (a guest's own traffic has no car damage sync yet).
+    // 0 on a guest (a guest's game has no traffic of its own).
     static uint16_t HostNetOf(uint32_t key);
     static uint32_t HostKeyOf(uint16_t net);
 };

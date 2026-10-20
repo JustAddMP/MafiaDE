@@ -1,7 +1,7 @@
--- Traffic drivers and copies right now (tools/onepc run_test.ps1 "traffic"): on an authority, its own traffic cars by
--- distance from our player and whether a driver sits at the wheel (the game streams drivers out beyond ~50 m:
--- traffic_sync.lua DRIVER_LOD); on a receiver, its copies of the other game's cars: driver seated, crew out (and the
--- totals of crews sent out / put back). One line back.
+-- Traffic drivers and copies right now (tools/onepc run_test.ps1 "traffic"): on the host (the only traffic authority),
+-- his traffic cars by distance from his player and whether a driver sits at the wheel (the game streams drivers out
+-- beyond ~50 m: traffic_sync.lua DRIVER_LOD); on a guest, his copies of the host's cars: driver seated, crew out (and
+-- the totals of crews sent out / put back); a guest's "ours" must be 0 everywhere (he shares no traffic). One line back.
 local M = MafiaCoop
 local T = M and M.Traffic
 if not T then return "no MafiaCoop.Traffic" end

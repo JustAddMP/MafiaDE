@@ -1118,11 +1118,12 @@ function M.FindLocalCar(c, except)
   local near = {}
   for s in string.gmatch(mc_entity_ids(10), "%d+") do
     local e = mc_entity(tonumber(s))
-    -- a hidden car is neither free nor in the way: ours behind a copy (M.Swap), or one of our own traffic cars that
-    -- traffic_sync.lua hid (deactivated) while the host's traffic shows here (adopted, the other player's car would
-    -- be invisible on this game)
-    local th = M.Traffic and M.Traffic.hidden
-    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not (th and th[tonumber(s)])
+    -- a hidden car is neither free nor in the way: ours behind a copy (M.Swap), or one of a guest's own leftover
+    -- traffic cars that guest_world hid (deactivated; adopted, the other player's car would be invisible on this
+    -- game). traffic_sync.lua hides nothing any more (host authority); guest_world answers M.GuestWorld.IsHidden.
+    local gw = M.GuestWorld
+    local hid = e and gw and gw.IsHidden and gw.IsHidden(e, tonumber(s))
+    if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not hid
       and not (except and same(except, e)) then
       local q = e:GetPos()
       local d = (q.x - c.tx) ^ 2 + (q.y - c.ty) ^ 2 + (q.z - c.tz) ^ 2

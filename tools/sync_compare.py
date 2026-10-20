@@ -59,9 +59,8 @@ TARGETS = {
     "car.p95": ("<=", 1.0, "car copy vs the driver's car, p95 (m)"),
     "car.pinned": ("<=", 10.0, "car copy pinned (% of samples)"),
     "car.speed_ratio": ("between", (0.9, 1.1), "copy speed / driver's speed, median"),
-    "traffic.true_p95": ("<=", 1.5, "traffic copy vs the authority's car at the same moment, p95 (m)"),
-    "traffic.shown": (">=", 95.0, "authority's traffic shown while near it (% of the time)"),
-    "traffic.unshared_near": ("<=", 0, "own traffic cars still driving near a receiver (max)"),
+    "traffic.true_p95": ("<=", 1.5, "traffic copy vs the host's car at the same moment, p95 (m)"),
+    "traffic.shown": (">=", 95.0, "the host's traffic shown on a guest's game while near it (% of the time)"),
     "traffic.crew_exits_per_min": ("<=", 1.0, "traffic copies whose crew was sent out, per minute with copies"),
     "traffic.reseats_per_min": ("<=", 3.0, "traffic copy crew members put back into their seat, per minute with copies"),
     "npc.p95": ("<=", 1.0, "NPC replica vs the authority's NPC, p95 (m)"),
@@ -889,88 +888,95 @@ def _traffic_breakdown(rows, recv_name):
 
 
 def traffic(a, b):
-    """Traffic sync by region (docs/sync-trace.md TRS / TRC / TRG / TRA / TRL / TRR / TRH / TRP / TRO): every game is
-    the authority for its own traffic and shows the other's; per direction the true error of the copies (TRC on the
-    receiver against the authority's TRS at the same moment), what was shown, and the receiver's own cars left
-    unshared."""
+    """Traffic sync under host authority (docs/host-authority.md; docs/sync-trace.md TRS / TRC / TRG / TRH / TRP /
+    TRO): the host's game owns every traffic and police car, a guest's game shows copies of the host's cars near him.
+    For the guest: the true error of his copies (TRC against the host's TRS at the same moment), what was shown, his
+    crews' churn; for the host: what he sent and his driver reads. A 0.16 trace's guest-owned traffic (the retired
+    region authority: TRC a=<guest>, TRA / TRL / TRR) is only counted, never compared."""
     if not any(tr.records[k] for tr in (a, b) for k in ("TRG", "TRH", "TRC", "TRS")):
         return
-    section("Traffic (every game's cars on the other's game)")
-    for auth, recv in ((a, b), (b, a)):
-        trh = auth.records["TRH"]
-        trc = [f for _, f in recv.records["TRC"] if num(f.get("a"), 0) == auth.local or
-               ("a" not in f and auth.role == "host")]  # 0.15 traces: TRC without a= are the host's cars
-        trs = auth.records["TRS"]
-        if not trh and not trc and not trs:
-            continue
-        who = "%s's cars on %s's game" % (auth.name, recv.name)
+    auth = a if a.role == "host" else b if b.role == "host" else (a if a.local == 0 else b)
+    recv = b if auth is a else a
+    section("Traffic (the host's cars on the guest's game, host authority)")
+
+    def host_row(f):  # a record of a copy of the host's car (0.15 and host authority: no a=; 0.16: a=0)
+        return "a" not in f or num(f.get("a"), -1) == auth.local
+
+    trh = auth.records["TRH"]
+    trc = [f for _, f in recv.records["TRC"] if host_row(f)]
+    trs = auth.records["TRS"]
+    # a 0.16 guest's own cars on either game (the host showed copies then too): gone with the region authority
+    old = [f for _, f in recv.records["TRC"] if not host_row(f)] + [f for _, f in auth.records["TRC"]]
+    who = "%s's cars on %s's game" % (auth.name, recv.name)
+    print("  authority: %s's game (the host; a guest's game scans and sends no traffic of its own)" % auth.name)
+    if old or any(auth.records[k] for k in ("TRA", "TRL", "TRR")) or any(recv.records[k] for k in ("TRL", "TRR")):
+        print("    (0.16 trace: %d copy records of the retired region authority - a guest's own traffic, or the host "
+              "showing it - are not compared)" % len(old))
+    if trh or trc or trs:
         print("  %s:" % who)
-        if len(trh) >= 2:
-            (t0, x), (t1, y) = trh[0], trh[-1]
-            secs = max(t1 - t0, 1e-6)
-            cars = [num(f.get("cars"), 0) for _, f in trh]
-            print("    authority: %.0f own traffic cars near other players on average (max %d), %.1f KB/s sent, %d spawn / "
-                  "%d state / %d despawn messages, bumps reported to it %d" % (
-                      statistics.fmean(cars), max(cars), (num(y.get("bytes"), 0) - num(x.get("bytes"), 0)) / 1024 / secs,
-                      num(y.get("spawnMsgs"), 0), num(y.get("stateMsgs"), 0), num(y.get("despawnMsgs"), 0),
-                      num(y.get("bumps"), 0)))
-            trp = [f for _, f in auth.records["TRP"] if num(f.get("id"), -1) == recv.local]
-            if trp:
-                print("    authority -> %s: relevant mean %.1f, admitted mean %.1f, states skipped as unchanged %d of "
-                      "%d, deferred by the budget (max) %d" % (
-                          recv.name, statistics.fmean(num(f.get("relevant"), 0) for f in trp),
-                          statistics.fmean(num(f.get("admitted"), 0) for f in trp), num(trp[-1].get("skipped"), 0),
-                          num(trp[-1].get("skipped"), 0) + num(trp[-1].get("states"), 0),
-                          max(num(f.get("deferred"), 0) for f in trp)))
-        # copy vs its target (what the receiver's controller saw)
-        errs = [e for e in (num(f.get("err"), 0) for f in trc) if e < 1e6]
-        if errs:
-            print("    copy vs its target (per sample): %s" % stats_line(errs))
-            far = Counter(f.get("net") for f in trc if 3 < num(f.get("err"), 0) < 1e6)
-            if far:
-                print("    copies most often more than 3 m off: %s" % ", ".join(
-                    "net %s (%d)" % kv for kv in far.most_common(5)))
-        # the true error: the copy against the authority's car at the same moment (the clocks lined up by the RX
-        # offsets), and against the authority's car at the time its target stood for (rT: the playout part left out)
-        truth = _truth(auth) if trs else {}
-        if trc and truth:
-            rel, _, _ = clock_relation(recv, auth, auth.local)
-            same, at_rt, rows = [], [], []
-            me = Series([(t, vec(f.get("p"))) for t, f in recv.records["TX"]], gap=1.0)
-            for t, f in recv.records["TRC"]:
-                if num(f.get("a"), 0) != auth.local:
-                    continue
-                tt, cp = truth.get(f.get("net")), vec(f.get("cp"))
-                if not tt or not cp:
-                    continue
-                if rel is not None:
-                    p = tt.at(t - rel)
-                    if p:
-                        same.append(dist2(cp, p))
-                        rows.append(_traffic_row(t, f, tt, t - rel, p, cp, me))
-                rt = num(f.get("rT"), -1)
-                if rt and rt > 0:
-                    p = tt.at(rt / 1000.0)
-                    if p:
-                        at_rt.append(dist2(cp, p))
-            if same:
-                print("    copy vs the authority's car at the same moment (true error): %s" % stats_line(same))
-                record("traffic.true_p95", pct(same, 95), who)
-            elif at_rt:
-                print("    (no clock relation: the true error at the target's time rT instead)")
-                record("traffic.true_p95", pct(at_rt, 95), who + " (at rT)")
-            if at_rt:
-                print("    copy vs the authority's car at its target's time rT: %s" % stats_line(at_rt))
-            if not same and not at_rt:
-                print("    no TRC lined up with a TRS (the copies' cars were not written as truth)")
-            _traffic_breakdown(rows, recv.name)
-        elif trc:
-            print("    no truth records (TRS) on %s's game: the true error cannot be computed" % auth.name)
-    # what each receiver showed, its region and its own leftovers
-    for recv in (a, b):
-        trg = [f for _, f in recv.records["TRG"]]
-        if not trg:
-            continue
+    if len(trh) >= 2:
+        (t0, x), (t1, y) = trh[0], trh[-1]
+        secs = max(t1 - t0, 1e-6)
+        cars = [num(f.get("cars"), 0) for _, f in trh]
+        print("    host: %.0f traffic cars near guests on average (max %d), %.1f KB/s sent, %d spawn / %d state / %d "
+              "despawn messages, bumps reported to him %d, guests' traffic messages ignored %d" % (
+                  statistics.fmean(cars), max(cars), (num(y.get("bytes"), 0) - num(x.get("bytes"), 0)) / 1024 / secs,
+                  num(y.get("spawnMsgs"), 0), num(y.get("stateMsgs"), 0), num(y.get("despawnMsgs"), 0),
+                  num(y.get("bumps"), 0), num(y.get("ignored"), 0)))
+        trp = [f for _, f in auth.records["TRP"] if num(f.get("id"), -1) == recv.local]
+        if trp:
+            print("    host -> %s: relevant mean %.1f, admitted mean %.1f, states skipped as unchanged %d of %d, "
+                  "deferred by the budget (max) %d" % (
+                      recv.name, statistics.fmean(num(f.get("relevant"), 0) for f in trp),
+                      statistics.fmean(num(f.get("admitted"), 0) for f in trp), num(trp[-1].get("skipped"), 0),
+                      num(trp[-1].get("skipped"), 0) + num(trp[-1].get("states"), 0),
+                      max(num(f.get("deferred"), 0) for f in trp)))
+    # copy vs its target (what the guest's controller saw)
+    errs = [e for e in (num(f.get("err"), 0) for f in trc) if e < 1e6]
+    if errs:
+        print("    copy vs its target (per sample): %s" % stats_line(errs))
+        far = Counter(f.get("net") for f in trc if 3 < num(f.get("err"), 0) < 1e6)
+        if far:
+            print("    copies most often more than 3 m off: %s" % ", ".join("net %s (%d)" % kv for kv in far.most_common(5)))
+    # the true error: the copy against the host's car at the same moment (the clocks lined up by the RX offsets), and
+    # against the host's car at the time its target stood for (rT: the playout part left out)
+    truth = _truth(auth) if trs else {}
+    if trc and truth:
+        rel, _, _ = clock_relation(recv, auth, auth.local)
+        same, at_rt, rows = [], [], []
+        me = Series([(t, vec(f.get("p"))) for t, f in recv.records["TX"]], gap=1.0)
+        for t, f in recv.records["TRC"]:
+            if not host_row(f):
+                continue
+            tt, cp = truth.get(f.get("net")), vec(f.get("cp"))
+            if not tt or not cp:
+                continue
+            if rel is not None:
+                p = tt.at(t - rel)
+                if p:
+                    same.append(dist2(cp, p))
+                    rows.append(_traffic_row(t, f, tt, t - rel, p, cp, me))
+            rt = num(f.get("rT"), -1)
+            if rt and rt > 0:
+                p = tt.at(rt / 1000.0)
+                if p:
+                    at_rt.append(dist2(cp, p))
+        if same:
+            print("    copy vs the host's car at the same moment (true error): %s" % stats_line(same))
+            record("traffic.true_p95", pct(same, 95), who)
+        elif at_rt:
+            print("    (no clock relation: the true error at the target's time rT instead)")
+            record("traffic.true_p95", pct(at_rt, 95), who + " (at rT)")
+        if at_rt:
+            print("    copy vs the host's car at its target's time rT: %s" % stats_line(at_rt))
+        if not same and not at_rt:
+            print("    no TRC lined up with a TRS (the copies' cars were not written as truth)")
+        _traffic_breakdown(rows, recv.name)
+    elif trc:
+        print("    no truth records (TRS) on %s's game: the true error cannot be computed" % auth.name)
+    # what the guest showed
+    trg = [f for _, f in recv.records["TRG"]]
+    if trg:
         print("  on %s's game:" % recv.name)
         due = [num(f.get("due"), -1) for f in trg]
         if any(d >= 0 for d in due):
@@ -979,94 +985,60 @@ def traffic(a, b):
             near = sum(1 for d in due if d > 0)
             if sd:
                 share = 100.0 * ss / sd
-                print("    shown: %.1f%% of the other games' cars within 150 m had a copy that drove (%d samples with "
-                      "cars near)" % (share, near))
+                print("    shown: %.1f%% of the host's cars within 150 m had a copy that drove (%d samples with cars "
+                      "near)" % (share, near))
                 record("traffic.shown", share, "on %s's game" % recv.name)
-            own = [f for f in trg if num(f.get("mode"), 0) == 0]
-            print("    region: our own %.0f%% of the time, another player's %.0f%%" % (
-                100.0 * len(own) / len(trg), 100.0 - 100.0 * len(own) / len(trg)))
         else:  # a 0.15 trace: the share of the time the host's traffic showed
             on = [f for f in trg if num(f.get("mode"), 0) == 1]
             print("    host traffic shown %.0f%% of the time (0.15 trace)" % (100.0 * len(on) / len(trg)))
             record("traffic.shown", 100.0 * len(on) / len(trg), "host traffic on %s (0.15 trace)" % recv.name)
-        print("    copies mean %.1f (max %d) of %.1f cars of others; pins %d, snaps %d, bumps %d, states %d (old %d)" % (
+        pd = [num(f.get("pd"), -1) for f in trg if num(f.get("pd"), -1) >= 0]
+        pd = pd or [num(f.get("pd"), 0) for _, f in recv.records["TRA"] if num(f.get("a"), -1) == auth.local]
+        print("    copies mean %.1f (max %d) of %.1f host cars; pins %d, snaps %d, bumps %d, states %d (old %d)%s" % (
             statistics.fmean(num(f.get("copies"), 0) for f in trg), max(num(f.get("copies"), 0) for f in trg),
             statistics.fmean(num(f.get("live"), 0) for f in trg), num(trg[-1].get("pins"), 0),
             num(trg[-1].get("snaps"), 0), num(trg[-1].get("bumps"), 0), num(trg[-1].get("states"), 0),
-            num(trg[-1].get("old"), 0)))
-        for a_id in sorted({f.get("a") for _, f in recv.records["TRA"]}):
-            tra = [f for _, f in recv.records["TRA"] if f.get("a") == a_id]
-            d = [num(f.get("due"), 0) for f in tra]
-            s = [num(f.get("shown"), 0) for f in tra]
-            print("    player %s's cars: live mean %.1f, copies mean %.1f, shown %s, playout %.0f ms median" % (
-                a_id, statistics.fmean(num(f.get("live"), 0) for f in tra),
-                statistics.fmean(num(f.get("copies"), 0) for f in tra),
-                ("%.1f%%" % (100.0 * sum(s) / sum(d))) if sum(d) else "-",
-                pct([num(f.get("pd"), 0) for f in tra], 50)))
-        trr = recv.records["TRR"]
-        if trr:
-            print("    region changes: %s" % ", ".join(
-                "%s at %s (%s m)" % ("own" if f.get("own") == "1" else "player " + f.get("auth", "?"), recv.wall(t),
-                                    f.get("d", "?")) for t, f in trr[:8]))
-        trl = [f for _, f in recv.records["TRL"]]
-        if trl:
-            late = [num(f.get("near"), 0) for f in trl if num(f.get("since"), 99) >= 10]
-            if "since" in trl[0]:
-                print("    own cars within 70 m not shared with a player near them (10 s after a region change): max "
-                      "%d; own cars hidden max %d, near us mean %.1f" % (
-                          max(late) if late else 0, max(num(f.get("hidden"), 0) for f in trl),
-                          statistics.fmean(num(f.get("mine"), 0) for f in trl)))
-                if late:
-                    record("traffic.unshared_near", max(late), "%s's own cars" % recv.name)
-            else:  # a 0.15 trace: the guest's own cars still driving near him while the host's showed
-                print("    our own traffic while the host's showed: hidden max %d, still driving near us max %d "
-                      "(0.15 trace)" % (max(num(f.get("hidden"), 0) for f in trl),
-                                        max(num(f.get("near"), 0) for f in trl)))
-                record("traffic.unshared_near", max(num(f.get("near"), 0) for f in trl), "%s's own cars (0.15)" % recv.name)
-    # drivers and crews (TRO): an authority's driver reads that failed and came back, a receiver's crews out / in / put
-    # back
-    for tr in (a, b):
-        tro = [f for _, f in tr.records["TRO"]]
-        misses = [f for f in tro if f.get("ev") == "miss"]
-        if misses or any(f.get("ev") == "back" for f in tro):
-            backs = [num(f.get("after"), 0) for f in tro if f.get("ev") == "back"]
-            print("  %s (authority): no driver read %d times (%s); read again %d times (after %s s); moving when "
-                  "missed %d" % (
-                      tr.name, len(misses), ", ".join("%s %d" % kv for kv in Counter(
-                          "seat 0 holds another human" if "holds" in f.get("why", "") else
-                          f.get("why", "?").replace("_", " ") for f in misses).most_common(4)),
-                      len(backs), stats_line(backs, "s") if backs else "-",
-                      sum(1 for f in misses if num(f.get("spd"), 0) > 2)))
-            dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
-            if dist:
-                print("  %s: distance from its player when a driver was not read: %s" % (tr.name, stats_line(dist)))
-                far = sum(1 for d in dist if d > TRAFFIC_DRIVER_LOD)
-                print("  %s: %d of %d beyond %.0f m (the game streams traffic drivers out there and drives the car on: "
-                      "a driven car, not driverless%s)" % (tr.name, far, len(dist), TRAFFIC_DRIVER_LOD,
-                                                         "" if any("far" in f for f in misses) else
-                                                         "; this trace's build still counted them as missing"))
-            trh = tr.records["TRH"]
-            last = trh[-1][1] if trh else {}
-            print("  %s: driverless (confirmed, 1 s slow) %d, driven again %d" % (
-                tr.name, num(last.get("orphaned"), 0), num(last.get("driven"), 0)))
-        ev = Counter(f.get("ev") for f in tro)
-        if ev.get("out") or ev.get("in") or ev.get("reseat"):
-            print("  %s (receiver): crews got out %d, back in %d, crew members put back in their seats %d" % (
-                tr.name, ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
-        # churn per minute that this game had copies of the others' cars (TRG every 0.5 s)
-        trg = [f for _, f in tr.records["TRG"]]
-        mins = sum(0.5 for f in trg if num(f.get("copies"), 0) > 0) / 60.0
-        if mins >= 0.5:
-            outs = [(t, (f.get("a"), f.get("net"))) for t, f in tr.records["TRO"] if f.get("ev") == "out"]
-            ins = defaultdict(list)
-            for t, f in tr.records["TRO"]:
-                if f.get("ev") == "in":
-                    ins[(f.get("a"), f.get("net"))].append(t)
-            flaps = sum(1 for t, k in outs if any(0 < ti - t < 2 for ti in ins[k]))
-            print("  %s (receiver): %.1f min with copies: %.1f crews out / min (%d back in within 2 s), %.1f put back "
-                  "/ min" % (tr.name, mins, len(outs) / mins, flaps, ev.get("reseat", 0) / mins))
-            record("traffic.crew_exits_per_min", len(outs) / mins, "on %s's game" % tr.name)
-            record("traffic.reseats_per_min", ev.get("reseat", 0) / mins, "on %s's game" % tr.name)
+            num(trg[-1].get("old"), 0), (", playout %.0f ms median" % pct(pd, 50)) if pd else ""))
+    # the host's driver reads (TRO miss / back)
+    tro = [f for _, f in auth.records["TRO"]]
+    misses = [f for f in tro if f.get("ev") == "miss"]
+    if misses or any(f.get("ev") == "back" for f in tro):
+        backs = [num(f.get("after"), 0) for f in tro if f.get("ev") == "back"]
+        print("  %s (host): no driver read %d times (%s); read again %d times (after %s s); moving when missed %d" % (
+            auth.name, len(misses), ", ".join("%s %d" % kv for kv in Counter(
+                "seat 0 holds another human" if "holds" in f.get("why", "") else
+                f.get("why", "?").replace("_", " ") for f in misses).most_common(4)),
+            len(backs), stats_line(backs, "s") if backs else "-", sum(1 for f in misses if num(f.get("spd"), 0) > 2)))
+        dist = [num(f.get("dist"), -1) for f in misses if num(f.get("dist"), -1) >= 0]
+        if dist:
+            print("  %s: distance from his player when a driver was not read: %s" % (auth.name, stats_line(dist)))
+            far = sum(1 for d in dist if d > TRAFFIC_DRIVER_LOD)
+            print("  %s: %d of %d beyond %.0f m (the game streams traffic drivers out there and drives the car on: a "
+                  "driven car, not driverless%s)" % (auth.name, far, len(dist), TRAFFIC_DRIVER_LOD,
+                                                     "" if any("far" in f for f in misses) else
+                                                     "; this trace's build still counted them as missing"))
+        last = trh[-1][1] if trh else {}
+        print("  %s: driverless (confirmed, 1 s slow) %d, driven again %d" % (
+            auth.name, num(last.get("orphaned"), 0), num(last.get("driven"), 0)))
+    # the guest's crews (TRO out / in / reseat) per minute that he had copies (TRG every 0.5 s)
+    rtro = [(t, f) for t, f in recv.records["TRO"] if host_row(f)]
+    ev = Counter(f.get("ev") for _, f in rtro)
+    if ev.get("out") or ev.get("in") or ev.get("reseat"):
+        print("  %s (guest): crews got out %d, back in %d, crew members put back in their seats %d" % (
+            recv.name, ev.get("out", 0), ev.get("in", 0), ev.get("reseat", 0)))
+    mins = sum(0.5 for f in trg if num(f.get("copies"), 0) > 0) / 60.0
+    if mins >= 0.5:
+        outs = [(t, f.get("net")) for t, f in rtro if f.get("ev") == "out"]
+        ins = defaultdict(list)
+        for t, f in rtro:
+            if f.get("ev") == "in":
+                ins[f.get("net")].append(t)
+        flaps = sum(1 for t, k in outs if any(0 < ti - t < 2 for ti in ins[k]))
+        print("  %s (guest): %.1f min with copies: %.1f crews out / min (%d back in within 2 s), %.1f put back / min" % (
+            recv.name, mins, len(outs) / mins, flaps, ev.get("reseat", 0) / mins))
+        record("traffic.crew_exits_per_min", len(outs) / mins, "on %s's game" % recv.name)
+        record("traffic.reseats_per_min", ev.get("reseat", 0) / mins, "on %s's game" % recv.name)
+    for tr in (auth, recv):
         notes = [s for _, s in tr.logs if "traffic: " in s and ("failed" in s or "knocked" in s)]
         for s in notes[:6]:
             print("  note (%s): %s" % (tr.name, s.split("traffic: ", 1)[-1][:160]))
