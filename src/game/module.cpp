@@ -24,6 +24,7 @@
 #include "game/traffic_sync.h"
 #include "game/ped_sync.h"
 #include "game/door_sync.h"
+#include "game/guest_world_sync.h"
 #include "game/police_sync.h"
 #include "game/world_env.h"
 
@@ -228,6 +229,7 @@ public:
             CarLookSync::Install();    // the same: copies of player and traffic cars get the car's look
             ExplosionSync::Install();  // last: its glue reads the others' tables
             ThrowSync::Install();      // the flights of thrown explosives (its glue is called by the explosions')
+            GuestWorldSync::Install(); // after every other glue: its Lua reads their tables (what is ours)
         }
         menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
@@ -255,6 +257,7 @@ public:
         CarDamageSync::Attach(session);
         CarLookSync::Attach(session);
         ThrowSync::Attach(session);
+        GuestWorldSync::Attach(session);
     }
     void OnSessionEnd() override {
         PlayerSync::Detach();
@@ -271,6 +274,7 @@ public:
         CarDamageSync::Detach();
         CarLookSync::Detach();
         ThrowSync::Detach();
+        GuestWorldSync::Detach();  // its main tick gives the guest's own world back
         latency::Attach(nullptr);
         _session = nullptr;
     }
@@ -335,6 +339,7 @@ public:
         ThrowSync::Tick(dt);
         CarDamageSync::Tick(dt);
         CarLookSync::Tick(dt);
+        GuestWorldSync::Tick(dt);
         JoinSync::Tick(dt);  // last: after every system's handlers and ticks of this frame
         _latencyLogIn -= dt;
         if (_latencyLogIn <= 0) {
@@ -421,6 +426,7 @@ public:
         CarDamageSync::GetStatus(out);
         CarLookSync::GetStatus(out);
         ThrowSync::GetStatus(out);
+        GuestWorldSync::GetStatus(out);
     }
     void SetMenuState(const MenuState& state) override { menu::SetState(state); }
     bool PopMenuCommand(MenuCommand* out) override { return menu::PopCommand(out); }

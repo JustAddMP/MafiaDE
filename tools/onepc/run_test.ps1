@@ -8,6 +8,13 @@ Say (Fit 0); Say (Fit 1)
 Start-Sleep 5
 Both "01-spawn"
 
+# suppress (guest_world, docs/host-authority.md WP-A): the guest's own moving cars and ambient humans per distance band
+# (0 everywhere once 10 s in the world), what guest_world hid, the switches and the pedestrian budget, and that the
+# puppets, the ped copies and npc copies still spawn; the host's cars / humans per 50 m band (where his world ends)
+Start-Sleep 5
+Say "guest suppress (10 s): $(Lua 1 "$PSScriptRoot\suppress_probe.lua")"
+Say "host world extent: $(Lua 0 "$PSScriptRoot\world_extent.lua")"
+
 # on foot: each walks 3 s (W held in its own window), the other must see him follow
 Say (Keys 1 @("W") 3000); Start-Sleep 2; Both "02-guest-walked"
 Say (Keys 0 @("W") 3000); Start-Sleep 2; Both "03-host-walked"
@@ -42,6 +49,8 @@ Say "loss on the guest: $(Lua 1 "$PSScriptRoot\losstest.lua")"; Start-Sleep 10; 
 
 # a minute side by side with traffic and pedestrians around
 Start-Sleep 60; Both "12-a-minute-later"
+Say "guest suppress (a minute later): $(Lua 1 "$PSScriptRoot\suppress_probe.lua")"
+Say "host world extent (a minute later): $(Lua 0 "$PSScriptRoot\world_extent.lua")"
 
 # traffic: the host's own cars by distance from him and whether a driver sits at the wheel (the game streams traffic
 # drivers out beyond ~50 m: those cars are still driven, not "driverless"), the guest's copies of them (driver seated,

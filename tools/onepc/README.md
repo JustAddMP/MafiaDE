@@ -26,6 +26,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | Step | Screenshots (`shots\`) | Must see |
 |---|---|---|
 | spawn | 01-spawn-host/guest | each window shows the other player standing near |
+| suppress (10 s, and after the minute) | (run.log lines `guest suppress` / `host world extent`, tools/onepc/suppress_probe.lua and world_extent.lua) | guest: `own moving cars: 0-50 m 0, 50-100 m 0, 100-150 m 0, 150- m 0; own ambient humans: ... 0 ...` (every band 0), `switches off`, `budget 0` (or `nil`: not readable, then the log says so), `puppets 1 of 1`, `ped copies` > 0 once the host has pedestrians near, npc copies when the host has NPCs near; guest log `guest world: our own traffic, police and pedestrians are off (the first world of the session): ambient traffic ok, police ok, pedestrian budget 0 (it was N)`; host: `cars/humans per band (m): 0-50: ..., 400+: ...` (where the bands run empty is where a guest's streets end: the leash numbers, host-authority D1) and `pedestrian budget N`, host log `guest world: we host: our own world stays on; the pedestrian budget here is N` |
 | on foot | 02-guest-walked, 03-host-walked | the walker's puppet followed (face.lua line: dist a few m, st=alive, hidden=false) |
 | fall | 04-host-fell, 05-guest-fell | puppet on the ground next to its player, one fall; no "put at its player's spot" loop |
 | motorbike | 06-host-on-bike, 07-host-off-bike | guest: a motorcycle with the host's puppet on it (log `puppet 0 rides bike`), then the puppet on foot; host log: `a motorbike (...)` with a key `0:16000001`-like, no `cars error` |
@@ -40,6 +41,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 
 | metric | expected |
 |---|---|
+| world.guest_own_cars / world.guest_own_peds | 0 (the guest's own moving cars within 150 m / ambient humans within 80 m still shown, max after 10 s in a world: `GW` records) |
 | foot.shown | >= 98 % both ways (was 19.5-40 % in the 2026-10-20 two-PC test) |
 | foot.respawns | 0 both ways |
 | foot.respawn_s | <= 5 s (the simulated loss on the guest) |

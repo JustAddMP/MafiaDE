@@ -116,6 +116,7 @@ on the other.
 | `PDS` | both | 1 Hz | our pedestrians as an authority: `peds=<our ambient humans near players> owned=<of them ours to send> bytes states spawns gones deaths killreq` (totals) |
 | `PDP` | both | 1 Hz per other player | `id relevant admitted states skipped bytes deferred` (our pedestrians for him) |
 | `PDE` | both | per event | `ev=adopt / spawn / release / hide / show / kill / diedhere / death / killreq key=<authority << 16 + net> local=<entity id here> how p from net` |
+| `GW` | guest | 1 Hz (and once when everything is given back) | guest_world (src/game/guest_world.h, docs/host-authority.md WP-A; unreleased): `ph=<0 no world 1 loading screen 2 in the world> w=<worlds seen (loads)> inw=<s in this world, -1 not in one> on=<1 our switches stand: ambient traffic and police spawning off, pedestrians off> mode=<budget block off: how our pedestrians are stopped (block: the fallback after a failed SetMaxHumanElements, or the ini)> hide=<0 nothing 1 hidden at once (loading screen, the first 3 s) 2 only out of view> cars=<our own moving traffic cars (a generator driver at the wheel) within 150 m still shown after the last scan> peds=<our own ambient humans within 80 m still shown> hidC hidP=<cars / humans hidden now> hid=<hidden so far this session> cand=<our own ambient cars and humans seen in the last scan> bud=<the pedestrian budget read before we set it, -1 unknown> bs=<budget: 0 untouched 1 set to 0 2 put back 3 a call failed 4 the old value unknown (left to the next world load)> blocks=<spots BlockSpawnersInSphere'd (fallback)> ra=<re-applies (every 5 s, or after other glue switched traffic on)> rs=<restores>` |
 | `PDL` | both | 1 Hz | ped_sync.lua: `amb=<ambient humans here> near=<reported near players> adopted spawned queued hidden fac=<copy spawner state> blocks=<spots our spawners were blocked around>` |
 | `POL` | both | on change, 1 Hz while wanted | Lua, our police state: `f=<PoliceState flags> w hunt lvl seen decay fine arrest off zone=<centre> p=<our position> held=<our zone's decay held (guest)> follow=<our red zone follows us> forced=<level held>` |
 | `POE` | both | per police event | `from=me ev=<name> arg` (ours, as sent) or `from=<id> ev arg` (another player's, received) |
@@ -225,6 +226,10 @@ Per player as seen on the other game:
   0.16.0 copy speed), the copy before our commands (`TRC pp`). Drivers and crews (`TRO`): the authority's misses and
   how many were beyond 40 m (the game's level of detail), the receiver's crews out / back in (within 2 s: a flap) /
   put back per minute with copies (`traffic.crew_exits_per_min`, `traffic.reseats_per_min`).
+- **guest world** (unreleased, `GW`): per world the guest loaded, his own moving cars and ambient humans still shown
+  near him from 10 s after the load (`world.guest_own_cars`, `world.guest_own_peds`: both must be 0), what was hidden,
+  how his pedestrians were stopped, the budget read / set / put back, blocked spots and re-applies; and whether
+  everything was given back at the end.
 - **doors:** per game, the door events by kind and verdict, how changes were attributed, the door messages, the
   applies with a failed call, how many of the changes it sent arrived on the other game, and the first 30 sends /
   receipts / snapshots.
