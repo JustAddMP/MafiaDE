@@ -509,6 +509,15 @@ Unexplained (2026-10-18):
 - [ ] CHAPTER 13: SALIERI: the guest's scripts stopped about 10 s after the opening cutscene (no Lua lines, status
   `no local player`, no error). Play the chapter start again and watch the guest's log.
 
+## Test checklist: 0.16.0
+
+0.16.0 (pre-release 2026-10-20) is not yet tested in game. The next two-PC test (about 25 minutes) plays the
+scenarios of "Sync architecture checks" below and runs `python tools/sync_compare.py <host trace> <guest trace>
+--check` on each session's pair (every line PASS), then goes through the open round 3 / round 4 items of "Test
+checklist: 0.15.0 features" ("Unreleased fixes", "Unreleased fixes from the first two-PC test"; both are in 0.16.0).
+Also: a 0.15.0 game joining a 0.16.0 host is turned away with `version mismatch: host has protocol 9 build 1600, you
+have protocol 9 build 1500` (JOIN FRIEND: `VERSION 0.15.0 - YOU HAVE 0.16.0`).
+
 ## Sync architecture checks (next two-PC test)
 
 The targets of docs/sync-architecture.md section 4. After the test, zip both `logs` folders and run

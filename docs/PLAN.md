@@ -649,6 +649,10 @@ README-dev.md "Sync architecture checks").
   (verified: car signals, failed missions in one load, the police fix; the rest not yet verified):
   https://github.com/JustAddMP/MafiaDE/releases/tag/v0.15.0. Not ticked until the remaining checks of README-dev.md
   "Test checklist: 0.15.0 features" are done.
+- [ ] GitHub pre-release v0.16.0 (round 3 and round 4 fixes, the sync architecture of section G; core v0.12.0,
+  protocol 9, modVersion 0.16.0 so 0.15.0 cannot join). Published 2026-10-20 as a pre-release, not yet tested in
+  game: https://github.com/JustAddMP/MafiaDE/releases/tag/v0.16.0. Not ticked until README-dev.md "Test checklist:
+  0.16.0" (the "Sync architecture checks" with `sync_compare.py --check`) passes.
 
 ### E. Robustness (ongoing)
 - [x] Clean shutdown: call Coop::Shutdown when the game window closes so guests see "host left" at once, not a 10 s timeout.

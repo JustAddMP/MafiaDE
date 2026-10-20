@@ -3,13 +3,26 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
-## Unreleased
+## 0.16.0 (2026-10-20), pre-release, not yet verified in game
 
-Fixes for the known issues of the 2026-10-18 test, built from reading the game's code and the test's logs, with
-automated tests where the logic runs without the game. None of it is verified in game yet; the checks are in
-README-dev.md "Test checklist: 0.15.0 features", "Unreleased fixes".
+The fixes for the problems found in the 2026-10-18 one-PC test and the 2026-10-19 two-PC test, and a rewrite of how
+the games stay in step (docs/sync-architecture.md, core v0.12.0): other players, their cars, NPCs, pedestrians,
+traffic and the time of day. Everything here was built from reading the game's code and the logs and traces of
+those tests, with automated tests where the logic runs without the game. **None of what is new in 0.16.0 has been
+played on two PCs yet.** The next test follows README-dev.md "Test checklist: 0.16.0" and "Sync architecture
+checks" (`tools/sync_compare.py <host trace> <guest trace> --check`).
 
-Fixed (unverified in game):
+Verified in the 2026-10-19 two-PC test, with the 0.15.0 build (over Steam, Free Ride; 0.16.0 changes several of
+these - movement, cars, traffic, NPCs - so they need checking again): Steam invite and join over Steam P2P, the
+lobby, HOST LEFT and hosting again; movement at about 28 ms round trip; the horn on a car copy; riding along in a
+friend's car both ways; the host's traffic on the guest's game (basic); car damage sync (crashes, shot tyres, the
+exploded flag); the host's police chasing a wanted guest without making the host wanted; enemies only the guest's
+game spawned shown on the host; Free Ride death and respawn; punches landing; a real gamepad in the co-op panels;
+a clean leave from either side.
+
+Written, not yet verified in game: everything below.
+
+Fixes for the known issues of the 2026-10-18 test (round 3), all unverified in game:
 - Co-op sessions no longer change the player's garage: garage.pf, the 2K play stats and the persistent script data are
   kept in the session's scratch copy like the save slots, and stay out of the real profile until the game restarts
   (the game keeps the garage in memory). Settings (controls, audio, video, language, map filter) are still the
@@ -42,7 +55,7 @@ Fixed (unverified in game):
   is given back before a car seat, a walk to a car door or a fall, is cleared when the puppet is re-created or
   respawns, and a late answer for an action that is already over is ignored.
 
-Fixed from the first two-PC test (2026-10-19), all unverified in game:
+Fixed from the first two-PC test (2026-10-19, round 4), all unverified in game:
 - Car copies drive at their real speed: SetSpeed takes km/h (read from the exe); copies got m/s and ran at 0.28 of
   their driver's speed, pinned most of the time. Every caller is fixed (player cars, traffic), reversing gives a
   negative speed, and GetSpeedFloat is read as km/h too. The SetSpeed probe logs once instead of a traceback per copy.
@@ -118,13 +131,26 @@ modelled, not run). **None of it is verified in game**; the next two-PC test che
   PDT / PDR, WEH / WEG, JN and more, docs/sync-trace.md), and `sync_compare.py --check` prints every target of
   docs/sync-architecture.md section 4 as PASS / FAIL.
 
-Protocol: PeerPaused (0x0103) is a new message (CarLook 0x0253 above is one too); the pose bits 8 / 16 / 32 use the
-existing PlayerState pose byte (no format change). The next release needs a protocol / version bump (not done here),
-so that players on different builds are told instead of half-syncing. The sync architecture makes it a must: NPC
-states moved to new messages (an older build would see no NPCs), and ParkedCars 0x0104, JoinReport 0x0207,
-NpcStates2 / NpcInfo / NpcLeave 0x0212-0x0214, TrafficSpawn2 / Despawn2 / States2 / Bump2 0x0224-0x0227,
-GuestNpcStates2 / Info / Leave 0x0424-0x0426 and the pedestrian messages 0x0280-0x0284 are new; WorldEnv gets an
-optional trailing sample time (older readers ignore it). Core goes to v0.12.0 (its protocol stays 9).
+Known issues:
+- Not yet tested in game on two PCs: all of 0.16.0 (the round 3 and round 4 fixes above and the whole sync
+  rewrite). Simulated numbers are from unit tests that model the game's AI walk, car physics and civilians; the game
+  may behave differently. Please send both PCs' `logs` folders after playing.
+- A player sitting in a car cannot be shot by the other players (shots on a seated puppet are not counted, also
+  through an open window).
+- After a player gets off a motorbike, the bike's copy may stay on the other screens for up to a second.
+- Car damage and car look are not shared for a guest's own traffic (the host's traffic and players' cars have them).
+- Pedestrian copies spawned for missing ones use a generic civilian look.
+- Not reached in any test yet: JOIN FRIEND between two PCs, chapters on two PCs, reconnect over Steam, doors, item
+  takes, grenades, seats after a reload, three or four players.
+
+Protocol: `modVersion` 0.16.0 (session build 1600; core v0.12.0, its `kProtocolVersion` stays 9). New messages:
+PeerPaused 0x0103, ParkedCars 0x0104, JoinReport 0x0207, NpcStates2 / NpcInfo / NpcLeave 0x0212-0x0214,
+TrafficSpawn2 / Despawn2 / States2 / Bump2 0x0224-0x0227, GuestNpcStates2 / Info / Leave 0x0424-0x0426, CarLook
+0x0253 and the pedestrian messages 0x0280-0x0284; NpcStates 0x0210 and GuestNpcStates 0x0420 are retired; WorldEnv
+gets an optional trailing sample time; the pose bits 8 / 16 / 32 use the existing PlayerState pose byte.
+
+Everyone needs 0.16.0: a 0.15.0 game cannot join a 0.16.0 host (or the other way round); it is turned away with
+"version mismatch: ... Both players need the same MafiaCoop version." (docs/protocol.md).
 
 ## 0.15.0 (2026-10-18), pre-release, mostly not yet verified in game
 

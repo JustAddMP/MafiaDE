@@ -4,12 +4,13 @@
 server, Steam invites. Players see each other walking, running, armed and driving, can shoot, punch and run each
 other over, and each picks the character he plays as. Weather, time and the story follow the host (chapter,
 checkpoint, objectives, cutscenes); mission NPCs are kept in step with the host's (deaths, your hits on them) and
-mission cars are not doubled. The host's enemies aim at every player; since 0.15.0 a friend near the host sees the
-host's traffic and police (not yet verified in game).
+mission cars are not doubled. The host's enemies aim at every player; since 0.16.0 traffic and pedestrians are
+shared wherever players are (not yet verified in game).
 
 ## Download
 
-The current version is the **0.15.0 pre-release**: download `MafiaCoop-0.15.0.zip` from
+The current version is the **0.16.0 pre-release** (not yet tested in game on two PCs; everyone needs 0.16.0, it
+cannot play with 0.15.0): download `MafiaCoop-0.16.0.zip` from
 [Releases](https://github.com/JustAddMP/MafiaDE/releases), extract it anywhere and read its `README.txt` (requirements,
 how to play, known issues, uninstall). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -44,16 +45,11 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- 0.15.0 is a pre-release with a first test on one PC only. Verified there: car lights and signals, failed missions
-  in one load, the police fix. The rest that is new in 0.15.0 (punches on the other players, the host's traffic and
-  police on a friend's game, doors, items, explosions, car damage, enemies only a friend's game spawned, the mission
-  car coming back, players on the map, reconnect, three or four players, JOIN FRIEND, real gamepads) is built but
-  not yet verified in game. See [CHANGELOG.md](CHANGELOG.md) for the details.
-- Found in the test: punches and throws do not show on the other player's character; the other player's map marker
-  was not seen on the minimap; a player's car shows as another variant and colour on the other screen; a car's
-  damage after an explosion can be read back as a repair; after a friend's reload his character may sit hidden in a
-  car; a wanted friend's police level runs down during a chase; a co-op chapter writes the player's garage
-  (`garage.pf`).
+- 0.16.0 is a pre-release that has not been tested in game on two PCs: the fixes for the 2026-10-18 and 2026-10-19
+  tests and the rewritten sync (players, cars, NPCs, pedestrians, traffic, time of day) are checked by automated
+  tests only. See [CHANGELOG.md](CHANGELOG.md) for what was verified with 0.15.0 and what is new.
+- A player sitting in a car cannot be shot; a motorbike's copy may stay up to a second after its rider got off; car
+  damage and look are not shared for a guest's own traffic.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only; enemy
   fights in one chapter's shootout (Bon Appetit's restaurant).
 - JOIN FRIEND and a physical gamepad have not been tested between two PCs / with a real controller yet.

@@ -1,9 +1,12 @@
-Mafia: Definitive Edition - Co-op (MafiaCoop) 0.15.0, pre-release
+Mafia: Definitive Edition - Co-op (MafiaCoop) 0.16.0, pre-release
 ==================================================================
 
 An unofficial, fan-made co-op mod: play Mafia: Definitive Edition together with friends. One small DLL, no separate
-server, Steam invites. This is a PRE-RELEASE: playable, but parts of the world (pedestrians, traffic away from the host) are not shared.
+server, Steam invites. This is a PRE-RELEASE: 0.16.0 has NOT been tested in game on two PCs yet.
 Read "Known issues" below before you play.
+
+EVERYONE NEEDS 0.16.0: it cannot play with 0.15.0 or older. A player with another version is turned away
+with "version mismatch ... Both players need the same MafiaCoop version."
 
 Contents of this zip
   MafiaCoop.exe          the launcher: starts the game with co-op
@@ -91,21 +94,16 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- 0.15.0 had a first test on one PC (two copies of the game). Checked and working: car lights and signals, failed
-  missions in one loading screen, and the police no longer making the host wanted because of a friend. The rest of
-  what is new in 0.15.0 (punches and other actions on the other players, the host's traffic and police, doors,
-  items on the ground, explosions, car damage, enemies only a friend's game has shown to the host, the mission car
-  coming back, every player on the map, reconnecting, three or four players, JOIN FRIEND, gamepad buttons in the
-  co-op panels) is built but not yet confirmed in game. Please send the logs when something looks wrong.
-- Punches and throws do not show on the other player's character yet (the hit itself still counts).
-- The other player's marker could not be seen on the minimap in the test, although the mod places it.
-- A player's car looks different on the other screen: the same model, but another variant and colour.
-- After a car blew up, the host's game sometimes takes the other game's damage report as a repair.
-- After a friend's game reloads at a new checkpoint while both are in a car, the host may see the friend's
-  character hidden in the car instead of seated.
-- A wanted friend's police level runs down on his own game even while the host's police chase him.
-- A co-op CHAPTER changes the player's garage (garage.pf in the game's profile folder is written). Your story saves
-  are never loaded or changed.
+- 0.16.0 is NOT yet tested in game on two PCs. It fixes the problems found in the 2026-10-18 and 2026-10-19 tests
+  (punches and throws on the other player's character, the minimap marker, how a player's car looks on the other
+  screen, car damage after an explosion, seats after a reload, a wanted friend's police level, the garage file,
+  car copies driving too slowly, two drivers in one car, shots between players, motorbikes, swimming, a paused
+  game, traffic losing its drivers, changing character) and rewrites how the games stay in step: the other
+  players, their cars, enemies, pedestrians (now shared), traffic (now shared wherever players are) and the time
+  of day. All of it is built and checked by automated tests only. Please send the logs (both PCs) after playing.
+- A player sitting in a car cannot be shot by the other players, not even through an open window.
+- After a player gets off a motorbike, its copy may stay on the other screens for up to a second.
+- Car damage and car colours are not shared for traffic that a friend's game spawned.
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared
   both ways (a friend's kill also kills the host's enemy, so a friend can clear a fight on his own), health follows
   the host's game, and the host's enemies also aim at the other players. An enemy that only the host's game spawned
@@ -116,8 +114,8 @@ KNOWN ISSUES
 - Mission cars are partly shared: a mission car is not doubled, and the host sits at the wheel of it on a friend's
   screen (checked in Taxi and Bon Appetit). Since 0.15.0 the mission car comes back when the driver parks and gets
   out (not yet tested). Only a few chapters were checked.
-- Near the host a friend sees the host's traffic and police cars (seen in the first test, not yet confirmed);
-  away from the host traffic is each player's own. Pedestrians are each player's own.
+- Traffic and pedestrians are shared wherever players are (new in 0.16.0, not yet tested); in 0.15.0 a friend
+  saw the host's traffic near the host (seen working in the 2026-10-19 test).
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit, the start of Salieri); other chapters and
   checkpoints may behave differently. A friend who falls behind the host's checkpoint is reloaded at the host's
   checkpoint.
