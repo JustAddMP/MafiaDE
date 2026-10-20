@@ -110,4 +110,59 @@ const char* Why(const Mapped& m) {
     }
 }
 
+bool KeptOut(Kind k, Scope s) {
+    switch (s) {
+        case Scope::All: return Redirected(k);
+        case Scope::Progress: return k == Kind::Progress || k == Kind::UnknownProfile;
+        default: return false;
+    }
+}
+
+const char* ScopeName(Scope s) {
+    switch (s) {
+        case Scope::All: return "saves and profile";
+        case Scope::Progress: return "profile only (his story saves stay his own)";
+        default: return "nothing";
+    }
+}
+
+void Guard::Load(const std::string& storage) { _story = Lower(storage) == "aslot"; }
+
+void Guard::Want(bool block, bool host) {
+    _wantBlock = block;
+    _wantHost = host;
+    if (block) _block = true;
+    if (host) _host = true;
+}
+
+void Guard::SetBlock(bool on) {
+    _block = _wantBlock = on;
+}
+
+void Guard::MainMenu() {
+    if (!_wantBlock) _block = false;
+    if (!_wantHost) _host = false;
+}
+
+Scope Guard::Current() const {
+    if (_block) return Scope::All;
+    if (_host) return _story ? Scope::Progress : Scope::All;
+    return Scope::None;
+}
+
+Where Guard::Route(const Mapped& m, bool write) {
+    if (KeptOut(m.kind, Current())) {
+        if (write && HeldAfterSession(m.kind)) _held.insert(m.file);
+        return Where::Scratch;
+    }
+    if (HeldAfterSession(m.kind) && IsHeld(m.file)) return Where::Held;
+    return Where::Real;
+}
+
+std::string Guard::HeldList() const {
+    std::string out;
+    for (const std::string& f : _held) out += (out.empty() ? "" : ", ") + f;
+    return out;
+}
+
 }  // namespace mc::game::save_paths

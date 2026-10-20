@@ -1571,6 +1571,7 @@ void MissionSync::Attach(net::Session& session) {
 }
 
 void MissionSync::Detach() {
+    save_guard::Want(false, false);  // the session ended: nothing kept out once the main menu is up (save_guard::Tick)
     if (_session) {
         _session->Off(kMsgMissionState);
         _session->Off(kMsgHostSave);
@@ -1607,20 +1608,22 @@ void MissionSync::Tick(float dt) {
     TryHookGameOver(_now);
     {
         // A guest's game writes no saves into his own slots while he is in a co-op session (the host's story, Free
-        // Ride autosaves, the save a load writes); that stays so until he is out of the co-op world (at the main
-        // menu) after the session ended (save_guard).
+        // Ride autosaves, the save a load writes); that stays so until he is back at the main menu after the session
+        // ended (save_guard::Tick).
         Shared& sh = S();
         bool following;
         // The host of a lobby CHAPTER session too: that chapter is not his story, and the game would save it into
-        // his Free Ride slot. A host who continues his story (STORY) keeps saving it as in single player.
-        bool hostChapter;
+        // his Free Ride slot. Every other host keeps his profile files (garage, stats) out, and his saves too unless
+        // his world is his own story (a STORY session: he keeps saving it as in single player; save_guard decides from
+        // the slot the world was loaded from).
+        bool hostChapter, hosting;
         {
             std::lock_guard lock(sh.mu);
             following = _session && _session->IsActive() && !_session->IsHost();
-            hostChapter = _session && _session->IsActive() && _session->IsHost() && sh.hostChapter;
+            hosting = _session && _session->IsActive() && _session->IsHost();
+            hostChapter = hosting && sh.hostChapter;
         }
-        if (following || hostChapter) save_guard::Block(true);
-        else if (save_guard::Blocking() && !PlayerSync::InWorld()) save_guard::Block(false);
+        save_guard::Want(following || hostChapter, hosting);
     }
     if (!_session) return;
     std::string start;

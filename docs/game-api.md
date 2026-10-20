@@ -1226,8 +1226,9 @@ MafiaCoop looks each name up once a second (`game.entitywrapper:GetEntityByName(
 switched off, within 4 m of us" as our pickup. **Decision: per player.** Each player collects his own copy for his own
 save; nothing is hidden on the other games, no other game's datastore or collection is written (writing the host's
 save from a guest's action, or deciding for a guest, is not safe without knowing the datastore layout). The others
-only hear about it (Collectible message, log, status line). Note: a guest's saves (and a CHAPTER host's) go to the
-scratch tree during co-op (save_guard.h), so what he collects there is not kept in his real save. **UNVERIFIED**:
+only hear about it (Collectible message, log, status line). Note: a guest's saves (and a CHAPTER or FREE RIDE host's) go to
+the scratch tree during co-op (save_guard.h), so what he collects there is not kept in his real save; a STORY host's
+story saves are real (his campaign), his progress profiles (persistent data, stats, garage) are kept out. **UNVERIFIED**:
 that the entities have exactly these names in the world (they are in the mission SDS string tables, e.g.
 `lh_pickup_cc_04_ennio_salieri_bv01` in mm_120_mansion), that `GetEntityByName` finds them, the fox count.
 

@@ -21,6 +21,13 @@ Say "host bike: $(Lua 0 "$PSScriptRoot\bike_spawn.lua")"; Start-Sleep 10
 Say (Keys 0 @("W") 4000); Start-Sleep 1; Both "06-host-on-bike"
 Say (Keys 0 @("E") 300); Start-Sleep 4; Both "07-host-off-bike"
 
+# the host's Free Ride garage (2026-10-20: the host's garage.pf was written for real at each garage visit): a car added
+# by script must give a garage.pf write that is kept out of the profile (run_stop.ps1 then finds garage.pf unchanged)
+Say "host garage: $(Lua 0 "$PSScriptRoot\garage_take.lua")"; Start-Sleep 3
+$hl = "$Out\logs\mafiacoop-host.log"
+Say ("host garage.pf: kept out {0}, written for real {1}" -f @(Select-String -Path $hl -Pattern "kept out of the player's profile \(progress: the cars").Count,
+  @(Select-String -Path $hl -Pattern "savesys: written: garage.pf").Count)
+
 # a car: the guest gets into one and drives 4 s
 Say "guest car: $(Lua 1 "$PSScriptRoot\car_spawn.lua")"; Start-Sleep 10
 Say (Keys 1 @("W") 4000); Start-Sleep 1; Both "08-guest-in-car"
