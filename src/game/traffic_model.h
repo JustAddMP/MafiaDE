@@ -300,6 +300,14 @@ struct GuestConfig {
     double quietAfter = 1.0;
     double localGap = 0.5;
     net::correction::Tuning correction = TrafficCorrection();  // the copy's position correction
+    // The game's own sideways move of a copy between two of our commands (its traffic system holds a car on its own
+    // line; the 0.17.0 one-PC run: 0.03-0.07 m put back every tick, copies held 1.05 m across their car): learned
+    // from each report (CopyReport::pre against the previous report, across the copy's heading) with this share per
+    // report, and added against it to the next command, at most sidePullMax m, while the host's car moves at least
+    // sidePullSpeed m/s
+    float sidePullAlpha = 0.3f;
+    float sidePullMax = 0.3f;
+    float sidePullSpeed = 1.0f;
 };
 
 struct CopyReport {
@@ -351,6 +359,7 @@ struct GuestStats {
     uint64_t states = 0, spawns = 0, despawns = 0, dropsOld = 0;
     uint32_t due = 0, shown = 0;  // host cars within viewRadius (at most maxCopies) / with a copy here
     uint64_t blends = 0, fixSnaps = 0;  // corrector: blended / snapped updates so far
+    uint64_t sidePulls = 0;  // commands with the game's sideways pull taken out (GuestConfig::sidePull*)
 };
 
 class ReceiverTraffic {
@@ -406,6 +415,9 @@ private:
         bool frozen = false;  // held at frozenPos / frozenRot (the host is paused)
         Vec3 frozenPos;
         float frozenRot[4] = {0, 0, 0, 1};
+        Vec3 sidePull;          // the game's sideways move of the copy per command, learned (SetReport)
+        Vec3 pullFrom;          // where the last report had the copy (after our commands)
+        bool havePullFrom = false;
         Car(const net::motion::VehicleTuning& v, const net::correction::Tuning& c) : vc(v), fix(c) {}
     };
     struct Host {
@@ -416,6 +428,7 @@ private:
         bool paused = false;
         explicit Host(const net::replica::StreamTuning& t) : stream(t) {}
     };
+    void ResetPull(Car& c);
     bool Present(const Car& c, uint32_t key, double now, CarState& out, double* rtMs = nullptr) const;
     float DistToMe(const Car& c, uint32_t key) const;
     Car& CarOf(uint32_t key);

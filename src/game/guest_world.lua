@@ -43,7 +43,8 @@ local COPY_SPOT = 8         -- m around a loading traffic copy's spawn spot: no 
 local F = { car = 1, human = 2, active = 4, puppet = 8, pfac = 16, tcopy = 32, crew = 64, pedOwned = 128,
   pedSpawner = 256, npcCopy = 512, npcSpawner = 1024, playerCar = 2048, ownVehicle = 4096, fixed = 8192,
   facBusy = 16384, copySpot = 32768, fresh = 65536, genDriver = 131072, tram = 262144, ambient = 524288,
-  mission = 1048576, inVehicle = 2097152 }
+  mission = 1048576, inVehicle = 2097152, inView = 4194304, late = 8388608 }
+local LATE_AFTER = 10       -- s (the dll's kLateAfter): a car first seen this long after our switches stood is late
 
 local function log(s) if mc_log then mc_log("guest world: " .. s) end end
 local function valid(o) return o ~= nil and IsObjectValid(o) end
@@ -126,6 +127,18 @@ function GW.Ours(p)
   for _, c in pairs(T and T.copies or {}) do
     addCar(c.ent, F.tcopy)
     for _, m in ipairs(c.crew or {}) do addHuman(m, F.crew) end
+    local id = valid(c.ent) and idOf(c.ent)
+    if id then GW.wasCopy[id] = c.key end
+  end
+  -- copies the host no longer sends that go once out of view (traffic_sync.lua T.Remove: DespawnEntity): still his
+  -- cars' copies until the game removes them
+  for key, x in pairs(T and T.leaving or {}) do
+    if valid(x.ent) then
+      addCar(x.ent, F.tcopy)
+      for _, m in ipairs(x.crew or {}) do addHuman(m, F.crew) end
+    else
+      T.leaving[key] = nil
+    end
   end
   -- ped_sync: its copies, adopted and hidden humans, its spawner's driver (PedOwned), its spawner car
   for id, _ in pairs(M.PedOwned or {}) do addId(id, F.pedOwned) end
@@ -185,6 +198,8 @@ local function carFacts(e, id, ours, busy, spots, now)
     if (q.x - s.x) ^ 2 + (q.y - s.y) ^ 2 <= COPY_SPOT * COPY_SPOT then f = f + F.copySpot break end
   end
   if now - (GW.seen[id] or now) < 2 then f = f + F.fresh end
+  -- made after our switches had stood for LATE_AFTER s in this world: the game made it despite them
+  if GW.off and GW.offT and (GW.seen[id] or now) - GW.offT >= LATE_AFTER then f = f + F.late end
   local okd, drv = pcall(e.GetSeatOwner, e, 0)
   if okd and valid(drv) and nameClass(nameOf(drv)) == "generator" then f = f + F.genDriver end
   local okm, model = pcall(e.GetVehicleModelName, e)
@@ -274,6 +289,8 @@ end
 -- One scan of every car and human: the verdicts (mc_gw_judge), the hides, the counts.
 function GW.Scan(p, mode, ev)
   if not (mc_entity_ids and mc_entity and mc_gw_judge) then return end
+  GW.wasCopy = GW.wasCopy or {}  -- entity id -> the host car's net id it was a copy of (GWC was=)
+  GW.keyT = GW.keyT or {}
   local now = M.now or 0
   local me = myPos(p)
   local cam, cd
@@ -312,6 +329,23 @@ function GW.Scan(p, mode, ev)
     end
     if counts == 1 and not hidden then
       if car then ownCars = ownCars + 1 else ownPeds = ownPeds + 1 end
+      -- which one (docs/sync-trace.md GWC): at most once a second per entity
+      if mc_trace and now - (GW.keyT[id] or -10) >= 1 then
+        GW.keyT[id] = now
+        local model, drv = "-", "-"
+        if car then
+          local okm, m = pcall(e.GetVehicleModelName, e)
+          if okm and m then model = tostring(m) end
+          local okd, d = pcall(e.GetSeatOwner, e, 0)
+          if okd and valid(d) then drv = tostring(nameOf(d) or "?") end
+        else
+          drv = tostring(nameOf(e) or "?")
+        end
+        local was = GW.wasCopy[id]
+        mc_trace("GWC", string.format("kind=%s id=%d model=%s src=%s was=%s p=%.1f,%.1f,%.1f spd=%.1f f=%d v=%d",
+          car and "car" or "human", id, (model:gsub("%s", "_")), (drv:gsub("%s", "_")),
+          was and ("tcopy:" .. tostring(was)) or "-", q.x, q.y, q.z, speed, facts, v))
+      end
     end
   end
   for _, kind in ipairs({ 10, 8 }) do
@@ -359,6 +393,8 @@ function GW.Off(budget, ev)
     c = pcall(t.SetMaxHumanElements, t, 0) and "1" or "0"
   end
   ev[#ev + 1] = string.format("SW %d %d %s", a and 1 or 0, b and 1 or 0, c)
+  -- when they first stood in this world (re-applied every 5 s; a new world starts the clock again)
+  if not GW.off or GW.offKey ~= GW.curKey then GW.offT, GW.offKey = M.now or 0, GW.curKey end
   GW.off = true
 end
 
@@ -383,6 +419,7 @@ end
 function GW.Update(dt, cmds)
   local ev = {}
   local phase, key = GW.Phase()
+  GW.curKey = key
   local p = M.Player and M.Player()
   local x, y, z, have = 0, 0, 0, 0
   if p then

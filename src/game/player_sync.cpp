@@ -851,6 +851,20 @@ void DriveCommands(Shared& sh, net::PlayerId id, Remote& rem, const PlayerState&
         vc = motion::VehicleCommand{};
         vc.fix = motion::VehicleCommand::Fix::Pin;
         for (int k = 0; k < 4; ++k) vc.rot[k] = rem.frozenQuat[k];
+    } else if (inCar && s.seat == 0 && (s.pose.bits & actions::kBike)) {
+        // a motorbike: player_sync.lua puts the bike copy on his transform every tick (no physics of its own to
+        // follow), so the controller has nothing to judge: its speed read from a copy moved every tick said "ran
+        // off" (19 vs 9.7 m/s) and counted the bike as pinned (the 2026-10-21 one-PC run: car.pinned 10.2 %, all of it
+        // the bike)
+        rem.car.Reset();
+        vc = motion::VehicleCommand{};
+        vc.fix = motion::VehicleCommand::Fix::Pin;
+        for (int k = 0; k < 4; ++k) vc.rot[k] = s.quat[k];
+        vc.vel = vi.targetVel;
+        if (vi.haveCopy) {
+            const float ex = vi.target.x - vi.copy.x, ey = vi.target.y - vi.copy.y, ez = vi.target.z - vi.copy.z;
+            vc.error = std::sqrt(ex * ex + ey * ey + ez * ez);
+        }
     } else {
         cc = rem.car.Update(vi);
         vc = cc.vc;

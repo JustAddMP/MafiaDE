@@ -587,6 +587,13 @@ function T.Remove(c, grace, p)
     if c.rv and M.RV and valid(c.ent) then M.RV.Idle(c.rv, c.ent) end
     if near then
       pcall(game.traffic.DespawnEntity, game.traffic, c.qid)  -- when unseen
+      -- it stays in the world until it is out of view: still the host's car's copy (guest_world.lua keeps it and its
+      -- crew; the 0.17.0 one-PC run counted such a copy as one of the guest's own moving cars for 10 s,
+      -- world.guest_own_cars 1)
+      if valid(c.ent) then
+        T.leaving = T.leaving or {}
+        T.leaving[c.key] = { ent = c.ent, crew = c.crew, t = M.now, model = c.model }
+      end
     else
       pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
     end

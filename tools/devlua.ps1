@@ -21,7 +21,8 @@ Remove-Item $out -ErrorAction SilentlyContinue
 Move-Item -Force "$in.tmp" $in
 $deadline = (Get-Date).AddSeconds($TimeoutS)
 while ((Get-Date) -lt $deadline) {
-    if (Test-Path $out) { Get-Content -Raw $out; exit 0 }
+    # the game may still be writing it (2026-10-21: "being used by another process" ended a run): read again
+    if (Test-Path $out) { try { $t = [IO.File]::ReadAllText($out); if ($t) { $t; exit 0 } } catch [IO.IOException] { } }
     Start-Sleep -Milliseconds 200
 }
 Write-Error "no answer within $TimeoutS s (is the game in a state that ticks scripts? see README-dev.md)"

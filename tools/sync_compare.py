@@ -306,10 +306,17 @@ def own_teleports(tr):
     return merged
 
 
+TELEPORT_BEFORE_S = 0.5  # s: a sample this shortly before a teleport is lined up with a truth across the jump
+
+
 def after_teleport(teleports, s):
-    """True when state-clock time s is within TELEPORT_HOLD_S after one of `teleports`."""
+    """True when state-clock time s is within TELEPORT_HOLD_S after one of `teleports`, or less than
+    TELEPORT_BEFORE_S before one (the truth there is interpolated across the jump: the 0.17.0 one-PC run's "worst
+    moment" of 256 m was the leash test's move, 0.03 s before it)."""
     i = bisect.bisect_right(teleports, s)
-    return i > 0 and s - teleports[i - 1] <= TELEPORT_HOLD_S
+    if i > 0 and s - teleports[i - 1] <= TELEPORT_HOLD_S:
+        return True
+    return i < len(teleports) and teleports[i] - s <= TELEPORT_BEFORE_S
 
 
 # Beyond this from the receiving player his game has no world (docs/host-authority.md section 9 / D1: the host's cars
@@ -342,7 +349,8 @@ def compare(sender, receiver, args, worst):
     if diff is None:
         print("  no states from this player in the receiver's trace")
         return
-    to_sender = lambda t: t - diff  # receiver clock -> sender clock
+    to_sender = lambda t: t - diff  # receiver clock -> sender clock (his state stamps, sT)
+    sender_wall = lambda t: sender.wall(t - unwrap_relation(diff))  # his wall clock (the trace clock: no stamp wrap)
 
     # ---- network ----
     tx = {int(num(f["sT"])): (t, f) for t, f in sender.records["TX"] if "sT" in f}
@@ -434,7 +442,7 @@ def compare(sender, receiver, args, worst):
             e = dist2(cp, tp)
             errs_true.append(e)
             by_gait[GAITS.get(sm, "?")].append(e)
-            worst.append((e, "on foot", label, receiver.wall(t), sender.wall(to_sender(t)), "gait %s (player %s)" % (
+            worst.append((e, "on foot", label, receiver.wall(t), sender_wall(t), "gait %s (player %s)" % (
                 GAITS.get(g), GAITS.get(sm))))
             rows.append((t, to_sender(t), cp[0], cp[1], tp[0], tp[1], e, err, g, sm, fix,
                          num(f.get("mult"), 1), num(f.get("want"), 0), num(f.get("meas"), -1), num(f.get("carry"), 0)))
@@ -588,8 +596,9 @@ def compare(sender, receiver, args, worst):
             e = dist2(cp, tc) if cp and tc else None
             if e is not None:
                 errs.append(e)
-                worst.append((e, "car", label, receiver.wall(t), sender.wall(to_sender(t)),
-                              "%s, %s" % ("pinned" if f.get("pin") == "1" else "own physics", f.get("key"))))
+                if not (teleports and after_teleport(teleports, to_sender(t))):  # a leash pull: not a sync error
+                    worst.append((e, "car", label, receiver.wall(t), sender_wall(t),
+                                  "%s, %s" % ("pinned" if f.get("pin") == "1" else "own physics", f.get("key"))))
             tsp, csp = num(f.get("tsp"), 0), num(f.get("csp"), 0)
             if tsp > 2:
                 spd.append(csp / tsp)
@@ -816,7 +825,8 @@ def npc_replicas(authority, receiver, worst):
             lag.append(ts * 1000.0 - rt)
         if e > 3:
             by_key[f.get("key")] += 1
-        worst.append((e, "NPC", "%s NPC %s" % (authority.name, f.get("key")), receiver.wall(t), authority.wall(ts),
+        worst.append((e, "NPC", "%s NPC %s" % (authority.name, f.get("key")), receiver.wall(t),
+                      authority.wall(t - unwrap_relation(diff)),
                       "kind %s, fix %s" % (f.get("kind"), f.get("why", "-"))))
         foot.append(e)
     print("  %d replica records, %d lined up with the authority's NPC (truth records %d of %d NPCs)" % (
@@ -1521,6 +1531,20 @@ def guest_world(guest):
                       last.get("bs"), last.get("bs", "?")), last.get("blocks", "?"), last.get("ra", "?")))
         late_cars += cars
         late_peds += peds
+    # which ones (GWC, once a second per entity while it counts): model, the driver's name (the spawner), a traffic
+    # copy it was (was=tcopy:<net>), where
+    gwc = guest.records["GWC"]
+    if gwc:
+        per = {}
+        for t, f in gwc:
+            per.setdefault((f.get("kind"), f.get("id")), []).append((t, f))
+        print("  own entities still shown (GWC): %d" % len(per))
+        for (kind, eid), rows in sorted(per.items(), key=lambda kv: kv[1][0][0])[:12]:
+            t0, f0 = rows[0]
+            t1, f1 = rows[-1]
+            print("    %s %s: %s, spawner %s, was %s, at %s (%.1f m/s) from %s for %.0f s (%d records)" % (
+                kind, eid, f0.get("model"), f0.get("src"), f0.get("was"), f0.get("p"), num(f0.get("spd"), 0),
+                guest.wall(t0), t1 - t0 + 1, len(rows)))
     if late_cars:
         record("world.guest_own_cars", max(late_cars), guest.name)
     if late_peds:
@@ -1934,7 +1958,8 @@ def session_headers(a, b):
             ("net", "mode"), ("net", "transport"), ("net", "port"), ("net", "relay_kbs"), ("net", "password"),
             ("window", "bb"), ("window", "fullscreen"), ("window", "windowed"), ("window", "monitor"),
             ("window", "dpi"), ("sys", "win"), ("sys", "cpus"), ("sys", "ram_mb"), ("sys", "fps"),
-            ("leash", "warn"), ("leash", "max"), ("leash", "cd"), ("leash", "on"), ("leash", "from")]
+            ("leash", "warn"), ("leash", "max"), ("leash", "cd"), ("leash", "on"), ("leash", "from"),
+            ("netsim", "on"), ("netsim", "latency"), ("netsim", "jitter"), ("netsim", "loss"), ("netsim", "dup")]
     must_match = {("H", "mod"), ("H", "core"), ("H", "proto"), ("H", "state"), ("H", "hz"), ("build", "ver"),
                   ("build", "core"), ("build", "build"), ("build", "proto"), ("build", "exe_crc"),
                   ("leash", "warn"), ("leash", "max"), ("leash", "cd"), ("leash", "on")}
@@ -1970,8 +1995,18 @@ def session_headers(a, b):
                 tr.name, f.get("id"), f.get("name", "?"), f.get("via"), f.get("steam"), f.get("seq"),
                 ", joined later" if f.get("later") == "1" else ""))
     print("  %d field(s) that must match differ" % mismatches)
+    # the one-PC test tool's simulated lag (core net/net_sim.h, --net-sim): never mistaken for the link
+    lag = [(tr, (s.get("netsim") or [{}])[0]) for tr, s in ((a, sa), (b, sb))]
+    lag_on = [(tr, f) for tr, f in lag if f.get("on") == "1"]
+    lag_note = ""
+    if lag_on:
+        lag_text = ", ".join("%s %s ms +-%s one way, loss %s %%, dup %s %%" % (
+            tr.name + " (" + tr.role + ")", f.get("latency"), f.get("jitter"), f.get("loss"), f.get("dup"))
+            for tr, f in lag_on)
+        lag_note = "; simulated lag on: " + lag_text
+        print("  SIMULATED LAG ON (net_sim, a test tool: every UDP datagram the game sends waits): %s" % lag_text)
     if len(sa) > 1 and len(sb) > 1:  # both have SES: the full comparison (H alone is the old warning above)
-        record("session.mismatch", mismatches, "%s / %s" % (a.name, b.name))
+        record("session.mismatch", mismatches, "%s / %s%s" % (a.name, b.name, lag_note))
 
 
 def summaries(traces):

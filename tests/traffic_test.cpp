@@ -1751,7 +1751,12 @@ struct ReplayResult {
 
 // legacySpeed: the copy gets |vc.vel| along its heading (backwards only when the authority's car reverses), as the
 // 0.16.0 Lua did with the controller's velocity vector; else GuestCmd::vel / reverse (CopySpeed).
-ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
+// sidePull: the game's traffic system holding each copy on a line of its own, sidePullOff m beside its car (half of
+// them on the left, half on the right), by this share of the way per frame while the car moves (the 0.17.0 one-PC
+// run: copies held 1.05 m across their car, 0.03-0.07 m put back every tick); reportPre: the Lua reports where the
+// copy was before its commands (TR ... pp: what ReceiverTraffic learns that pull from).
+ReplayResult RunReplay(bool legacySpeed, uint64_t seed, float sidePull = 0, bool reportPre = true,
+                       float sidePullOff = 1.6f) {
     ReplayResult res;
     const ReplayTruth truth;
     AuthorityTraffic auth;
@@ -1770,7 +1775,7 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
     struct SimCopy {
         bool exists = false;
         double spawnAt = -1;
-        Vec3 cp, cv, lastTarget;
+        Vec3 cp, cv, lastTarget, pre;
         float cq[4] = {0, 0, 0, 1};
     };
     std::map<uint32_t, SimCopy> copies;  // by the receiver's key
@@ -1817,6 +1822,7 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
         recv.SetLocal(ReplayViewer(frame));
         recv.Tick(local, dt, cmds, bumps);
         std::set<uint32_t> driven;
+        for (auto& [key, s] : copies) s.pre = s.cp;  // before this tick's commands
         for (const auto& c : cmds) {
             SimCopy& s = copies[c.key];
             if (c.type == GuestCmd::Type::Add) {
@@ -1864,6 +1870,8 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
                 r.pos = s.cp;
                 r.vel = s.cv;
                 for (int k = 0; k < 4; ++k) r.rot[k] = s.cq[k];
+                r.pre = s.pre;
+                r.havePre = reportPre;
                 recv.SetReport(key, r, local);
             }
         }
@@ -1887,12 +1895,23 @@ ReplayResult RunReplay(bool legacySpeed, uint64_t seed) {
             (stand ? res.simStand : res.simMove).push_back(es);
             ++res.samples;
         }
-        // their own motion until the next frame (a little side slip)
+        // their own motion until the next frame (a little side slip; the game's pull toward its own line)
         for (auto& [key, s] : copies) {
             if (!s.exists) continue;
             s.cp.x += s.cv.x * dt + rng.Uniform(-0.01f, 0.01f);
             s.cp.y += s.cv.y * dt + rng.Uniform(-0.01f, 0.01f);
             s.cp.z += s.cv.z * dt;
+            CarState tn;
+            if (sidePull > 0 && truth.At(static_cast<int>(key), frame, tn, 0.6)) {
+                const float sp = std::hypot(tn.vel.x, tn.vel.y);
+                if (sp > 1.0f) {
+                    const float lx = -tn.vel.y / sp, ly = tn.vel.x / sp;  // left of the car's way
+                    const float off = (key % 2 ? 1.0f : -1.0f) * sidePullOff;
+                    const float across = (tn.pos.x + lx * off - s.cp.x) * lx + (tn.pos.y + ly * off - s.cp.y) * ly;
+                    s.cp.x += lx * across * sidePull;
+                    s.cp.y += ly * across * sidePull;
+                }
+            }
         }
         frame += step + rng.Uniform(-0.002f, 0.002f);
     }
@@ -1920,6 +1939,27 @@ void TestReplay() {
     // host authority (docs/host-authority.md WP-B): the session A result of the 2026-10-20 fixes is kept (0.75 m)
     Check(r.P95(r.sim) <= 0.8f, "replay: host authority keeps the 2026-10-20 result (p95 <= 0.8 m)",
           Fmt("%.2f m", r.P95(r.sim)));
+    // the game's sideways pull (the 0.17.0 one-PC run, traffic.true_p95 1.97 m: copies held 1.05 m across their car
+    // for seconds, 0.03-0.07 m put back every tick): without the copy's position before its commands the receiver
+    // cannot see it and the copies stay off as in game; with it the pull is taken out in advance
+    for (float k : {0.03f, 0.07f}) {
+        const ReplayResult blind = RunReplay(false, 2026, k, false);
+        const ReplayResult fixd = RunReplay(false, 2026, k, true);
+        std::printf("INFO  replay with a sideways pull of %.2f / frame toward a line 1.6 m beside the car: p95 %.2f m "
+                    "(moving %.2f) without the pull taken out, %.2f m (moving %.2f) with it; pins %u / %u\n",
+                    k, blind.P95(blind.sim), blind.P95(blind.simMove), fixd.P95(fixd.sim), fixd.P95(fixd.simMove),
+                    blind.pins, fixd.pins);
+        char name[128];
+        std::snprintf(name, sizeof name, "replay, sideways pull %.2f / frame: fails without the pull taken out", k);
+        Check(blind.P95(blind.simMove) > 1.0f, name, Fmt("moving p95 %.2f m", blind.P95(blind.simMove)));
+        std::snprintf(name, sizeof name, "replay, sideways pull %.2f / frame: traffic.true_p95 <= 1.0 m", k);
+        Check(fixd.samples > 700 && fixd.P95(fixd.sim) >= 0 && fixd.P95(fixd.sim) <= 1.0f, name,
+              Fmt("p95 %.2f m (moving %.2f)", fixd.P95(fixd.sim), fixd.P95(fixd.simMove)));
+    }
+    // and with no pull, the learning changes nothing that mattered (side slip noise only)
+    const ReplayResult calm = RunReplay(false, 2026, 0, true);
+    Check(calm.P95(calm.sim) <= 0.8f, "replay: the sideways pull learning keeps the result with no pull (p95 <= 0.8 m)",
+          Fmt("%.2f m", calm.P95(calm.sim)));
 }
 
 // the latency trace's systems (game/latency.cpp): the host's traffic states are "traffic", spawn / despawn / bump

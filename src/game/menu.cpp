@@ -82,6 +82,13 @@ std::unordered_map<int, std::string> _lastBuilt;
 std::string _pendingLoad;
 ULONGLONG _lastPoll = 0;
 ULONGLONG _loadStartedAt = 0;  // when the menu last took a requested load (it polls a few more frames after that)
+ULONGLONG _pendingAt = 0;      // when _pendingLoad was asked for (dropped after kPendingFor ms untaken)
+// The main menu of a game whose window is not in front polls far less often (the one-PC runs of 2026-10-21: a
+// guest's FREE RIDE start from the host's lobby was refused as "not at the main menu" while his window was behind the
+// host's, and he stayed at the menu): it counts as up while it polled within kMenuAlive ms.
+constexpr ULONGLONG kMenuAlive = 3000;
+constexpr ULONGLONG kPendingFor = 8000;
+ULONGLONG _pollGapMax = 0;     // the longest gap between two polls (logged with a refusal)
 
 void SetOptimistic(Mode m) {  // _mutex held
     _state.mode = m;
@@ -570,7 +577,14 @@ std::string BuildSpec(int location) {
 std::string Poll(int location) {
     {
         std::lock_guard lock(_mutex);
-        _lastPoll = GetTickCount64();
+        const ULONGLONG nowMs = GetTickCount64();
+        if (_lastPoll && nowMs - _lastPoll > _pollGapMax && nowMs - _lastPoll < 60000) _pollGapMax = nowMs - _lastPoll;
+        _lastPoll = nowMs;
+        if (!_pendingLoad.empty() && nowMs - _pendingAt > kPendingFor) {
+            MC_LOG_WARN("menu: requested load '%s' not taken in %llu ms: dropped", _pendingLoad.c_str(),
+                        static_cast<unsigned long long>(kPendingFor));
+            _pendingLoad.clear();
+        }
         if (!_pendingLoad.empty()) {
             std::string what;
             what.swap(_pendingLoad);
@@ -740,7 +754,7 @@ bool Active() { return _active.load(); }
 bool AtMainMenu() {
     if (!lua::MainThreadId()) return false;
     std::lock_guard lock(_mutex);
-    return _lastPoll && GetTickCount64() - _lastPoll < 1000;
+    return _lastPoll && GetTickCount64() - _lastPoll < kMenuAlive;
 }
 
 bool MainMenuShown() {
@@ -751,9 +765,16 @@ bool MainMenuShown() {
 }
 
 bool RequestLoad(const std::string& what) {
-    if (!AtMainMenu()) return false;
+    if (!AtMainMenu()) {
+        std::lock_guard lock(_mutex);
+        MC_LOG_INFO("menu: load '%s' not requested: the main menu last polled %s ago (longest gap %llu ms)", what.c_str(),
+                    _lastPoll ? (std::to_string(GetTickCount64() - _lastPoll) + " ms").c_str() : "never",
+                    static_cast<unsigned long long>(_pollGapMax));
+        return false;
+    }
     std::lock_guard lock(_mutex);
     _pendingLoad = what;
+    _pendingAt = GetTickCount64();
     MC_LOG_INFO("menu: load '%s' requested", what.c_str());
     return true;
 }

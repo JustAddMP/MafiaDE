@@ -3,6 +3,43 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## Unreleased (feat/fix-0171, after 0.17.0; no version change: 0.17.0 stays the published release)
+
+The three targets the 0.17.0 one-PC run failed, the report's cosmetics, the one-PC tools (windows inside the test
+strip from the first frame, simulated lag on by default). Core: `net/net_sim.h` (`--net-sim`), `window_area`.
+Checked on one PC (2026-10-21 02:19-02:24, two games over UDP loopback with `--net-sim latency=8,jitter=2` on both,
+SUM rtt 22-50 ms, median 26 ms): `sync_compare --check` all PASS (traffic.true_p95 0.71 m, foot.dz_p95 0.09 / 0.03 m,
+world.guest_own_cars 0, car.pinned 0 %, lat.player.p95 22 / 25 ms); no game window outside the strip while shown; no
+save or profile file changed. Not tested on two PCs.
+
+- Traffic copies: the game pulls a traffic copy sideways toward a line of its own between our commands (0.03-0.07 m
+  every tick in the 0.17.0 run: copies held 1.05 m across their car for seconds, 1.97 m p95, 2.36 m beyond 90 m).
+  ReceiverTraffic learns that pull from where the copy was before each command (TR `pp`, already reported) and adds
+  it against it to the next command (`GuestConfig::sidePull*`, game/traffic_model.h). Replay test with a simulated
+  pull: 1.21 m -> 0.76 m p95 (tests/traffic_test.cpp).
+- Puppets: off a motorbike the puppet is put at its player's spot and no longer stays marked seated; when the fast
+  exit with the bike's entity does not take, the scene object, the owner and then the normal exit are tried (the
+  puppet stayed on the bike, 0.74 m up, re-asked every second); a puppet standing at its player's spot but 0.25 m+
+  above or below him for 1 s is put at his spot (at most every 5 s), and held there (kinematic) while he stands when
+  it fell again (the host stood on his parked bike, 0.5 m up, on his own game). A bike copy (put on its rider's
+  transform every tick) is no longer judged by the car controller (its speed read from a copy moved every tick said
+  "ran off": car.pinned 10.2 %, all of it the bike).
+- Guest world: a copy of a host car the host no longer sends that waits to go out of view is still a copy (it was
+  counted as the guest's own moving car); a car the game made despite the switches (first seen 10 s after they stood,
+  e.g. a police car next to the guest driving) is hidden even in view (`kSpawnedLate`); a new `GWC` trace record
+  names each own car / human still shown (model, the spawner's name, the traffic copy it was, where).
+- Main menu: a main menu behind another window polls rarely; a lobby start was refused as "not at the main menu"
+  (the guest stayed at the menu, the next Enter was CONTINUE). The menu counts as up while it polled within 3 s, a
+  requested load is dropped after 8 s untaken, a refused one is logged with the poll gap.
+- sync_compare: the worst moments leave out a sample 0.5 s before a teleport (the leash test's 256 m) and car samples
+  after one; the sender's wall time is his trace clock (it showed 04:59 for 22:02: the 32-bit stamp wrap); the GWC
+  list; the simulated lag in the session headers and the `session.mismatch` line.
+- tools/onepc: `--window-area` and a windowed videoconfig (the start window used to come up at 2320,479 for ~3 s,
+  the game window at 0,0 over the primary monitor for ~0.3 s); the keeper with a WinEvent hook and a 50 ms poll,
+  logging every window seen outside the strip; `-NetSim` (default `latency=8,jitter=2,loss=0,dup=0`); no Enter at a
+  main menu (CONTINUE), the Free Ride start checked on both games, the windows brought to the front for it; devlua
+  reads an answer the game is still writing again.
+
 ## 0.17.0 (2026-10-20), pre-release, checked on one PC, not yet tested on two PCs
 
 The host's game owns the world now (docs/host-authority.md): traffic, police, pedestrians and enemies are the host's

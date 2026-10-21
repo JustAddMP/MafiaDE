@@ -738,8 +738,28 @@ void ReceiverTraffic::SetLocal(const Vec3& me, bool haveMe) {
 void ReceiverTraffic::SetReport(uint32_t key, const CopyReport& r, double now) {
     auto it = cars_.find(key);
     if (it == cars_.end() || !Finite(r.pos) || !Finite(r.vel)) return;
-    it->second.rep = r;
-    it->second.repAt = now;
+    Car& c = it->second;
+    // The game's own sideways move of the copy since our last command (where it was before this tick's commands
+    // against where our previous report had it, across the copy's heading): learned for SidePull
+    float fwd[2];
+    if (r.havePre && Finite(r.pre) && c.havePullFrom && now - c.repAt <= cfg_.reportFresh && pmotion::CarForward(r.rot, fwd)) {
+        const float mx = r.pre.x - c.pullFrom.x, my = r.pre.y - c.pullFrom.y;
+        const float side = -mx * fwd[1] + my * fwd[0];  // left of the heading positive
+        const float sx = -fwd[1] * side, sy = fwd[0] * side;
+        if (std::hypot(sx, sy) < cfg_.sidePullMax * 4) {  // a bigger jump is a knock or a teleport, not the pull
+            c.sidePull.x += cfg_.sidePullAlpha * (sx - c.sidePull.x);
+            c.sidePull.y += cfg_.sidePullAlpha * (sy - c.sidePull.y);
+        }
+    }
+    c.pullFrom = r.pos;
+    c.havePullFrom = true;
+    c.rep = r;
+    c.repAt = now;
+}
+
+void ReceiverTraffic::ResetPull(Car& c) {
+    c.sidePull = {};
+    c.havePullFrom = false;
 }
 
 void ReceiverTraffic::Release(uint32_t key) {
@@ -757,6 +777,7 @@ void ReceiverTraffic::Gone(uint32_t key) {
     it->second.fix.Reset();
     it->second.repAt = -1e9;
     it->second.crewOut = false;
+    ResetPull(it->second);
 }
 
 void ReceiverTraffic::Clear() {
@@ -962,6 +983,7 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             c.repAt = -1e9;
             c.haveLast = false;
             c.accDt = 0;
+            ResetPull(c);
             c.lastErr = 1e9f;  // no bump before the copy was seen on its target once
             c.crewOut = false;  // a new copy comes with its crew seated
             ++copies;
@@ -1047,6 +1069,25 @@ void ReceiverTraffic::Tick(double now, float dt, std::vector<GuestCmd>& out, std
             }
         } else if (cmd.vc.fix == motion::VehicleCommand::Fix::Pin || cmd.vc.fix == motion::VehicleCommand::Fix::Snap) {
             c.fix.Reset();  // put on its target: no stuck time, no previous target carried over
+        }
+        // The game's own sideways pull on the copy (SetReport: learned from where it was before each command against
+        // where we left it): taken out in advance, so the blend is not held at the dead zone plus what the game moves
+        // it back each tick (the 0.17.0 one-PC run: copies 1.05 m across their car for 15 s at a time, 0.03-0.07 m put
+        // back every tick, 1.97 m p95 moving; 2.36 m beyond 90 m)
+        if (vi.haveCopy && cmd.vc.fix != motion::VehicleCommand::Fix::Pin &&
+            cmd.vc.fix != motion::VehicleCommand::Fix::Snap && Speed(vi.targetVel) >= cfg_.sidePullSpeed) {
+            float px = -c.sidePull.x, py = -c.sidePull.y;
+            const float pl = std::hypot(px, py);
+            if (pl > cfg_.sidePullMax) {
+                px *= cfg_.sidePullMax / pl;
+                py *= cfg_.sidePullMax / pl;
+            }
+            if (pl > vehicleTuning_.minMove) {
+                cmd.vc.nudge.x += px;
+                cmd.vc.nudge.y += py;
+                cmd.vc.fix = motion::VehicleCommand::Fix::Blend;
+                ++stats_.sidePulls;
+            }
         }
         // The speed the copy is given (SetSpeed takes one number: along the copy's heading): the target's speed plus
         // the error along that heading (CopySpeed), never backwards against the way the host's car goes. A

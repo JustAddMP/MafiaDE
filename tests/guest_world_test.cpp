@@ -325,6 +325,17 @@ void TestVerdicts() {
     Check(Judge({ambHuman, ahead, 0}, HideMode::AtOnce, v) == Verdict::Hide, "ambient human: hidden at once");
     Check(Judge({genCar | kInView, behind, 10}, HideMode::OutOfView, v) == Verdict::Hide,
           "a stale kInView bit is recomputed from the camera");
+    // a car the game made despite our switches (first seen kLateAfter s after they stood): hidden in view too
+    Check(Judge({genCar | kSpawnedLate, ahead, 10}, HideMode::OutOfView, v) == Verdict::Hide,
+          "a car made late (despite the switches) in view: hidden");
+    Check(Judge({genCar | kSpawnedLate | kFresh, ahead, 10}, HideMode::OutOfView, v) == Verdict::KeepOurs,
+          "a late car is still left alone while fresh (one of ours may be loading it)");
+    Check(Judge({genCar | kSpawnedLate | kTrafficCopy, ahead, 10}, HideMode::OutOfView, v) == Verdict::KeepOurs,
+          "a late car that is a traffic copy: ours");
+    Check(Judge({ambHuman | kSpawnedLate, ahead, 0}, HideMode::OutOfView, v) == Verdict::KeepInView,
+          "the late bit is for cars only (an ambient human in view stays)");
+    Check(Judge({genCar | kSpawnedLate, ahead, 10}, HideMode::None, v) == Verdict::KeepInView,
+          "a late car in mode none: nothing hidden");
     // not the guest's own ambient world: left alone
     struct Case { const char* name; uint32_t facts; Verdict want; };
     const Case others[] = {

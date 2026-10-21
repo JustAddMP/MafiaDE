@@ -179,8 +179,13 @@ enum Fact : uint32_t {
                                 //   name / AI / vehicle part)
     kMissionName = 1u << 20,    // human: behavior_object_prime-NN-<suffix> with a suffix (a mission spawner's)
     kInVehicle = 1u << 21,      // human: in a vehicle (a crew is hidden with its car)
-    kInView = 1u << 22          // in view of the camera (Judge computes it when the glue passes the camera)
+    kInView = 1u << 22,         // in view of the camera (Judge computes it when the glue passes the camera)
+    kSpawnedLate = 1u << 23     // car: first seen when our switches had stood for kLateAfter s in this world: made
+                                //   despite them (2026-10-21 one-PC runs: a police car with a generator driver
+                                //   appeared next to the guest driving his car, kept in view 7-10 s,
+                                //   world.guest_own_cars 1): hidden even in view, it was only just made
 };
+constexpr double kLateAfter = 10.0;  // s after our switches stood in a world (the glue sets kSpawnedLate)
 
 enum class Verdict : uint8_t {
     KeepOurs = 0,     // ours (or looks like a spawner of ours)

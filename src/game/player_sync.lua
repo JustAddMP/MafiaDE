@@ -2121,20 +2121,31 @@ function M.GetOut(pp, fast)
   if pp.exitSo then return end
   if fast then
     -- GetOutCarFast takes the vehicle (in game 2026-10-20: without it "Missing adaptor arguments"; with the bike's
-    -- scene object the player got off)
+    -- scene object the player got off). The 2026-10-21 one-PC run: with the bike's entity the puppet stayed on the
+    -- bike (GetOwner still the bike, 0.74 m above him) and it was asked again every second for a minute: each try
+    -- takes the next way - the entity, the scene object, the owner scene object, then the normal exit (GetOffVehicle)
     local c = pp.bikeRec or (pp.vkey and M.cars[pp.vkey])
-    local veh = c and valid(c.ent) and c.ent or nil
-    if not veh then
-      local g2, oso = pcall(function() return pp.so:GetOwnerSceneObject() end)
-      veh = (g2 and valid(oso)) and oso or nil
-    end
-    local good, r = pcall(pp.so.GetOutCarFast, pp.so, veh)
-    if good then
-      pp.exitSo, pp.exitT = r or true, M.now
-      log("puppet " .. pp.id .. " gets off the bike (fast)")
+    local g2, oso = pcall(function() return pp.so:GetOwnerSceneObject() end)
+    local ways = {}
+    if c and valid(c.ent) then ways[#ways + 1] = { c.ent, "entity" } end
+    if c and valid(c.bso) and not same(c.bso, c.ent) then ways[#ways + 1] = { c.bso, "scene object" } end
+    if g2 and valid(oso) and not (c and (same(oso, c.ent) or same(oso, c.bso))) then ways[#ways + 1] = { oso, "owner" } end
+    pp.offTries = (pp.offTries or 0) + 1
+    local way = ways[pp.offTries]
+    if way then
+      local good, r = pcall(pp.so.GetOutCarFast, pp.so, way[1])
+      if good then
+        pp.exitSo, pp.exitT = r or true, M.now
+        log(string.format("puppet %s gets off the bike (fast, the bike's %s, try %d)", pp.id, way[2], pp.offTries))
+        return
+      end
+      log("puppet " .. pp.id .. ": GetOutCarFast (" .. way[2] .. ") failed (" .. tostring(r) .. ")")
+      pp.exitT = M.now - 1  -- the next way at the next tick
+      pp.exitSo = nil
       return
     end
-    log("puppet " .. pp.id .. ": GetOutCarFast failed (" .. tostring(r) .. "): the normal exit")
+    log(string.format("puppet %s: still on the bike after %d fast exits: the normal exit", pp.id, #ways))
+    pp.offTries = 0
   end
   pp.exitSo, pp.exitT = pp.so:GetOffVehicle(), M.now
   log("puppet " .. pp.id .. " getting out")
@@ -2766,6 +2777,10 @@ function M.Drive(pp)
   local gok, gerr = pcall(M.GuardTick, pp, so)  -- the shield: no local death (game/puppet_guard.h)
   if not gok then logErr("puppet guard", gerr) end
   if not pp.ally and M.WantsBrain() then M.Ally(pp, so) end
+  if pp.heightHold and (pp.veh or pp.hidden) then  -- held at his spot (M.HeightGuard): not in a vehicle / hidden
+    pp.heightHold = nil
+    pcall(so.SetPhysState, so, pp.hidden and 2 or 0)
+  end
   if pp.veh and pp.seat <= 3 then  -- seat 9 (getting in or out): on foot, he walks to / from the door
     pp.act = nil  -- his punches / throws from a car seat are not shown
     if pp.actRun then M.ActionEnd(pp, so, "he is in a car") end
@@ -2811,6 +2826,9 @@ function M.Drive(pp)
     return
   end
   pp.seatKey = nil
+  -- on foot: no seat any more (a bike get-off left it marked seated until the next seat: the 0.17.0 one-PC run's
+  -- PR seated=1 for 55 s after the host got off his bike)
+  pp.seated = false
   if pp.perch then M.PerchEnd(pp, "he is off the bike") end
   -- he walks to / from a car door (seat 9): script control is given back (an action may still play out, without it)
   if pp.veh and pp.seat == 9 then M.ScriptRelease(pp, so, "door walk", "door") end
@@ -2818,10 +2836,19 @@ function M.Drive(pp)
   local br = pp.bikeRec
   if br and valid(br.ent) and M.OnBike(so, br) then
     M.GetOut(pp, true)
-    if M.now - pp.exitT < 1 then return end
-    pp.exitSo = nil  -- still on it after 1 s: tried again next tick
+    if M.now - (pp.exitT or M.now) < 1 then return end
+    pp.exitSo = nil  -- still on it after 1 s: tried again next tick (the next way, M.GetOut)
   elseif br then
-    pp.bikeRec = nil
+    pp.bikeRec, pp.offTries = nil, nil
+    -- off the bike: put at his spot, where his game put him (GetOutCarFast leaves the puppet where the bike's exit
+    -- is on our game: in the 0.17.0 one-PC run on top of the parked bike copy, 0.75 m above him for 55 s)
+    if not pp.hidden and pp.tx then
+      so:SetPos(V(pp.tx, pp.ty, pp.tz))
+      if pp.hx then so:SetDir(V(pp.hx, pp.hy, 0)) end
+      log(string.format("puppet %s is off bike %s: put at its player's spot", pp.id, tostring(br.key)))
+      trace("PH", string.format("id=%s why=bike_off", pp.id))
+    end
+    pp.heightT = nil
   end
   if valid(so:GetOwner()) then  -- the player got out: let the puppet climb out, then follow on foot again
     M.GetOut(pp)
@@ -2900,12 +2927,65 @@ end
 -- pulled toward the target every tick while its walk played at its own pace: the feet slid.
 -- SetMovementSpeedMult(m) (C_WrapperHuman, an AI command; docs/game-api.md 4, unverified) is given right before each
 -- walk command, so a walk is never interrupted by it.
+-- Height guard: a puppet that stands at his spot but on something he is not on (a parked bike copy, a car roof) or
+-- below it (slid off a kerb's edge) is put at his spot. Only while he stands (gait 0, not in the air, his height
+-- steady) and the puppet is within HEIGHT_NEAR m of him across the ground, HEIGHT_OFF m above or below him for
+-- HEIGHT_FOR s; at most once every HEIGHT_EVERY s (0.17.0 one-PC run: 0.75 m above him on the bike copy for 55 s,
+-- then 0.30 m below him for minutes; foot.dz_p95 0.75 m).
+local HEIGHT_OFF, HEIGHT_NEAR, HEIGHT_FOR, HEIGHT_EVERY, HEIGHT_HOLD = 0.25, 1.0, 1.0, 5.0, 12.0
+
+function M.HeightGuard(pp, so, lc, p0)
+  local stand = lc.gait == 0 and not pp.inAir and math.sqrt((pp.vx or 0) ^ 2 + (pp.vy or 0) ^ 2) < 0.3
+  -- held at his spot (below): while he stands there, nothing else; let go once he moves or his height changes
+  if pp.heightHold then
+    local h = pp.heightHold
+    if stand and math.abs(pp.tz - h.z) < 0.1 and math.abs(pp.tx - h.x) + math.abs(pp.ty - h.y) < 0.3 then
+      so:SetPos(V(pp.tx, pp.ty, pp.tz))
+      return true
+    end
+    pp.heightHold = nil
+    pcall(so.SetPhysState, so, 0)
+    log(string.format("puppet %s: no longer held at its player's spot (he moved)", pp.id))
+    trace("PH", string.format("id=%s why=height_release", pp.id))
+    return false
+  end
+  local dz = p0.z - pp.tz
+  if not (stand and pp.dist < HEIGHT_NEAR and math.abs(dz) > HEIGHT_OFF) then
+    pp.heightT = nil
+    return false
+  end
+  if not pp.heightT or math.abs(pp.tz - (pp.heightZ or pp.tz)) > 0.05 then
+    pp.heightT, pp.heightZ = M.now, pp.tz
+    return false
+  end
+  if M.now - pp.heightT < HEIGHT_FOR or M.now - (pp.heightFixT or -100) < HEIGHT_EVERY then return false end
+  -- put at his spot again within HEIGHT_HOLD s and still below him: there is nothing under it here where he stands
+  -- on something (the 2026-10-21 02:01 run: the host stood on his parked bike, 0.5 m up; his puppet fell off the
+  -- bike copy every time, put back every 5 s for two minutes): held there kinematic while he stands
+  local again = dz < 0 and pp.heightFixT and M.now - pp.heightFixT < HEIGHT_HOLD
+  pp.heightFixT, pp.heightT = M.now, nil
+  pp.heightFixes = (pp.heightFixes or 0) + 1
+  so:SetPos(V(pp.tx, pp.ty, pp.tz))
+  if again then
+    pcall(so.SetPhysState, so, 1)
+    pp.heightHold = { x = pp.tx, y = pp.ty, z = pp.tz }
+  end
+  if pp.heightFixes <= 10 or pp.heightFixes % 50 == 0 then
+    log(string.format("puppet %s stood %.2f m %s its player for %.1f s: put at his spot%s (#%d)", pp.id, math.abs(dz),
+      dz > 0 and "above" or "below", HEIGHT_FOR, again and ", held there while he stands (it fell again)" or "",
+      pp.heightFixes))
+  end
+  trace("PH", string.format("id=%s why=height dz=%.2f n=%d hold=%d", pp.id, dz, pp.heightFixes, again and 1 or 0))
+  return true
+end
+
 function M.Walk(pp, so)
   local lc = pp.lc
   if not lc then return end
   local aiming = pp.cb and pp.cb.aim
   local p0 = so:GetPos()
   pp.dist = math.sqrt((pp.tx - p0.x) ^ 2 + (pp.ty - p0.y) ^ 2)
+  if lc.fix ~= 2 and M.HeightGuard(pp, so, lc, p0) then return end
   if lc.fix == 2 then
     so:SetPos(V(pp.tx, pp.ty, pp.tz))
     if not aiming then so:SetDir(V(pp.hx, pp.hy, 0)) end

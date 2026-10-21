@@ -6,6 +6,7 @@ from the repo root, after `build.cmd`:
 
 ```
 powershell -ExecutionPolicy Bypass -File tools\onepc\run_start.ps1   # saves backed up, keeper, both games, Free Ride
+                                                                      # (-NetSim "latency=20,jitter=5" / "off": the lag)
 powershell -ExecutionPolicy Bypass -File tools\onepc\run_test.ps1    # the checks, screenshots
 powershell -ExecutionPolicy Bypass -File tools\onepc\run_stop.ps1    # keeper off, unmute, close, saves restored + checked
 powershell -ExecutionPolicy Bypass -File tools\onepc\compare.ps1     # sync_compare --check + log counts
@@ -15,9 +16,25 @@ Settings (environment): `MC_GAME_DOCS` (the game's `My Games\Mafia Definitive Ed
 OneDrive-redirected on the test PC), `MC_AREA_X` / `MC_AREA_R` (the screen strip the windows must stay in, default
 2916 / 4233), `MC_ONEPC_WORK` (notes, screenshots, the save backup; default `%TEMP%\mafiacoop-onepc`).
 
-Rules the scripts follow: the keeper starts before the games and moves / shrinks a window into the area within a
-quarter second (the game opens a 480x481 start window elsewhere for a moment and can grow its window to the profile's
-resolution: both are logged in `run.log` as "first seen at"); key presses go only to a game window that is in front;
+Simulated lag (on by default): run_start.ps1 starts both games with `--net-sim latency=8,jitter=2,loss=0,dup=0`
+(core `net/net_sim.h`, ini `net_sim = ...` in any section): every UDP datagram a game sends waits 8 ms +-2 ms, so
+the round trip in game is 20-30 ms like a real link instead of ~7-10 ms (the games' own frames add ~8 ms: with
+12 ms +-3 the 2026-10-21 01:45 run's SUM `rtt=` read 29-47 ms, median 34; core `tests/net_sim.cpp` measures 12 ms
++-3 on bare transports at 23 ms). The guest's `net: ... rtt` log lines and the SUM `rtt=` show it. It is a test tool, not a sync
+setting: Steam P2P never gets it, the logs say `SIMULATED LAG ON` at the transport start and in the session start
+block, and the SES `part=netsim` record puts it into sync_compare's session headers (`SIMULATED LAG ON ...`, and the
+`session.mismatch` line names it). `-NetSim off` runs without it; any other value is passed on as it is.
+
+Windows (the strip x `MC_AREA_X`..`MC_AREA_R`): the games are started with `--window-area <x>,<r>,<y>` (core
+`dll/window_place.h`: every top-level window the game creates is made at x, y - its 480x481 start window used to come
+up in the middle of the primary monitor, 2320,479, for about 3 s) and `Saves\videoconfig.cfg` says windowed (`x y
+1280 720 0 ...`; the old `... 1 ...` made the game a fullscreen window over the whole primary monitor, 0,0, for
+~0.3 s). The keeper starts before the games: a WinEvent hook moves any window of the game or MafiaCoop.exe that is
+created, shown or moved outside the strip at once (before it is shown when it can), with a 50 ms poll as the
+fallback; `keeper.log` has a line `OUTSIDE ... (VISIBLE)` for every window seen outside while shown (and the totals
+when it stops: `windows seen outside the strip while shown: N`) - report every one. Left over: hidden system windows
+of the game (SystemUserAdapterWindowClass, the D3D / DXGI helper windows) are made at 0,0 by Windows, never shown;
+the keeper moves them anyway. Key presses go only to a game window that is in front;
 screenshots copy only a game window's rectangle; run_stop.ps1 stops the keeper before unmuting (it would mute again)
 and must end with `unmuted sessions: 0`, `profile and save files changed by the run: 0` and `saves: 0 file(s) differ`. Never pick New Game.
 
