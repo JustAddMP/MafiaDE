@@ -2397,8 +2397,9 @@ function M.Seat(pp, c)
     -- A back seat (2, 3) does not keep a puppet put there at once: in the 2026-10-21 04:44 one-PC run the rider's
     -- puppet was thrown out of the back seat 0.0 s after each GetOnVehicle (both ways, 4 times, then hidden for the
     -- ride), while the game's own animated get-in from beside the car (05:05, the same car and seat) kept it seated
-    -- through the drive. Thrown out of a back seat of a standing car: put at its door and the animated get-in, once.
-    if pp.seat >= 2 and (pp.ejects or 0) >= 1 and not pp.rearAnim then
+    -- through the drive (and in the 05:08 run, used after the first throw-out, every time). A back seat of a standing
+    -- car: put at its door and the animated get-in, first (once per seat; a moving car gets the seat at once).
+    if pp.seat >= 2 and not pp.rearAnim then
       local sp = M.SpeedMs(car)
       if sp >= 0 and sp < 0.3 then
         local cp = car:GetPos()
@@ -2413,8 +2414,8 @@ function M.Seat(pp, c)
         if pp.hidden then M.Hide(pp, false, true) end
         so:SetPos(V(cp.x - dx * 0.8 + sx * 1.6, cp.y - dy * 0.8 + sy * 1.6, cp.z))
         animate, fast, pp.rearAnim = true, false, true
-        log(string.format("puppet %s: back seat %d of car %s did not keep it: at its door, the animated get-in", pp.id,
-          pp.seat, tostring(pp.vkey)))
+        log(string.format("puppet %s: back seat %d of car %s: at its door, the animated get-in", pp.id, pp.seat,
+          tostring(pp.vkey)))
       end
     end
     if pp.hidden then M.Hide(pp, false, true) end
