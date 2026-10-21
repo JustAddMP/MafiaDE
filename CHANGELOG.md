@@ -10,7 +10,13 @@ showed (tools/onepc/run_more.ps1: driving together, ride along both ways and in 
 guest downed far away, leave and rejoin, a crime near the host). Wire-compatible with 0.17.0 (no message changed).
 Core: test input `text`. Checked on one PC (2026-10-21 07:10-07:16, run_start + run_test, `--net-sim
 latency=8,jitter=2`): `sync_compare --check` all PASS, seat.flips_per_min 0 / 0 (the bike loop happened and was
-perched); no save or profile file changed; both session bundles written at a normal close. Not tested on two PCs.
+perched); no save or profile file changed; both session bundles written at a normal close. With run_more the
+scenarios pass but for flaky single values (seat.flips 0.3-1.5 a minute from a front passenger thrown out at once,
+car.speed_ratio of short drives, lat.player.p95 41-47 ms on the guest after a rejoin). The harsh profile (`--net-sim
+latency=40,jitter=15,loss=0.02`, rtt ~91 ms) passes everything but lat.player.p95 (66-80 ms) and seat.flips (1.6 /
+0.35): tools/onepc/README.md has its limits. A lobby CHAPTER 2: TAXI (07:49): all PASS (npc.p95 0.27 m, npc.max
+3.81 m, ped.coverage 99.3 %), up to the taxi stand only (its first fight needs the mission played). Not tested on
+two PCs.
 
 - Motorbike: the host's puppet on the guest was thrown off its bike copy ~0.1 s after every seat command and put
   back at once, 163-193 times a ride (two of four 0.17.0 runs; seen again on 2026-10-21 in four of nine rides: the
