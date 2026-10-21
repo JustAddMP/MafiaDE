@@ -120,6 +120,12 @@ void Expect(System s, const std::string& key) {
     if (sh.accept) sh.tracker.Expect(s, key);
 }
 
+void Forget(System s, const std::string& key) {
+    Shared& sh = S();
+    std::lock_guard lock(sh.mu);
+    sh.tracker.Forget(s, key);
+}
+
 }  // namespace join
 
 void JoinSync::Attach(net::Session& session) {

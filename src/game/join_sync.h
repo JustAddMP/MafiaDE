@@ -55,6 +55,9 @@ inline bool PerKey(System s) { return s == System::Player || s == System::Police
 void Mark(System s, const std::string& key = {});
 void Mark(System s, uint32_t key);
 void Expect(System s, const std::string& key);
+// A part expected before that can no longer come (the copy that asked for its car damage was despawned: the host's
+// car left our area): not waited for any more.
+void Forget(System s, const std::string& key);
 
 class Tracker {
 public:
@@ -94,6 +97,11 @@ public:
     }
     void Expect(System s, const std::string& key) {
         if (begun_ && !reported_ && !complete_) Need(s, key);
+    }
+    // The 2026-10-21 05:37 one-PC run: a guest who joined again waited the whole 15 s for the damage of host traffic
+    // car t125, whose copy had been despawned (the car left his area) before the answer came: "still missing".
+    void Forget(System s, const std::string& key) {
+        if (!complete_) need_.erase({s, PerKey(s) ? key : std::string()});
     }
     void Mark(System s, const std::string& key, double now) {
         const size_t i = static_cast<size_t>(s);

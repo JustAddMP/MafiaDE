@@ -138,6 +138,7 @@ void OnDespawn(net::PlayerId from, net::ByteReader& r) {
     for (uint16_t n : nets) {
         sh.recv.OnDespawn(n, now);
         vis::Event(vis::Kind::Traffic, n, "leave", "rx", from);
+        join::Forget(join::System::CarDamage, "t" + std::to_string(n));  // its damage answer may never come now
     }
     _rxDespawns += static_cast<uint32_t>(nets.size());
 }

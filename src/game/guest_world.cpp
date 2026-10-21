@@ -328,7 +328,7 @@ Verdict Judge(const Entity& e, HideMode mode, const View& view, const char** rea
         why = "not hiding";
         return Verdict::KeepInView;
     }
-    if (mode == HideMode::OutOfView && (f & kInView) && !(car && (f & kSpawnedLate))) {
+    if (mode == HideMode::OutOfView && (f & kInView) && !(car && (f & (kSpawnedLate | kPolice)))) {
         why = "in view";
         return Verdict::KeepInView;
     }

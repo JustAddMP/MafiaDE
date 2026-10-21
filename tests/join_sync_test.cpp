@@ -119,6 +119,22 @@ void TestCarDamage() {
     Check(c && std::fabs(c->after - 6.0) < 1e-9, "cars: complete with the last answer", c ? std::to_string(c->after) : "");
     t.Expect(System::CarDamage, "0:999");  // after complete: not waited for
     Check(t.Missing().empty(), "cars: a copy asking after the world is complete is not waited for");
+
+    // the 2026-10-21 05:37 run's rejoin: a host traffic car's copy asked, then was despawned before the answer
+    Tracker f;
+    f.Begin(0.0, false, {0});
+    f.InWorld(0.0);
+    MarkAll(f, 0.5, {0});
+    f.Mark(System::Doors, {}, 3.5);
+    f.Expect(System::CarDamage, "t125");
+    f.Expect(System::CarDamage, "t126");
+    f.Mark(System::CarDamage, "t126", 4.0);
+    Check(!Find(f.Poll(4.1), Ev::Complete), "cars: t125 not answered yet: waited for");
+    f.Forget(System::CarDamage, "t125");
+    auto fe = f.Poll(4.2);
+    const Ev* fc = Find(fe, Ev::Complete);
+    Check(fc && !fc->late && fc->after < 5.0, "cars: its copy despawned: no longer waited for (complete, not 'still missing')",
+          fc ? std::to_string(fc->after) : "none");
 }
 
 void TestEarlyMarks() {

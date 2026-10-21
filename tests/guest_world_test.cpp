@@ -328,6 +328,10 @@ void TestVerdicts() {
     // a car the game made despite our switches (first seen kLateAfter s after they stood): hidden in view too
     Check(Judge({genCar | kSpawnedLate, ahead, 10}, HideMode::OutOfView, v) == Verdict::Hide,
           "a car made late (despite the switches) in view: hidden");
+    Check(Judge({genCar | kPolice, ahead, 13}, HideMode::OutOfView, v) == Verdict::Hide,
+          "our own police car in view (made early, met 450 m out): hidden");
+    Check(Judge({genCar | kPolice | kTrafficCopy, ahead, 13}, HideMode::OutOfView, v) == Verdict::KeepOurs,
+          "a copy of the host's police car: kept");
     Check(Judge({genCar | kSpawnedLate | kFresh, ahead, 10}, HideMode::OutOfView, v) == Verdict::KeepOurs,
           "a late car is still left alone while fresh (one of ours may be loading it)");
     Check(Judge({genCar | kSpawnedLate | kTrafficCopy, ahead, 10}, HideMode::OutOfView, v) == Verdict::KeepOurs,

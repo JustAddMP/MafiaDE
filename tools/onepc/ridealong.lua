@@ -1,5 +1,5 @@
 -- (one-PC scenario, either game) our player gets into the OTHER player's car (our copy of it) at seat
--- MafiaCoop.rideSeat (0 = driver, 1 = front passenger, 2 / 3 = the back; default 1), walking to its door and getting in (animated): the ride
+-- MafiaCoop.rideSeat (0 = driver, 1 = front passenger, 2 / 3 = the back; default 1), at once: the ride
 -- along. A seat the car does not have is refused (the 2026-10-21 04:06 run: seat 2 of a two-seat smith_v12 put the
 -- guest under the street); if we are not in the car 2 s later and fell, we are put back where we stood.
 local M = MafiaCoop
@@ -24,7 +24,7 @@ end
 local q0 = { x = q.x, y = q.y, z = q.z }
 StartThread(function()
   p:LockControls(true)
-  local ok, e = pcall(p.GetOnVehicle, p, best.ent, seat + 1, true, "WALK")  -- animated, as a player gets in
+  local ok, e = pcall(p.GetOnVehicle, p, best.ent, seat + 1, false, "WALK")  -- at once (the 05:51 run: animated, 45 s or never)
   if ok and e then Wait(e) end
   p:LockControls(false)
   Sleep(2)

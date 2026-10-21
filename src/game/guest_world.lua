@@ -43,7 +43,7 @@ local COPY_SPOT = 8         -- m around a loading traffic copy's spawn spot: no 
 local F = { car = 1, human = 2, active = 4, puppet = 8, pfac = 16, tcopy = 32, crew = 64, pedOwned = 128,
   pedSpawner = 256, npcCopy = 512, npcSpawner = 1024, playerCar = 2048, ownVehicle = 4096, fixed = 8192,
   facBusy = 16384, copySpot = 32768, fresh = 65536, genDriver = 131072, tram = 262144, ambient = 524288,
-  mission = 1048576, inVehicle = 2097152, inView = 4194304, late = 8388608 }
+  mission = 1048576, inVehicle = 2097152, inView = 4194304, late = 8388608, police = 16777216 }
 local LATE_AFTER = 10       -- s (the dll's kLateAfter): a car first seen this long after our switches stood is late
 
 local function log(s) if mc_log then mc_log("guest world: " .. s) end end
@@ -205,6 +205,7 @@ local function carFacts(e, id, ours, busy, spots, now)
   local okm, model = pcall(e.GetVehicleModelName, e)
   model = okm and tostring(model or ""):lower() or ""
   if model:find("tram") or model:find("train") or model:find("boat") then f = f + F.tram end
+  if model:find("_p$") or model:find("police") then f = f + F.police end  -- (guest_world.h kPolice)
   return f, q
 end
 

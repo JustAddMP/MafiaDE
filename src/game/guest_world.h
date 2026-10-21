@@ -180,10 +180,14 @@ enum Fact : uint32_t {
     kMissionName = 1u << 20,    // human: behavior_object_prime-NN-<suffix> with a suffix (a mission spawner's)
     kInVehicle = 1u << 21,      // human: in a vehicle (a crew is hidden with its car)
     kInView = 1u << 22,         // in view of the camera (Judge computes it when the glue passes the camera)
-    kSpawnedLate = 1u << 23     // car: first seen when our switches had stood for kLateAfter s in this world: made
+    kSpawnedLate = 1u << 23,    // car: first seen when our switches had stood for kLateAfter s in this world: made
                                 //   despite them (2026-10-21 one-PC runs: a police car with a generator driver
                                 //   appeared next to the guest driving his car, kept in view 7-10 s,
                                 //   world.guest_own_cars 1): hidden even in view, it was only just made
+    kPolice = 1u << 24          // car: a police car (model *_p: shubert_e_six_p, ...). The guest's game has no police of
+                                //   its own (the host's are copies); one made before the switches stood, met later far
+                                //   from the start (the 05:37 / 05:51 one-PC runs: 450 m out for the leash, 13 m/s in
+                                //   view for 6 s, world.guest_own_cars 1): hidden even in view
 };
 constexpr double kLateAfter = 10.0;  // s after our switches stood in a world (the glue sets kSpawnedLate)
 
