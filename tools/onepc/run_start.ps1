@@ -93,7 +93,7 @@ if ($Chapter) {
   $start = $rows | Where-Object { $_.label -like "START*" } | Select-Object -First 1
   Say "host lobby: $($mode.label) / $($start.label)"
   if (-not ($mode -and $mode.label -like "*$Chapter*" -and $mode.label -notlike "*STORY*" -and $start.label -like "START CHAPTER*$Chapter*")) {
-    Say "the host's lobby does not show the chapter $Chapter: stop (run_stop.ps1)"; exit 1
+    Say "the host's lobby does not show the chapter ${Chapter}: stop (run_stop.ps1)"; exit 1
   }
   Say "host start: $(PickRow 'host' $rows 'START CHAPTER')"
   for ($k = 0; $k -lt 20 -and -not (LogHas "host" "lobby start: CHAPTER"); $k++) { Start-Sleep 1 }
