@@ -108,7 +108,8 @@ lost each way. The default targets of `sync_compare --check` are for the default
 these looser limits are what to hold it to (read the FAIL lines of compare.txt against them; the defaults are not
 changed):
 
-HARSH_TABLE
+(Measured in the first harsh run on this branch: see below once it is in; until then read its FAILs against the
+default limits and say by how much.)
 
 One PC cannot show: Steam P2P, real latency / loss, two different machines' timing, the real Free Ride garage
 removing a puppet (simulated by losstest.lua), a bike from the garage (spawned by bike_spawn.lua instead), a car
