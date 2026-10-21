@@ -85,7 +85,7 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 ## run_more.ps1: the longer scenarios (docs/host-authority.md section 6)
 
 After run_test.ps1, before run_stop.ps1 (`-Steps drive,ride,leashcar,down,rejoin,crime`, any of them, in this order).
-Both games get four-seat cars (`shubert_e_six_taxi`, car_spawn.lua with `MafiaCoop.tcarModel`), spawned one after
+Both games get four-seat cars (`culver_airmaster`, not the taxi: see run_more.ps1; car_spawn.lua with `MafiaCoop.tcarModel`), spawned one after
 the other (two cars of one model spawned at once 3 m apart are taken for one car by M.FindLocalCar's adoption).
 
 | Step | Screenshots | Must see (run.log, logs) |

@@ -15,15 +15,17 @@ param([string]$Steps = "drive,ride,leashcar,down,rejoin,crime")
 . "$PSScriptRoot\common.ps1"
 $want = $Steps -split ","
 function Step([string]$n) { $want -contains $n }
-function Both([string]$name) { Lua 0 "$PSScriptRoot\face.lua" | Out-Null; Lua 1 "$PSScriptRoot\face.lua" | Out-Null
+function Both([string]$name) { foreach ($g in 0, 1) { $r = ReloadGuard $g; if ($r) { Say $r } }
+  Lua 0 "$PSScriptRoot\face.lua" | Out-Null; Lua 1 "$PSScriptRoot\face.lua" | Out-Null
   Start-Sleep 1; Say "host: $(Lua 0 "$PSScriptRoot\face.lua")"; Say "guest: $(Lua 1 "$PSScriptRoot\face.lua")"
   Say (Shot 0 $name); Say (Shot 1 $name) }
 function Seats([string]$what) { Say "$what host sees: $(Lua 0 "$PSScriptRoot\seat_probe.lua")"; Say "$what guest sees: $(Lua 1 "$PSScriptRoot\seat_probe.lua")" }
 function Count([string]$tag, [string]$pattern) { @(Select-String -Path "$Out\logs\mafiacoop-$tag.log" -Pattern $pattern).Count }
 Say (Fit 0); Say (Fit 1)
-# four-seat cars (the ride along takes the back seat too), one after the other: two cars of one model spawned at the
+# four-seat cars (the ride along takes the back seat too; not the taxi: the 05:24 run's host world was reloaded
+# (FreeRoamRetry) right after he got into one), one after the other: two cars of one model spawned at the
 # same moment 3 m apart are taken for one car (player_sync.lua M.FindLocalCar adopts a free car of that model)
-foreach ($i in 0, 1) { Lua $i -code "MafiaCoop.tcarModel = 'shubert_e_six_taxi'; return 'ok'" | Out-Null }
+foreach ($i in 0, 1) { Lua $i -code "MafiaCoop.tcarModel = 'culver_airmaster'; return 'ok'" | Out-Null }
 
 if (Step "drive") {
   # each in a car of his own, then each drives a few seconds (keys go to the window in front, one at a time)
@@ -99,8 +101,15 @@ if (Step "rejoin") {
   for ($k = 0; $k -lt 20 -and (Count "guest" "handshake complete") -le $j0; $k++) { Start-Sleep 1 }
   Say "guest connected again: $((Count 'guest' 'handshake complete') -gt $j0)"
   Front 1; Start-Sleep 2
-  $rows = PanelRows "guest" "open lobby"
-  Say "guest lobby: $(($rows | ForEach-Object { $_.label }) -join ' | ')"
+  # the lobby shows JOIN GAME once the host's lobby state says he is in his game (the 05:33 run: READY = NO for the
+  # first look 6 s after the connect): looked at again for up to 30 s
+  $tj = Get-Date
+  for ($k = 0; $k -lt 10; $k++) {
+    $rows = PanelRows "guest" "open lobby"
+    if ($rows | Where-Object { $_.label -like "JOIN GAME*" }) { break }
+    Set-Content "$Out\dev\guest.input.txt" "key 0x1B"; Start-Sleep 2
+  }
+  Say "guest lobby ($([int]((Get-Date) - $tj).TotalSeconds) s): $(($rows | ForEach-Object { $_.label }) -join ' | ')"
   $s0 = Count "guest" "menu: starting 'free_ride'"
   Say "guest join game: $(PickRow 'guest' $rows 'JOIN GAME')"
   for ($k = 0; $k -lt 15 -and (Count "guest" "menu: starting 'free_ride'") -le $s0; $k++) { Start-Sleep 1 }

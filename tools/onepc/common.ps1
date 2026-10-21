@@ -113,3 +113,22 @@ function Front([int]$i) {
   [OnePc]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [OnePc]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
   [OnePc]::SetForegroundWindow($h) | Out-Null; Start-Sleep 1
 }
+# A Free Ride world reload of game $i (its player died or the game failed something: FreeRoamRetry loads
+# 'freeroam_player_death'; the 2026-10-21 05:29 run) leaves its loading screen waiting for a key, and nothing of
+# that game ticks meanwhile. Called after a step: when the game logged such a load since the last call, Enter is
+# pressed on that window (only on this loading screen: the load is the Free Ride's own state, never the story) until
+# its scripts answer again. Returns a line for the log, or "" when nothing happened.
+$script:ReloadSeen = @{}
+function ReloadGuard([int]$i) {
+  $tag = @('host', 'guest')[$i]
+  $n = @(Select-String -Path "$Out\logs\mafiacoop-$tag.log" -Pattern "load of 'freeroam_player_death'|load of 'freeroam_before_quest").Count
+  if (-not $script:ReloadSeen.ContainsKey($tag)) { $script:ReloadSeen[$tag] = 0 }
+  if ($n -le $script:ReloadSeen[$tag]) { return "" }
+  $script:ReloadSeen[$tag] = $n
+  for ($k = 0; $k -lt 8; $k++) {
+    $ans = & "$Repo\tools\devlua.ps1" -Tag $tag -Code "local g, up = pcall(game.hud.IsLoadingScreenUp, game.hud) return (g and up) and 'loading' or 'in world'" -TimeoutS 4 2>$null
+    if ("$ans" -match "in world") { return "the $tag's Free Ride world was reloaded (FreeRoamRetry): back in it after $k Enter(s)" }
+    Keys $i @("ENTER") | Out-Null; Start-Sleep 5
+  }
+  "the $tag's Free Ride world was reloaded (FreeRoamRetry) and it is not back after 8 Enters"
+}

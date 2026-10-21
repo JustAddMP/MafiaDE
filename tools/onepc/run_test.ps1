@@ -1,7 +1,8 @@
 # One-PC test, step 2 (both games in a co-op Free Ride, run_start.ps1): the 2026-10-20 checks. Screenshots of the
 # game windows only go to $Work\shots, the run's notes to $Work\run.log. See tools/onepc/README.md for what to expect.
 . "$PSScriptRoot\common.ps1"
-function Both([string]$name) { Lua 0 "$PSScriptRoot\face.lua" | Out-Null; Lua 1 "$PSScriptRoot\face.lua" | Out-Null
+function Both([string]$name) { foreach ($g in 0, 1) { $r = ReloadGuard $g; if ($r) { Say $r } }
+  Lua 0 "$PSScriptRoot\face.lua" | Out-Null; Lua 1 "$PSScriptRoot\face.lua" | Out-Null
   Start-Sleep 1; Say "host: $(Lua 0 "$PSScriptRoot\face.lua")"; Say "guest: $(Lua 1 "$PSScriptRoot\face.lua")"
   Say (Shot 0 $name); Say (Shot 1 $name) }
 Say (Fit 0); Say (Fit 1)
