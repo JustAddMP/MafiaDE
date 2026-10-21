@@ -2,8 +2,15 @@
 # must not be there. Output: $Work\compare.txt.
 . "$PSScriptRoot\common.ps1"
 $host_ = Get-ChildItem "$Out\logs\trace\mafiacoop-host-*.trace" | Sort-Object LastWriteTime | Select-Object -Last 1
-$guest = Get-ChildItem "$Out\logs\trace\mafiacoop-guest-*.trace" | Sort-Object LastWriteTime | Select-Object -Last 1
-python -I "$Repo\tools\sync_compare.py" $host_.FullName $guest.FullName --check | Set-Content "$Work\compare.txt"
+# every guest trace of the host's session: a guest who left and joined again (run_more.ps1 rejoin) wrote a second
+# one; each is compared with the host's (one report after the other, each with its own target list)
+$guests = @(Get-ChildItem "$Out\logs\trace\mafiacoop-guest-*.trace" | Where-Object { $_.LastWriteTime -ge $host_.CreationTime } | Sort-Object CreationTime)
+if (-not $guests) { $guests = @(Get-ChildItem "$Out\logs\trace\mafiacoop-guest-*.trace" | Sort-Object LastWriteTime | Select-Object -Last 1) }
+Remove-Item "$Work\compare.txt" -ErrorAction SilentlyContinue
+foreach ($guest in $guests) {
+  Add-Content "$Work\compare.txt" "######## $($host_.Name) vs $($guest.Name)"
+  python -I "$Repo\tools\sync_compare.py" $host_.FullName $guest.FullName --check | Add-Content "$Work\compare.txt"
+}
 foreach ($tag in "host", "guest") {
   $log = "$Out\logs\mafiacoop-$tag.log"
   foreach ($p in "cars error", "did not load in", "is gone \(removed by the game", "spawner is stuck", "rides bike",

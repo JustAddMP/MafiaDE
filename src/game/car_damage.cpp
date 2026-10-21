@@ -284,11 +284,21 @@ bool Repaired(const Snapshot& was, const Snapshot& now) {
     // writes on it), none of that is a repair (0.15.0 test: such a drop was sent out as one)
     if ((was.flags & kExploded) && (now.flags & kExploded)) return false;
     if (was.layout == now.layout && was.parts.size() == now.parts.size()) {
+        // A part that lost 24 quanta or more, or came back, and the car's damage as a whole at least halved: a repair
+        // repairs every part. One part alone reading lower while the car is still a wreck around it is the game's
+        // damage model (the 2026-10-21 04:44 one-PC run: the guest's crashed taxi went "parts 6/38 damaged, worst
+        // 100%" -> "4/38, worst 100%" and back many times a second after a crash, each read as a repair: "epoch N,
+        // everyone repairs theirs" 12 times in 2 s, the host's copy repaired and damaged again each time).
+        bool drop = false;
+        uint32_t before = 0, after = 0;
         for (size_t i = 0; i < now.parts.size(); ++i) {
             const uint8_t o = was.parts[i], v = now.parts[i];
-            if (o == kGone && v != kGone) return true;
-            if (o != kGone && v != kGone && o >= v + 24) return true;
+            if (o == kGone && v != kGone) drop = true;
+            if (o != kGone && v != kGone && o >= v + 24) drop = true;
+            before += o;
+            after += v;
         }
+        if (drop && after * 2 <= before) return true;
     }
     const size_t nw = std::min(was.wheels.size(), now.wheels.size());
     for (size_t i = 0; i < nw; ++i)

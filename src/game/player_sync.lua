@@ -2394,6 +2394,29 @@ function M.Seat(pp, c)
       local sp = M.SpeedMs(car)
       animate = sp >= 0 and sp < 0.3 and (q.x - cp.x) ^ 2 + (q.y - cp.y) ^ 2 < 4 * 4
     end
+    -- A back seat (2, 3) does not keep a puppet put there at once: in the 2026-10-21 04:44 one-PC run the rider's
+    -- puppet was thrown out of the back seat 0.0 s after each GetOnVehicle (both ways, 4 times, then hidden for the
+    -- ride), while the game's own animated get-in from beside the car (05:05, the same car and seat) kept it seated
+    -- through the drive. Thrown out of a back seat of a standing car: put at its door and the animated get-in, once.
+    if pp.seat >= 2 and (pp.ejects or 0) >= 1 and not pp.rearAnim then
+      local sp = M.SpeedMs(car)
+      if sp >= 0 and sp < 0.3 then
+        local cp = car:GetPos()
+        local g, d = pcall(car.GetDir, car)
+        local dx, dy = 0, 1
+        if g and d then
+          local l = math.sqrt(d.x * d.x + d.y * d.y)
+          if l > 1e-3 then dx, dy = d.x / l, d.y / l end
+        end
+        local side = pp.seat == 2 and -1 or 1  -- seat 2 behind the driver (left), 3 on the right
+        local sx, sy = dy * side, -dx * side   -- the car's right is (dy, -dx)
+        if pp.hidden then M.Hide(pp, false, true) end
+        so:SetPos(V(cp.x - dx * 0.8 + sx * 1.6, cp.y - dy * 0.8 + sy * 1.6, cp.z))
+        animate, fast, pp.rearAnim = true, false, true
+        log(string.format("puppet %s: back seat %d of car %s did not keep it: at its door, the animated get-in", pp.id,
+          pp.seat, tostring(pp.vkey)))
+      end
+    end
     if pp.hidden then M.Hide(pp, false, true) end
     pp.seatAnim = animate
     if animate then pp.animTried = true end
@@ -2877,6 +2900,7 @@ function M.Drive(pp)
     if pp.seatKey ~= sk then
       if mc_seatloop then mc_seatloop(tonumber(pp.id) or 0) end  -- a new ride: its get-offs counted from zero
       pp.seatKey, pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = sk, 0, 0, false, nil, nil
+      pp.rearAnim = nil
       pp.leaving, pp.seatCheckOff, pp.seatedT, pp.seatCar = nil, nil, nil, nil
     end
     -- the same key, another car: the record was looked up again (a new world here, a copy for an adopted car, ours

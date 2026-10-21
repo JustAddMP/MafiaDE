@@ -158,6 +158,19 @@ void TestRepairPlanExcess() {
     Check(Repaired(was, now), "explosion undone is a repair");
     now = was;
     Check(!Repaired(was, now), "same is no repair");
+    {  // the 2026-10-21 04:44 one-PC run: a crashed car's parts read lower and higher by themselves (no repair)
+        Snapshot w = Car(), n = Car();
+        w.parts[0] = 254; w.parts[1] = 254; w.parts[2] = 120; w.parts[3] = 90; w.parts[4] = 60; w.parts[5] = 40;
+        n = w;
+        n.parts[4] = 0;   // one part 60 -> 0 ...
+        n.parts[5] = 10;  // ... another 40 -> 10: 6 damaged -> 5, worst still 100 %
+        Check(!Repaired(w, n), "a wreck with two parts reading lower is no repair (total 818 -> 728)");
+        Snapshot r = Car();  // a real repair: everything back to 0
+        Check(Repaired(w, r), "every part back to 0 is a repair");
+        Snapshot half = w;
+        for (auto& v : half.parts) v = static_cast<uint8_t>(v / 3);
+        Check(Repaired(w, half), "every part down to a third is a repair");
+    }
 
     Snapshot local = Car(), auth = Car();
     auth.parts[0] = 100;
