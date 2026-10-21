@@ -82,6 +82,34 @@ and must end with `unmuted sessions: 0`, `profile and save files changed by the 
 | run_stop.ps1 | `profile and save files changed by the run: 0` (before anything is put back; was garage.pf and aslot\save1.sav for the host in the 2026-10-20 test) and `saves: 0 file(s) differ`; only settings (gamesettings.pf, videoconfig.cfg, ...) may be listed as `restored` |
 | log counts | `cars error` 0 on both; `did not load in` 0; `rides bike` >= 1 (guest); `sits in car` >= 1 (host); `has no driver (for 1 s` and `is driven again: our crew gets back in` 0 or a handful (guest), `keeps leaving seat` 0; `the game streams drivers out` (host) whenever a host car farther than 40 m from him lost its driver |
 
+## run_more.ps1: the longer scenarios (docs/host-authority.md section 6)
+
+After run_test.ps1, before run_stop.ps1 (`-Steps drive,ride,leashcar,down,rejoin,crime`, any of them, in this order).
+Both games get four-seat cars (`shubert_e_six_taxi`, car_spawn.lua with `MafiaCoop.tcarModel`), spawned one after
+the other (two cars of one model spawned at once 3 m apart are taken for one car by M.FindLocalCar's adoption).
+
+| Step | Screenshots | Must see (run.log, logs) |
+|---|---|---|
+| drive | 20-drove | `seat_probe.lua` on both: each sees the other's puppet `seated true` in the other's car key, not hidden |
+| ride | 21-guest-rides-seat1/2, 22-host-rides-seat1/2 | ridealong.lua puts the rider into the other's car (seat 1 front, 2 back); both games show the rider's puppet `seated true` in that car and seat while the driver drives 5 s; never a fall under the street (ridealong.lua puts a rider back where he stood if the seat did not take him) |
+| leashcar | 23-leash-car-countdown, 24-leash-car-pulled | `guest leash pulls in a car: 1 (... leash: pulled back beside the host (road|beside))`, the guest still at the wheel |
+| down | 25-guest-down-far, 26-guest-respawned | `guest downed 1, respawned next to the host 1, died 0` (down_far.lua: 200 m away, hurt to health <= 12) |
+| rejoin | 27-guest-main-menu, 29-guest-rejoined | `guest left: True`, the quit to the main menu, `guest connected again: True`, `JOIN GAME (FREE RIDE)` picked, `guest in the world again: True`; compare.ps1's `join.complete_s` has a second (rejoin) value |
+| crime | 30-guest-wanted, 31-guest-chased | crime.lua makes the guest wanted (his own zone, HUNT 2); `host police on the guest` >= 1 when host police are near (`our police take him on`), `guest own police shown 0` |
+
+`run_start.ps1 -Chapter TAXI` starts the lobby's CHAPTER 2: TAXI (mm_20_taxi from the game's own chapter start
+save, saves kept out like a guest's) instead of the Free Ride: the MODE row is stepped and dumped until it shows the
+chapter, START only then (never STORY, the player's own story).
+
+## The harsh network profile
+
+`run_start.ps1 -NetSim "latency=40,jitter=15,loss=0.02,dup=0"`: about 100 ms round trip and 2 % of the datagrams
+lost each way. The default targets of `sync_compare --check` are for the default lag (8 ms +-2); with this profile
+these looser limits are what to hold it to (read the FAIL lines of compare.txt against them; the defaults are not
+changed):
+
+HARSH_TABLE
+
 One PC cannot show: Steam P2P, real latency / loss, two different machines' timing, the real Free Ride garage
 removing a puppet (simulated by losstest.lua), a bike from the garage (spawned by bike_spawn.lua instead), a car
 taken out of the real garage menu (garage_take.lua changes the garage by script; that the script API is

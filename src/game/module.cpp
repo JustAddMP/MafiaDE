@@ -216,6 +216,12 @@ void DrawNotice(render::DrawList& d, float w, float h) {
 class MafiaModule final : public GameModule {
 public:
     void Init(const std::wstring& dllDir, const std::string& logTag) override {
+        // The menu hooks first: the game loads its main menu movie (main_menu_main.gfx) about 2.6-3.0 s after the dll
+        // starts, and each hook enabled here takes ~0.3 s (MinHook stops the game's threads for it). Installed after
+        // the ~15 hooks of the sync systems, the menu's were enabled 2.3-3.5 s in and missed the movie in 8 of 24
+        // starts of the 2026-10-21 one-PC runs: no CO-OP entry in the main menu, and the lobby's FREE RIDE start was
+        // refused there ("the main menu last polled never ago"). First, they are in place ~0.9 s in.
+        menu::Install(dllDir);
         // Lua bridge: hooks the script tick (GameMainThread); player sync runs on it. Failure only disables it.
         if (lua::Install(dllDir, logTag)) {
             PlayerSync::Install();
@@ -234,7 +240,6 @@ public:
             GuestWorldSync::Install(); // after every other glue: its Lua reads their tables (what is ours)
             LeashSync::Install();      // after PlayerSync: player_sync.lua holds M.Leash (game/leash_sync.h)
         }
-        menu::Install(dllDir);
         save_guard::Install();  // after the menu hooks: those must be in place before the first menu movie loads
         sectors_guard::Install();  // makes the friend-brain puppets safe (player_sync.lua M.Ally)
     }

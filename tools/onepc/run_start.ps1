@@ -2,7 +2,10 @@
 # them into a co-op Free Ride through the lobby. See tools/onepc/README.md. Needs a build in out\.
 # -NetSim: the simulated lag both games get (core net/net_sim.h, --net-sim: what each game sends over UDP waits this
 # long; 8 ms +-2 on both sides: a 20-30 ms round trip in game, the games add ~8 ms of their own); "off": none.
-param([string]$NetSim = "latency=8,jitter=2,loss=0,dup=0")
+# -Chapter: a lobby CHAPTER instead of the Free Ride (its name as the MODE row shows it, e.g. "TAXI": CHAPTER 2: TAXI,
+# mm_20_taxi from its own start save, never the player's story): the MODE row is stepped until it shows it, START only
+# then.
+param([string]$NetSim = "latency=8,jitter=2,loss=0,dup=0", [string]$Chapter = "")
 . "$PSScriptRoot\common.ps1"
 Remove-Item "$Work\run.log", "$Work\keeper.stop" -ErrorAction SilentlyContinue
 if (Games) { Say "a game is already running: close it first"; exit 1 }
@@ -58,6 +61,11 @@ if (-not (LogHas "guest" "lobby panel opened")) {
   Say "guest lobby panel: opened by test_input ($(LogHas 'guest' 'lobby panel opened'))"
 }
 if (LogHas "guest" "local player in world") { Say "the guest is in a world before the lobby started: stop (run_stop.ps1)"; exit 1 }
+# the main menu movie must have been patched (the CO-OP entry; the lobby's FREE RIDE start goes through its poll): a
+# game whose menu hooks came too late stays at its menu (the 2026-10-21 03:51 run: "the main menu last polled never")
+foreach ($tag in "host", "guest") {
+  if (-not (LogHas $tag "patched /gui/main_menu_main")) { Say "the $tag's main menu was not patched (its menu hooks came too late): stop (run_stop.ps1)"; exit 1 }
+}
 Set-Content "$Out\dev\guest.input.txt" "pad X`nwait 500`ndump"  # X = Ready (the lobby now has an OUTFIT row: DOWN + A hit it)
 Start-Sleep 3
 # the host's window in front first: a windowed game's main menu does not tick while another window has the focus, and
@@ -67,9 +75,34 @@ if ($hw -ne [IntPtr]::Zero) {
   [OnePc]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [OnePc]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
   [OnePc]::SetForegroundWindow($hw) | Out-Null; Start-Sleep 1
 }
-Set-Content "$Out\dev\host.input.txt" "open lobby`nwait 800`npad X`nwait 500"
-for ($k = 0; $k -lt 20 -and -not (LogHas "host" "lobby start: FREE RIDE"); $k++) { Start-Sleep 1 }
-Say "lobby start: $(LogHas 'host' 'lobby start: FREE RIDE')"
+if ($Chapter) {
+  # the MODE row stepped right until it shows the chapter (dumped and checked at every step; never STORY at START)
+  $rows = PanelRows "host" "open lobby"
+  $mode = $rows | Where-Object { $_.label -like "MODE =*" } | Select-Object -First 1
+  $cur = $rows | Where-Object { $_.sel } | Select-Object -First 1
+  if (-not $mode) { Say "no MODE row in the host's lobby: stop (run_stop.ps1)"; exit 1 }
+  $d = $mode.i - $(if ($cur) { $cur.i } else { 0 })
+  $nav = @(); for ($k = 0; $k -lt [Math]::Abs($d); $k++) { $nav += $(if ($d -gt 0) { "pad DOWN" } else { "pad UP" }); $nav += "wait 250" }
+  if ($nav) { Set-Content "$Out\dev\host.input.txt" ($nav -join "`n"); Start-Sleep 2 }
+  for ($k = 0; $k -lt 25; $k++) {
+    $rows = PanelRows "host" "wait 100"
+    $mode = $rows | Where-Object { $_.label -like "MODE =*" } | Select-Object -First 1
+    if ($mode -and $mode.label -like "*$Chapter*") { break }
+    Set-Content "$Out\dev\host.input.txt" "pad RIGHT`nwait 300"; Start-Sleep 1
+  }
+  $start = $rows | Where-Object { $_.label -like "START*" } | Select-Object -First 1
+  Say "host lobby: $($mode.label) / $($start.label)"
+  if (-not ($mode -and $mode.label -like "*$Chapter*" -and $mode.label -notlike "*STORY*" -and $start.label -like "START CHAPTER*$Chapter*")) {
+    Say "the host's lobby does not show the chapter $Chapter: stop (run_stop.ps1)"; exit 1
+  }
+  Say "host start: $(PickRow 'host' $rows 'START CHAPTER')"
+  for ($k = 0; $k -lt 20 -and -not (LogHas "host" "lobby start: CHAPTER"); $k++) { Start-Sleep 1 }
+  Say "lobby start: $(LogHas 'host' 'lobby start: CHAPTER') ($(@(Select-String -Path "$Out\logs\mafiacoop-host.log" -Pattern 'mission: loading' | Select-Object -Last 1).Line))"
+} else {
+  Set-Content "$Out\dev\host.input.txt" "open lobby`nwait 800`npad X`nwait 500"
+  for ($k = 0; $k -lt 20 -and -not (LogHas "host" "lobby start: FREE RIDE"); $k++) { Start-Sleep 1 }
+  Say "lobby start: $(LogHas 'host' 'lobby start: FREE RIDE')"
+}
 # the host's main menu must take the start ("menu: starting 'free_ride'"); if it does not, an Enter below would be
 # CONTINUE on his own story (the 2026-10-21 01:28 run): stop instead, with a screenshot of each window
 for ($k = 0; $k -lt 10 -and -not (LogHas "host" "menu: starting 'free_ride'"); $k++) { Start-Sleep 1 }

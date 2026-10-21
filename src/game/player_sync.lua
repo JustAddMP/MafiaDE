@@ -722,9 +722,25 @@ function M.Restore(c, how, wrecked, why, failed)
   end
 end
 
+-- A copy we despawned (M.DropCar) can stand a few frames more: not another car of anyone's in that time.
+local DROPPED_KEEP = 10  -- s a despawned copy is not taken for another car of anyone's (it may stand a few frames more)
+M.dropped = M.dropped or {}
+function M.RecentlyDropped(e)
+  local keep, hit = {}, false
+  for _, d in ipairs(M.dropped) do
+    if M.now - d.t < DROPPED_KEEP and valid(d.ent) then
+      keep[#keep + 1] = d
+      if same(d.ent, e) then hit = true end
+    end
+  end
+  M.dropped = keep
+  return hit
+end
+
 function M.DropCar(c)
   if c.orig then M.Restore(c, "copy", false, "its record is dropped") end  -- never leave our real car hidden
   if c.qid then
+    if valid(c.ent) then M.dropped[#M.dropped + 1] = { ent = c.ent, t = M.now } end
     pcall(game.traffic.DespawnEntityImmediately, game.traffic, c.qid)
   elseif c.wasTraffic and valid(c.ent) then
     pcall(c.ent.SetDespawnImmunity, c.ent, false)  -- our ambient traffic car again
@@ -1121,6 +1137,7 @@ end
 -- Driving that one instead of spawning a copy on top of it keeps the mission's own car in this game (a copy on top
 -- of it shoved it away, and the guest's mission flow failed when its car was gone).
 local ADOPT_DIST = 3
+local DROP_SAME_SPOT = 1.5  -- m: a parked copy of his this close to where his new car is: his car again (M.DropOldCopy)
 -- Returns: a free car of the same model standing there (adopt it) and its distance; else nil, the nearest car that
 -- stands in the way (ours, or another model: a copy spawned into it shoved it away, and a mission car shoved like
 -- that failed the mission - the game then loaded the free roam state before the quest) and its distance. Also the
@@ -1141,6 +1158,7 @@ function M.FindLocalCar(c, except)
     -- game). traffic_sync.lua hides nothing any more (host authority); guest_world answers M.GuestWorld.IsHidden.
     local gw = M.GuestWorld
     local hid = e and gw and gw.IsHidden and gw.IsHidden(e, tonumber(s))
+    if e and M.RecentlyDropped(e) then hid = true end
     if e and e.GetVehicleModelName and not M.IsHiddenOrig(e) and not hid
       and not (except and same(except, e)) then
       local q = e:GetPos()
@@ -1283,7 +1301,7 @@ function M.CarTick(c)
       -- two is usually moving off), then the copy goes beside his car (src/game/seats.h PlaceCopy) - after a reload
       -- both games put each player into his own copy of the same mission car at the same spot, and his puppet
       -- stayed hidden for as long as both stood there (0.15.0 test, Taxi cp_020).
-      if M.DropOldCopy(c, block) then return end
+      if M.DropOldCopy(c, block, blockD) then return end
       c.blockSince = c.blockSince or M.now
       local spot = M.AsideSpotFor(c, near)
       local dec = mc_copyplace and mc_copyplace(0, 0, blockD or -1, M.now - c.blockSince, spot and 1 or 0) or "wait"
@@ -1439,7 +1457,11 @@ end
 -- a picture of an earlier car: his car's id changed (he reloaded or rejoined: a checkpoint load gives the same car a
 -- new entity) and the old copy was left parked right where his car is now. On his game there is one car there, so
 -- the old copy goes and the next look spawns his. True when it was dropped.
-function M.DropOldCopy(c, block)
+function M.DropOldCopy(c, block, blockD)
+  -- only a copy on the very spot (his reloaded or rejoined car stands where the old one stood): one 2.9 m beside it
+  -- was his other car, still there on his game (the 2026-10-21 04:05 one-PC run: his old parked car's copy dropped,
+  -- and the copy itself, not yet despawned, then adopted as his new car - his puppet unseatable and hidden in it)
+  if blockD and blockD > DROP_SAME_SPOT then return false end
   local k, bc = M.KeyOf(block)
   if not bc or bc == c or not bc.qid or bc.driver or bc.orig or bc.localIn or bc.fromTraffic then return false end
   if bc.st ~= "ready" or not valid(bc.ent) then return false end
@@ -2223,6 +2245,20 @@ end
 function M.Seat(pp, c)
   local so, car = pp.so, c.ent
   local own = so:GetOwner()
+  -- still in ANOTHER car (his last one: the exit there did not happen; the 2026-10-21 04:13 one-PC run: the guest's
+  -- puppet stayed in his parked taxi on the host and never sat in the host's car he rode in): out of it at once
+  -- first (GetOutCarFast), the seat command follows on a later tick
+  if valid(own) and not same(own, car) and not (c.bso and same(own, c.bso)) then
+    if M.now - (pp.otherOutT or -10) >= 1 then
+      pp.otherOutT = M.now
+      local good, err = pcall(so.GetOutCarFast, so, own)
+      log(string.format("puppet %s is still in another car (%s) for car %s seat %d: out of it at once (GetOutCarFast %s)",
+        pp.id, tostring(M.KeyOf(own) or guidNum(own)), tostring(pp.vkey), pp.seat,
+        good and "ok" or ("failed: " .. tostring(err))))
+      trace("SCP", string.format("key=%s ev=otherout id=%s ok=%d", tostring(pp.vkey), pp.id, good and 1 or 0))
+    end
+    return true
+  end
   if own and same(own, car) then
     local h = seatHolder(car, pp.seat, so)
     if h == "ours" or h == "?" or pp.seatCheckOff then
@@ -2899,9 +2935,26 @@ function M.Drive(pp)
     end
     pp.heightT = nil
   end
-  if valid(so:GetOwner()) then  -- the player got out: let the puppet climb out, then follow on foot again
-    M.GetOut(pp)
+  local owner = so:GetOwner()
+  if valid(owner) then  -- the player got out: let the puppet climb out, then follow on foot again
+    -- The animated exit (GetOffVehicle) did not always take it out: in the 2026-10-21 04:13 one-PC run the guest's
+    -- puppet stayed in his car copy on the host, 3.7 m above him, "getting out" every 3 s for half a minute while he
+    -- walked 13 m off. A second try is the fast exit (GetOutCarFast, as off a bike), a third also puts it at his spot.
+    if not pp.exitSo then pp.carOut = (pp.carOut or 0) + 1 end
+    if pp.carOut and pp.carOut >= 2 and not pp.exitSo then
+      local good, err = pcall(so.GetOutCarFast, so, owner)
+      if pp.carOut >= 3 and pp.tx and not pp.hidden then so:SetPos(V(pp.tx, pp.ty, pp.tz)) end
+      pp.exitSo, pp.exitT = true, M.now
+      log(string.format("puppet %s still in its car after the exit (try %d): out at once (GetOutCarFast %s%s)", pp.id,
+        pp.carOut, good and "ok" or ("failed: " .. tostring(err)), pp.carOut >= 3 and ", put at his spot" or ""))
+      trace("SCP", string.format("key=%s ev=forceout id=%s try=%d ok=%d", tostring(pp.vkey or "-"), pp.id, pp.carOut,
+        good and 1 or 0))
+    else
+      M.GetOut(pp)
+    end
     if M.now - pp.exitT < 3 then return end
+  else
+    pp.carOut = nil
   end
   pp.exitSo = nil
   -- Too fast for one on foot (T field 68: game/puppet_guard.h FastFoot; a vehicle his game sends as on foot), or

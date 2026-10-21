@@ -75,4 +75,41 @@ function Lua([int]$i, [string]$file, [string]$code) {
   if ($file) { & "$Repo\tools\devlua.ps1" -Tag $tag -File $file } else { & "$Repo\tools\devlua.ps1" -Tag $tag -Code $code }
 }
 function LogHas([string]$tag, [string]$pattern) { (Get-Content "$Out\logs\mafiacoop-$tag.log" -Raw -ErrorAction SilentlyContinue) -match $pattern }
-function Say([string]$s) { $line = "$(Get-Date -f HH:mm:ss) $s"; $line; Add-Content "$Work\run.log" $line }
+# (another reader of run.log, e.g. a tail, makes Add-Content fail now and then: tried again)
+function Say([string]$s) { $line = "$(Get-Date -f HH:mm:ss) $s"; $line
+  for ($k = 0; $k -lt 10; $k++) { try { Add-Content "$Work\run.log" $line -ErrorAction Stop; break } catch { Start-Sleep -Milliseconds 100 } } }
+# The rows of one of our panels on game $tag: test_input's dump after a marker line (index, selected, label)
+function PanelRows([string]$tag, [string]$open) {
+  $mark = "rows-$(Get-Random)"
+  Set-Content "$Out\dev\$tag.input.txt" "$open`nwait 800`nlog $mark`ndump"
+  Start-Sleep 3
+  $lines = Get-Content "$Out\logs\mafiacoop-$tag.log"
+  $at = -1
+  for ($i = $lines.Count - 1; $i -ge 0; $i--) { if ($lines[$i] -match [regex]::Escape($mark)) { $at = $i; break } }
+  $rows = @()
+  if ($at -ge 0) {
+    for ($i = $at + 1; $i -lt $lines.Count; $i++) {
+      if ($lines[$i] -match "test_input:   \[(\d+)\](\*?)\s+(.+?)  \(") { $rows += [pscustomobject]@{ i = [int]$Matches[1]; sel = $Matches[2] -eq "*"; label = $Matches[3] } }
+    }
+  }
+  $rows
+}
+# Selects the row whose label starts with $label on the open panel and presses A (pad DOWN / UP from the selected row)
+function PickRow([string]$tag, $rows, [string]$label) {
+  $target = $rows | Where-Object { $_.label -like "$label*" } | Select-Object -First 1
+  $cur = $rows | Where-Object { $_.sel } | Select-Object -First 1
+  if (-not $target) { return "no row '$label' (rows: $(($rows | ForEach-Object { $_.label }) -join ' | '))" }
+  $from = if ($cur) { $cur.i } else { 0 }
+  $d = $target.i - $from
+  $cmd = @()
+  for ($k = 0; $k -lt [Math]::Abs($d); $k++) { $cmd += $(if ($d -gt 0) { "pad DOWN" } else { "pad UP" }); $cmd += "wait 250" }
+  $cmd += "dump"; $cmd += "pad A"; $cmd += "wait 500"
+  Set-Content "$Out\dev\$tag.input.txt" ($cmd -join "`n")
+  Start-Sleep 3
+  "picked '$($target.label)' (row $($target.i), from $from)"
+}
+function Front([int]$i) {
+  $h = GameWindow $i; if ($h -eq [IntPtr]::Zero) { return }
+  [OnePc]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [OnePc]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+  [OnePc]::SetForegroundWindow($h) | Out-Null; Start-Sleep 1
+}
