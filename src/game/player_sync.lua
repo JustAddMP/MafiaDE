@@ -2399,8 +2399,9 @@ function M.Seat(pp, c)
     -- ride), while the game's own animated get-in from beside the car (05:05, the same car and seat) kept it seated
     -- through the drive (and in the 05:08 run, used after the first throw-out, every time). A back seat of a standing
     -- car: put at its door and the animated get-in, first (once per seat; a moving car gets the seat at once).
-    -- (the 06:10 run: the front passenger seat too, once: thrown out 0.0 s after a seat command at once)
-    if pp.seat >= 1 and not pp.rearAnim then
+    -- (Not the front passenger seat: tried in the 06:25 / 06:41 runs, its animated get-in did not finish within
+    -- ANIM_WAIT and the seat command at once after it was thrown out twice; at once first it holds nearly always.)
+    if pp.seat >= 2 and not pp.rearAnim then
       local sp = M.SpeedMs(car)
       if sp >= 0 and sp < 0.3 then
         local cp = car:GetPos()
@@ -2410,8 +2411,8 @@ function M.Seat(pp, c)
           local l = math.sqrt(d.x * d.x + d.y * d.y)
           if l > 1e-3 then dx, dy = d.x / l, d.y / l end
         end
-        local side = pp.seat == 2 and -1 or 1  -- seat 2 behind the driver (left); 1 beside him and 3 on the right
-        local along = pp.seat == 1 and 0.6 or -0.8
+        local side = pp.seat == 2 and -1 or 1  -- seat 2 behind the driver (left), 3 on the right
+        local along = -0.8
         local sx, sy = dy * side, -dx * side   -- the car's right is (dy, -dx)
         if pp.hidden then M.Hide(pp, false, true) end
         so:SetPos(V(cp.x + dx * along + sx * 1.6, cp.y + dy * along + sy * 1.6, cp.z))
