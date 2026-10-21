@@ -108,8 +108,15 @@ lost each way. The default targets of `sync_compare --check` are for the default
 these looser limits are what to hold it to (read the FAIL lines of compare.txt against them; the defaults are not
 changed):
 
-(Measured in the first harsh run on this branch: see below once it is in; until then read its FAILs against the
-default limits and say by how much.)
+| metric | default | harsh profile | first harsh run (2026-10-21 07:30, run_test + run_more, SUM rtt median 91 ms) |
+|---|---|---|---|
+| `lat.player.p95` | <= 40 ms | **<= 100 ms** (the 40 ms +-15 one way is in it) | 66.0 (host) / 70.8 (guest); after the rejoin 66.0 / 79.5 |
+| `seat.flips_per_min` | 0 | **<= 2** (an AI passenger / driver put in at once and thrown out, put back, 2-3 times before the slower re-seat; more often with this lag) | 1.60 (host on the guest: his puppet in the guest's front passenger seat, thrown out 3 times) / 0.35 |
+| everything else | as above | as above | PASS: foot.p95 0.10 / 0.10, foot.shown 99.6 / 99.8 %, car.p95 0.29 / 0.49 m, car.speed_ratio 0.90 / 1.06, traffic.true_p95 0.79 m, npc.p95 0.01 m, ped.coverage 98.2 %, ped.p95 0.59 m, join.complete_s 5.05 s, leash 2 pulls / 0 false, bw.host_up 10.7 KB/s |
+
+The scenarios all ran as with the default lag (ride along both ways and seats, the leash in a car, the guest downed
+200 m away and back beside the host, leave and rejoin, the host's police on the wanted guest), no save or profile
+file changed, all three session bundles written.
 
 One PC cannot show: Steam P2P, real latency / loss, two different machines' timing, the real Free Ride garage
 removing a puppet (simulated by losstest.lua), a bike from the garage (spawned by bike_spawn.lua instead), a car
