@@ -12,7 +12,7 @@ StartThread(function()
   MafiaCoop.tcar.ent = car
   Sleep(0.5)
   p:LockControls(true)
-  local e = p:GetOnVehicle(car, 1, false, "WALK")
+  local e = p:GetOnVehicle(car, 1, true, "WALK")  -- walked to and animated, as a player gets in (at once: a 4 m jump of his state)
   Wait(e)
   p:LockControls(false)
   MafiaCoop.tcar.st = "in"

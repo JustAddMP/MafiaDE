@@ -26,6 +26,13 @@ Say (Fit 0); Say (Fit 1)
 # (FreeRoamRetry) right after he got into one), one after the other: two cars of one model spawned at the
 # same moment 3 m apart are taken for one car (player_sync.lua M.FindLocalCar adopts a free car of that model)
 foreach ($i in 0, 1) { Lua $i -code "MafiaCoop.tcarModel = 'culver_airmaster'; return 'ok'" | Out-Null }
+# the rider walks to the door and gets in (animated, as a player does; at once his state jumped there, a puppet snap
+# on foot in the 05:37 run): waited for, up to 30 s
+function WaitSeated([int]$i, [int]$seat) {
+  $t = Get-Date
+  for ($k = 0; $k -lt 30; $k++) { if ((Lua $i "$PSScriptRoot\seat_probe.lua") -match "we: car \S+ seat $seat") { break }; Start-Sleep 1 }
+  Say "$(@('host', 'guest')[$i]) in seat ${seat} after $([int]((Get-Date) - $t).TotalSeconds) s"; Start-Sleep 2
+}
 
 if (Step "drive") {
   # each in a car of his own, then each drives a few seconds (keys go to the window in front, one at a time)
@@ -40,7 +47,7 @@ if (Step "ride") {
   foreach ($seat in 1, 2) {
     Say (Keys 1 @("E") 300); Start-Sleep 5
     Lua 1 -code "MafiaCoop.rideSeat = $seat; return 'seat $seat'" | Out-Null
-    Say "guest rides with the host (seat $seat): $(Lua 1 "$PSScriptRoot\ridealong.lua")"; Start-Sleep 5
+    Say "guest rides with the host (seat $seat): $(Lua 1 "$PSScriptRoot\ridealong.lua")"; WaitSeated 1 $seat
     Seats "guest in the host's car seat ${seat}:"
     Say (Keys 0 @("W") 5000); Start-Sleep 1; Both "21-guest-rides-seat$seat"
     Seats "after the host drove (guest seat $seat):"
@@ -51,7 +58,7 @@ if (Step "ride") {
   Say (Keys 0 @("E") 300); Start-Sleep 5
   foreach ($seat in 1, 2) {
     Lua 0 -code "MafiaCoop.rideSeat = $seat; return 'seat $seat'" | Out-Null
-    Say "host rides with the guest (seat $seat): $(Lua 0 "$PSScriptRoot\ridealong.lua")"; Start-Sleep 5
+    Say "host rides with the guest (seat $seat): $(Lua 0 "$PSScriptRoot\ridealong.lua")"; WaitSeated 0 $seat
     Seats "host in the guest's car seat ${seat}:"
     Say (Keys 1 @("W") 5000); Start-Sleep 1; Both "22-host-rides-seat$seat"
     Seats "after the guest drove (host seat $seat):"
