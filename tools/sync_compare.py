@@ -379,6 +379,12 @@ def compare(sender, receiver, args, worst):
 
     # ---- on foot ----
     pup = [(t, f) for t, f in receiver.records["PUP"] if num(f.get("id"), -1) == sid]
+    # only while the sender's trace runs: a guest who left and joined again wrote two traces, and the host's PUP of
+    # him covers both (his snaps of the other session counted against this one's minutes: the 2026-10-21 04:44 run)
+    stamps = [num(f["sT"]) / 1000 for _, f in sender.records["TX"] if "sT" in f]
+    if stamps:
+        lo, hi = min(stamps) - 1.0, max(stamps) + 1.0
+        pup = [(t, f) for t, f in pup if lo <= to_sender(t) <= hi]
     by_gait = defaultdict(list)
     errs_ctl, errs_true, rows = [], [], []
     confusion = Counter()
@@ -659,7 +665,7 @@ def compare(sender, receiver, args, worst):
         print("  seat notes: %d (put-backs inside the car: %d), first ones:" % (len(seatnotes), backs))
         for t, s in seatnotes[:4]:
             print("    %s %s" % (receiver.wall(t), s.split("sync: ", 1)[-1][:150]))
-    seat_flips(pr, who)
+    seat_flips([(t, f) for t, f in pr if not stamps or lo <= to_sender(t) <= hi], who)  # (his trace's span only)
     rides = [(t, s) for t, s in receiver.logs if "ride along:" in s]
     for t, s in rides[:4]:
         print("  ride along: %s %s" % (receiver.wall(t), s.split("ride along: ", 1)[-1][:150]))

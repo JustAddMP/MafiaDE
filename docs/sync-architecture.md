@@ -97,6 +97,7 @@ Numbers: S1 / S2 = the two sessions of the 2026-10-19 test; "host->guest" = the 
 | | `foot.shown` his puppet (or his car copy) there while his states arrive (added after the 2026-10-20 test) | 19.5-20.6 % (host on the guest, 0.16.0) | >= 98 % |
 | | `foot.respawns` / `foot.respawn_s` puppet spawned again with no reason / back after the game removed it | 1 / never (0.16.0) | 0 / <= 5 s |
 | | `foot.dz_p95` height puppet vs player on foot | 0.76-0.79 m (0.16.0, bike riders) | <= 0.5 m |
+| Puppet in a seat | `seat.flips_per_min` off its seat and put back while its player sits on (PR `ejects`; the first / last 2 s of a stay left out) | 490 a minute (0.17.0 one-PC run 02:19: on and off a motorbike ten times a second) | 0 |
 | Player car copy | `car.p95` copy vs car | 0.80-1.93 m | **<= 1.0 m** |
 | | `car.pinned` share of samples | 56-74 % | <= 10 % |
 | | `car.speed_ratio` median | 0.28 | 0.9-1.1 |

@@ -112,6 +112,8 @@ if (Step "rejoin") {
   for ($k = 0; $k -lt 12 -and (Count "guest" "local player in world") -le $w0; $k++) { Start-Sleep 7; if ((Count "guest" "local player in world") -le $w0) { Say (Keys 1 @("ENTER")) } }
   Say "guest in the world again: $((Count 'guest' 'local player in world') -gt $w0)"; Say (Fit 1)
   Start-Sleep 10; Both "29-guest-rejoined"
+  # a minute together after the rejoin (each walks a little): the second session's foot.* numbers
+  Say (Keys 1 @("W") 3000); Start-Sleep 2; Say (Keys 0 @("W") 3000); Start-Sleep 45; Both "29b-a-minute-after-rejoin"
 }
 
 if (Step "crime") {
