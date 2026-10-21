@@ -1,11 +1,13 @@
-Mafia: Definitive Edition - Co-op (MafiaCoop) 0.17.0, pre-release
+Mafia: Definitive Edition - Co-op (MafiaCoop) 0.17.1, pre-release
 ==================================================================
 
 An unofficial, fan-made co-op mod: play Mafia: Definitive Edition together with friends. One small DLL, no separate
-server, Steam invites. This is a PRE-RELEASE: 0.17.0 was checked on one PC with two copies of the game, but it
+server, Steam invites. This is a PRE-RELEASE: 0.17.1 was checked on one PC with two copies of the game, but it
 has NOT been tested on two PCs yet. Read "Known issues" below before you play.
 
-EVERYONE NEEDS 0.17.0: it cannot play with 0.16.0 or older. A player with another version is turned away
+UPDATE FROM 0.17.0: in 0.17.0, a Free Ride host who died had his real story save overwritten. 0.17.1 fixes that.
+
+EVERYONE NEEDS 0.17.1: it cannot play with 0.17.0 or older. A player with another version is turned away
 with "version mismatch ... Both players need the same MafiaCoop version."
 
 Contents of this zip
@@ -108,11 +110,13 @@ MafiaCoop.exe keeps working either way. In this mode the launcher's game version
 
 KNOWN ISSUES
 ------------
-- 0.17.0 is NOT yet tested on two PCs. It was checked on one PC with two copies of the game: the host's traffic,
+- 0.17.1 is NOT yet tested on two PCs. It was checked on one PC with two copies of the game: the host's traffic,
   pedestrians and enemies on the friend's game, the friend's own traffic and pedestrians switched off, the leash
-  countdown and pull, a player removed by the game coming back in under 2 seconds, and the new session logs. A few
-  numbers were still off in that check (traffic copies up to 2 m from the host's cars at the 95 % mark, a player's
-  copy standing on a parked motorbike) - please send your logs (see PROBLEMS at the end).
+  countdown and pull, driving and riding along together, leaving and rejoining, and the session logs. Please send
+  your logs (see PROBLEMS at the end).
+- When the game keeps throwing a player's copy off its motorbike, the copy is put on the saddle for the rest of
+  the ride. A copy sitting in a car's front seat is occasionally thrown out. Once, the host's world reloaded after
+  he got into a taxi. After a rejoin the lobby shows READY instead of JOIN GAME for a few seconds.
 - A player sitting in a car cannot be shot by the other players, not even through an open window.
 - After a player gets off a motorbike, its copy may stay on the other screens for up to a second.
 - Enemies and NPCs are partly shared. Mission characters are matched up between the games: deaths are shared

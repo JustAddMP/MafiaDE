@@ -540,6 +540,20 @@ Unexplained (2026-10-18):
 - [ ] CHAPTER 13: SALIERI: the guest's scripts stopped about 10 s after the opening cutscene (no Lua lines, status
   `no local player`, no error). Play the chapter start again and watch the guest's log.
 
+## Test checklist: 0.17.1
+
+0.17.1 (pre-release 2026-10-21): the fixes of CHANGELOG 0.17.1 (the Free Ride host's death writing his story save,
+the motorbike seat loop, the CO-OP menu entry, puppets in cars, car repairs, the leash hold, the guest's own police,
+rejoins). Checked on one PC (tools/onepc, run_start + run_test + run_more, `sync_compare --check` 0 failed at 07:10),
+**not yet on two PCs**. The two-PC test is the 0.17.0 one below (docs/host-authority.md section 6), plus:
+- [ ] The Free Ride host dies (and the guest dies far away): the host's `aslot\save1.sav` is unchanged afterwards.
+- [ ] A ride on the motorbike with the other on the back / alone: `seat.flips_per_min` 0; any `BKS ev=off` and
+  `mc_seatloop` (perched) in the guest's trace.
+- [ ] Twenty game starts: the CO-OP entry in every main menu.
+- [ ] Leave and rejoin: JOIN GAME in the lobby at once (READY for a few seconds in the one-PC runs).
+Also: a 0.17.0 game joining a 0.17.1 host is turned away with `version mismatch: host has protocol 9 build 1701, you
+have protocol 9 build 1700`.
+
 ## Test checklist: 0.17.0
 
 0.17.0 (pre-release 2026-10-20): host authority (docs/host-authority.md) and the session diagnostics. Checked on one PC

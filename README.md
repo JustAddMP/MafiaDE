@@ -10,8 +10,8 @@ pedestrians and enemies (a friend's game shows copies of them and makes none of 
 
 ## Download
 
-The current version is the **0.17.0 pre-release** (checked on one PC with two copies of the game, not yet tested
-on two PCs; **everyone needs 0.17.0**, it cannot play with 0.16.0): download `MafiaCoop-0.17.0.zip` from
+The current version is the **0.17.1 pre-release** (checked on one PC with two copies of the game, not yet tested
+on two PCs; **everyone needs 0.17.1**, it cannot play with 0.17.0): download `MafiaCoop-0.17.1.zip` from
 [Releases](https://github.com/JustAddMP/MafiaDE/releases), extract it anywhere and read its `README.txt` (requirements,
 how to play, known issues, uninstall). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
@@ -46,8 +46,9 @@ those two files); it only ever deletes its own files.
 
 ## Known issues
 
-- 0.17.0 is a pre-release: the host-owns-the-world sync was checked on one PC with two copies of the game, not yet
-  on two PCs. See [CHANGELOG.md](CHANGELOG.md) for what the one-PC check showed.
+- 0.17.1 is a pre-release: the host-owns-the-world sync was checked on one PC with two copies of the game, not yet
+  on two PCs. See [CHANGELOG.md](CHANGELOG.md) for what the one-PC checks showed. **Update from 0.17.0:** in 0.17.0
+  a Free Ride host who died had his real story save written; 0.17.1 fixes that.
 - **The leash:** the streets only live around the host (Mafia brings the world to life around its own player only).
   From 300 m away from the host a friend sees a warning, beyond 400 m a 10 s countdown, then he is put back beside
   the host (in his car if he drives). The host can change the numbers in his `MafiaCoop.ini` (`leash_warn_m`,
@@ -56,6 +57,9 @@ those two files); it only ever deletes its own files.
   `MafiaCoop.exe` (one per session, made when the session ends or the game closes; after a crash a
   `...-recovered.zip` is made at the next start).
 - A player sitting in a car cannot be shot; a motorbike's copy may stay up to a second after its rider got off.
+- When the game keeps throwing a rider's copy off its motorbike, the copy is put on the saddle for the rest of the
+  ride; a copy in a car's front seat is occasionally thrown out; once the host's world reloaded after he got into a
+  taxi; after a rejoin the lobby shows READY instead of JOIN GAME for a few seconds.
 - Story co-op was tested in a few chapters (Omerta, Taxi, Bon Appetit) and a few more chapter starts only; enemy
   fights in one chapter's shootout (Bon Appetit's restaurant).
 - JOIN FRIEND and a physical gamepad have not been tested between two PCs / with a real controller yet.

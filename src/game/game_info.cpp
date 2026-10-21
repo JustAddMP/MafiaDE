@@ -15,7 +15,7 @@ constexpr GameBuild kBuilds[] = {
 constexpr GameInfo kInfo = {
     .modName = "MafiaCoop",
     // Bump when the wire format or sync changes: the session handshake derives its build number from it.
-    .modVersion = "0.17.0",
+    .modVersion = "0.17.1",
     .launcherName = L"MafiaCoop.exe",
     .dllName = L"mafiacoop.dll",
     .iniName = L"MafiaCoop.ini",

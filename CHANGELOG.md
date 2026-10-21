@@ -3,7 +3,18 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
-## Unreleased (feat/fix-0172, after 0.17.0; no version change: 0.17.0 stays the published release)
+## 0.17.1 (2026-10-21), pre-release, checked on one PC, not yet tested on two PCs
+
+Fixes for 0.17.0, above all its save bug: **a co-op Free Ride host who died had his real story save
+(aslot\save1.sav) written** (see "Saves" below); anyone on 0.17.0 should update. Plus the motorbike seat loop, the
+missing CO-OP main menu entry in about a third of the starts, puppets stuck in cars or thrown out of back seats, false
+car repairs, a car falling through the street after a leash pull, the guest's own police shown, and rejoins waiting.
+**Both players need 0.17.1** (session build 1701): a 0.17.0 game is turned away with the version mismatch message
+(the messages themselves are unchanged). Core v0.14.1 (protocol stays 9). The two parts below are the two rounds of
+fixes, each with the one-PC check it got; the release build passed `sync_compare --check` on one PC (2026-10-21
+07:10, 0 failed). Not tested on two PCs.
+
+### After the longer one-PC scenarios (feat/fix-0172)
 
 The 0.17.0 one-PC run's motorbike seat loop, then what the longer scenarios of docs/host-authority.md section 6
 showed (tools/onepc/run_more.ps1: driving together, ride along both ways and in both seats, the leash in a car, the
@@ -49,7 +60,7 @@ two PCs.
   session bundles are written; killed only after 60 s), compare.ps1 compares every guest trace of the session,
   ReloadGuard (Enter on a Free Ride death / retry loading screen).
 
-## Unreleased (feat/fix-0171, after 0.17.0; no version change: 0.17.0 stays the published release)
+### After the 0.17.0 one-PC run (feat/fix-0171)
 
 The three targets the 0.17.0 one-PC run failed, the report's cosmetics, the one-PC tools (windows inside the test
 strip from the first frame, simulated lag on by default). Core: `net/net_sim.h` (`--net-sim`), `window_area`.

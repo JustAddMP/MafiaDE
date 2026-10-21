@@ -48,6 +48,10 @@ PedStates / PedSpawn / PedGone / PedDeath / PedKill (0x0280-0x0284); retired: Np
 (0x0420); WorldEnv gets an optional trailing u32 sampleMs; the PlayerState pose byte gets bits 3-5 (swimming, under
 water, motorbike) without a format change.
 
+0.17.1 (`modVersion` 0.17.1, session build 1701; core 0.14.1, `kProtocolVersion` stays 9): no message changed,
+not playable with 0.17.0 (build 1700 is rejected in the handshake with the version mismatch message; the seat,
+car and save fixes of CHANGELOG 0.17.1 change what both sides expect of each other).
+
 0.17.0 (`modVersion` 0.17.0, session build 1700; core 0.14.0, `kProtocolVersion` stays 9; host authority,
 docs/host-authority.md): not playable with 0.16.0 (a 0.16.0 game, build 1600, is rejected in the handshake with the
 version mismatch message). New: LeashConfig (0x0208, host -> guests) and LeashEvent (0x0209, guest -> host), see "The
