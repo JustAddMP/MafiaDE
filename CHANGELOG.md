@@ -3,6 +3,46 @@
 Mod versions of MafiaCoop (Mafia: Definitive Edition co-op). Everyone in a session needs the same version. Supported
 game: the Steam build 16502642 (exe CRC32 `BCE2C8EF`).
 
+## Unreleased (feat/fix-0172, after 0.17.0; no version change: 0.17.0 stays the published release)
+
+The 0.17.0 one-PC run's motorbike seat loop, then what the longer scenarios of docs/host-authority.md section 6
+showed (tools/onepc/run_more.ps1: driving together, ride along both ways and in both seats, the leash in a car, the
+guest downed far away, leave and rejoin, a crime near the host). Wire-compatible with 0.17.0 (no message changed).
+Core: test input `text`. Checked on one PC (2026-10-21 07:10-07:16, run_start + run_test, `--net-sim
+latency=8,jitter=2`): `sync_compare --check` all PASS, seat.flips_per_min 0 / 0 (the bike loop happened and was
+perched); no save or profile file changed; both session bundles written at a normal close. Not tested on two PCs.
+
+- Motorbike: the host's puppet on the guest was thrown off its bike copy ~0.1 s after every seat command and put
+  back at once, 163-193 times a ride (two of four 0.17.0 runs; seen again on 2026-10-21 in four of nine rides: the
+  seat getter, GetOwner and GetOwnerSceneObject all read "off", a real eject). Thrown off 3 times within 2 s
+  (game/puppet_guard.h SeatLoop, mc_seatloop) it is perched on the saddle for the rest of the ride; every get-off is
+  traced (`BKS ev=off` with what the seat checks read); M.OnBike also takes the motorcycle component's seat getter.
+  Replay of the two logged rides: 163 / 192 get-offs -> 2 put-backs, then perched (tests/puppet_guard_test.cpp).
+- Saves: a co-op Free Ride host who died loaded 'freeroam_player_death' from the story slot; the save guard took
+  that for his story and his REAL aslot\save1.sav was written (the run's backup put it back). A `freeroam_*` load
+  from the story slot in a Free Ride stays a Free Ride (save_paths Guard::Load; replay in tests/save_paths_test.cpp).
+- Main menu: the menu hooks are installed first; installed after the sync systems' hooks (~0.3 s each) they were in
+  place 2.3-3.5 s after the dll started, the main menu movie loads at 2.6-3.0 s, and 8 of 24 starts had no CO-OP
+  entry and refused the lobby's FREE RIDE start ("the main menu last polled never ago"). Now ~0.9 s.
+- Cars: a puppet still in its car 3 s after its player got out gets the fast exit and is put at his spot (it stayed
+  in the copy 3.7 m above him for half a minute); a puppet still in another car when its player's state names a new
+  seat is taken out of that one first (it never sat in the host's car it rode in); a back seat of a standing car gets
+  the animated get-in from its door (put there at once the rider was thrown out at once, 4 times, then hidden for the
+  ride); a parked copy is "his car again" only on the very spot (1.5 m) and a despawned copy is not adopted as
+  another car for 10 s (his old parked car's copy, not yet gone, became his new car: puppet hidden, unseatable).
+- Car damage: a repair needs the car's damage at least halved (a crashed car's parts reading lower by themselves
+  were "repairs": 12 epochs in 2 s, the host's copy repaired and damaged again each time).
+- Leash: held on the pull's spot for 10 s (25 holds) while the ground loads (after 3 s a pulled car fell through
+  the street beside the host and the guest was downed).
+- Guest world: the guest's own police cars are hidden even in view (one made before the switches, met 450 m out).
+- Join: a traffic copy despawned before its damage answer is not waited for (a rejoin was "still missing" for 15 s).
+- sync_compare: `seat.flips_per_min` (target 0; the 0.17.0 02:19 run: 490); a sender trace's span only for the foot
+  and seat numbers (a rejoin writes a second guest trace).
+- tools/onepc: run_more.ps1 and its helpers (ridealong, seat_probe, crime, down_far, bike_flip_probe, eject_test),
+  run_start.ps1 `-Chapter`, both main menus checked patched, run_stop.ps1 closes the games normally (WM_CLOSE: the
+  session bundles are written; killed only after 60 s), compare.ps1 compares every guest trace of the session,
+  ReloadGuard (Enter on a Free Ride death / retry loading screen).
+
 ## Unreleased (feat/fix-0171, after 0.17.0; no version change: 0.17.0 stays the published release)
 
 The three targets the 0.17.0 one-PC run failed, the report's cosmetics, the one-PC tools (windows inside the test
