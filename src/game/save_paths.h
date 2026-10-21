@@ -76,10 +76,13 @@ enum class Where { Real, Scratch, Held };
 // The decision state of save_guard (one per process, under its mutex). Pure: tests replay logged sessions through it.
 class Guard {
 public:
-    // A save load request (save_guard's LoadDetour) and the storage it reads: "aslot" is the player's story (CONTINUE,
-    // its checkpoints, its fail screen); anything else ("debugloadchapter": FREE RIDE and our chapter loads, "bslot")
-    // is not.
-    void Load(const std::string& storage);
+    // A save load request (save_guard's LoadDetour), the storage it reads and the save's id: "aslot" is the player's
+    // story (CONTINUE, its checkpoints, its fail screen); anything else ("debugloadchapter": FREE RIDE and our chapter
+    // loads, "bslot") is not. Except a free roam state ("freeroam_*", e.g. "freeroam_player_death": the Free Ride's
+    // respawn after a death, "freeroam_before_quest_activated") read from "aslot" while the world is not his story:
+    // the Free Ride's own state, not his story (the 2026-10-21 one-PC run: the Free Ride host died, the respawn's
+    // aslot load made him a STORY host and his real aslot\save1.sav was written).
+    void Load(const std::string& storage, const std::string& id = {});
     // What the session needs (mission_sync, every session frame; (false, false) at its end): a guest or the host of
     // a lobby CHAPTER (block), the host of any session (host). Turned on at once; turned off only by MainMenu().
     void Want(bool block, bool host);

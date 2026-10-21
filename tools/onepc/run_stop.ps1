@@ -3,8 +3,8 @@
 # back it counts what the run changed: a save or profile file (gamesaves\..., profiles\...\*.pf other than the
 # settings) must not change in a co-op run, for the host or the guest (both games use the same profile folder on one
 # PC): "profile and save files changed by the run: 0". Settings (gamesettings.pf, key bindings, language, audio, video,
-# map filter, Saves\videoconfig.cfg which run_start.ps1 itself writes) may change. The games are killed (a crash in the
-# session as far as the save guard knows): the real files must be as before all the same.
+# map filter, Saves\videoconfig.cfg which run_start.ps1 itself writes) may change. The games are closed the
+# normal way (below), so each writes its session bundle.
 . "$PSScriptRoot\common.ps1"
 $Settings = @("gamesettings.pf", "gameinputmodule.pf", "profile_language.pf", "profile_audiosettings.pf",
   "profile_videosettings.pf", "map_filter.pf", "videoconfig.cfg", "launcconfig.cfg")
@@ -15,8 +15,16 @@ function IsSaveOrProfile([string]$rel) {
 New-Item -ItemType File "$Work\keeper.stop" -Force | Out-Null
 Start-Sleep 2
 for ($k = 0; $k -lt 3; $k++) { Say (& "$PSScriptRoot\unmute.ps1"); Start-Sleep 1 }  # the last one must say 0
-Stop-Process -Name mafiadefinitiveedition -Force -ErrorAction SilentlyContinue
-Start-Sleep 3
+# closed the normal way (WM_CLOSE: the game quits, ExitProcess, the dll ends the session and writes its bundle,
+# logs\bundles\<mod>-<stamp>-<role>.zip); killed only when one is still running after 60 s (then its bundle is a
+# -recovered one at the next start)
+foreach ($g in (Games)) { $null = $g.CloseMainWindow() }
+for ($k = 0; $k -lt 60 -and (Games); $k++) { Start-Sleep 1 }
+if (Games) { Say "a game did not close within 60 s: killed (no session bundle for it)"; Stop-Process -Name mafiadefinitiveedition -Force -ErrorAction SilentlyContinue; Start-Sleep 3 }
+else { Say "games closed normally" }
+$since = (Get-Date).AddMinutes(-3)
+for ($k = 0; $k -lt 20; $k++) { $z = @(Get-ChildItem "$Out\logs\bundles\*.zip" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt $since -and $_.Name -notmatch 'recovered' }); if ($z.Count -ge 2) { break }; Start-Sleep 1 }
+Say "session bundles written at the close: $($z.Count) ($(($z | ForEach-Object { $_.Name }) -join ', '))"
 if (Games) { Say "a game is still running"; exit 1 }
 $bak = Join-Path $Work "save-backup"
 $bad = 0

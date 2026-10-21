@@ -82,4 +82,18 @@ ShieldOut Shield::Update(double t, uint32_t hazards) {
     return o;
 }
 
+void SeatLoop::Reset() {
+    count_ = recent_ = 0;
+}
+
+bool SeatLoop::Off(double t) {
+    // the newest few get-off times, a ring of 8 (n_ is at most 8)
+    times_[count_ % 8] = t;
+    ++count_;
+    recent_ = 0;
+    for (int i = 0; i < count_ && i < 8; ++i)
+        if (t - times_[(count_ - 1 - i) % 8] < window_) ++recent_;
+    return recent_ >= n_;
+}
+
 }  // namespace mc::game::puppet_guard

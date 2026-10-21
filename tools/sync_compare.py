@@ -63,6 +63,7 @@ TARGETS = {
     "foot.respawn_s": ("<=", 5.0, "puppet the game removed: back after (s, max)"),
     "foot.dz_p95": ("<=", 0.5, "puppet height vs the player's on foot, p95 (m; a puppet under the floor)"),
     "car.p95": ("<=", 1.0, "car copy vs the driver's car, p95 (m)"),
+    "seat.flips_per_min": ("<=", 0, "puppet off its seat and back while its player sits on steadily (PR ejects), per minute in a vehicle"),
     "car.pinned": ("<=", 10.0, "car copy pinned (% of samples)"),
     "car.speed_ratio": ("between", (0.9, 1.1), "copy speed / driver's speed, median"),
     "traffic.true_p95": ("<=", 1.5, "traffic copy vs the host's car at the same moment, p95 (m)"),
@@ -658,12 +659,53 @@ def compare(sender, receiver, args, worst):
         print("  seat notes: %d (put-backs inside the car: %d), first ones:" % (len(seatnotes), backs))
         for t, s in seatnotes[:4]:
             print("    %s %s" % (receiver.wall(t), s.split("sync: ", 1)[-1][:150]))
+    seat_flips(pr, who)
     rides = [(t, s) for t, s in receiver.logs if "ride along:" in s]
     for t, s in rides[:4]:
         print("  ride along: %s %s" % (receiver.wall(t), s.split("ride along: ", 1)[-1][:150]))
     probes = [s for _, s in receiver.logs if "probe:" in s or "SetSpeed" in s or "engine was" in s]
     for s in probes[:6]:
         print("  car note: %s" % s.split("sync: ", 1)[-1][:160])
+
+
+def seat_flips(pr, who):
+    """A puppet off its seat and put back while its player sat on (the 0.17.0 one-PC runs: on and off a motorbike ten
+    times a second): the PR records' `ejects` counter going up while `veh` stays the same, left out the first and the
+    last SETTLE s of each stay in one vehicle (getting on and off), per minute of steady riding."""
+    SETTLE = 2.0
+    stays, cur = [], None  # [veh, t0, t1, [(t, ejects, bike)]]
+    for t, f in pr:
+        veh = f.get("veh", "nil")
+        if veh in ("nil", "-", None):
+            cur = None
+            continue
+        if cur is None or cur[0] != veh:
+            cur = [veh, t, t, []]
+            stays.append(cur)
+        cur[2] = t
+        cur[3].append((t, int(num(f.get("ejects"), 0)), f.get("bike") == "1"))
+    flips = {"bike": 0, "car": 0}
+    secs = {"bike": 0.0, "car": 0.0}
+    for veh, t0, t1, rows in stays:
+        kind = "bike" if any(b for _, _, b in rows) else "car"
+        lo, hi = t0 + SETTLE, t1 - SETTLE
+        if hi <= lo:
+            continue
+        secs[kind] += hi - lo
+        prev = None
+        for t, e, _ in rows:
+            if t < lo or t > hi:
+                prev = e if t < lo else prev
+                continue
+            if prev is not None and e > prev:
+                flips[kind] += e - prev
+            prev = e
+    total = secs["bike"] + secs["car"]
+    if total <= 0:
+        return
+    print("    seat flips while he sat on steadily: bike %d in %.0f s, car %d in %.0f s (the first / last %.0f s of a stay "
+          "left out)" % (flips["bike"], secs["bike"], flips["car"], secs["car"], SETTLE))
+    record("seat.flips_per_min", (flips["bike"] + flips["car"]) / (total / 60.0), who)
 
 
 def players(sender, receiver):

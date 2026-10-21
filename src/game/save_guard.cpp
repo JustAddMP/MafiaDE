@@ -17,7 +17,7 @@
 #include <vector>
 
 namespace mc::game::save_guard {
-void OnLoad(const std::string& storage);  // below: the storage of a world load (a STORY host keeps his saves)
+void OnLoad(const std::string& storage, const std::string& id);  // below: a world load (a STORY host keeps his saves)
 
 namespace {
 
@@ -94,7 +94,7 @@ void* LoadDetour(void* self, void* out, uint32_t slot, void* id, void* name) {
         MC_LOG_INFO("savesys: the game leaves the mission (back to the free roam state before the quest)%s",
                     _block.load() ? ": it gets the session's checkpoint instead" : "");
     }
-    OnLoad(storage);
+    OnLoad(storage, saveId);
     if (storage == "debugloadchapter") {
         std::lock_guard lock(_dbgMu);
         _dbgId = saveId;
@@ -514,8 +514,16 @@ void Tick(bool atMainMenu) {
     Change([](save_paths::Guard& g) { g.MainMenu(); }, "out of the co-op world (main menu)");
 }
 
-void OnLoad(const std::string& storage) {
-    Change([&storage](save_paths::Guard& g) { g.Load(storage); },
+void OnLoad(const std::string& storage, const std::string& id) {
+    {
+        std::lock_guard lock(_mu);
+        if (_guard.Host() && !_guard.Block() && !_guard.StoryWorld() && storage == "aslot" &&
+            ToLower(id).rfind("freeroam_", 0) == 0)
+            MC_LOG_INFO("savesys: '%s' from the story slot: the Free Ride's own state (a respawn or a retry), not his "
+                        "story: his saves stay kept out",
+                        id.c_str());
+    }
+    Change([&storage, &id](save_paths::Guard& g) { g.Load(storage, id); },
            storage == "aslot" ? "a load from the story slot" : "a load (not the story slot)");
 }
 

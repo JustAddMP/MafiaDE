@@ -1693,6 +1693,24 @@ int McPupGuard(lua_State* L) {
     return 2;
 }
 
+// mc_seatloop(id, now) -> loop, recent: player id's puppet was thrown off its bike at `now` (game/puppet_guard.h
+// SeatLoop): loop when that makes N get-offs within the window (the glue perches it for the ride), recent: how many.
+// mc_seatloop(id) alone resets it (a new ride). GameMainThread only.
+std::map<int, puppet_guard::SeatLoop> _seatLoops;
+
+int McSeatLoop(lua_State* L) {
+    const int id = lua::TypeOf(L, 1) == lua::TNumber ? static_cast<int>(lua::ToNumber(L, 1)) : 0;
+    if (_seatLoops.size() > 64 && !_seatLoops.count(id)) _seatLoops.clear();
+    if (lua::TypeOf(L, 2) != lua::TNumber) {
+        _seatLoops[id].Reset();
+        return 0;
+    }
+    const bool loop = _seatLoops[id].Off(lua::ToNumber(L, 2));
+    lua::PushBool(L, loop);
+    lua::PushNumber(L, static_cast<float>(_seatLoops[id].Recent()));
+    return 2;
+}
+
 bool LoadModule(lua_State* L) {
     std::string src = kPlayerSyncLua;
     const char* origin = "embedded";
@@ -1733,6 +1751,7 @@ bool LoadModule(lua_State* L) {
     lua::RegisterGlobal(L, "mc_pvp_damage", &McPvpDamage);
     lua::RegisterGlobal(L, "mc_pvp_evidence", &McPvpEvidence);
     lua::RegisterGlobal(L, "mc_pupguard", &McPupGuard);
+    lua::RegisterGlobal(L, "mc_seatloop", &McSeatLoop);
     return true;
 }
 

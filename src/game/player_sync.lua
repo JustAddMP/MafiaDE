@@ -530,9 +530,15 @@ function M.BikeModel(ent, mc)
   return "motorcycle_1935"
 end
 
--- Does human h sit on bike record c (GetOwner or GetOwnerSceneObject is the bike)?
-function M.OnBike(h, c)
+-- Does human h sit on bike record c (the motorcycle component's seat getter names it on `seat`, or GetOwner or
+-- GetOwnerSceneObject is the bike)? In game (2026-10-21 one-PC run, tools/onepc/bike_flip_probe.lua) the getter named
+-- the puppet on its saddle every tick while GetOwner read nil and GetOwnerSceneObject the bike.
+function M.OnBike(h, c, seat)
   if not valid(h) then return false end
+  if c.mc and seat then
+    local g0, o = pcall(function() return c.mc:GetSeatOwner(seat) end)
+    if g0 and valid(o) and o == h then return true end
+  end
   local good, own = pcall(h.GetOwner, h)
   if good and valid(own) and (same(own, c.ent) or same(own, c.bso)) then return true end
   local g2, oso = pcall(function() return h:GetOwnerSceneObject() end)
@@ -2403,9 +2409,28 @@ local BIKE_SADDLE = 0.55                      -- m above the bike's origin (a gu
 local BIKE_BACK = { [0] = -0.05, [1] = -0.6 }  -- m along the bike: the rider, the pillion behind him (guesses)
 M.bikeAnims = M.bikeAnims or { "hero_moto_idle", "hero_moto_hold_idle", "hero_moto_speed_loop" }
 
+-- What the seat checks of human h read on bike record c: owner, owner scene object, the saddle getter (BKS ev=off).
+function M.BikeReadout(h, c, seat)
+  local function name(o)
+    if not valid(o) then return "nil" end
+    if o == c.ent then return "ent" end
+    if c.bso and o == c.bso then return "bso" end
+    if o == h then return "pup" end
+    return "other"
+  end
+  local g1, own = pcall(h.GetOwner, h)
+  local g2, oso = pcall(function() return h:GetOwnerSceneObject() end)
+  local sg = "-"
+  if c.mc then
+    local g3, o = pcall(function() return c.mc:GetSeatOwner(seat) end)
+    sg = g3 and name(o) or "err"
+  end
+  return string.format("own=%s oso=%s sg=%s", g1 and name(own) or "err", g2 and name(oso) or "err", sg)
+end
+
 function M.SeatBike(pp, c)
   local so = pp.so
-  if M.OnBike(so, c) then
+  if M.OnBike(so, c, pp.seat) then
     if pp.perch then M.PerchEnd(pp, "it sits on the bike now", true) end
     pp.bikeRec = c
     if not pp.seated then
@@ -2418,13 +2443,34 @@ function M.SeatBike(pp, c)
     return true
   end
   if pp.seated then
+    -- Off the bike while its player rides on. In the 0.17.0 one-PC runs of 01:59 and 02:19 (two of four) the game
+    -- threw the host's puppet off its bike copy ~100 ms after every GetOnVehicle, 163-193 times a ride, and each time
+    -- it was put back at once: on and off ten times a second. Not seen again in seven rides on 2026-10-21 03:2x; what
+    -- the checks read is traced (BKS ev=off). Thrown off 3 times within 2 s (mc_seatloop, game/puppet_guard.h SeatLoop):
+    -- perched on the saddle for the rest of this ride (M.PerchStart; no seat tried again until he gets on a bike anew).
     pp.seated, pp.ejects = false, (pp.ejects or 0) + 1
-    log(string.format("puppet %s is off bike %s (#%d): on again", pp.id, tostring(pp.vkey), pp.ejects))
+    pp.ejectsAll = (pp.ejectsAll or 0) + 1
+    local loop, recent = false, 1
+    if mc_seatloop then loop, recent = mc_seatloop(tonumber(pp.id) or 0, M.now) end
+    local how = M.BikeReadout(so, c, pp.seat)
+    trace("BKS", string.format("key=%s id=%s seat=%d ev=off n=%d %s loop=%d", tostring(pp.vkey), pp.id, pp.seat,
+      pp.ejects, how, loop and 1 or 0))
+    if pp.ejects <= 10 or pp.ejects % 50 == 0 then
+      log(string.format("puppet %s is off bike %s (#%d, %s)%s", pp.id, tostring(pp.vkey), pp.ejects, how,
+        loop and "" or ": on again"))
+    end
     pp.seatTries = 0
+    if loop and not pp.perch then
+      log(string.format("puppet %s: thrown off bike %s %d times in 2 s: perched on its saddle for this ride instead "
+        .. "(not seated again until he gets on a bike anew)", pp.id, tostring(pp.vkey), recent or 0))
+      M.PerchStart(pp, c, "thrown off again and again")
+      pp.perch.stay = true
+      return true
+    end
   end
   if pp.perch then
     M.PerchTick(pp, c)
-    if M.now - (pp.perch.retryT or pp.perch.t) < BIKE_RETRY then return true end
+    if pp.perch.stay or M.now - (pp.perch.retryT or pp.perch.t) < BIKE_RETRY then return true end
     pp.perch.retryT = M.now
   elseif (pp.seatTries or 0) >= BIKE_TRIES then
     M.PerchStart(pp, c)
@@ -2456,7 +2502,7 @@ function M.SeatBike(pp, c)
 end
 
 -- Perched on the bike (no seat): at its saddle every tick, physics off, a riding animation tried once.
-function M.PerchStart(pp, c)
+function M.PerchStart(pp, c, why)
   local so = pp.so
   pp.perch = { key = c.key, t = M.now }
   if pp.hidden then M.Hide(pp, false, true) end
@@ -2466,9 +2512,11 @@ function M.PerchStart(pp, c)
     local ok = pcall(so.AnimPlay, so, name, false)
     if ok then anim = name break end
   end
-  log(string.format("puppet %s: could not be seated on bike %s after %d tries: perched on it (physics off %s, "
-    .. "animation %s)", pp.id, tostring(pp.vkey), pp.seatTries or 0, good and "ok" or "failed", anim))
-  trace("BKS", string.format("key=%s id=%s seat=%d ev=perch anim=%s", tostring(pp.vkey), pp.id, pp.seat, anim))
+  log(string.format("puppet %s: %s on bike %s: perched on it (physics off %s, animation %s)", pp.id,
+    why or string.format("could not be seated after %d tries", pp.seatTries or 0), tostring(pp.vkey),
+    good and "ok" or "failed", anim))
+  trace("BKS", string.format("key=%s id=%s seat=%d ev=perch anim=%s why=%s", tostring(pp.vkey), pp.id, pp.seat, anim,
+    why and "loop" or "tries"))
   M.PerchTick(pp, c)
 end
 
@@ -2791,6 +2839,7 @@ function M.Drive(pp)
     local sk = tostring(pp.vkey) .. "/" .. pp.seat
     local c = pp.vkey and M.cars[pp.vkey]
     if pp.seatKey ~= sk then
+      if mc_seatloop then mc_seatloop(tonumber(pp.id) or 0) end  -- a new ride: its get-offs counted from zero
       pp.seatKey, pp.seatTries, pp.ejects, pp.seated, pp.animTried, pp.seatAnim = sk, 0, 0, false, nil, nil
       pp.leaving, pp.seatCheckOff, pp.seatedT, pp.seatCar = nil, nil, nil, nil
     end

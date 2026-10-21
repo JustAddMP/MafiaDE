@@ -2,7 +2,8 @@
 // Miles: mafiacoop.log, guest of A then host of B) by a script outside the repo: every save-system event of
 // save_guard's log in order. tests/save_paths_test.cpp replays them through save_paths::Guard.
 // type: host / guest (a session starts), end (it ended), menu (the main menu is up), load (arg = storage),
-// write (arg = path from profiles/ or gamesaves/ on; logged = where 0.16.0 put it: real, scratch, held).
+// write (arg = path from profiles/ or gamesaves/ on; logged = where 0.16.0 put it: real, scratch, held; for a load in
+// host_death: the save's id).
 #pragma once
 
 namespace coop_file_writes {
@@ -104,6 +105,24 @@ constexpr Event miles[] = {
     {"02:50:05.093", "write", "profiles/temporaryprofile/garage.pf", "held"},
     {"02:50:22.972", "write", "gamesaves/default/aslot/save1.sav", "real"},
     {"02:50:38.872", "write", "gamesaves/default/aslot/save1.sav", "real"},
+};
+
+// The 2026-10-21 03:21 one-PC run (tools/onepc, the host's mafiacoop-host.log): a co-op Free Ride host who died; the
+// game's respawn read 'freeroam_player_death' from the story slot. For a load, `logged` holds the save's id.
+constexpr Event host_death[] = {
+    {"03:21:27.153", "menu", "", ""},
+    {"03:21:35.011", "host", "", ""},
+    {"03:22:28.351", "load", "debugloadchapter", "freeroam_test"},
+    {"03:22:29.945", "write", "profiles/temporaryprofile/gamesettings.pf", "real"},
+    {"03:22:29.979", "load", "debugloadchapter", "freeroam_test"},
+    {"03:22:48.468", "write", "gamesaves/default/aslot/save1.sav", "scratch"},
+    {"03:23:15.251", "write", "profiles/temporaryprofile/garage.pf", "scratch"},
+    {"03:36:34.658", "write", "profiles/temporaryprofile/garage.pf", "scratch"},
+    {"03:36:35.398", "write", "gamesaves/default/aslot/save1.sav", "scratch"},
+    {"03:36:44.262", "load", "aslot", "freeroam_player_death"},
+    {"03:36:44.263", "write", "gamesaves/default/aslot/save1.sav", "real"},
+    {"03:36:44.721", "write", "profiles/temporaryprofile/gamesettings.pf", "real"},
+    {"03:36:44.778", "load", "aslot", "freeroam_player_death"},
 };
 
 }  // namespace coop_file_writes

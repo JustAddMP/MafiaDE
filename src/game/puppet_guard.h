@@ -82,4 +82,24 @@ private:
     uint32_t last_ = 0;
 };
 
+// ---- SeatLoop -------------------------------------------------------------------------------------------------------
+// receiver: a puppet thrown off the motorbike its player rides, again and again. In the 0.17.0 one-PC runs of 01:59
+// and 02:19 the game threw the host's puppet off its bike copy ~0.1 s after every seat command (163 and 192 times in
+// one ride), and the glue put it back at once each time: on and off ten times a second. N get-offs within `window` s
+// are a loop: the glue stops seating it for that ride and perches it on the saddle (player_sync.lua M.SeatBike).
+class SeatLoop {
+public:
+    explicit SeatLoop(int n = 3, double window = 2.0) : n_(n), window_(window) {}
+    // a get-off at t (s): true when it makes a loop (the n-th within the window; every later one too)
+    bool Off(double t);
+    int Recent() const { return recent_; }  // get-offs within the window up to the last Off
+    void Reset();
+
+private:
+    int n_;
+    double window_;
+    double times_[8] = {};
+    int count_ = 0, recent_ = 0;
+};
+
 }  // namespace mc::game::puppet_guard

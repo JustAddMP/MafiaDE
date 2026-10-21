@@ -24,8 +24,11 @@ Say "host falls: $(Lua 0 "$PSScriptRoot\fall.lua")"; Start-Sleep 4; Both "04-hos
 Say "guest falls: $(Lua 1 "$PSScriptRoot\fall.lua")"; Start-Sleep 4; Both "05-guest-fell"
 
 # a motorbike (the 0.16.0 "cars error"): the host gets on one, rides 4 s, the guest must see a bike with his puppet on it
+# (bike_flip_probe.lua on the guest: what its seat checks read every tick while he rides, the changes into run.log)
+Say "guest bike probe: $(Lua 1 "$PSScriptRoot\bike_flip_probe.lua")"
 Say "host bike: $(Lua 0 "$PSScriptRoot\bike_spawn.lua")"; Start-Sleep 10
 Say (Keys 0 @("W") 4000); Start-Sleep 1; Both "06-host-on-bike"
+Say "guest bike probe: $(Lua 1 "$PSScriptRoot\bike_flip_probe.lua")"
 Say (Keys 0 @("E") 300); Start-Sleep 4; Both "07-host-off-bike"
 
 # the host's Free Ride garage (2026-10-20: the host's garage.pf was written for real at each garage visit): a car added

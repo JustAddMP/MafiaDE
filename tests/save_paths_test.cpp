@@ -69,7 +69,7 @@ Replay Run(const coop_file_writes::Event* ev, size_t n, bool story = false, cons
             r.g.MainMenu();
             if (role == Role::None) inCoop = false;
         }
-        if (type == "load") r.g.Load(story ? "aslot" : e.arg);
+        if (type == "load") r.g.Load(story ? "aslot" : e.arg, e.logged);  // (a load's `logged`: the save's id)
         if (type != "write") continue;
         const Mapped m = Classify(kData + "/" + e.arg);
         const Where w = r.g.Route(m, true);
@@ -326,6 +326,29 @@ int main() {
                   WriteAt(adam, nAdam, "02:45:34.399", true) == Where::Real,
               "STORY host: his save1.sav and aslot.pf written as in single player");
         Check(st.realAfter == 4, "STORY host: only his 3 story saves and aslot.pf real", std::to_string(st.realAfter));
+    }
+    {
+        // The 2026-10-21 one-PC run: the Free Ride host died; the respawn loaded 'freeroam_player_death' from the story
+        // slot (aslot), which made him a STORY host, and his real aslot\save1.sav was written at once (0.17.0).
+        constexpr size_t nDeath = sizeof host_death / sizeof host_death[0];
+        const Replay d = Run(host_death, nDeath);
+        Report("Free Ride host who died (one PC)", d);
+        const Where w = WriteAt(host_death, nDeath, "03:36:44.263");
+        Check(w == Where::Scratch, "Free Ride host's death respawn 03:36:44 save1.sav kept out (0.17.0: real)",
+              WhereName(w));
+        Check(d.realBefore == 1 && d.realAfter == 0, "Free Ride host who died: 1 real co-op write in 0.17.0, now 0",
+              std::to_string(d.realBefore) + " -> " + std::to_string(d.realAfter));
+        Check(d.g.Current() == Scope::All && !d.g.StoryWorld(), "...still a Free Ride (scope All) after the respawn");
+        Guard s;  // a STORY host (his own story from the slot): a free roam id does not change that
+        s.Want(false, true);
+        s.Load("aslot", "chapter_checkpoint");
+        s.Load("aslot", "freeroam_player_death");
+        Check(s.StoryWorld() && s.Current() == Scope::Progress, "STORY host: a freeroam_* load keeps his story");
+        Guard c;  // CONTINUE from the menu after a Free Ride session: a story load
+        c.Want(false, true);
+        c.Load("debugloadchapter", "freeroam_test");
+        c.Load("aslot", "mm_110_omerta_cp_020");
+        Check(c.StoryWorld(), "a story id from the slot after a Free Ride: his story again");
     }
     {
         // A crash in the middle of Adam's session (after the 02:41:48 garage write): nothing real was written.

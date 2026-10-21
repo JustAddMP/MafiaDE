@@ -126,7 +126,11 @@ const char* ScopeName(Scope s) {
     }
 }
 
-void Guard::Load(const std::string& storage) { _story = Lower(storage) == "aslot"; }
+void Guard::Load(const std::string& storage, const std::string& id) {
+    const bool aslot = Lower(storage) == "aslot";
+    if (aslot && !_story && Lower(id).rfind("freeroam_", 0) == 0) return;  // the Free Ride's own state (save_paths.h)
+    _story = aslot;
+}
 
 void Guard::Want(bool block, bool host) {
     _wantBlock = block;

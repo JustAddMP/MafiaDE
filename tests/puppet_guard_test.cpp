@@ -7,6 +7,7 @@
 #include <functional>
 #include <string>
 
+#include "data/bike_flips_0171.h"
 #include "game/puppet_guard.h"
 
 using namespace mc::game::puppet_guard;
@@ -96,6 +97,43 @@ int main() {
         bool any = false;
         for (int i = 0; i < 100; ++i) any |= sh.Update(i * 0.1, 0).on;
         Check(!any, "no hazard: never a demigod (its DAMAGE events carry the local player's hits)");
+    }
+    {  // SeatLoop: the 0.17.0 one-PC rides replayed (tests/data/bike_flips_0171.h): every get-off was a put-back then
+        // (seat command at once); now the third within 2 s perches the puppet for the rest of the ride
+        auto replay = [](const double* offs, size_t n, int& putBacks, double& perchAt) {
+            SeatLoop loop;
+            putBacks = 0;
+            perchAt = -1;
+            for (size_t i = 0; i < n; ++i) {
+                if (loop.Off(offs[i])) {
+                    perchAt = offs[i];  // perched: no more seat commands this ride, so no more get-offs
+                    break;
+                }
+                ++putBacks;
+            }
+        };
+        int pb = 0;
+        double at = 0;
+        const size_t n19 = sizeof bike_flips_0171::onepc_0219 / sizeof(double);
+        replay(bike_flips_0171::onepc_0219, n19, pb, at);
+        Check(n19 == 163 && pb == 2 && at > 0 && at < 0.5,
+              "02:19 ride: 163 get-offs, each put back -> 2 put-backs, then perched",
+              std::to_string(pb) + " put-backs, perched at " + std::to_string(at) + " s");
+        const size_t n59 = sizeof bike_flips_0171::onepc_0159 / sizeof(double);
+        replay(bike_flips_0171::onepc_0159, n59, pb, at);
+        Check(n59 == 192 && pb == 2 && at > 0 && at < 0.5,
+              "01:59 ride: 192 get-offs, each put back -> 2 put-backs, then perched",
+              std::to_string(pb) + " put-backs, perched at " + std::to_string(at) + " s");
+        // a rough ride: a get-off now and then (a crash, a jump) is put back every time, never a loop
+        SeatLoop rough;
+        bool any = false;
+        for (double t : {3.0, 4.5, 9.0, 10.9, 30.0, 31.0}) any |= rough.Off(t);
+        Check(!any, "get-offs 1.5-20 s apart: always put back (no loop)");
+        SeatLoop two;
+        const bool a = two.Off(1.0), b = two.Off(1.1), c = two.Off(3.2), d = two.Off(3.3), e = two.Off(3.4);
+        Check(!a && !b && !c && !d && e && two.Recent() == 3, "3 within 2 s are a loop, 2 are not");
+        two.Reset();
+        Check(!two.Off(3.5) && two.Recent() == 1, "reset (a new ride): counted from zero");
     }
     std::printf("%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;
