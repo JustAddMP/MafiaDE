@@ -132,4 +132,17 @@ for ($k = 0; $k -lt 12; $k++) {
   if (-not $g) { Say (Keys 1 @("ENTER")) }
 }
 Say "in the world: host $(LogHas 'host' 'local player in world'), guest $(LogHas 'guest' 'local player in world')"
+if ($Chapter) {
+  # a chapter's guest loads the host's checkpoint once more after its start (MissionSync: "following the host: loading
+  # his checkpoint"), and that loading screen waits for a key too (the 07:43 run: 50 s on it). Only co-op loads here
+  # (mission: loading ... through the chapter loader), never the story: Enter while its loading screen is up, 40 s.
+  for ($k = 0; $k -lt 8; $k++) {
+    Start-Sleep 5
+    foreach ($i in 0, 1) {
+      $tag = @('host', 'guest')[$i]
+      $ans = & "$Repo\tools\devlua.ps1" -Tag $tag -Code "local g, up = pcall(game.hud.IsLoadingScreenUp, game.hud) return (g and up) and 'loading' or 'in world'" -TimeoutS 4 2>$null
+      if ("$ans" -notmatch "in world") { Say "$tag on a loading screen after the chapter start (a follow load): $(Keys $i @('ENTER'))" }
+    }
+  }
+}
 Say (Fit 0); Say (Fit 1)
