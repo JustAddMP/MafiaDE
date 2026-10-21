@@ -464,14 +464,14 @@ void TestSettle() {
         Check(holds[0] == '0' && holds[1] == '1', "settle: the recorded fall is caught at its first reading under the "
               "spot (1.8 m down)", holds);
     }
-    for (double loadS : {0.0, 0.8, 1.5, 2.5}) {
+    for (double loadS : {0.0, 0.8, 1.5, 2.5, 6.0, 9.0}) {  // 6 / 9 s: the 06:25 run's car (ground later than 3 s)
         Settle s;
         const float spot = 2.86f;
         s.Start(0, 0, 0, spot);
         float z = spot, vz = 0, minZ = spot;
         int holds = 0;
         bool hold = false;
-        for (double t = 0; t < 6.0; t += 1.0 / 60) {
+        for (double t = 0; t < 12.0; t += 1.0 / 60) {
             if (hold) {  // the glue's HOLD on the next tick
                 z = spot;
                 vz = 0;
@@ -501,7 +501,7 @@ void TestSettle() {
         Check(!any, "settle: walking down 1 m after the pull: no hold");
         Settle late;
         late.Start(0, 0, 0, 3.0f);
-        Check(!late.Update(kSettleS + 0.1, -20.0f), "settle: only within 3 s of the pull (a fall later is the game's)");
+        Check(!late.Update(kSettleS + 0.1, -20.0f), "settle: only within kSettleS of the pull (a fall later is the game's)");
         Settle none;
         Check(!none.Update(1.0, -20.0f), "settle: no pull, no hold");
     }

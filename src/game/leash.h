@@ -170,10 +170,13 @@ std::string Banner(State s, float dist, double left);
 // run, the second pull from 450 m: put down beside the host at z 2.86, we fell through the street - z 1.06, -3.5,
 // -9.2, -15.2 within 1.4 s - and landed downed at health 1, our puppet on the host died with us and was spawned again
 // 10 s later). For kSettleS after a pull, once we are more than kSettleDropM below the spot we are put back on it (the
-// glue's HOLD), at most kSettleMax times; then the game's own fall goes on.
-constexpr double kSettleS = 3.0;
+// glue's HOLD), at most kSettleMax times; then the game's own fall goes on. 3 s / 8 holds were not enough in the
+// 2026-10-21 06:25 one-PC run: pulled back in his car from 450 m, the guest's car was put back 5 times in 3 s (one
+// hold every ~0.55 s: a 1.5 m fall), then fell through the street beside the host at up to 70 m/s and he was downed:
+// the ground there loaded later than 3 s. Now 10 s (a hold every ~0.55 s while it lasts: about 18).
+constexpr double kSettleS = 10.0;
 constexpr float kSettleDropM = 1.5f;
-constexpr int kSettleMax = 8;
+constexpr int kSettleMax = 25;
 
 class Settle {
 public:

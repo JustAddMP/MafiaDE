@@ -2966,14 +2966,17 @@ function M.Drive(pp)
   if valid(owner) then  -- the player got out: let the puppet climb out, then follow on foot again
     -- The animated exit (GetOffVehicle) did not always take it out: in the 2026-10-21 04:13 one-PC run the guest's
     -- puppet stayed in his car copy on the host, 3.7 m above him, "getting out" every 3 s for half a minute while he
-    -- walked 13 m off. A second try is the fast exit (GetOutCarFast, as off a bike), a third also puts it at his spot.
+    -- walked 13 m off. A second try is the fast exit (GetOutCarFast, as off a bike) and puts it at his spot (the 06:25
+    -- run: the fast exit alone left it 23 m from him, snapped every frame for a second). The first try is the fast one
+    -- too when the car copy still moves (the animated exit needs a standing car).
     if not pp.exitSo then pp.carOut = (pp.carOut or 0) + 1 end
+    if pp.carOut and pp.carOut == 1 and not pp.exitSo and M.SpeedMs(owner) > 1 then pp.carOut = 2 end
     if pp.carOut and pp.carOut >= 2 and not pp.exitSo then
       local good, err = pcall(so.GetOutCarFast, so, owner)
-      if pp.carOut >= 3 and pp.tx and not pp.hidden then so:SetPos(V(pp.tx, pp.ty, pp.tz)) end
+      if pp.tx and not pp.hidden then so:SetPos(V(pp.tx, pp.ty, pp.tz)) end
       pp.exitSo, pp.exitT = true, M.now
-      log(string.format("puppet %s still in its car after the exit (try %d): out at once (GetOutCarFast %s%s)", pp.id,
-        pp.carOut, good and "ok" or ("failed: " .. tostring(err)), pp.carOut >= 3 and ", put at his spot" or ""))
+      log(string.format("puppet %s still in its car after the exit (try %d): out at once (GetOutCarFast %s), put at his "
+        .. "spot", pp.id, pp.carOut, good and "ok" or ("failed: " .. tostring(err))))
       trace("SCP", string.format("key=%s ev=forceout id=%s try=%d ok=%d", tostring(pp.vkey or "-"), pp.id, pp.carOut,
         good and 1 or 0))
     else
@@ -5116,7 +5119,7 @@ end
 -- The leash (src/game/leash.h, docs/host-authority.md 3), guest only: the decisions are in C++; this reads what they
 -- need and carries out the pull. src/game/leash_sync.cpp calls MafiaCoop.Leash(cmd) once per script tick after
 -- M.Update. cmd "PULL": the screen fades out (HUD_FaderFadeOut, as mission_sync.lua uses it), we are put back near the
--- host (M.LeashPull), it fades in again. cmd "HOLD x y z" (src/game/leash.h Settle: for 3 s after a pull, when we sank
+-- host (M.LeashPull), it fades in again. cmd "HOLD x y z" (src/game/leash.h Settle: for 10 s after a pull, when we sank
 -- 1.5 m under the spot - the ground there not loaded yet): we (our car) are put back on x y z. Returns "" outside a
 -- session and on the host, else
 --   "R inWorld x y host hx hy cut selfDown hostDown hostCar passenger drive z" [.. " P ok how [sx sy sz]"]
